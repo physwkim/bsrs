@@ -3,6 +3,7 @@
 //! See `bluesky/src/bluesky/run_engine.py:_command_registry` for the reference
 //! command set.
 
+use futures::future::BoxFuture;
 use serde_json::Value;
 use std::any::Any;
 use std::collections::HashMap;
@@ -164,6 +165,55 @@ pub enum Msg {
         args: ConfigureArgs,
     },
 
+    /// Prepare a `Preparable` device for a step or fly scan.
+    /// Mirrors bluesky `Msg('prepare', flyer_object, value)`. The
+    /// resulting `Status` is added to the named wait group like
+    /// `Set` / `Kickoff` / `Complete`.
+    Prepare {
+        /// Target device.
+        obj: Arc<dyn PreparableObj>,
+        /// Initial state / per-scan parameters. Opaque to the engine;
+        /// the device's `prepare_dyn` interprets it.
+        value: Value,
+        /// Optional group for `Wait`.
+        group: Option<GroupId>,
+    },
+
+    /// Wait for arbitrary `Future`s — the cirrus equivalent of
+    /// bluesky's `Msg('wait_for', None, awaitable_factories)`. The
+    /// factories are invoked each time the message is processed, so
+    /// the message can be re-issued during rewind.
+    WaitFor {
+        /// Awaitable factories. Each factory produces a fresh future
+        /// on every call.
+        factories: Vec<Arc<dyn Fn() -> BoxFuture<'static, crate::error::Result<()>> + Send + Sync>>,
+        /// Optional timeout. If exceeded, the engine returns
+        /// `CirrusError::Timeout`.
+        timeout: Option<Duration>,
+    },
+
+    /// Register a device for pause/resume hooks. The engine calls
+    /// `PausableObj::pause_dyn` on every registered device when it
+    /// enters the pause gate, and `resume_dyn` on resume.
+    RegisterPausable(Arc<dyn PausableObj>),
+    /// Remove a previously-registered Pausable device.
+    UnregisterPausable(Arc<dyn PausableObj>),
+
+    /// Read a line of user input. The engine routes the `prompt`
+    /// through its configured input handler (see
+    /// `RunEngine::set_input_handler`); without a handler the run
+    /// fails with `CirrusError::Plan`.
+    Input {
+        /// Prompt to display.
+        prompt: String,
+    },
+
+    /// Surface the engine type name as a `MsgResult::EngineClass`.
+    /// Mirrors bluesky's `Msg('RE_class')`. Useful for plans that
+    /// need to introspect whether they are running under cirrus or
+    /// the legacy bluesky RunEngine.
+    ReClass,
+
     /// Resume after a deferred pause / suspend.
     Resume,
 
@@ -227,12 +277,41 @@ impl Msg {
                 | Msg::Unmonitor(_)
                 | Msg::InstallSuspender { .. }
                 | Msg::RemoveSuspender { .. }
+                | Msg::RegisterPausable(_)
+                | Msg::UnregisterPausable(_)
                 | Msg::Rewindable(_)
                 | Msg::Custom { .. }
                 | Msg::Publish(_)
                 | Msg::Locate(_)
+                | Msg::Input { .. }
+                | Msg::ReClass
                 | Msg::Null
         )
+    }
+
+    /// `Some(name)` if the message targets a named device that should
+    /// be tracked across the run for cleanup. Used by the engine to
+    /// build `objs_seen` / `movable_objs_touched` registers.
+    pub fn obj_name(&self) -> Option<&str> {
+        match self {
+            Msg::Read(o) => Some(o.name()),
+            Msg::Set { obj, .. } => Some(obj.name()),
+            Msg::Trigger { obj, .. } => Some(obj.name()),
+            Msg::Locate(o) => Some(o.name()),
+            Msg::Stage(o) => Some(o.name()),
+            Msg::Unstage(o) => Some(o.name()),
+            Msg::Stop { obj, .. } => Some(obj.name()),
+            Msg::Kickoff { obj, .. } => Some(obj.name()),
+            Msg::Complete { obj, .. } => Some(obj.name()),
+            Msg::Collect { obj, .. } => Some(obj.name()),
+            Msg::Monitor { obj, .. } => Some(obj.name()),
+            Msg::Unmonitor(o) => Some(o.name()),
+            Msg::Configure { obj, .. } => Some(obj.name()),
+            Msg::Prepare { obj, .. } => Some(obj.name()),
+            Msg::RegisterPausable(o) => Some(o.name()),
+            Msg::UnregisterPausable(o) => Some(o.name()),
+            _ => None,
+        }
     }
 }
 
@@ -309,6 +388,21 @@ impl Clone for Msg {
                 obj: obj.clone(),
                 args: args.clone(),
             },
+            Msg::Prepare { obj, value, group } => Msg::Prepare {
+                obj: obj.clone(),
+                value: value.clone(),
+                group: group.clone(),
+            },
+            Msg::WaitFor { factories, timeout } => Msg::WaitFor {
+                factories: factories.clone(),
+                timeout: *timeout,
+            },
+            Msg::RegisterPausable(o) => Msg::RegisterPausable(o.clone()),
+            Msg::UnregisterPausable(o) => Msg::UnregisterPausable(o.clone()),
+            Msg::Input { prompt } => Msg::Input {
+                prompt: prompt.clone(),
+            },
+            Msg::ReClass => Msg::ReClass,
             Msg::Resume => Msg::Resume,
             Msg::InstallSuspender { id, suspender } => Msg::InstallSuspender {
                 id: *id,
@@ -355,6 +449,12 @@ impl std::fmt::Debug for Msg {
             Msg::ClearCheckpoint => write!(f, "ClearCheckpoint"),
             Msg::Pause { defer } => write!(f, "Pause(defer={defer})"),
             Msg::Configure { obj, .. } => write!(f, "Configure({})", obj.name()),
+            Msg::Prepare { obj, .. } => write!(f, "Prepare({})", obj.name()),
+            Msg::WaitFor { factories, .. } => write!(f, "WaitFor(n={})", factories.len()),
+            Msg::RegisterPausable(o) => write!(f, "RegisterPausable({})", o.name()),
+            Msg::UnregisterPausable(o) => write!(f, "UnregisterPausable({})", o.name()),
+            Msg::Input { prompt } => write!(f, "Input({prompt:?})"),
+            Msg::ReClass => write!(f, "ReClass"),
             Msg::Resume => write!(f, "Resume"),
             Msg::InstallSuspender { id, .. } => write!(f, "InstallSuspender({id})"),
             Msg::RemoveSuspender { id } => write!(f, "RemoveSuspender({id})"),
@@ -417,6 +517,14 @@ pub trait ReadableObj: NamedObj {
 pub trait MovableObj: NamedObj {
     /// Move and return a `Status`.
     async fn set_dyn(&self, value: f64) -> crate::status::Status;
+    /// Engine-side hook invoked on pause for every object that this
+    /// run has set. Defaults to a no-op so existing impls keep
+    /// working; overrides should delegate to the device's own stop
+    /// path. Mirrors bluesky's `_stop_movable_objects` walk.
+    async fn stop_on_pause(&self, success: bool) -> Result<(), crate::error::CirrusError> {
+        let _ = success;
+        Ok(())
+    }
 }
 
 /// Setpoint + readback record returned by [`LocatableObj::locate_dyn`].
@@ -467,6 +575,33 @@ pub trait FlyableObj: NamedObj {
     async fn kickoff_dyn(&self) -> crate::status::Status;
     /// Wait for completion.
     async fn complete_dyn(&self) -> crate::status::Status;
+    /// Engine-side hook invoked on pause for every object that this
+    /// run has kickoff'd. Default no-op; override on flyers that
+    /// should stop their hardware when the engine pauses.
+    async fn stop_on_pause(&self, success: bool) -> Result<(), crate::error::CirrusError> {
+        let _ = success;
+        Ok(())
+    }
+}
+
+/// Anything that can be `prepare()`'d for a step / fly scan.
+/// Object-safe analogue of [`crate::ext`]'s `Preparable` trait.
+#[async_trait::async_trait]
+pub trait PreparableObj: NamedObj {
+    /// Prepare; returned `Status` resolves when the device is ready.
+    async fn prepare_dyn(&self, value: Value) -> crate::status::Status;
+}
+
+/// Devices that want pause/resume hooks called on them by the engine.
+/// Mirrors `bluesky.protocols.Pausable` — the engine walks every
+/// registered `PausableObj` on pause (after `stop_on_pause` runs) and
+/// on resume.
+#[async_trait::async_trait]
+pub trait PausableObj: NamedObj {
+    /// Called after the engine enters the pause gate.
+    async fn pause_dyn(&self) -> Result<(), crate::error::CirrusError>;
+    /// Called just before the engine resumes the message loop.
+    async fn resume_dyn(&self) -> Result<(), crate::error::CirrusError>;
 }
 
 /// Anything that can be collected (Flyable companion).

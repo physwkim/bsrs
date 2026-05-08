@@ -124,6 +124,9 @@ impl MovableObj for SoftMotor {
     async fn set_dyn(&self, value: f64) -> Status {
         self.set(value).await
     }
+    async fn stop_on_pause(&self, success: bool) -> Result<()> {
+        StoppableObj::stop_dyn(self, success).await
+    }
 }
 
 #[async_trait]

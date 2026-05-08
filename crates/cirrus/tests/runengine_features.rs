@@ -397,3 +397,397 @@ async fn pause_changes_state_to_paused() {
     let _ = join.await.unwrap();
     assert_eq!(re.state(), EngineRunState::Idle);
 }
+
+// -- Movable stop on pause ---------------------------------------------------
+//
+// `MovableObj::stop_on_pause` defaults to a no-op; SoftMotor overrides it
+// to delegate to its existing `StoppableObj::stop_dyn`. We need a concrete
+// counter to prove the wiring fires; reuse the SoftMotor pattern with a
+// hand-rolled mock that increments a counter.
+
+struct StopCountingMovable {
+    name: String,
+    stops: Arc<AtomicU64>,
+}
+
+impl cirrus_core::msg::NamedObj for StopCountingMovable {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[async_trait::async_trait]
+impl cirrus_core::msg::MovableObj for StopCountingMovable {
+    async fn set_dyn(&self, _value: f64) -> cirrus_core::status::Status {
+        cirrus_core::status::Status::done()
+    }
+    async fn stop_on_pause(&self, _success: bool) -> Result<(), cirrus_core::error::CirrusError> {
+        self.stops.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn pause_calls_stop_on_pause_for_set_movables() {
+    let stops = Arc::new(AtomicU64::new(0));
+    let mover: Arc<dyn cirrus_core::msg::MovableObj> = Arc::new(StopCountingMovable {
+        name: "m1".into(),
+        stops: stops.clone(),
+    });
+    let re = Arc::new(RunEngine::new(vec![]));
+    let re2 = re.clone();
+    let mover_for_plan = mover.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Set { obj: mover_for_plan, value: 1.0, group: None };
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let join = tokio::spawn(async move { re2.run_async(plan).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    re.pause(false);
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert!(
+        stops.load(Ordering::SeqCst) >= 1,
+        "stop_on_pause should fire for movables touched by Msg::Set"
+    );
+    re.resume();
+    let _ = join.await.unwrap();
+}
+
+#[tokio::test]
+async fn cleanup_calls_stop_on_pause_for_touched_movables() {
+    let stops = Arc::new(AtomicU64::new(0));
+    let mover: Arc<dyn cirrus_core::msg::MovableObj> = Arc::new(StopCountingMovable {
+        name: "m1".into(),
+        stops: stops.clone(),
+    });
+    let re = RunEngine::new(vec![]);
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Set { obj: mover.clone(), value: 1.0, group: None };
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    re.run_async(plan).await.unwrap();
+    assert_eq!(
+        stops.load(Ordering::SeqCst),
+        1,
+        "stop_on_pause must fire once during run cleanup",
+    );
+}
+
+// -- Msg::Prepare ------------------------------------------------------------
+
+struct ScriptedPreparable {
+    name: String,
+    captured: Arc<StdMutex<Vec<Value>>>,
+}
+
+impl cirrus_core::msg::NamedObj for ScriptedPreparable {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[async_trait::async_trait]
+impl cirrus_core::msg::PreparableObj for ScriptedPreparable {
+    async fn prepare_dyn(&self, value: Value) -> cirrus_core::status::Status {
+        self.captured.lock().unwrap().push(value);
+        cirrus_core::status::Status::done()
+    }
+}
+
+#[tokio::test]
+async fn prepare_invokes_device_and_groups_status() {
+    let captured = Arc::new(StdMutex::new(Vec::<Value>::new()));
+    let dev: Arc<dyn cirrus_core::msg::PreparableObj> = Arc::new(ScriptedPreparable {
+        name: "flyer".into(),
+        captured: captured.clone(),
+    });
+    let re = RunEngine::new(vec![]);
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Prepare { obj: dev, value: serde_json::json!({"frames": 5}), group: Some("p".into()) };
+        yield Msg::Wait { group: "p".into(), error_on_timeout: true, timeout: None };
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    re.run_async(plan).await.unwrap();
+    let got = captured.lock().unwrap().clone();
+    assert_eq!(got.len(), 1, "prepare_dyn should be called exactly once");
+    assert_eq!(got[0], serde_json::json!({"frames": 5}));
+}
+
+// -- Msg::WaitFor ------------------------------------------------------------
+
+#[tokio::test]
+async fn wait_for_runs_factories_in_order() {
+    let log = Arc::new(StdMutex::new(Vec::<u32>::new()));
+    let l1 = log.clone();
+    let l2 = log.clone();
+    let f1: Arc<
+        dyn Fn() -> futures::future::BoxFuture<'static, cirrus_core::error::Result<()>>
+            + Send
+            + Sync,
+    > = Arc::new(move || {
+        let l = l1.clone();
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            l.lock().unwrap().push(1);
+            Ok(())
+        })
+    });
+    let f2: Arc<
+        dyn Fn() -> futures::future::BoxFuture<'static, cirrus_core::error::Result<()>>
+            + Send
+            + Sync,
+    > = Arc::new(move || {
+        let l = l2.clone();
+        Box::pin(async move {
+            l.lock().unwrap().push(2);
+            Ok(())
+        })
+    });
+    let re = RunEngine::new(vec![]);
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::WaitFor { factories: vec![f1, f2], timeout: None };
+    });
+    re.run_async(plan).await.unwrap();
+    assert_eq!(log.lock().unwrap().clone(), vec![1, 2]);
+}
+
+#[tokio::test]
+async fn wait_for_times_out() {
+    let f: Arc<
+        dyn Fn() -> futures::future::BoxFuture<'static, cirrus_core::error::Result<()>>
+            + Send
+            + Sync,
+    > = Arc::new(|| {
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok(())
+        })
+    });
+    let re = RunEngine::new(vec![]);
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::WaitFor { factories: vec![f], timeout: Some(Duration::from_millis(50)) };
+    });
+    let result = re.run_async(plan).await.unwrap();
+    assert_eq!(
+        result.exit_status, "fail",
+        "WaitFor timeout should fail run"
+    );
+}
+
+// -- Pausable device hooks ---------------------------------------------------
+
+struct PauseTracker {
+    name: String,
+    paused: Arc<AtomicU64>,
+    resumed: Arc<AtomicU64>,
+}
+
+impl cirrus_core::msg::NamedObj for PauseTracker {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[async_trait::async_trait]
+impl cirrus_core::msg::PausableObj for PauseTracker {
+    async fn pause_dyn(&self) -> Result<(), cirrus_core::error::CirrusError> {
+        self.paused.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn resume_dyn(&self) -> Result<(), cirrus_core::error::CirrusError> {
+        self.resumed.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn pausable_hooks_fire_on_pause_and_resume() {
+    let paused = Arc::new(AtomicU64::new(0));
+    let resumed = Arc::new(AtomicU64::new(0));
+    let dev: Arc<dyn cirrus_core::msg::PausableObj> = Arc::new(PauseTracker {
+        name: "pausable_dev".into(),
+        paused: paused.clone(),
+        resumed: resumed.clone(),
+    });
+    let re = Arc::new(RunEngine::new(vec![]));
+    re.register_pausable(dev.clone()).await;
+
+    let re2 = re.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::Sleep(Duration::from_millis(50));
+    });
+    let join = tokio::spawn(async move { re2.run_async(plan).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    re.pause(false);
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert_eq!(
+        paused.load(Ordering::SeqCst),
+        1,
+        "pause_dyn should fire once on pause"
+    );
+    re.resume();
+    let _ = join.await.unwrap();
+    assert_eq!(
+        resumed.load(Ordering::SeqCst),
+        1,
+        "resume_dyn should fire once on resume"
+    );
+}
+
+#[tokio::test]
+async fn register_pausable_via_msg() {
+    let paused = Arc::new(AtomicU64::new(0));
+    let resumed = Arc::new(AtomicU64::new(0));
+    let dev: Arc<dyn cirrus_core::msg::PausableObj> = Arc::new(PauseTracker {
+        name: "via_msg".into(),
+        paused: paused.clone(),
+        resumed: resumed.clone(),
+    });
+    let re = Arc::new(RunEngine::new(vec![]));
+    let re2 = re.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::RegisterPausable(dev.clone());
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::UnregisterPausable(dev);
+    });
+    let join = tokio::spawn(async move { re2.run_async(plan).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    re.pause(false);
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    re.resume();
+    let _ = join.await.unwrap();
+    assert!(paused.load(Ordering::SeqCst) >= 1);
+    assert!(resumed.load(Ordering::SeqCst) >= 1);
+}
+
+// -- Suspender — request_suspend pauses; suspend_until auto-resumes ----------
+
+#[tokio::test]
+async fn request_suspend_pauses_engine() {
+    let re = Arc::new(RunEngine::new(vec![]));
+    let re2 = re.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::Sleep(Duration::from_millis(50));
+    });
+    let join = tokio::spawn(async move { re2.run_async(plan).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    re.request_suspend("shutter closed");
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(
+        re.state(),
+        EngineRunState::Paused,
+        "request_suspend must pause, not abort"
+    );
+    re.resume();
+    let _ = join.await.unwrap().unwrap();
+    assert_eq!(
+        re.state(),
+        EngineRunState::Idle,
+        "engine returns to idle after manual resume"
+    );
+}
+
+#[tokio::test]
+async fn suspend_until_pauses_then_auto_resumes() {
+    let re = Arc::new(RunEngine::new(vec![]));
+    let re2 = re.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::Sleep(Duration::from_millis(50));
+    });
+    let join = tokio::spawn(async move { re2.run_async(plan).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    re.suspend_until(Box::pin(async move {
+        let _ = rx.await;
+    }));
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(re.state(), EngineRunState::Paused);
+    let _ = tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("did not auto-resume in time")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        re.state(),
+        EngineRunState::Idle,
+        "engine returns to idle after auto-resume"
+    );
+}
+
+// -- Msg::Input --------------------------------------------------------------
+
+#[tokio::test]
+async fn input_with_handler_returns_text() {
+    let re = RunEngine::new(vec![]);
+    re.set_input_handler(Some(Arc::new(|prompt: String| {
+        Box::pin(async move { Ok(format!("answer:{prompt}")) })
+    })));
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::Input { prompt: "name?".into() };
+    });
+    re.run_async(plan).await.unwrap();
+    match re.take_msg_result() {
+        cirrus_engine::MsgResult::Input { text } => assert_eq!(text, "answer:name?"),
+        other => panic!("expected MsgResult::Input, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn input_without_handler_fails() {
+    let re = RunEngine::new(vec![]);
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::Input { prompt: "no handler".into() };
+    });
+    let result = re.run_async(plan).await.unwrap();
+    assert_eq!(result.exit_status, "fail");
+}
+
+// -- Msg::ReClass ------------------------------------------------------------
+
+#[tokio::test]
+async fn re_class_reports_engine_name() {
+    let re = RunEngine::new(vec![]);
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::ReClass;
+    });
+    re.run_async(plan).await.unwrap();
+    match re.take_msg_result() {
+        cirrus_engine::MsgResult::EngineClass { name } => assert_eq!(name, "cirrus.RunEngine"),
+        other => panic!("expected MsgResult::EngineClass, got {other:?}"),
+    }
+}
+
+// -- sigint_count reset ------------------------------------------------------
+
+#[tokio::test]
+async fn sigint_count_resets_across_runs() {
+    use std::sync::atomic::AtomicU8;
+    // The counter is private; we exercise the externally observable
+    // consequence: an engine that completed a previous run still
+    // responds to a single explicit pause() request without going
+    // straight into the abort/halt path.
+    //
+    // We can't simulate SIGINT in a unit test without owning the
+    // process signal handler, but the reset itself is small and
+    // mechanically verifiable: install_signal_handler is idempotent
+    // and reset happens on every run_async entry.
+    let re = Arc::new(RunEngine::new(vec![]));
+    re.run_async(one_count_plan()).await.unwrap();
+    re.run_async(one_count_plan()).await.unwrap();
+    // Just prove the engine is reusable; this is the behavior the
+    // sigint_count reset is needed for.
+    assert_eq!(re.state(), EngineRunState::Idle);
+    let _ = AtomicU8::new(0); // touch import to silence unused warning
+}

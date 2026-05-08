@@ -80,6 +80,12 @@ pub type MdValidator = Arc<dyn Fn(&HashMap<String, Value>) -> Result<()> + Send 
 /// inside `run_async` *outside* the message loop.
 pub type PlanHook = Arc<dyn Fn() + Send + Sync + 'static>;
 
+/// Handler used by [`RunEngine`] to satisfy `Msg::Input`. Receives the
+/// prompt and returns the user's response. Mirrors bluesky's
+/// `_input` which routes through `AsyncInput`.
+pub type InputHandler =
+    Arc<dyn Fn(String) -> BoxFuture<'static, Result<String>> + Send + Sync + 'static>;
+
 /// Side-channel result from the most recently-processed `Msg`. Producers
 /// that yield `Msg`s (Lua coroutines, future async-fn plans) can poll
 /// `RunEngine::take_msg_result` after each yield to see what the engine
@@ -125,6 +131,16 @@ pub enum MsgResult {
     CloseRun {
         /// `success` / `abort` / `fail` / etc.
         exit_status: String,
+    },
+    /// `Msg::Input` produced a string from the configured handler.
+    Input {
+        /// The user's response.
+        text: String,
+    },
+    /// `Msg::ReClass` — the engine identifies itself.
+    EngineClass {
+        /// Stable identifier — `"cirrus.RunEngine"`.
+        name: &'static str,
     },
 }
 
@@ -187,6 +203,8 @@ pub struct RunEngine {
     /// with `CirrusError::Timeout`. Mirrors bluesky's
     /// `loop_until_completion_timeout`.
     loop_timeout: StdMutex<Option<Duration>>,
+    /// Optional handler for `Msg::Input`. `None` = inputs fail.
+    input_handler: StdMutex<Option<InputHandler>>,
     /// Side-channel for the most recently-processed `Msg`'s result.
     /// Producers (Lua coroutine bridge, future async-fn plans) poll
     /// `take_msg_result` between Msg yields.
@@ -204,6 +222,18 @@ struct EngineState {
     /// drops the `Subscription` (RAII unsubscribe) and aborts the pump on
     /// `Drop`. Inserted by `Msg::Monitor`, removed by `Msg::Unmonitor`.
     monitor_tasks: HashMap<String, MonitorTask>,
+    /// Movables touched by `Msg::Set` during this run, keyed by name
+    /// for dedup. Engine walks this on pause / cleanup and calls
+    /// `MovableObj::stop_on_pause(success=true)`. Mirrors bluesky's
+    /// `_movable_objs_touched`.
+    movable_objs_touched: HashMap<String, Arc<dyn cirrus_core::msg::MovableObj>>,
+    /// Flyers touched by `Msg::Kickoff` during this run, same role
+    /// as `movable_objs_touched`.
+    flyable_objs_touched: HashMap<String, Arc<dyn cirrus_core::msg::FlyableObj>>,
+    /// Devices that opted into pause/resume hooks via
+    /// `Msg::RegisterPausable` or `RunEngine::register_pausable`.
+    /// Walked on every pause-enter and resume.
+    pausables: HashMap<String, Arc<dyn cirrus_core::msg::PausableObj>>,
     msg_cache: VecDeque<Msg>,
     replay_queue: VecDeque<Msg>,
     rewindable: bool,
@@ -247,6 +277,7 @@ impl RunEngine {
             before_plan: StdMutex::new(None),
             after_plan: StdMutex::new(None),
             loop_timeout: StdMutex::new(None),
+            input_handler: StdMutex::new(None),
             last_msg_result: StdMutex::new(MsgResult::None),
             signal_installed: AtomicBool::new(false),
         }
@@ -272,6 +303,10 @@ impl RunEngine {
         self.is_halting.store(false, Ordering::SeqCst);
         self.is_stopping.store(false, Ordering::SeqCst);
         self.is_paused.store(false, Ordering::SeqCst);
+        // Reset SIGINT 3-tap counter — a previous session's taps must
+        // not put a fresh run into the abort/halt path on the very
+        // first ctrl-c.
+        self.sigint_count.store(0, Ordering::SeqCst);
         // Renew the cancel token so a previous abort/stop's cancel state
         // doesn't immediately tear down this run.
         *self.cancel.lock().unwrap() = CancellationToken::new();
@@ -286,12 +321,27 @@ impl RunEngine {
             },
             None => self.run_loop(plan).await,
         };
-        // Cleanup: unstage anything still staged; drop suspenders.
+        // Cleanup: stop touched movables / flyers, unstage anything
+        // still staged, drop suspenders. Mirrors bluesky's `_run`
+        // exit chain (`_stop_movable_objects` then `unstage`).
         let mut state = self.state.lock().await;
         let staged = std::mem::take(&mut state.staged);
+        let movables = std::mem::take(&mut state.movable_objs_touched);
+        let flyables = std::mem::take(&mut state.flyable_objs_touched);
+        let _ = std::mem::take(&mut state.pausables);
         let _ = std::mem::take(&mut state.suspenders); // Drop aborts watchers
         let _ = std::mem::take(&mut state.monitor_tasks); // K1: monitor pumps
         drop(state);
+        for (_name, m) in movables {
+            if let Err(e) = m.stop_on_pause(true).await {
+                tracing::warn!("stop_on_pause failed for movable {}: {e}", m.name());
+            }
+        }
+        for (_name, fly) in flyables {
+            if let Err(e) = fly.stop_on_pause(true).await {
+                tracing::warn!("stop_on_pause failed for flyer {}: {e}", fly.name());
+            }
+        }
         for s in staged {
             let _ = s.unstage_dyn().await;
         }
@@ -403,16 +453,62 @@ impl RunEngine {
         *self.loop_timeout.lock().unwrap() = t;
     }
 
+    /// Install a handler that satisfies `Msg::Input`. `None` clears
+    /// the handler — subsequent `Msg::Input` will fail with
+    /// `CirrusError::Plan`.
+    pub fn set_input_handler(&self, h: Option<InputHandler>) {
+        *self.input_handler.lock().unwrap() = h;
+    }
+
+    /// Register a Pausable device. Equivalent to yielding
+    /// `Msg::RegisterPausable(obj)` from a plan; useful when the
+    /// device is set up before the run begins (e.g. by a host
+    /// application or plan preprocessor).
+    pub async fn register_pausable(&self, obj: Arc<dyn cirrus_core::msg::PausableObj>) {
+        self.state
+            .lock()
+            .await
+            .pausables
+            .insert(obj.name().to_string(), obj);
+    }
+
+    /// Remove a previously-registered Pausable device.
+    pub async fn unregister_pausable(&self, name: &str) {
+        self.state.lock().await.pausables.remove(name);
+    }
+
+    /// Pause the engine and auto-resume when `fut` resolves. Mirrors
+    /// bluesky's `RE.request_suspend(fut, …)`.
+    ///
+    /// Spawns a background task that awaits `fut`; when it resolves,
+    /// the engine is resumed. The engine is paused immediately. If
+    /// the engine is already paused, this still installs the
+    /// auto-resume task — the next resume will fire when `fut`
+    /// resolves.
+    pub fn suspend_until(self: &Arc<Self>, fut: BoxFuture<'static, ()>) {
+        self.is_paused.store(true, Ordering::SeqCst);
+        let me = Arc::downgrade(self);
+        tokio::spawn(async move {
+            fut.await;
+            if let Some(me) = me.upgrade() {
+                me.resume();
+            }
+        });
+    }
+
     /// Synonym for [`pause`]. Mirrors bluesky's `RE.request_pause`.
     pub fn request_pause(&self, defer: bool) {
         self.pause(defer);
     }
 
-    /// External nudge: ask the engine to suspend (treated as `abort` for
-    /// now — no async-resume hook here; pair with a `Suspender` if you
-    /// want a *resume-when-condition* pattern).
-    pub fn request_suspend(&self, reason: impl Into<String>) {
-        self.abort(reason);
+    /// External nudge: ask the engine to pause. The engine pauses at
+    /// the next opportunity; pair with a `Suspender` (via
+    /// `Msg::InstallSuspender`) or call `suspend_until(fut)` if you
+    /// want auto-resume on a condition. Mirrors bluesky's
+    /// `request_suspend` for the no-future case (which pauses, not
+    /// aborts).
+    pub fn request_suspend(&self, _reason: impl Into<String>) {
+        self.pause(false);
     }
 
     /// Sync entry point — drive a plan via the cirrus runtime.
@@ -646,18 +742,63 @@ impl RunEngine {
     }
 
     async fn on_pause_enter(&self) {
-        // Suspend monitors (drop them; they'll be re-installed on resume by
-        // re-issuing Monitor messages from the cache, if any).
-        let mut state = self.state.lock().await;
-        state.monitor_tasks.clear();
+        // Snapshot touched objects under the lock, then drop the lock
+        // before awaiting their stop / pause hooks so a slow backend
+        // can't hold the engine state locked.
+        let (movables, flyables, pausables) = {
+            let mut state = self.state.lock().await;
+            // Suspend monitors — drop them; resume will replay the
+            // Monitor messages from the rewind cache if applicable.
+            state.monitor_tasks.clear();
+            let movables: Vec<_> = state.movable_objs_touched.values().cloned().collect();
+            let flyables: Vec<_> = state.flyable_objs_touched.values().cloned().collect();
+            let pausables: Vec<_> = state.pausables.values().cloned().collect();
+            (movables, flyables, pausables)
+        };
+        // Per doc 03: pause "Calls Stoppable::stop(success=true) on
+        // all set/kickoff'd objects". `stop_on_pause` defaults to a
+        // no-op for non-stoppable devices.
+        for m in movables {
+            if let Err(e) = m.stop_on_pause(true).await {
+                tracing::warn!(
+                    "stop_on_pause failed on pause for movable {}: {e}",
+                    m.name()
+                );
+            }
+        }
+        for fly in flyables {
+            if let Err(e) = fly.stop_on_pause(true).await {
+                tracing::warn!(
+                    "stop_on_pause failed on pause for flyer {}: {e}",
+                    fly.name()
+                );
+            }
+        }
+        // Mirror bluesky `_run`: after the stop walk, notify Pausable
+        // devices so they can quiesce internal state.
+        for p in pausables {
+            if let Err(e) = p.pause_dyn().await {
+                tracing::warn!("pause_dyn failed for {}: {e}", p.name());
+            }
+        }
     }
 
     async fn on_resume(&self) {
-        // Move msg_cache → replay_queue so the engine replays from the last
-        // checkpoint.
-        let mut state = self.state.lock().await;
-        let cache = std::mem::take(&mut state.msg_cache);
-        state.replay_queue.extend(cache);
+        // Snapshot pausables under the lock; release before awaiting
+        // user code.
+        let pausables: Vec<_> = {
+            let mut state = self.state.lock().await;
+            // Move msg_cache → replay_queue so the engine replays
+            // from the last checkpoint.
+            let cache = std::mem::take(&mut state.msg_cache);
+            state.replay_queue.extend(cache);
+            state.pausables.values().cloned().collect()
+        };
+        for p in pausables {
+            if let Err(e) = p.resume_dyn().await {
+                tracing::warn!("resume_dyn failed for {}: {e}", p.name());
+            }
+        }
     }
 
     // -- handler ------------------------------------------------------------
@@ -758,6 +899,14 @@ impl RunEngine {
                 };
             }
             Msg::Set { obj, value, group } => {
+                // Track for pause / cleanup before issuing the move so
+                // a status that fails or never resolves still leaves
+                // the obj in our touched register.
+                self.state
+                    .lock()
+                    .await
+                    .movable_objs_touched
+                    .insert(obj.name().to_string(), obj.clone());
                 let status = obj.set_dyn(value).await;
                 if let Some(g) = group.clone() {
                     *self.last_msg_result.lock().unwrap() = MsgResult::Status { group: g };
@@ -786,6 +935,11 @@ impl RunEngine {
                 obj.stop_dyn(success).await?;
             }
             Msg::Kickoff { obj, group } => {
+                self.state
+                    .lock()
+                    .await
+                    .flyable_objs_touched
+                    .insert(obj.name().to_string(), obj.clone());
                 let status = obj.kickoff_dyn().await;
                 if let Some(g) = group.clone() {
                     *self.last_msg_result.lock().unwrap() = MsgResult::Status { group: g };
@@ -889,8 +1043,60 @@ impl RunEngine {
             Msg::RemoveSuspender { id } => {
                 self.state.lock().await.suspenders.remove(&id);
             }
+            Msg::RegisterPausable(obj) => {
+                self.state
+                    .lock()
+                    .await
+                    .pausables
+                    .insert(obj.name().to_string(), obj);
+            }
+            Msg::UnregisterPausable(obj) => {
+                self.state.lock().await.pausables.remove(obj.name());
+            }
+            Msg::Input { prompt } => {
+                let handler = self.input_handler.lock().unwrap().clone();
+                let h = handler.ok_or_else(|| {
+                    CirrusError::Plan("Msg::Input issued but no input handler installed".into())
+                })?;
+                let text = h(prompt).await?;
+                *self.last_msg_result.lock().unwrap() = MsgResult::Input { text };
+            }
+            Msg::ReClass => {
+                *self.last_msg_result.lock().unwrap() = MsgResult::EngineClass {
+                    name: "cirrus.RunEngine",
+                };
+            }
             Msg::Configure { obj, args } => {
                 obj.configure_dyn(args).await?;
+            }
+            Msg::Prepare { obj, value, group } => {
+                let status = obj.prepare_dyn(value).await;
+                if let Some(g) = group.clone() {
+                    *self.last_msg_result.lock().unwrap() = MsgResult::Status { group: g };
+                }
+                self.handle_status(status, group).await?;
+            }
+            Msg::WaitFor { factories, timeout } => {
+                let token = self.cancel.lock().unwrap().clone();
+                let inner = async {
+                    for f in factories {
+                        f().await?;
+                    }
+                    Ok::<(), CirrusError>(())
+                };
+                match timeout {
+                    Some(d) => tokio::select! {
+                        r = tokio::time::timeout(d, inner) => match r {
+                            Ok(r) => r?,
+                            Err(_) => return Err(CirrusError::Timeout(d)),
+                        },
+                        _ = token.cancelled() => return Err(CirrusError::Cancelled),
+                    },
+                    None => tokio::select! {
+                        r = inner => r?,
+                        _ = token.cancelled() => return Err(CirrusError::Cancelled),
+                    },
+                }
             }
             Msg::Custom { name, payload } => {
                 let handler = self.commands.lock().unwrap().get(name).cloned();

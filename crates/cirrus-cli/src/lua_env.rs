@@ -993,6 +993,14 @@ fn msg_result_to_lua(lua: &Lua, r: cirrus_engine::MsgResult) -> LuaValue {
             let _ = t.set("readback", readback);
             LuaValue::Table(t)
         }
+        MsgResult::Input { text } => lua
+            .create_string(&text)
+            .map(LuaValue::String)
+            .unwrap_or(LuaValue::Nil),
+        MsgResult::EngineClass { name } => lua
+            .create_string(name)
+            .map(LuaValue::String)
+            .unwrap_or(LuaValue::Nil),
     }
 }
 
