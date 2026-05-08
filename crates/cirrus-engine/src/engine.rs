@@ -1,6 +1,22 @@
 //! The RunEngine: consumes a `Plan`, dispatches `Msg`, emits `Document`s.
+//!
+//! M4 surface:
+//!
+//! - `pause(defer)` / `resume()` / `abort(reason)` / `halt(reason)` — engine
+//!   control. Pause clears the run permit; resume notifies waiters and replays
+//!   the rewind cache (since the last `Checkpoint`).
+//! - `Checkpoint` / `ClearCheckpoint` Msg — define rewindable regions. Cache
+//!   `Msg`s tagged `is_cacheable()` between a Checkpoint and the next
+//!   ClearCheckpoint (or end of run).
+//! - `InstallSuspender` / `RemoveSuspender` Msg — register objects whose
+//!   `watch()` future resolves on the resume condition (e.g. a shutter PV).
+//! - SIGINT 3-tap — first ctrl-c → `pause(false)`, second → `abort`, third →
+//!   `halt`. Installed via `install_signal_handler()`; off by default so the
+//!   engine plays nicely with hosts that own SIGINT.
 
-use std::collections::HashMap;
+use std::any::Any;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,18 +27,19 @@ use cirrus_core::status::{Status, StatusError};
 use cirrus_event_model::compose::RunBundle;
 use cirrus_event_model::Document;
 use futures::StreamExt;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
 use crate::bundler::RunBundler;
 use crate::sink::DocumentSink;
+use crate::suspender::{Suspender, SuspenderHandle};
 
 /// Final state of a finished run.
 #[derive(Debug, Clone)]
 pub struct RunResult {
     /// Run start UID, if a run was opened.
     pub run_uid: Option<String>,
-    /// Final exit status (`success` / `abort` / `fail` / `no-run`).
+    /// Final exit status (`success` / `abort` / `fail` / `halt` / `no-run`).
     pub exit_status: String,
 }
 
@@ -32,11 +49,23 @@ struct WaitGroup {
     members: Vec<Status>,
 }
 
+/// Optional pre/post-suspend plan injection (placeholder for M4+).
+pub type SuspendCallback = Box<dyn FnOnce() -> Plan + Send + Sync>;
+
 /// The RunEngine.
 pub struct RunEngine {
     sinks: Vec<Arc<dyn DocumentSink>>,
     cancel: CancellationToken,
+    permit: Arc<Notify>,
+    is_paused: Arc<AtomicBool>,
+    deferred_pause: AtomicBool,
+    is_aborting: AtomicBool,
+    is_halting: AtomicBool,
+    sigint_count: AtomicU8,
+    suspender_count: AtomicU64,
     state: Mutex<EngineState>,
+    /// `true` if `install_signal_handler()` has run.
+    signal_installed: AtomicBool,
 }
 
 #[derive(Default)]
@@ -45,6 +74,10 @@ struct EngineState {
     groups: HashMap<String, WaitGroup>,
     staged: Vec<Arc<dyn cirrus_core::msg::StageableObj>>,
     monitors: Vec<(String, Arc<dyn cirrus_core::msg::MonitorableObj>)>,
+    msg_cache: VecDeque<Msg>,
+    replay_queue: VecDeque<Msg>,
+    rewindable: bool,
+    suspenders: HashMap<u64, SuspenderHandle>,
 }
 
 impl RunEngine {
@@ -53,17 +86,25 @@ impl RunEngine {
         Self {
             sinks,
             cancel: CancellationToken::new(),
+            permit: Arc::new(Notify::new()),
+            is_paused: Arc::new(AtomicBool::new(false)),
+            deferred_pause: AtomicBool::new(false),
+            is_aborting: AtomicBool::new(false),
+            is_halting: AtomicBool::new(false),
+            sigint_count: AtomicU8::new(0),
+            suspender_count: AtomicU64::new(0),
             state: Mutex::new(EngineState::default()),
+            signal_installed: AtomicBool::new(false),
         }
     }
 
     /// Async entry point — drive a plan to completion.
     pub async fn run_async(&self, plan: Plan) -> Result<RunResult> {
         let outcome = self.run_loop(plan).await;
-        // Cleanup on exit (run_loop's defer-style cleanup is handled inline).
+        // Cleanup: unstage anything still staged; drop suspenders.
         let mut state = self.state.lock().await;
-        // Unstage anything left.
         let staged = std::mem::take(&mut state.staged);
+        let _ = std::mem::take(&mut state.suspenders); // Drop aborts watchers
         drop(state);
         for s in staged {
             let _ = s.unstage_dyn().await;
@@ -77,30 +118,116 @@ impl RunEngine {
         cirrus_core::runtime::block_on(self.run_async(plan))
     }
 
-    /// The main message loop.
-    async fn run_loop(&self, mut plan: Plan) -> Result<RunResult> {
+    /// External: request a pause. If `defer = true`, the pause takes effect at
+    /// the next `Checkpoint`; otherwise immediately at the top of the message
+    /// loop.
+    pub fn pause(&self, defer: bool) {
+        if defer {
+            self.deferred_pause.store(true, Ordering::SeqCst);
+        } else {
+            self.is_paused.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// External: resume a paused engine. Replays the rewind cache before
+    /// pulling the next plan message.
+    pub fn resume(&self) {
+        self.is_paused.store(false, Ordering::SeqCst);
+        self.permit.notify_waiters();
+    }
+
+    /// External: abort the run. Closes the open run with `exit_status="abort"`.
+    pub fn abort(&self, _reason: impl Into<String>) {
+        self.is_aborting.store(true, Ordering::SeqCst);
+        self.is_paused.store(false, Ordering::SeqCst);
+        self.cancel.cancel();
+        self.permit.notify_waiters();
+    }
+
+    /// External: halt — like abort but skips run-level cleanup.
+    pub fn halt(&self, _reason: impl Into<String>) {
+        self.is_halting.store(true, Ordering::SeqCst);
+        self.is_aborting.store(true, Ordering::SeqCst);
+        self.is_paused.store(false, Ordering::SeqCst);
+        self.cancel.cancel();
+        self.permit.notify_waiters();
+    }
+
+    /// Whether a pause is currently in effect.
+    pub fn is_paused(&self) -> bool {
+        self.is_paused.load(Ordering::SeqCst)
+    }
+
+    /// Install a SIGINT handler implementing bluesky's 3-tap pattern:
+    /// 1st = `pause(false)`, 2nd = `abort`, 3rd = `halt`.
+    pub fn install_signal_handler(self: &Arc<Self>) {
+        if self
+            .signal_installed
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let me = self.clone();
+        tokio::spawn(async move {
+            loop {
+                if tokio::signal::ctrl_c().await.is_err() {
+                    return;
+                }
+                let n = me.sigint_count.fetch_add(1, Ordering::SeqCst) + 1;
+                match n {
+                    1 => {
+                        eprintln!("\n[cirrus] ctrl-c — pausing (tap again to abort)");
+                        me.pause(false);
+                    }
+                    2 => {
+                        eprintln!("[cirrus] ctrl-c (2) — aborting (tap again to halt)");
+                        me.abort("user abort");
+                    }
+                    _ => {
+                        eprintln!("[cirrus] ctrl-c (3+) — halting");
+                        me.halt("user halt");
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
+    // -- main loop ----------------------------------------------------------
+
+    async fn run_loop(&self, plan: Plan) -> Result<RunResult> {
+        let plan = Mutex::new(plan);
         let mut run_uid: Option<String> = None;
         let mut exit_status = String::from("no-run");
 
-        while let Some(item) = plan.next().await {
-            if self.cancel.is_cancelled() {
+        loop {
+            let msg = match self.next_msg(&plan).await {
+                Some(m) => m,
+                None => {
+                    if self.is_halting.load(Ordering::SeqCst) {
+                        exit_status = "halt".into();
+                    } else if self.is_aborting.load(Ordering::SeqCst) {
+                        exit_status = "abort".into();
+                    }
+                    break;
+                }
+            };
+            if self.is_halting.load(Ordering::SeqCst) {
+                exit_status = "halt".into();
+                break;
+            }
+            if self.is_aborting.load(Ordering::SeqCst) {
                 exit_status = "abort".into();
                 break;
             }
-            let msg = match item {
-                PlanItem::Bare(m) => m,
-                _ => continue,
-            };
             tracing::debug!("RE msg: {:?}", &msg);
             match self.handle(msg).await {
-                Ok(Some(uid)) => {
-                    run_uid = Some(uid);
-                }
+                Ok(Some(uid)) => run_uid = Some(uid),
                 Ok(None) => {}
                 Err(e) => {
                     tracing::error!("plan error: {e}");
                     exit_status = "fail".into();
-                    // Best-effort run close if a run is open
                     self.close_run_if_open("fail", Some(format!("{e}"))).await?;
                     return Ok(RunResult {
                         run_uid,
@@ -110,11 +237,22 @@ impl RunEngine {
             }
         }
 
-        // If a run is still open at end of plan, close it as success.
-        let still_open = {
-            let state = self.state.lock().await;
-            state.bundler.is_some()
-        };
+        // On abort/halt: close the open run with the right status.
+        if exit_status == "abort" || exit_status == "halt" {
+            let reason = if exit_status == "halt" {
+                None
+            } else {
+                Some("user-requested abort".into())
+            };
+            self.close_run_if_open(&exit_status, reason).await?;
+            return Ok(RunResult {
+                run_uid,
+                exit_status,
+            });
+        }
+
+        // Normal exit: close any open run as success.
+        let still_open = self.state.lock().await.bundler.is_some();
         if still_open {
             self.close_run_if_open("success", None).await?;
             exit_status = "success".into();
@@ -128,7 +266,64 @@ impl RunEngine {
         })
     }
 
-    /// Returns the run UID if `OpenRun` was processed.
+    /// Pull the next message: handle pause gating, replay queue, then plan.
+    async fn next_msg(&self, plan: &Mutex<Plan>) -> Option<Msg> {
+        loop {
+            // Pause gate
+            while self.is_paused.load(Ordering::SeqCst) && !self.is_aborting.load(Ordering::SeqCst)
+            {
+                self.on_pause_enter().await;
+                self.permit.notified().await;
+                self.on_resume().await;
+            }
+            if self.is_aborting.load(Ordering::SeqCst) {
+                return None;
+            }
+            // Replay queue first
+            {
+                let mut state = self.state.lock().await;
+                if let Some(m) = state.replay_queue.pop_front() {
+                    return Some(m);
+                }
+            }
+            // Plan stream
+            let item = {
+                let mut p = plan.lock().await;
+                p.next().await
+            };
+            let item = item?;
+            let m = match item {
+                PlanItem::Bare(m) => m,
+                _ => continue,
+            };
+            // Cache if rewindable
+            {
+                let mut state = self.state.lock().await;
+                if state.rewindable && m.is_cacheable() {
+                    state.msg_cache.push_back(m.clone());
+                }
+            }
+            return Some(m);
+        }
+    }
+
+    async fn on_pause_enter(&self) {
+        // Suspend monitors (drop them; they'll be re-installed on resume by
+        // re-issuing Monitor messages from the cache, if any).
+        let mut state = self.state.lock().await;
+        state.monitors.clear();
+    }
+
+    async fn on_resume(&self) {
+        // Move msg_cache → replay_queue so the engine replays from the last
+        // checkpoint.
+        let mut state = self.state.lock().await;
+        let cache = std::mem::take(&mut state.msg_cache);
+        state.replay_queue.extend(cache);
+    }
+
+    // -- handler ------------------------------------------------------------
+
     async fn handle(&self, msg: Msg) -> Result<Option<String>> {
         match msg {
             Msg::OpenRun(meta) => {
@@ -142,8 +337,9 @@ impl RunEngine {
                 self.close_run_if_open(&exit_status, reason).await?;
             }
             Msg::Create { stream_name } => {
-                let mut state = self.state.lock().await;
-                state
+                self.state
+                    .lock()
+                    .await
                     .bundler
                     .as_mut()
                     .ok_or_else(|| CirrusError::Plan("Create with no open run".into()))?
@@ -163,8 +359,9 @@ impl RunEngine {
                 }
             }
             Msg::Drop => {
-                let mut state = self.state.lock().await;
-                state
+                self.state
+                    .lock()
+                    .await
                     .bundler
                     .as_mut()
                     .ok_or_else(|| CirrusError::Plan("Drop with no open run".into()))?
@@ -225,7 +422,6 @@ impl RunEngine {
             }
             Msg::Collect { obj, stream_name } => {
                 let descs = obj.describe_collect_dyn().await?;
-                // Declare any streams not yet declared.
                 let new_descriptors: Vec<cirrus_event_model::EventDescriptor> = {
                     let mut state = self.state.lock().await;
                     let bundler = state
@@ -258,9 +454,7 @@ impl RunEngine {
                 }
             }
             Msg::Monitor { obj, name } => {
-                // Subscription; engine just notes ownership. Real monitor pump
-                // is M4 work — for now we accept and store.
-                let _ = obj.subscribe_dyn().await?;
+                let _sub = obj.subscribe_dyn().await?;
                 let stream = name.unwrap_or_else(|| "primary".into());
                 self.state.lock().await.monitors.push((stream, obj));
             }
@@ -285,12 +479,36 @@ impl RunEngine {
                     }
                 }
             }
-            Msg::Checkpoint | Msg::ClearCheckpoint => {
-                // No rewind in M0/M1 — accept silently.
+            Msg::Checkpoint => {
+                let mut state = self.state.lock().await;
+                // Clear cache up to this point — the rewindable region restarts.
+                state.msg_cache.clear();
+                state.rewindable = true;
+                drop(state);
+                // If a deferred_pause is queued, apply it now.
+                if self.deferred_pause.swap(false, Ordering::SeqCst) {
+                    self.is_paused.store(true, Ordering::SeqCst);
+                }
             }
-            Msg::Pause { defer: _ } => {
-                // M0/M1: pause is best-effort — return a Plan error so users see it.
-                return Err(CirrusError::Plan("Pause not yet implemented".into()));
+            Msg::ClearCheckpoint => {
+                let mut state = self.state.lock().await;
+                state.rewindable = false;
+                state.msg_cache.clear();
+            }
+            Msg::Pause { defer } => {
+                self.pause(defer);
+            }
+            Msg::Resume => {
+                self.resume();
+            }
+            Msg::Rewindable(b) => {
+                self.state.lock().await.rewindable = b;
+            }
+            Msg::InstallSuspender { id, suspender } => {
+                self.install_suspender(id, suspender).await?;
+            }
+            Msg::RemoveSuspender { id } => {
+                self.state.lock().await.suspenders.remove(&id);
             }
             Msg::Configure { obj, args } => {
                 obj.configure_dyn(args).await?;
@@ -306,12 +524,40 @@ impl RunEngine {
         Ok(None)
     }
 
+    /// Allocate a fresh suspender id.
+    pub fn next_suspender_id(&self) -> u64 {
+        self.suspender_count.fetch_add(1, Ordering::SeqCst)
+    }
+
+    async fn install_suspender(&self, id: u64, susp: Arc<dyn Any + Send + Sync>) -> Result<()> {
+        // Recover the typed handle. The plan-side Msg carried `Arc<dyn Any>`
+        // wrapping an `Arc<dyn Suspender>`.
+        let typed: Arc<dyn Suspender> = susp
+            .downcast::<Arc<dyn Suspender>>()
+            .map(|a| (*a).clone())
+            .map_err(|_| {
+                CirrusError::Plan("InstallSuspender payload was not Arc<dyn Suspender>".into())
+            })?;
+
+        let permit = self.permit.clone();
+        let paused = self.is_paused.clone();
+        let suspender_clone = typed.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let fut = suspender_clone.watch();
+                fut.await;
+                paused.store(false, Ordering::SeqCst);
+                permit.notify_waiters();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let registration = SuspenderHandle::new(id, typed, handle);
+        self.state.lock().await.suspenders.insert(id, registration);
+        Ok(())
+    }
+
     async fn open_run(&self, meta: RunMetadata) -> Result<String> {
-        let start = RunBundle::start(
-            meta.scan_id,
-            None, // hints come from per-object during bundling
-        );
-        let mut start_doc = start;
+        let mut start_doc = RunBundle::start(meta.scan_id, None);
         for (k, v) in meta.extra {
             start_doc.extra.insert(k, v);
         }
@@ -322,9 +568,7 @@ impl RunEngine {
         }
         let bundle = Arc::new(RunBundle::open(&start_doc));
         let uid = start_doc.uid.clone();
-        // Emit start
         self.broadcast(&Document::Start(start_doc)).await?;
-        // Install bundler
         let mut state = self.state.lock().await;
         if state.bundler.is_some() {
             return Err(CirrusError::Plan(

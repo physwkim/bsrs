@@ -184,6 +184,8 @@ dependencies = [
 name = "cirrus"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
+ "async-trait",
  "bytes",
  "cirrus-backend-mock",
  "cirrus-backend-soft",

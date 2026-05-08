@@ -22,3 +22,6 @@ cirrus-backend-mock = { path = "../cirrus-backends/mock" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 bytes.workspace = true
 futures.workspace = true
+async-stream.workspace = true
+async-trait.workspace = true
+cirrus-engine.workspace = true

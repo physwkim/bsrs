@@ -171,6 +171,184 @@ async fn fly_plan_drives_standard_detector_to_completion() {
     assert!(matches!(&docs[docs.len() - 1], Stop(_)));
 }
 
+// -- M4 -----------------------------------------------------------------
+
+#[tokio::test]
+async fn pause_then_resume_completes_run_with_success() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    let det = SoftDetector::new("p_det");
+    let sink = Arc::new(CapturingSink::new());
+    let re = Arc::new(RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]));
+
+    // Build a plan with an embedded "yield Pause" message in the middle.
+    // Engine should gate at the pause, observable by counting docs delivered
+    // before vs after we call resume().
+    let pre_count = Arc::new(AtomicUsize::new(0));
+    let pre_count_clone = pre_count.clone();
+    let det_clone = det.clone();
+    let plan = cirrus_core::plan::plan_box(async_stream::stream! {
+        yield cirrus_core::Msg::OpenRun(Default::default());
+        yield cirrus_core::Msg::Create { stream_name: "primary".into() };
+        yield cirrus_core::Msg::Read(det_clone.clone() as Arc<dyn cirrus_core::msg::ReadableObj>);
+        yield cirrus_core::Msg::Save;
+        // ...checkpoint here...
+        yield cirrus_core::Msg::Checkpoint;
+        // signal that we've passed the first batch:
+        pre_count_clone.store(1, Ordering::SeqCst);
+        yield cirrus_core::Msg::Pause { defer: false };
+        // After resume: another read-save + close.
+        yield cirrus_core::Msg::Create { stream_name: "primary".into() };
+        yield cirrus_core::Msg::Read(det_clone as Arc<dyn cirrus_core::msg::ReadableObj>);
+        yield cirrus_core::Msg::Save;
+        yield cirrus_core::Msg::CloseRun {
+            exit_status: "success".into(),
+            reason: None,
+        };
+    });
+
+    let re_run = re.clone();
+    let join = tokio::spawn(async move { re_run.run_async(plan).await });
+
+    // Wait until the plan reached the pause point.
+    for _ in 0..50 {
+        if pre_count.load(Ordering::SeqCst) == 1 && re.is_paused() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(re.is_paused(), "engine should be paused");
+
+    // At this point: Start, Descriptor, Event 1, Stop NOT YET
+    let docs_before_resume = sink.snapshot().await;
+    assert_eq!(docs_before_resume.len(), 3, "got {docs_before_resume:#?}");
+
+    // Resume.
+    re.resume();
+    let result = join.await.unwrap().unwrap();
+    assert_eq!(result.exit_status, "success");
+    let docs = sink.snapshot().await;
+    // Start + Descriptor + 2 Events + Stop = 5
+    assert_eq!(docs.len(), 5);
+}
+
+#[tokio::test]
+async fn abort_closes_run_with_abort_status() {
+    let det = SoftDetector::new("a_det");
+    let sink = Arc::new(CapturingSink::new());
+    let re = Arc::new(RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]));
+
+    let det_clone = det.clone();
+    let plan = cirrus_core::plan::plan_box(async_stream::stream! {
+        yield cirrus_core::Msg::OpenRun(Default::default());
+        yield cirrus_core::Msg::Create { stream_name: "primary".into() };
+        yield cirrus_core::Msg::Read(det_clone as Arc<dyn cirrus_core::msg::ReadableObj>);
+        yield cirrus_core::Msg::Save;
+        // Pause here; the test will abort instead of resuming.
+        yield cirrus_core::Msg::Pause { defer: false };
+        yield cirrus_core::Msg::CloseRun {
+            exit_status: "success".into(),
+            reason: None,
+        };
+    });
+
+    let re_run = re.clone();
+    let join = tokio::spawn(async move { re_run.run_async(plan).await });
+
+    for _ in 0..50 {
+        if re.is_paused() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    re.abort("test");
+    let result = join.await.unwrap().unwrap();
+    assert_eq!(result.exit_status, "abort");
+    let docs = sink.snapshot().await;
+    // Last doc must be a RunStop with exit_status="abort".
+    if let cirrus_core::Document::Stop(s) = docs.last().unwrap() {
+        assert_eq!(s.exit_status, "abort");
+    } else {
+        panic!("last doc was not Stop: {:?}", docs.last());
+    }
+}
+
+#[tokio::test]
+async fn suspender_auto_resumes_engine() {
+    use cirrus_engine::Suspender;
+    use futures::future::BoxFuture;
+    use std::sync::atomic::{AtomicBool, Ordering as AOrd};
+    use std::sync::Arc as StdArc;
+    use std::time::Duration;
+
+    struct ManualGate {
+        cleared: StdArc<AtomicBool>,
+        notify: StdArc<tokio::sync::Notify>,
+    }
+    #[async_trait::async_trait]
+    impl Suspender for ManualGate {
+        fn name(&self) -> &str {
+            "manual_gate"
+        }
+        fn watch(&self) -> BoxFuture<'static, ()> {
+            let cleared = self.cleared.clone();
+            let notify = self.notify.clone();
+            Box::pin(async move {
+                while !cleared.load(AOrd::SeqCst) {
+                    notify.notified().await;
+                }
+            })
+        }
+    }
+
+    let cleared = StdArc::new(AtomicBool::new(false));
+    let notify = StdArc::new(tokio::sync::Notify::new());
+    let gate = StdArc::new(ManualGate {
+        cleared: cleared.clone(),
+        notify: notify.clone(),
+    });
+
+    let sink = Arc::new(CapturingSink::new());
+    let re = Arc::new(RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]));
+
+    let id = re.next_suspender_id();
+    let gate_dyn: Arc<dyn cirrus_engine::Suspender> = gate;
+    let payload: Arc<dyn std::any::Any + Send + Sync> = Arc::new(gate_dyn);
+
+    let plan = cirrus_core::plan::plan_box(async_stream::stream! {
+        yield cirrus_core::Msg::InstallSuspender { id, suspender: payload };
+        yield cirrus_core::Msg::OpenRun(Default::default());
+        yield cirrus_core::Msg::Pause { defer: false };
+        // After auto-resume:
+        yield cirrus_core::Msg::CloseRun {
+            exit_status: "success".into(),
+            reason: None,
+        };
+        yield cirrus_core::Msg::RemoveSuspender { id };
+    });
+
+    let re_run = re.clone();
+    let join = tokio::spawn(async move { re_run.run_async(plan).await });
+
+    // Wait for pause, then clear the gate.
+    for _ in 0..50 {
+        if re.is_paused() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    cleared.store(true, AOrd::SeqCst);
+    notify.notify_waiters();
+
+    let result = tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("engine did not exit after suspender cleared")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.exit_status, "success");
+}
+
 #[tokio::test]
 async fn sync_facade_runs_blocking_count() {
     use std::thread;

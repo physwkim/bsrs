@@ -148,6 +148,28 @@ pub enum Msg {
         args: ConfigureArgs,
     },
 
+    /// Resume after a deferred pause / suspend.
+    Resume,
+
+    /// Install a suspender. The boxed object is opaque to the engine; the
+    /// suspender registry lives in `cirrus-engine`.
+    InstallSuspender {
+        /// Stable identifier for later removal.
+        id: u64,
+        /// Opaque suspender object.
+        suspender: Arc<dyn Any + Send + Sync>,
+    },
+
+    /// Remove a previously-installed suspender.
+    RemoveSuspender {
+        /// Identifier returned by `InstallSuspender`.
+        id: u64,
+    },
+
+    /// Set whether the current region is rewindable. Mirrors bluesky's
+    /// `Msg('rewindable', None, bool)`.
+    Rewindable(bool),
+
     /// Custom user command.
     Custom {
         /// Command name.
@@ -158,6 +180,122 @@ pub enum Msg {
 
     /// No-op message — useful for spinning the loop.
     Null,
+}
+
+impl Msg {
+    /// Whether this message should be added to the rewind cache when the
+    /// engine is in a rewindable region (between `Checkpoint` and the next
+    /// `ClearCheckpoint` / non-rewindable command).
+    ///
+    /// Mirrors bluesky's `UNCACHEABLE_COMMANDS` set
+    /// (`run_engine.py` ≈ `_UNCACHEABLE_COMMANDS`).
+    pub fn is_cacheable(&self) -> bool {
+        !matches!(
+            self,
+            Msg::OpenRun(_)
+                | Msg::CloseRun { .. }
+                | Msg::Wait { .. }
+                | Msg::Pause { .. }
+                | Msg::Resume
+                | Msg::Checkpoint
+                | Msg::ClearCheckpoint
+                | Msg::Configure { .. }
+                | Msg::Monitor { .. }
+                | Msg::Unmonitor(_)
+                | Msg::InstallSuspender { .. }
+                | Msg::RemoveSuspender { .. }
+                | Msg::Rewindable(_)
+                | Msg::Custom { .. }
+                | Msg::Null
+        )
+    }
+}
+
+impl Clone for Msg {
+    fn clone(&self) -> Self {
+        match self {
+            Msg::OpenRun(m) => Msg::OpenRun(m.clone()),
+            Msg::CloseRun {
+                exit_status,
+                reason,
+            } => Msg::CloseRun {
+                exit_status: exit_status.clone(),
+                reason: reason.clone(),
+            },
+            Msg::Create { stream_name } => Msg::Create {
+                stream_name: stream_name.clone(),
+            },
+            Msg::Save => Msg::Save,
+            Msg::Drop => Msg::Drop,
+            Msg::DeclareStream {
+                stream_name,
+                data_keys,
+            } => Msg::DeclareStream {
+                stream_name: stream_name.clone(),
+                data_keys: data_keys.clone(),
+            },
+            Msg::Read(o) => Msg::Read(o.clone()),
+            Msg::Set { obj, value, group } => Msg::Set {
+                obj: obj.clone(),
+                value: *value,
+                group: group.clone(),
+            },
+            Msg::Trigger { obj, group } => Msg::Trigger {
+                obj: obj.clone(),
+                group: group.clone(),
+            },
+            Msg::Stage(o) => Msg::Stage(o.clone()),
+            Msg::Unstage(o) => Msg::Unstage(o.clone()),
+            Msg::Kickoff { obj, group } => Msg::Kickoff {
+                obj: obj.clone(),
+                group: group.clone(),
+            },
+            Msg::Complete { obj, group } => Msg::Complete {
+                obj: obj.clone(),
+                group: group.clone(),
+            },
+            Msg::Collect { obj, stream_name } => Msg::Collect {
+                obj: obj.clone(),
+                stream_name: stream_name.clone(),
+            },
+            Msg::Monitor { obj, name } => Msg::Monitor {
+                obj: obj.clone(),
+                name: name.clone(),
+            },
+            Msg::Unmonitor(o) => Msg::Unmonitor(o.clone()),
+            Msg::Wait {
+                group,
+                error_on_timeout,
+                timeout,
+            } => Msg::Wait {
+                group: group.clone(),
+                error_on_timeout: *error_on_timeout,
+                timeout: *timeout,
+            },
+            Msg::Sleep(d) => Msg::Sleep(*d),
+            Msg::Checkpoint => Msg::Checkpoint,
+            Msg::ClearCheckpoint => Msg::ClearCheckpoint,
+            Msg::Pause { defer } => Msg::Pause { defer: *defer },
+            Msg::Configure { obj, args } => Msg::Configure {
+                obj: obj.clone(),
+                args: args.clone(),
+            },
+            Msg::Resume => Msg::Resume,
+            Msg::InstallSuspender { id, suspender } => Msg::InstallSuspender {
+                id: *id,
+                suspender: suspender.clone(),
+            },
+            Msg::RemoveSuspender { id } => Msg::RemoveSuspender { id: *id },
+            Msg::Rewindable(b) => Msg::Rewindable(*b),
+            // `Custom` carries `Box<dyn Any>` which has no clone bound; cloning
+            // is never the right thing for these. We collapse to `Null` so
+            // higher-level code can still operate safely; in practice
+            // `is_cacheable()` returns false for `Custom`, so this branch is
+            // unreachable from the rewind path.
+            Msg::Custom { .. } => Msg::Null,
+            Msg::Null => Msg::Null,
+        }
+    }
 }
 
 impl std::fmt::Debug for Msg {
@@ -185,6 +323,10 @@ impl std::fmt::Debug for Msg {
             Msg::ClearCheckpoint => write!(f, "ClearCheckpoint"),
             Msg::Pause { defer } => write!(f, "Pause(defer={defer})"),
             Msg::Configure { obj, .. } => write!(f, "Configure({})", obj.name()),
+            Msg::Resume => write!(f, "Resume"),
+            Msg::InstallSuspender { id, .. } => write!(f, "InstallSuspender({id})"),
+            Msg::RemoveSuspender { id } => write!(f, "RemoveSuspender({id})"),
+            Msg::Rewindable(b) => write!(f, "Rewindable({b})"),
             Msg::Custom { name, .. } => write!(f, "Custom({name})"),
             Msg::Null => write!(f, "Null"),
         }
