@@ -439,6 +439,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "cirrus-qs"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "cirrus-backend-soft",
+ "cirrus-callbacks",
+ "cirrus-core",
+ "cirrus-engine",
+ "cirrus-event-model",
+ "cirrus-plans",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "zmq",
+]
+
+[[package]]
 name = "cirrus-stream"
 version = "0.1.0"
 dependencies = [

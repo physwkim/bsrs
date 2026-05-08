@@ -1,0 +1,28 @@
+[package]
+name = "cirrus-qs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "queueserver-compatible 0MQ JSON-RPC daemon backed by cirrus-engine."
+
+[dependencies]
+async-trait.workspace = true
+async-stream.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+cirrus-core.workspace = true
+cirrus-engine.workspace = true
+cirrus-event-model.workspace = true
+cirrus-plans.workspace = true
+cirrus-callbacks = { workspace = true, features = ["zmq"] }
+zmq = "0.10"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+cirrus-backend-soft = { path = "../cirrus-backends/soft" }

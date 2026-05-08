@@ -21,6 +21,7 @@ members = [
     "crates/cirrus-callbacks",
     "crates/cirrus",
     "crates/cirrus-cli",
+    "crates/cirrus-qs",
 ]
 
 [workspace.package]
@@ -59,6 +60,7 @@ cirrus-backend-mock   = { path = "crates/cirrus-backends/mock" }
 cirrus-stream         = { path = "crates/cirrus-stream" }
 cirrus-callbacks      = { path = "crates/cirrus-callbacks" }
 cirrus-derive         = { path = "crates/cirrus-derive" }
+cirrus-qs             = { path = "crates/cirrus-qs" }
 
 [profile.dev]
 opt-level = 1
