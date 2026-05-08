@@ -14,7 +14,9 @@
 #![deny(missing_docs)]
 
 mod client;
+mod lua_env;
 mod manager;
+mod repl;
 
 use clap::{Parser, Subcommand};
 
@@ -32,19 +34,34 @@ enum TopCmd {
     QsManager(manager::ManagerArgs),
     /// REQ-side client (replacement for `qserver`).
     Qs(client::ClientArgs),
+    /// Interactive Lua REPL with cirrus types pre-registered. Drives an
+    /// in-process `RunEngine`; no qs-manager required. IPython-like
+    /// development surface for plans.
+    Repl(repl::ReplArgs),
 }
 
 fn main() {
     let cli = Cli::parse();
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-    let exit = rt.block_on(async {
-        match cli.command {
-            TopCmd::QsManager(a) => manager::run(a).await,
-            TopCmd::Qs(a) => client::run(a).await,
+    let exit = match cli.command {
+        // REPL runs from a sync context so RE:run can `block_on` the
+        // cirrus runtime to drive plans.
+        TopCmd::Repl(a) => repl::run(a),
+        // Server / client paths build their own multi-thread tokio
+        // runtime — neither needs the caller's runtime.
+        TopCmd::QsManager(a) => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            rt.block_on(manager::run(a))
         }
-    });
+        TopCmd::Qs(a) => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            rt.block_on(client::run(a))
+        }
+    };
     std::process::exit(exit);
 }
