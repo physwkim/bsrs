@@ -5,6 +5,7 @@ use std::sync::Arc;
 use cirrus::backends::soft::{SoftDetector, SoftMotor};
 use cirrus::callbacks::CapturingSink;
 use cirrus::prelude::*;
+use cirrus_core::msg::{LocatableObj, StoppableObj};
 
 #[tokio::test]
 async fn count_plan_emits_expected_document_sequence() {
@@ -347,6 +348,56 @@ async fn suspender_auto_resumes_engine() {
         .unwrap()
         .unwrap();
     assert_eq!(result.exit_status, "success");
+}
+
+#[tokio::test]
+async fn mvr_reads_position_inside_plan_then_moves_relative() {
+    let motor = Arc::new(SoftMotor::new("m1", Some(2.5)));
+    let re = RunEngine::new(vec![]);
+
+    // mvr should: locate (readback=2.5) → set(2.5+1.5=4.0) → wait.
+    let plan = cirrus_plans::stubs::mvr(motor.clone() as Arc<dyn LocatableObj>, 1.5);
+    re.run_async(plan).await.unwrap();
+
+    let loc = LocatableObj::locate_dyn(motor.as_ref()).await.unwrap();
+    assert!(
+        (loc.readback - 4.0).abs() < 1e-9,
+        "readback = {}",
+        loc.readback
+    );
+}
+
+#[tokio::test]
+async fn stop_plan_dispatches_through_engine() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Counts how many times `stop_dyn` is called.
+    struct CountingStoppable {
+        name: String,
+        calls: AtomicU32,
+    }
+    #[async_trait::async_trait]
+    impl cirrus_core::msg::NamedObj for CountingStoppable {
+        fn name(&self) -> &str {
+            &self.name
+        }
+    }
+    #[async_trait::async_trait]
+    impl StoppableObj for CountingStoppable {
+        async fn stop_dyn(&self, _success: bool) -> cirrus_core::error::Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let s = Arc::new(CountingStoppable {
+        name: "shutter".into(),
+        calls: AtomicU32::new(0),
+    });
+    let re = RunEngine::new(vec![]);
+    let plan = cirrus_plans::stubs::stop(s.clone() as Arc<dyn StoppableObj>);
+    re.run_async(plan).await.unwrap();
+    assert_eq!(s.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

@@ -141,7 +141,15 @@ impl<T: Clone + Send + Sync + 'static> EpicsCaBackend<T> {
             _marker: std::marker::PhantomData,
         }
     }
+}
 
+impl<T: Clone + Send + Sync + 'static> cirrus_devices::BackendFromPv for EpicsCaBackend<T> {
+    fn from_pv(pv: &str) -> Self {
+        Self::new(pv)
+    }
+}
+
+impl<T: Clone + Send + Sync + 'static> EpicsCaBackend<T> {
     async fn ensure_channel(&self, timeout: Duration) -> Result<Arc<CaChannel>> {
         self.channel
             .get_or_try_init(|| self.ctx.get_or_open(&self.pv, timeout))

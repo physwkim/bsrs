@@ -3,8 +3,8 @@
 #![deny(missing_docs)]
 
 use cirrus_core::msg::{
-    CollectableObj, ConfigurableObj, ConfigureArgs, FlyableObj, MonitorableObj, MovableObj, Msg,
-    ReadableObj, RunMetadata, StageableObj, TriggerableObj,
+    CollectableObj, ConfigurableObj, ConfigureArgs, FlyableObj, LocatableObj, MonitorableObj,
+    MovableObj, Msg, ReadableObj, RunMetadata, StageableObj, StoppableObj, TriggerableObj,
 };
 use cirrus_core::plan::{plan_box, Plan};
 use std::sync::Arc;
@@ -96,17 +96,19 @@ pub mod stubs {
         })
     }
 
-    /// `mvr(motor, delta)` — relative move. Reads the current readback, adds
-    /// `delta`, then mv-and-wait.
-    ///
-    /// **Note:** unlike bluesky's `mvr` we cannot read inside a generator
-    /// without a `Locatable` round-trip. The motor must implement
-    /// `MovableObj + ReadableObj`. The current value is read off the same
-    /// `obj` via the `ReadableObj::read_dyn` trait method *outside* the plan
-    /// (one early call), then a normal `mv` is yielded. If you need
-    /// strict-async-readback semantics, use `Locatable::locate` directly.
-    pub async fn mvr(motor: Arc<dyn MovableObj>, current: f64, delta: f64) -> Plan {
-        mv(motor, current + delta)
+    /// `mvr(motor, delta)` — relative move. The plan reads the current
+    /// readback via `LocatableObj::locate_dyn` *inside* the generator,
+    /// adds `delta`, then yields `Set`+`Wait` for the absolute target.
+    /// Motor must implement `LocatableObj` (which extends `MovableObj`).
+    pub fn mvr(motor: Arc<dyn LocatableObj>, delta: f64) -> Plan {
+        plan_box(async_stream::stream! {
+            let loc = motor.locate_dyn().await
+                .expect("mvr: locate_dyn failed");
+            let target = loc.readback + delta;
+            let movable: Arc<dyn MovableObj> = motor;
+            yield Msg::Set { obj: movable, value: target, group: Some("mv".into()) };
+            yield Msg::Wait { group: "mv".into(), error_on_timeout: true, timeout: None };
+        })
     }
 
     /// `trigger(obj, group)`.
@@ -116,12 +118,18 @@ pub mod stubs {
         })
     }
 
-    /// `stop(obj)` — best-effort stop. Issues `Custom("stop", obj)` for the
-    /// engine to dispatch (engine wires this to `Stoppable::stop` when the
-    /// device implements it). For now this is a no-op placeholder.
-    pub fn stop(_obj: Arc<dyn ReadableObj>) -> Plan {
+    /// `stop(obj)` — yield `Msg::Stop` so the engine calls
+    /// `StoppableObj::stop_dyn(success=true)` on the device.
+    pub fn stop(obj: Arc<dyn StoppableObj>) -> Plan {
         plan_box(async_stream::stream! {
-            yield Msg::Null;
+            yield Msg::Stop { obj, success: true };
+        })
+    }
+
+    /// Like `stop` but signals an emergency stop (`success=false`).
+    pub fn stop_emergency(obj: Arc<dyn StoppableObj>) -> Plan {
+        plan_box(async_stream::stream! {
+            yield Msg::Stop { obj, success: false };
         })
     }
 

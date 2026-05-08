@@ -84,6 +84,16 @@ pub enum Msg {
     /// Unstage a device.
     Unstage(Arc<dyn StageableObj>),
 
+    /// Stop a `Stoppable` device. `success=true` is a planned stop;
+    /// `success=false` is an emergency stop (device may take defensive action).
+    Stop {
+        /// Stoppable device.
+        obj: Arc<dyn StoppableObj>,
+        /// Whether the stop is part of a normal plan (`true`) or emergency
+        /// (`false`).
+        success: bool,
+    },
+
     /// Begin a fly-scan acquisition.
     Kickoff {
         /// Flyable device.
@@ -246,6 +256,10 @@ impl Clone for Msg {
             },
             Msg::Stage(o) => Msg::Stage(o.clone()),
             Msg::Unstage(o) => Msg::Unstage(o.clone()),
+            Msg::Stop { obj, success } => Msg::Stop {
+                obj: obj.clone(),
+                success: *success,
+            },
             Msg::Kickoff { obj, group } => Msg::Kickoff {
                 obj: obj.clone(),
                 group: group.clone(),
@@ -312,6 +326,7 @@ impl std::fmt::Debug for Msg {
             Msg::Trigger { obj, .. } => write!(f, "Trigger({})", obj.name()),
             Msg::Stage(o) => write!(f, "Stage({})", o.name()),
             Msg::Unstage(o) => write!(f, "Unstage({})", o.name()),
+            Msg::Stop { obj, success } => write!(f, "Stop({}, success={success})", obj.name()),
             Msg::Kickoff { obj, .. } => write!(f, "Kickoff({})", obj.name()),
             Msg::Complete { obj, .. } => write!(f, "Complete({})", obj.name()),
             Msg::Collect { obj, .. } => write!(f, "Collect({})", obj.name()),
@@ -367,6 +382,31 @@ pub trait ReadableObj: NamedObj {
 pub trait MovableObj: NamedObj {
     /// Move and return a `Status`.
     async fn set_dyn(&self, value: f64) -> crate::status::Status;
+}
+
+/// Setpoint + readback record returned by [`LocatableObj::locate_dyn`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DynLocation {
+    /// Where the device was last requested to move.
+    pub setpoint: f64,
+    /// Where the device currently is.
+    pub readback: f64,
+}
+
+/// Anything with a notion of "where it is" + "where it's going".
+/// Required by `mvr` plan stub for relative motion.
+#[async_trait::async_trait]
+pub trait LocatableObj: MovableObj {
+    /// Read setpoint + readback in one round-trip.
+    async fn locate_dyn(&self) -> Result<DynLocation, crate::error::CirrusError>;
+}
+
+/// Anything that can be safely stopped (`Stoppable` from bluesky.protocols).
+/// Engine dispatches `Msg::Stop` to this trait.
+#[async_trait::async_trait]
+pub trait StoppableObj: NamedObj {
+    /// Safely stop the device. `success` mirrors `bluesky.protocols.Stoppable`.
+    async fn stop_dyn(&self, success: bool) -> Result<(), crate::error::CirrusError>;
 }
 
 /// Anything that can be triggered.

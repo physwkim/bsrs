@@ -2,7 +2,9 @@
 
 use async_trait::async_trait;
 use cirrus_core::error::Result;
-use cirrus_core::msg::{MovableObj, NamedObj, ReadableObj};
+use cirrus_core::msg::{
+    DynLocation, LocatableObj, MovableObj, NamedObj, ReadableObj, StoppableObj,
+};
 use cirrus_core::reading::ReadingValue;
 use cirrus_core::status::Status;
 use cirrus_core::Kind;
@@ -121,5 +123,23 @@ impl ReadableObj for SoftMotor {
 impl MovableObj for SoftMotor {
     async fn set_dyn(&self, value: f64) -> Status {
         self.set(value).await
+    }
+}
+
+#[async_trait]
+impl LocatableObj for SoftMotor {
+    async fn locate_dyn(&self) -> Result<DynLocation> {
+        let setpoint = SignalBackend::get_setpoint(self.backend.as_ref()).await?;
+        let readback = SignalBackend::get_value(self.backend.as_ref()).await?;
+        Ok(DynLocation { setpoint, readback })
+    }
+}
+
+#[async_trait]
+impl StoppableObj for SoftMotor {
+    async fn stop_dyn(&self, _success: bool) -> Result<()> {
+        // Soft motor: no motion in flight to halt; just record the call.
+        // Real implementations would write to a STOP PV.
+        Ok(())
     }
 }

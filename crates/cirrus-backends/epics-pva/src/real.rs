@@ -44,6 +44,12 @@ impl<T: Clone + Send + Sync + 'static> EpicsPvaBackend<T> {
     }
 }
 
+impl<T: Clone + Send + Sync + 'static> cirrus_devices::BackendFromPv for EpicsPvaBackend<T> {
+    fn from_pv(pv: &str) -> Self {
+        Self::new(pv)
+    }
+}
+
 fn pv_field_to_f64(p: &PvField) -> Option<f64> {
     match p {
         PvField::Scalar(s) => match s {

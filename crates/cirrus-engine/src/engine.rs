@@ -412,6 +412,9 @@ impl RunEngine {
                     .staged
                     .retain(|o| !Arc::ptr_eq(&(o.clone() as Arc<_>), &(obj.clone() as Arc<_>)));
             }
+            Msg::Stop { obj, success } => {
+                obj.stop_dyn(success).await?;
+            }
             Msg::Kickoff { obj, group } => {
                 let status = obj.kickoff_dyn().await;
                 self.handle_status(status, group).await?;

@@ -27,6 +27,12 @@ impl<T: Clone + Send + Sync + 'static> EpicsPvaBackend<T> {
     }
 }
 
+impl<T: Clone + Send + Sync + 'static> cirrus_devices::BackendFromPv for EpicsPvaBackend<T> {
+    fn from_pv(pv: &str) -> Self {
+        Self::new(pv)
+    }
+}
+
 #[async_trait]
 impl<T: Clone + Send + Sync + Serialize + 'static> SignalBackend<T> for EpicsPvaBackend<T> {
     async fn connect(&self, _timeout: Duration) -> Result<()> {
