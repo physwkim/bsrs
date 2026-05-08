@@ -2,3 +2,10 @@
 **/*.rs.bk
 *.swp
 .DS_Store
+
+# kodex tool caches (generated locally, not part of source)
+/kodex-out/
+
+# editor / OS misc
+.idea/
+.vscode/
