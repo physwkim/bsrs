@@ -448,14 +448,14 @@ impl UserData for LuaRunEngine {
             // Drive the plan to completion on cirrus's own runtime. Lua
             // callbacks run from a sync REPL thread (see main.rs), so
             // `block_on` here is safe.
-            let result = cirrus_core::runtime::cirrus_runtime()
-                .block_on(re.run_async(plan))
-                .map_err(|e| mlua::Error::RuntimeError(format!("plan failed: {e}")))?;
-            // Replay any buffered Lua subscriber callbacks emitted
-            // from worker threads (monitor pumps, suspender watchers)
-            // — running on the REPL thread now that block_on has
-            // returned, so mlua's reentrant lock won't deadlock.
+            let raw = cirrus_core::runtime::cirrus_runtime().block_on(re.run_async(plan));
+            // Drain BEFORE propagating any error. Buffered subscriber
+            // entries from worker-thread emits (monitor pumps,
+            // suspender watchers) must be flushed even when run_async
+            // itself returned Err (e.g. loop_timeout) — otherwise
+            // those callbacks are silently lost.
             drain_lua_subscriber_buffers();
+            let result = raw.map_err(|e| mlua::Error::RuntimeError(format!("plan failed: {e}")))?;
             Ok(format!(
                 "exit_status={} run_uid={}",
                 result.exit_status,
@@ -871,10 +871,12 @@ impl UserData for LuaRunEngine {
                     Err(e) => return Err(e),
                 }
                 let opts = cirrus_engine::RunOptions { md, subs };
-                let result = cirrus_core::runtime::cirrus_runtime()
-                    .block_on(re.run_async_with(plan, opts))
-                    .map_err(|e| mlua::Error::RuntimeError(format!("plan failed: {e}")))?;
+                let raw =
+                    cirrus_core::runtime::cirrus_runtime().block_on(re.run_async_with(plan, opts));
+                // Drain before error-propagation; see RE:run note.
                 drain_lua_subscriber_buffers();
+                let result =
+                    raw.map_err(|e| mlua::Error::RuntimeError(format!("plan failed: {e}")))?;
                 Ok(format!(
                     "exit_status={} run_uid={}",
                     result.exit_status,

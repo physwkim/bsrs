@@ -1031,6 +1031,44 @@ print("result=" .. tostring(r))
 }
 
 #[test]
+fn lua_subscriber_drains_even_when_run_returns_error() {
+    // Regression for R1-1: when run_async returns Err (e.g.
+    // loop_timeout), the Lua RE:run binding's `?` used to short-
+    // circuit BEFORE drain_lua_subscriber_buffers(), losing any
+    // buffered subscriber entries forever. Fix drains
+    // unconditionally before propagating.
+    //
+    // Verify by: setting a tight loop_timeout, registering a
+    // subscriber that records each doc into a Lua table,
+    // running a plan that emits Start (so the subscriber sees
+    // something) then Sleep that blows past the timeout. The
+    // run errors, but the start doc must still reach the
+    // subscriber.
+    let (out, _err, code) = run_script(
+        r#"
+local seen = {}
+RE:subscribe(function(name, body) table.insert(seen, name) end)
+RE:set_loop_timeout(0.05)
+local function p()
+    coroutine.yield(msg.open_run())
+    coroutine.yield(msg.sleep(2.0))   -- blows past timeout
+    coroutine.yield(msg.close_run())
+end
+local ok, _err = pcall(function() RE:run(plan(p)) end)
+print("ok=" .. tostring(ok))
+print("seen=" .. table.concat(seen, ","))
+"#,
+    );
+    assert_eq!(code, 0);
+    // The run errored — that's expected. But the subscriber must
+    // have received the start document via drain.
+    assert!(
+        out.contains("seen=") && out.contains("start"),
+        "subscriber must see start doc even after timeout error; out = {out}"
+    );
+}
+
+#[test]
 fn re_subscribe_name_filter_only_fires_for_match() {
     let (out, err, code) = run_script(
         r#"

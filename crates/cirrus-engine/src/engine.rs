@@ -1149,7 +1149,13 @@ impl RunEngine {
                     let stream = stream_name.clone().unwrap_or(name);
                     let ev = {
                         let state = self.state.lock().await;
-                        let bundler = state.bundler.as_ref().unwrap();
+                        let bundler = state.bundler.as_ref().ok_or_else(|| {
+                            CirrusError::Plan(
+                                "Collect lost open run mid-process (bundler cleared while \
+                                 collect_dyn was awaiting)"
+                                    .into(),
+                            )
+                        })?;
                         bundler
                             .compose()
                             .event(&stream, data, timestamps)
