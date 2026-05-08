@@ -3,6 +3,7 @@
 #![deny(missing_docs)]
 
 pub mod error;
+pub mod ext;
 pub mod kind;
 pub mod msg;
 pub mod plan;
@@ -13,6 +14,10 @@ pub mod subscription;
 pub mod suspender;
 
 pub use error::{CirrusError, Result};
+pub use ext::{
+    FlyableExt, LocatableExt, MonitorableExt, MovableExt, ReadableExt, StageableExt, StoppableExt,
+    TriggerableExt,
+};
 pub use kind::Kind;
 pub use msg::{ConfigureArgs, GroupId, Msg, RunMetadata};
 pub use plan::{plan_box, Plan, PlanItem};

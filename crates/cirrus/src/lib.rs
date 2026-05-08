@@ -28,6 +28,15 @@ pub mod ophyd {
 pub mod prelude {
     pub use cirrus_core::reading::{ReadingF64, ReadingValue, TypedReading};
     pub use cirrus_core::{CirrusError, Document, Kind, Msg, Plan, Result, Status, SubToken};
+    // Bluesky-style short-name extensions for trait objects:
+    //   motor.position().await?     // = motor.locate_dyn().await?.readback
+    //   det.read().await?           // = det.read_dyn().await?
+    //   motor.set(1.0).await        // returns Status
+    //   det.trigger().await         // returns Status
+    pub use cirrus_core::{
+        FlyableExt, LocatableExt, MonitorableExt, MovableExt, ReadableExt, StageableExt,
+        StoppableExt, TriggerableExt,
+    };
     pub use cirrus_engine::{BroadcastSink, DocumentSink, RunEngine, RunResult};
     pub use cirrus_event_model::{
         DataKey, EventDescriptor, RunStart, RunStop, StreamDatum, StreamRange, StreamResource,
