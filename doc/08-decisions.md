@@ -23,6 +23,10 @@ Open questions need an answer before the milestone that depends on them.
 | **D14** | Two co-equal user-facing modules: `cirrus::ophyd_async` (async, primary) and `cirrus::ophyd` (sync, blanket impl over async via `cirrus_runtime().block_on`). | Equal-status API surfaces requested by the user; sync is not a second-class facade. |
 | **D15** | RunEngine has two entry points: `run_async(plan).await` and `run_blocking(plan)`. The latter must not be called from inside an async task. | Mirrors bluesky `RE.__call__` blocking semantics; same plan code drives both. |
 | **D16** | The cirrus runtime is a process-singleton `tokio::Runtime` started lazily by `cirrus_core::runtime()`. | Required for the sync facade to call `block_on` from any thread. |
+| **D17** | The cirrus / Python boundary is the **Document**, not the RunEngine. cirrus emits via `DocumentSink` implementations (Zmq, Tiled, JSONL); the bluesky Python ecosystem (databroker, suitcase, BestEffortCallback, tiled-writer) consumes unchanged. | Drops the `use_cirrus()` shim and the shadow-device path entirely; eliminates PyO3 boundary cost on the hot path; matches the bluesky `Publisher` / `RemoteDispatcher` pattern. |
+| **D18** | `ZmqDocumentSink` envelope: `b"<prefix> <name> <body>"`, msgpack default body, JSON option. Matches `bluesky.callbacks.zmq.Publisher`. | One-line interop with `bluesky.callbacks.zmq.RemoteDispatcher(addr, deserializer=msgpack.unpackb)`. |
+| **D19** | `TiledSink` is intentionally minimal (RunStart register + RunStop patch). Full bluesky TiledWriter behavior delegated to a Python relay (`ZmqDocumentSink → RemoteDispatcher → TiledWriter`). | Avoids forking the schema-normalizing 800-line writer logic; lets Tiled team own the write protocol. |
+| **D20** | M8 = `cirrus-qs` queueserver worker. Manager / 0MQ JSON-RPC API / web UI / queue management remain bluesky-queueserver. cirrus only replaces the worker process. | Production deployment story without rewriting operations infrastructure. |
 
 ## Project naming
 
@@ -38,7 +42,7 @@ Open questions need an answer before the milestone that depends on them.
 |---|---|---|
 | **O1** | Do we generate the device tree statically via `#[derive(Device)]` only, or also support a dynamic builder for runtime-configurable composition (read from YAML)? | Static-only for M0–M3; revisit at M6 when CLI users need runtime config. |
 | **O2** | Should `cirrus-cli` use `rustyline` (line editor) or `reedline` (Nushell's editor)? | reedline — better hint/history support, async-friendly. |
-| **O3** | Do we ship a `cirrus-tiled` callback in M3 or wait? | M3 — Tiled is the canonical bluesky storage; lacking it makes M3 incomplete in practice. |
+| **O3** | ~~`cirrus-tiled` callback~~ — superseded by D19 (minimal `TiledSink` in M6, full path via Python relay). | resolved |
 | **O4** | Should `Wait` group bookkeeping use `JoinSet` or a hand-rolled `HashMap<GroupId, Vec<Status>>`? | `JoinSet` — gets cancellation semantics for free. |
 | **O5** | Do we support nested runs (ophyd-async multi-run plans)? | Defer to M4. The pattern is rare and complicates the bundler. |
 | **O6** | Should `cirrus-py` expose `RunEngine` as a Python-callable, or only the device classes? | Both — match bluesky's `RE(plan)` call pattern. M7. |
@@ -54,3 +58,7 @@ Open questions need an answer before the milestone that depends on them.
 | Open string command + dictionary registry (bluesky style) | Maximum extensibility. | Loses compile-time exhaustiveness; the closed enum + `Custom` arm covers the same use cases. |
 | Two parallel trait families with separate impls (true peer surfaces) | Maximum independence between sync and async. | Doubles every device impl; maintenance bomb. Blanket impl is the right factoring. |
 | `Frame` carrying `Vec<Buffer>` (rogue's literal layout) | Direct rogue port. | `Bytes` already supports chunk chaining; one fewer concept. |
+| `cirrus.use_cirrus()` monkey-patch of `bluesky.RunEngine` | One-line bluesky drop-in (D17 alternative). | PyO3 boundary cost eats most of the speedup (1–5% net). Big API surface to maintain. The Document-as-contract path (D17) is the cleaner factoring. |
+| Auto-translating Python ophyd devices to Rust shadow devices at runtime | Migration path with zero device rewrites. | Classification heuristics fragile (declarative vs custom-method discrimination). Once a user commits to cirrus they almost always want to author devices natively in Rust. |
+| Embedded Lua / rhai for plan authoring | Hot-reload + sandboxing without Rust recompile. | Sits between Rust (faster + safer) and Python (familiar + ecosystem) without dominating either. The PyO3 plan generator (M7) covers the same need with a language users already know. |
+| `typify` build-time codegen for event-model schemas | Auto-generated types from JSON schemas (D12 implementation method). | Schemas are stable and small enough that hand-ported `serde` types are easier to read, debug, and version-pin. Switching to typify remains an option later (D12 is the *what*, not the *how*). |

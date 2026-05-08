@@ -5,11 +5,29 @@ edition.workspace = true
 license.workspace = true
 description = "Document sinks: JSONL, table, etc."
 
+[features]
+default = []
+zmq = ["dep:zmq", "dep:rmp-serde"]
+tiled = ["dep:reqwest"]
+
 [dependencies]
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 cirrus-core.workspace = true
 cirrus-event-model.workspace = true
 cirrus-engine.workspace = true
+
+zmq        = { version = "0.10", optional = true }
+rmp-serde  = { version = "1", optional = true }
+reqwest    = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+serde_json.workspace = true
+zmq = "0.10"
+rmp-serde = "1"
+cirrus-plans.workspace = true
+cirrus-backend-soft = { path = "../cirrus-backends/soft" }

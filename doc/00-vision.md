@@ -2,74 +2,106 @@
 
 ## What we are building
 
-A Rust port of **bluesky + ophyd + ophyd-async** with EPICS CA/PVA backends built
-directly on `epics-rs` (no Python shim).
-A reserved extension surface so that **rogue** (SLAC FPGA DAQ) can be added in Phase 2
-without forklift changes.
+A Rust-native bluesky-compatible DAQ runtime. Plans, devices, and the
+RunEngine all live in Rust. The output — `event-model` Documents — flows into
+the bluesky Python ecosystem (databroker, Tiled, BestEffortCallback, suitcase)
+unchanged. EPICS CA/PVA backends bind directly to `epics-rs` (no Python shim).
 
 A single user, on a single RunEngine, can:
 
-- drive EPICS motors / detectors / waveforms
+- drive EPICS motors / detectors / waveforms — pure Rust path
 - (Phase 2) drive direct-attached FPGA boards via rogue, in the same plan
-- emit bluesky-compatible Document streams to Tiled / HDF5 / Kafka
+- emit bluesky-compatible Document streams over 0MQ / HTTP / files, picked
+  up by the existing Python analysis stack with **zero code change there**
 
-## Two user populations, one core
+## The Document is the contract
 
-cirrus is async on the inside but exposes **two co-equal** API surfaces:
+```
+┌──────────────────────────────┐    ┌──────────────────────────────────┐
+│ Rust (cirrus, hot path)      │    │ Python (bluesky stack, unchanged)│
+│                               │    │                                   │
+│  cirrus-plans  ──┐           │    │ ┌── BestEffortCallback             │
+│  cirrus-devices  │           │    │ ├── suitcase-{jsonl,hdf5,...}     │
+│  cirrus-stream   ├─► Document├────┼─┤   tiled-ingester (RemoteDispatch)│
+│  cirrus-engine ──┘ event-model     │ ├── databroker (catalog query)    │
+│                                    │ ├── bluesky-widgets (GUI)         │
+│       ▼                            │ └── jupyter / matplotlib          │
+│  ┌──────────────────────────┐      │                                    │
+│  │ DocumentSink trait       │      │      ▲                             │
+│  │  ├ ZmqDocumentSink       │──────┼──────┘ same Document, no change    │
+│  │  ├ TiledSink (HTTP)      │──────┤                                    │
+│  │  ├ JsonlSink (file)      │      │                                    │
+│  │  └ KafkaSink (broker)    │      │                                    │
+│  └──────────────────────────┘      │                                    │
+└──────────────────────────────┘    └──────────────────────────────────┘
+```
+
+The boundary is not "Python or Rust"; the boundary is **the Document**.
+
+## Two co-equal Rust API surfaces
+
+cirrus is async on the inside but exposes both styles for *Rust authoring*:
 
 | Module | Style | Origin | Users |
 |---|---|---|---|
-| `cirrus::ophyd_async` | async / await | ophyd-async (Python) | new code, `await` everywhere |
+| `cirrus::ophyd_async` | async / await | ophyd-async (Python) | new Rust code |
 | `cirrus::ophyd` | sync, blocking | ophyd (Python) | scripts, REPL, ophyd-trained users |
 
-The sync layer is **not a second-class facade**. It is a peer surface: the same
-`Device` and `Signal` types appear in both, with method signatures translated.
-Internally the sync methods drive the async ones via the cirrus tokio runtime.
-
-This matches Python practice — bluesky `RE(plan)` is sync (runs asyncio in a worker
-thread), ophyd is sync (uses CA dispatcher thread), ophyd-async is async. cirrus
-unifies all three under one Rust async core.
+Same `Device` and `Signal` types appear in both. The sync layer drives the
+async one via the cirrus tokio runtime — single implementation, two surfaces.
 
 ## Why rewrite
 
 | Issue | bluesky + ophyd | cirrus |
 |---|---|---|
-| GIL bottleneck in single process | Yes | None (async tokio) |
-| Same language as IOC | Python ↔ C IOC boundary every time | Rust IOC (`epics-rs`) lives next door |
-| EPICS protocol stacks | C `libca.so` + C++ `pvxs` | pure Rust `epics-ca-rs` + `epics-pva-rs` |
+| GIL on hot path | Yes | None (Rust async core) |
+| EPICS protocol stack | C `libca.so` + C++ `pvxs` | pure Rust `epics-ca-rs` + `epics-pva-rs` |
 | Direct-attached hardware (rogue) | Hard to integrate | One trait impl, lands cleanly |
 | Memory + cancellation safety | Human discipline | Compiler-enforced + K1–K12 rules |
+| Same language as IOC | Python ↔ C boundary every time | Rust IOC (`epics-rs`) lives next door |
+
+The Python ecosystem **stays valuable** — analysis, visualization, archiving,
+queue management. cirrus replaces only the orchestration hot path.
 
 ## Where the name comes from
 
-**cirrus** = high-altitude wispy cloud.
+**cirrus** = high-altitude wispy cloud. NSLS-II sky/cloud naming convention
+(bluesky / nimbus / databroker / tiled). Light and fast.
 
-- Aligns with the NSLS-II sky/cloud naming convention (bluesky / nimbus / databroker / tiled).
-- Conveys "light and fast" — fits the single-task message loop of the RunEngine.
-- Searchable: Cirrus CI exists but in a different domain, low collision risk.
+## Migration story
 
-The earlier candidate `rdaq` was rejected because (a) it does not say *which* DAQ, (b)
-it breaks the local `archiver-rs` / `epics-rs` suffix-rs convention, and (c) is unsearchable.
+| Stage | Move | Result |
+|---|---|---|
+| **0** (current) | bluesky + ophyd + pyepics | baseline |
+| **1** (entry) | One beamline rewrites plans+devices in Rust. cirrus emits documents over `ZmqDocumentSink`. Python analysis Jupyter unchanged — RemoteDispatcher subscribes to cirrus. | hot path Rust; analysis stack untouched |
+| **2** | More beamlines move over. queueserver worker swapped to `cirrus-qs` (M8). Manager / REST / web UI unchanged. | production deployment |
+| **3** | (optional) Analysis tools also rewritten. Most facilities stop here. | full Rust |
+
+Stage 1 is **the design's meaningful entry point**. Stage 2 is what makes it
+deployable in production.
 
 ## Phase strategy
 
 ```
-Phase 1: bluesky-in-Rust   (the word "rogue" appears 0 times in code)
-   M0 ─► M1 ─► M2 ─► M3 ─► M4 ─► M5 ─► M6 ─► M7?
-                                          │
-                                          └── complete bluesky replacement here
-
-Phase 2: rogue addition    (only when needed; 0 trait changes)
-   P2-A: rogue ZMQ Variable backend  (impl SignalBackend)
-   P2-B: rogue DMA frame source      (impl FrameSource)
+Phase 1: pure cirrus                       Phase 2: optional integrations
+   M0 ─► M1 ─► M2 ─► M3 ─► M4 ─► M5         + rogue ZMQ / DMA backends
+                                             + cirrus-py PyO3 plan generator
+   M6 = Document sinks (Zmq, Tiled, ...)     + cirrus-qs queueserver worker (M8)
+   M7 = (deferred) PyO3 plan authoring
 ```
 
 Detailed breakdown in [`07-milestones.md`](07-milestones.md).
 
-## Non-goals
+## Non-goals (rejected as design dead-ends)
 
-- Re-implementing the full bluesky callback ecosystem (BestEffortCallback, LiveTable, LivePlot)
-  in Phase 1. Tiled / JSONL / HDF5 sinks are enough.
-- Replacing areaDetector C++ plugins. cirrus is a PVA-monitor *consumer*; IOC-side replacement
-  belongs to `epics-rs/crates/ad-core-rs` and `ad-plugins-rs`.
-- Replacing bluesky-queueserver / bluesky-httpserver. If needed later, separate crate.
+- **`use_cirrus()` runtime monkey-patch** of bluesky.RunEngine — modest
+  speedup (PyO3 boundary cost eats most of the gains), large maintenance.
+- **Auto-translating Python ophyd devices to shadow Rust devices** —
+  classification heuristics fragile; most users want to author in Rust
+  anyway when committing to cirrus.
+- **Embedded Lua / rhai scripting for plans** — between Rust (faster, safer)
+  and Python (familiar, ecosystem) without dominating either. PyO3 plan
+  generator supersedes this path.
+- **Re-implementing bluesky.callbacks.tiled_writer's full schema-normalizing
+  writer** in Rust — `ZmqDocumentSink → Python relay → TiledWriter` covers
+  the production case without forking the Tiled write protocol.
