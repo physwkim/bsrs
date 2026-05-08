@@ -1,4 +1,4 @@
-//! Reference sinks.
+//! In-memory frame-counter sink.
 
 use async_trait::async_trait;
 use cirrus_core::error::Result;
@@ -6,9 +6,9 @@ use cirrus_protocols_async::{Frame, FrameSink};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// In-memory frame counter sink.
+/// Counts frames for tests.
 pub struct CountingSink {
-    /// Number of frames received.
+    /// Total frames received.
     pub count: Arc<AtomicU64>,
 }
 

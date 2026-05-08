@@ -8,8 +8,12 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+pub use cirrus_core::Subscription;
+
 use cirrus_core::{
-    error::Result, reading::ReadingValue, status::{Status, SubToken},
+    error::Result,
+    reading::ReadingValue,
+    status::{Status, SubToken},
     ConfigureArgs,
 };
 use cirrus_event_model::{DataKey, StreamDatum, StreamResource};
@@ -133,8 +137,8 @@ pub struct Location<T> {
 pub trait AsyncSubscribable<T: Send + Sync + 'static = f64>: Send + Sync {
     /// Stable name.
     fn name(&self) -> &str;
-    /// Subscribe; returns a watch receiver of readings.
-    async fn subscribe(&self) -> Result<watch::Receiver<ReadingValue>>;
+    /// Subscribe; returns a `Subscription` whose Drop unsubscribes (K2).
+    async fn subscribe(&self) -> Result<Subscription>;
 }
 
 /// Stoppable: safe shutdown of a device.

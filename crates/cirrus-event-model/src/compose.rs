@@ -81,10 +81,12 @@ impl RunBundle {
             object_keys,
         };
         let is_new = !streams.contains_key(name);
-        streams.entry(name.to_string()).or_insert_with(|| StreamState {
-            descriptor_uid: descriptor.uid.clone(),
-            seq_num: AtomicU64::new(0),
-        });
+        streams
+            .entry(name.to_string())
+            .or_insert_with(|| StreamState {
+                descriptor_uid: descriptor.uid.clone(),
+                seq_num: AtomicU64::new(0),
+            });
         (descriptor, is_new)
     }
 

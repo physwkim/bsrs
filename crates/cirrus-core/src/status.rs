@@ -120,7 +120,12 @@ impl Status {
         match self.inner.state.load(Ordering::Acquire) {
             SUCCESS => cb(&StatusOutcome::Success),
             ERROR => {
-                let err = self.inner.error.lock().unwrap().clone()
+                let err = self
+                    .inner
+                    .error
+                    .lock()
+                    .unwrap()
+                    .clone()
                     .unwrap_or(StatusError::Failed("unknown".into()));
                 cb(&StatusOutcome::Failed(err));
             }

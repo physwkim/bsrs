@@ -7,7 +7,7 @@ use cirrus_core::status::{Status, SubToken};
 use cirrus_core::Kind;
 use cirrus_event_model::DataKey;
 use cirrus_protocols_async::{
-    AsyncReadable, AsyncSubscribable, ReadingValueCallback, SignalBackend,
+    AsyncReadable, AsyncSubscribable, ReadingValueCallback, SignalBackend, Subscription,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -141,7 +141,7 @@ where
     fn name(&self) -> &str {
         &self.config.name
     }
-    async fn subscribe(&self) -> Result<watch::Receiver<ReadingValue>> {
+    async fn subscribe(&self) -> Result<Subscription> {
         let (tx, rx) = watch::channel(ReadingValue {
             value: Value::Null,
             timestamp: 0.0,
@@ -162,11 +162,10 @@ where
                 }
             })
         };
-        let _token = self.backend.set_callback(Some(cb));
-        // For now we leak the token — a real impl would tie it to the rx
-        // lifetime. This is a known M0/M1 limitation; M4 fixes it.
-        std::mem::forget(_token);
-        Ok(rx)
+        // K2: SubToken lives inside Subscription. Drop of Subscription removes
+        // the backend slot via the token's Drop impl.
+        let token = self.backend.set_callback(Some(cb));
+        Ok(Subscription::new(rx, token))
     }
 }
 

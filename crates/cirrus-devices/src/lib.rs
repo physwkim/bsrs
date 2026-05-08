@@ -8,3 +8,6 @@ pub mod signal;
 
 pub use detector::{StandardDetector, TriggerInfo};
 pub use signal::{Signal, SignalConfig, SignalKind};
+
+/// Re-export of the `#[derive(Device)]` proc-macro.
+pub use cirrus_derive::Device;

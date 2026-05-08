@@ -16,6 +16,9 @@ fn main() -> Result<()> {
     // Sync entry — ophyd-style. Plan is identical to the async version.
     let plan = cirrus::ophyd::count(vec![det], 5);
     let result = re.run_blocking(plan)?;
-    println!("run finished: {} (uid: {:?})", result.exit_status, result.run_uid);
+    println!(
+        "run finished: {} (uid: {:?})",
+        result.exit_status, result.run_uid
+    );
     Ok(())
 }

@@ -5,11 +5,11 @@ use cirrus_core::error::Result;
 use cirrus_core::msg::{NamedObj, ReadableObj};
 use cirrus_core::reading::ReadingValue;
 use cirrus_core::status::Status;
+use cirrus_devices::StandardDetector;
 use cirrus_event_model::{DataKey, Dtype};
 use cirrus_protocols_async::{
     AsyncReadable, DetectorControl, DetectorWriter, StreamAsset, TriggerInfo,
 };
-use cirrus_devices::StandardDetector;
 use futures::stream::{self, BoxStream, StreamExt};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

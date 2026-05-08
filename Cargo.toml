@@ -7,6 +7,7 @@ default-members = [
 members = [
     "crates/cirrus-event-model",
     "crates/cirrus-core",
+    "crates/cirrus-derive",
     "crates/cirrus-protocols-async",
     "crates/cirrus-protocols-sync",
     "crates/cirrus-engine",
@@ -57,6 +58,7 @@ cirrus-backend-soft   = { path = "crates/cirrus-backends/soft" }
 cirrus-backend-mock   = { path = "crates/cirrus-backends/mock" }
 cirrus-stream         = { path = "crates/cirrus-stream" }
 cirrus-callbacks      = { path = "crates/cirrus-callbacks" }
+cirrus-derive         = { path = "crates/cirrus-derive" }
 
 [profile.dev]
 opt-level = 1

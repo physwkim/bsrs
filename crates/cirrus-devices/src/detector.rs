@@ -229,9 +229,7 @@ where
     C: DetectorControl + Send + Sync + 'static,
     W: DetectorWriter + Send + Sync + 'static,
 {
-    async fn describe_collect_dyn(
-        &self,
-    ) -> Result<HashMap<String, HashMap<String, DataKey>>> {
+    async fn describe_collect_dyn(&self) -> Result<HashMap<String, HashMap<String, DataKey>>> {
         let dks = WritesStreamAssets::name(self).to_string();
         let _ = dks; // unused
         let dk = self.writer.open(1).await?;

@@ -7,16 +7,21 @@ description = "EPICS Channel Access backend for cirrus, built on epics-ca-rs."
 
 [features]
 default = []
-# Wires up the actual epics-ca-rs dependency. Disabled by default until the
-# epics-ca-rs API is wired by hand. Without this feature the crate exposes
-# only stubs that always return `Backend("epics-ca disabled")` errors.
-real = []
+# When enabled, links `epics-ca-rs` and exposes a real `SignalBackend`.
+# Disabled by default so the rest of the workspace builds without dragging in
+# the full EPICS Rust stack.
+real = ["dep:epics-ca-rs", "dep:epics-base-rs"]
 
 [dependencies]
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
 cirrus-core.workspace = true
 cirrus-event-model.workspace = true
 cirrus-protocols-async.workspace = true
+
+epics-ca-rs    = { path = "../../../../epics-rs/crates/epics-ca-rs", optional = true }
+epics-base-rs  = { path = "../../../../epics-rs/crates/epics-base-rs", optional = true }

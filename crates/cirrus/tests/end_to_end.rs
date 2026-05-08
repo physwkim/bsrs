@@ -72,6 +72,79 @@ async fn scan_plan_emits_motor_and_detector_readings() {
 }
 
 #[tokio::test]
+async fn binary_frame_sink_writes_and_emits_stream_docs() {
+    use cirrus::stream::sinks::BinaryFrameSink;
+    use cirrus_protocols_async::{DetectorWriter, Frame, FrameSink};
+    use futures::StreamExt;
+
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("frames.cirbin1");
+    let sink = BinaryFrameSink::new("det", &path, 4);
+
+    // Open + accept 3 frames + close.
+    sink.open(1).await.unwrap();
+    for i in 0..3_u32 {
+        sink.accept(Frame {
+            payload: bytes::Bytes::from(i.to_le_bytes().to_vec()),
+            ts_ns: 0,
+            channel: 0,
+            flags: 0,
+            seq: i as u64,
+        })
+        .await
+        .unwrap();
+    }
+    sink.close().await.unwrap();
+
+    // Verify file: magic + 3 × (len_le, payload).
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(&bytes[..8], b"CIRBIN1\n");
+    assert_eq!(bytes.len(), 8 + 3 * (4 + 4));
+    assert_eq!(sink.indices_written().await, 3);
+
+    // collect_stream_docs(3) should produce StreamResource + StreamDatum [0,3).
+    let docs: Vec<_> = sink.collect_stream_docs(3).collect::<Vec<_>>().await;
+    assert_eq!(docs.len(), 2);
+    use cirrus::ophyd_async::StreamAsset;
+    assert!(matches!(&docs[0], StreamAsset::Resource(_)));
+    if let StreamAsset::Datum(d) = &docs[1] {
+        assert_eq!(d.indices.start, 0);
+        assert_eq!(d.indices.stop, 3);
+    } else {
+        panic!("expected StreamDatum");
+    }
+}
+
+fn tempdir() -> std::io::Result<tempdir_shim::TempDir> {
+    tempdir_shim::TempDir::new()
+}
+
+mod tempdir_shim {
+    use std::path::{Path, PathBuf};
+    pub struct TempDir(PathBuf);
+    impl TempDir {
+        pub fn new() -> std::io::Result<Self> {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let p = std::env::temp_dir().join(format!("cirrus-test-{nanos}"));
+            std::fs::create_dir_all(&p)?;
+            Ok(Self(p))
+        }
+        pub fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
+#[tokio::test]
 async fn fly_plan_drives_standard_detector_to_completion() {
     use cirrus::backends::soft::SoftDetector as ScalarDet;
     use cirrus_core::msg::{CollectableObj, FlyableObj, StageableObj};

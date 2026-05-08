@@ -3,7 +3,7 @@
 #![deny(missing_docs)]
 
 use cirrus_core::msg::{
-    CollectableObj, FlyableObj, Msg, MovableObj, ReadableObj, RunMetadata, StageableObj,
+    CollectableObj, FlyableObj, MovableObj, Msg, ReadableObj, RunMetadata, StageableObj,
     TriggerableObj,
 };
 use cirrus_core::plan::{plan_box, Plan};

@@ -1,4 +1,4 @@
-//! Reference sources.
+//! Source that yields a fixed sequence of frames synchronously.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -20,7 +20,7 @@ fn now_ns() -> u64 {
 /// Source that yields a fixed sequence of frames synchronously.
 pub struct VecFrameSource {
     frames: Mutex<Vec<Frame>>,
-    /// Monotonic seq counter — kept for telemetry (read by overflow accounting tests).
+    /// Monotonic seq counter — kept for telemetry.
     pub seq: Arc<AtomicU64>,
 }
 
@@ -51,7 +51,6 @@ impl VecFrameSource {
 #[async_trait]
 impl FrameSource for VecFrameSource {
     fn frames(&self) -> BoxStream<'static, Frame> {
-        // Drain the queue once.
         let frames = std::mem::take(&mut *self.frames.blocking_lock());
         stream::iter(frames).boxed()
     }

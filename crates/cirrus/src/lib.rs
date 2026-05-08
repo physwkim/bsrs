@@ -16,8 +16,8 @@ pub mod ophyd {
     pub use cirrus_protocols_async::{
         AsyncConfigurable, AsyncMovable, AsyncReadable, AsyncSubscribable, Collectable,
         DetectorControl, DetectorWriter, Flyable, Frame, FrameSink, FrameSource, Locatable,
-        Pausable, Preparable, SignalBackend, Stageable, Stoppable, StreamAsset, Triggerable,
-        TriggerInfo, WritesStreamAssets,
+        Pausable, Preparable, SignalBackend, Stageable, Stoppable, StreamAsset, TriggerInfo,
+        Triggerable, WritesStreamAssets,
     };
     pub use cirrus_protocols_sync::{
         Configurable, FlyableSync, Movable, Readable, StageableSync, TriggerableSync,
@@ -26,8 +26,8 @@ pub mod ophyd {
 
 /// Common items re-exported regardless of API surface.
 pub mod prelude {
-    pub use cirrus_core::{CirrusError, Document, Kind, Msg, Plan, Result, Status, SubToken};
     pub use cirrus_core::reading::{ReadingF64, ReadingValue, TypedReading};
+    pub use cirrus_core::{CirrusError, Document, Kind, Msg, Plan, Result, Status, SubToken};
     pub use cirrus_engine::{BroadcastSink, DocumentSink, RunEngine, RunResult};
     pub use cirrus_event_model::{
         DataKey, EventDescriptor, RunStart, RunStop, StreamDatum, StreamRange, StreamResource,

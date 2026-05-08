@@ -7,8 +7,7 @@
 #![deny(missing_docs)]
 
 use cirrus_core::{
-    error::Result, reading::ReadingValue, runtime::block_on, status::Status,
-    ConfigureArgs,
+    error::Result, reading::ReadingValue, runtime::block_on, status::Status, ConfigureArgs,
 };
 use cirrus_event_model::DataKey;
 use std::collections::HashMap;

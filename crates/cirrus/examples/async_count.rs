@@ -16,6 +16,9 @@ async fn main() -> Result<()> {
 
     let plan = cirrus::ophyd_async::count(vec![det], 5);
     let result = re.run_async(plan).await?;
-    println!("run finished: {} (uid: {:?})", result.exit_status, result.run_uid);
+    println!(
+        "run finished: {} (uid: {:?})",
+        result.exit_status, result.run_uid
+    );
     Ok(())
 }

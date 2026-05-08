@@ -11,9 +11,9 @@ pub mod compose;
 pub mod documents;
 
 pub use documents::{
-    Configuration, DataKey, Datum, DatumPage, Document, Dtype, Event, EventDescriptor,
-    EventPage, Hints, Limits, LimitsRange, PerObjectHint, Reading, Resource, RunStart,
-    RunStop, StreamDatum, StreamRange, StreamResource,
+    Configuration, DataKey, Datum, DatumPage, Document, Dtype, Event, EventDescriptor, EventPage,
+    Hints, Limits, LimitsRange, PerObjectHint, Reading, Resource, RunStart, RunStop, StreamDatum,
+    StreamRange, StreamResource,
 };
 
 /// Errors when composing or routing documents.

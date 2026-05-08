@@ -85,10 +85,7 @@ impl RunBundler {
             bundle.readings.insert(k, v);
         }
         // Stash data keys for descriptor synthesis at save time.
-        let s = self
-            .stream_data_keys
-            .entry(stream_name)
-            .or_default();
+        let s = self.stream_data_keys.entry(stream_name).or_default();
         for (k, v) in data_keys {
             s.insert(k, v);
         }

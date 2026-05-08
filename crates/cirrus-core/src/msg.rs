@@ -265,19 +265,19 @@ pub trait CollectableObj: NamedObj {
     /// Yield events. Empty vec if nothing buffered.
     async fn collect_dyn(
         &self,
-    ) -> Result<Vec<(String, HashMap<String, Value>, HashMap<String, f64>)>, crate::error::CirrusError>;
+    ) -> Result<
+        Vec<(String, HashMap<String, Value>, HashMap<String, f64>)>,
+        crate::error::CirrusError,
+    >;
 }
 
 /// Anything that can be subscribed to (monitor stream).
 #[async_trait::async_trait]
 pub trait MonitorableObj: NamedObj {
-    /// Subscribe — engine receives a watch::Receiver of readings.
+    /// Subscribe — engine receives a `Subscription` (rx + RAII token).
     async fn subscribe_dyn(
         &self,
-    ) -> Result<
-        tokio::sync::watch::Receiver<crate::reading::ReadingValue>,
-        crate::error::CirrusError,
-    >;
+    ) -> Result<crate::subscription::Subscription, crate::error::CirrusError>;
 }
 
 /// Anything that can be configured.

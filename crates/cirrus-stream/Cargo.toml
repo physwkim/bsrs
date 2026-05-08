@@ -16,3 +16,15 @@ tracing.workspace = true
 cirrus-core.workspace = true
 cirrus-event-model.workspace = true
 cirrus-protocols-async.workspace = true
+uuid.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[features]
+default = []
+# Enables PvaMonitorSource by linking epics-pva-rs.
+pva = ["dep:epics-pva-rs"]
+
+[dependencies.epics-pva-rs]
+path = "../../../epics-rs/crates/epics-pva-rs"
+optional = true

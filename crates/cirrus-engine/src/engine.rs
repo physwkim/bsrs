@@ -179,9 +179,7 @@ impl RunEngine {
                     state
                         .bundler
                         .as_mut()
-                        .ok_or_else(|| {
-                            CirrusError::Plan("DeclareStream with no open run".into())
-                        })?
+                        .ok_or_else(|| CirrusError::Plan("DeclareStream with no open run".into()))?
                         .declare_stream(stream_name, data_keys)?
                 };
                 self.broadcast(&Document::Descriptor(descriptor)).await?;
@@ -268,10 +266,9 @@ impl RunEngine {
             }
             Msg::Unmonitor(obj) => {
                 let mut state = self.state.lock().await;
-                state.monitors.retain(|(_, o)| !Arc::ptr_eq(
-                    &(o.clone() as Arc<_>),
-                    &(obj.clone() as Arc<_>),
-                ));
+                state.monitors.retain(|(_, o)| {
+                    !Arc::ptr_eq(&(o.clone() as Arc<_>), &(obj.clone() as Arc<_>))
+                });
             }
             Msg::Wait {
                 group,
@@ -341,9 +338,10 @@ impl RunEngine {
     async fn close_run_if_open(&self, exit_status: &str, reason: Option<String>) -> Result<()> {
         let stop_doc = {
             let mut state = self.state.lock().await;
-            state.bundler.take().map(|bundler| {
-                bundler.compose().stop(exit_status, reason)
-            })
+            state
+                .bundler
+                .take()
+                .map(|bundler| bundler.compose().stop(exit_status, reason))
         };
         if let Some(stop) = stop_doc {
             self.broadcast(&Document::Stop(stop)).await?;
@@ -374,9 +372,7 @@ impl RunEngine {
             None => match status.await {
                 Ok(()) => Ok(()),
                 Err(StatusError::Cancelled) => Err(CirrusError::Cancelled),
-                Err(StatusError::Timeout) => {
-                    Err(CirrusError::Timeout(Duration::from_secs(0)))
-                }
+                Err(StatusError::Timeout) => Err(CirrusError::Timeout(Duration::from_secs(0))),
                 Err(StatusError::Failed(s)) => Err(CirrusError::Backend(s)),
             },
         }
@@ -390,7 +386,11 @@ impl RunEngine {
     ) -> Result<()> {
         let members = {
             let mut state = self.state.lock().await;
-            state.groups.remove(group).map(|g| g.members).unwrap_or_default()
+            state
+                .groups
+                .remove(group)
+                .map(|g| g.members)
+                .unwrap_or_default()
         };
         if members.is_empty() {
             return Ok(());
