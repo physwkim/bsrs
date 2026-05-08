@@ -3,14 +3,21 @@ name = "cirrus-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "cirrus REPL / CLI."
+description = "cirrus CLI — qs-manager (server) and qs (client) subcommands."
 
 [dependencies]
 tokio.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+zmq.workspace = true
 cirrus-core.workspace = true
 cirrus-engine.workspace = true
 cirrus-callbacks.workspace = true
+cirrus-plans.workspace = true
+cirrus-qs.workspace = true
+cirrus-backend-soft.workspace = true
 
 [[bin]]
 name = "cirrus"

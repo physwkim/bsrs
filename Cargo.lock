@@ -330,11 +330,18 @@ dependencies = [
 name = "cirrus-cli"
 version = "0.1.0"
 dependencies = [
+ "cirrus-backend-soft",
  "cirrus-callbacks",
  "cirrus-core",
  "cirrus-engine",
+ "cirrus-plans",
+ "cirrus-qs",
+ "clap",
+ "serde_json",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "zmq",
 ]
 
 [[package]]
