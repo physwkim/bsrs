@@ -241,9 +241,14 @@ Example:
   RE:run(plan(my_scan, {{det1}}, m1, 5))
 
 Coroutine yield return values:
-  msg.open_run         returns the run UID (string) on the next resume
-  all other Msg yields return nil (Wait + Group ID for Set/Trigger
-  synchronization)
+  msg.open_run                            -> run UID (string)
+  msg.set / trigger / kickoff / complete  -> wait-group string
+                                             (auto-allocated if not given;
+                                              feed back into msg.wait)
+  msg.locate                              -> {{setpoint=, readback=}}
+  msg.read                                -> {{field={{value=, timestamp=, ...}}}}
+  msg.close_run                           -> exit_status string
+  every other msg.*                       -> nil
 
 Multi-line: incomplete input keeps the prompt at `... `; type `:reset` to drop.
 "#

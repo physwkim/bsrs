@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use cirrus_backend_soft::{SoftDetector, SoftMotor};
 use cirrus_core::msg::{
-    LocatableObj, MovableObj, Msg, MonitorableObj, ReadableObj, RunMetadata, StageableObj,
-    StoppableObj, TriggerableObj,
+    FlyableObj, LocatableObj, MovableObj, Msg, MonitorableObj, ReadableObj, RunMetadata,
+    StageableObj, StoppableObj, TriggerableObj,
 };
 use cirrus_core::plan::{plan_box, Plan};
 use cirrus_engine::{DocumentSink, RunEngine};
@@ -25,6 +25,7 @@ pub struct LuaDevice {
     pub triggerable: Option<Arc<dyn TriggerableObj>>,
     pub stageable: Option<Arc<dyn StageableObj>>,
     pub monitorable: Option<Arc<dyn MonitorableObj>>,
+    pub flyable: Option<Arc<dyn FlyableObj>>,
 }
 
 impl UserData for LuaDevice {
@@ -182,6 +183,7 @@ pub fn build_lua(re: Arc<RunEngine>) -> mlua::Result<Lua> {
             triggerable: None,
             stageable: None,
             monitorable: None,
+            flyable: None,
         })
     })?;
     lua.globals().set("soft_detector", f)?;
@@ -197,6 +199,7 @@ pub fn build_lua(re: Arc<RunEngine>) -> mlua::Result<Lua> {
             triggerable: None,
             stageable: None,
             monitorable: None,
+            flyable: None,
         })
     })?;
     lua.globals().set("soft_motor", f)?;
@@ -459,6 +462,8 @@ fn register_msg_namespace(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
     // set(device, value, [group]) -> Msg::Set
+    // If `group` is omitted, the bridge auto-generates a unique id so
+    // the coroutine receives a wait-able group string back from yield.
     msg.set(
         "set",
         lua.create_function(
@@ -471,7 +476,7 @@ fn register_msg_namespace(lua: &Lua) -> mlua::Result<()> {
                 Ok(LuaMsg(Msg::Set {
                     obj: mv,
                     value: val,
-                    group,
+                    group: Some(group.unwrap_or_else(auto_group)),
                 }))
             },
         )?,
@@ -485,7 +490,10 @@ fn register_msg_namespace(lua: &Lua) -> mlua::Result<()> {
                 .triggerable
                 .clone()
                 .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not triggerable", d.name)))?;
-            Ok(LuaMsg(Msg::Trigger { obj: t, group }))
+            Ok(LuaMsg(Msg::Trigger {
+                obj: t,
+                group: Some(group.unwrap_or_else(auto_group)),
+            }))
         })?,
     )?;
     // wait(group, [timeout_secs], [error_on_timeout])
@@ -594,8 +602,60 @@ fn register_msg_namespace(lua: &Lua) -> mlua::Result<()> {
             Ok(LuaMsg(Msg::Unmonitor(m)))
         })?,
     )?;
+    // locate(motor) -> Msg::Locate. Coroutine receives a {setpoint, readback}
+    // table on the next resume.
+    msg.set(
+        "locate",
+        lua.create_function(|_, dev: mlua::AnyUserData| {
+            let d = dev.borrow::<LuaDevice>()?;
+            let l = d
+                .locatable
+                .clone()
+                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not locatable", d.name)))?;
+            Ok(LuaMsg(Msg::Locate(l)))
+        })?,
+    )?;
+    // kickoff(device, [group]) — auto-group if absent.
+    msg.set(
+        "kickoff",
+        lua.create_function(|_, (dev, group): (mlua::AnyUserData, Option<String>)| {
+            let d = dev.borrow::<LuaDevice>()?;
+            let f = d
+                .flyable
+                .clone()
+                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not flyable", d.name)))?;
+            Ok(LuaMsg(Msg::Kickoff {
+                obj: f,
+                group: Some(group.unwrap_or_else(auto_group)),
+            }))
+        })?,
+    )?;
+    // complete(device, [group])
+    msg.set(
+        "complete",
+        lua.create_function(|_, (dev, group): (mlua::AnyUserData, Option<String>)| {
+            let d = dev.borrow::<LuaDevice>()?;
+            let f = d
+                .flyable
+                .clone()
+                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not flyable", d.name)))?;
+            Ok(LuaMsg(Msg::Complete {
+                obj: f,
+                group: Some(group.unwrap_or_else(auto_group)),
+            }))
+        })?,
+    )?;
     lua.globals().set("msg", msg)?;
     Ok(())
+}
+
+/// Allocate a unique wait-group id for an auto-grouped Set / Trigger /
+/// Kickoff / Complete. Returned to the coroutine via the bridge as the
+/// yield's return value, so plans can `coroutine.yield(msg.wait(s))`.
+fn auto_group() -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("auto-{n}")
 }
 
 // ---------------------------------------------------------------------------
@@ -615,44 +675,24 @@ fn coroutine_to_plan(
     re: Arc<cirrus_engine::RunEngine>,
 ) -> Plan {
     plan_box(async_stream::stream! {
+        // Drain any stale result from a previous run.
+        let _ = re.take_msg_result();
+
         let mut started = false;
-        // Tracks the kind of the most recently yielded Msg so we can
-        // produce the right return value for the next coroutine.resume.
-        let mut last_kind: Option<MsgKind> = None;
-        // Pre-OpenRun snapshot of the engine's run uid (`None` typically),
-        // captured so the post-yield read can detect "OpenRun just
-        // succeeded" vs. "still no run open".
-        let mut prev_uid: Option<String> = None;
+        let mut have_pending_result = false;
 
         loop {
-            // Build the resume argument from whatever the previous Msg's
-            // result was.
             let resume_args: Variadic<LuaValue> = if !started {
                 started = true;
                 Variadic::from_iter(args.iter().cloned())
-            } else if let Some(kind) = last_kind.take() {
-                let result_value = match kind {
-                    MsgKind::OpenRun => {
-                        let now = re.current_run_uid().await;
-                        match (now, prev_uid.clone()) {
-                            (Some(uid), prev) if Some(&uid) != prev.as_ref() => {
-                                match lua.create_string(&uid) {
-                                    Ok(s) => LuaValue::String(s),
-                                    Err(_) => LuaValue::Nil,
-                                }
-                            }
-                            _ => LuaValue::Nil,
-                        }
-                    }
-                    MsgKind::Other => LuaValue::Nil,
-                };
-                Variadic::from_iter(std::iter::once(result_value))
+            } else if have_pending_result {
+                have_pending_result = false;
+                let result = re.take_msg_result();
+                let v = msg_result_to_lua(&lua, result);
+                Variadic::from_iter(std::iter::once(v))
             } else {
                 Variadic::new()
             };
-            // Capture the live UID before this resume so we can detect
-            // OpenRun completion afterwards.
-            prev_uid = re.current_run_uid().await;
 
             let resume_result: mlua::Result<LuaValue> = thread.resume(resume_args);
             match resume_result {
@@ -660,12 +700,8 @@ fn coroutine_to_plan(
                     let still_running = thread.status() == ThreadStatus::Resumable;
                     if let LuaValue::UserData(ud) = &v {
                         if let Ok(m) = ud.borrow::<LuaMsg>() {
-                            let kind = match &m.0 {
-                                cirrus_core::msg::Msg::OpenRun(_) => MsgKind::OpenRun,
-                                _ => MsgKind::Other,
-                            };
                             yield m.0.clone();
-                            last_kind = Some(kind);
+                            have_pending_result = true;
                             if !still_running {
                                 break;
                             }
@@ -687,10 +723,94 @@ fn coroutine_to_plan(
     })
 }
 
-/// Internal: which kind of Msg we just yielded, so the bridge knows
-/// what to return to the coroutine on the next resume.
-#[derive(Copy, Clone)]
-enum MsgKind {
-    OpenRun,
-    Other,
+fn msg_result_to_lua(lua: &Lua, r: cirrus_engine::MsgResult) -> LuaValue {
+    use cirrus_engine::MsgResult;
+    match r {
+        MsgResult::None => LuaValue::Nil,
+        MsgResult::OpenRun { uid } => lua
+            .create_string(&uid)
+            .map(LuaValue::String)
+            .unwrap_or(LuaValue::Nil),
+        MsgResult::Status { group } => lua
+            .create_string(&group)
+            .map(LuaValue::String)
+            .unwrap_or(LuaValue::Nil),
+        MsgResult::CloseRun { exit_status } => lua
+            .create_string(&exit_status)
+            .map(LuaValue::String)
+            .unwrap_or(LuaValue::Nil),
+        MsgResult::Reading { data } => {
+            // Build a Lua table {field = {value=, timestamp=, ...}, ...}
+            let t = match lua.create_table() {
+                Ok(t) => t,
+                Err(_) => return LuaValue::Nil,
+            };
+            for (k, v) in data {
+                let inner = match lua.create_table() {
+                    Ok(i) => i,
+                    Err(_) => continue,
+                };
+                let _ = inner.set("value", json_to_lua(lua, &v.value));
+                let _ = inner.set("timestamp", v.timestamp);
+                if let Some(s) = v.alarm_severity {
+                    let _ = inner.set("alarm_severity", s as i64);
+                }
+                if let Some(m) = v.message {
+                    let _ = inner.set("message", m);
+                }
+                let _ = t.set(k, inner);
+            }
+            LuaValue::Table(t)
+        }
+        MsgResult::Location { setpoint, readback } => {
+            let t = match lua.create_table() {
+                Ok(t) => t,
+                Err(_) => return LuaValue::Nil,
+            };
+            let _ = t.set("setpoint", setpoint);
+            let _ = t.set("readback", readback);
+            LuaValue::Table(t)
+        }
+    }
+}
+
+fn json_to_lua(lua: &Lua, v: &serde_json::Value) -> LuaValue {
+    use serde_json::Value as J;
+    match v {
+        J::Null => LuaValue::Nil,
+        J::Bool(b) => LuaValue::Boolean(*b),
+        J::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                LuaValue::Integer(i)
+            } else if let Some(f) = n.as_f64() {
+                LuaValue::Number(f)
+            } else {
+                LuaValue::Nil
+            }
+        }
+        J::String(s) => lua
+            .create_string(s)
+            .map(LuaValue::String)
+            .unwrap_or(LuaValue::Nil),
+        J::Array(a) => {
+            let t = match lua.create_table() {
+                Ok(t) => t,
+                Err(_) => return LuaValue::Nil,
+            };
+            for (i, x) in a.iter().enumerate() {
+                let _ = t.set(i + 1, json_to_lua(lua, x));
+            }
+            LuaValue::Table(t)
+        }
+        J::Object(o) => {
+            let t = match lua.create_table() {
+                Ok(t) => t,
+                Err(_) => return LuaValue::Nil,
+            };
+            for (k, x) in o {
+                let _ = t.set(k.clone(), json_to_lua(lua, x));
+            }
+            LuaValue::Table(t)
+        }
+    }
 }

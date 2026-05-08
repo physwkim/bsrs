@@ -80,6 +80,54 @@ pub type MdValidator = Arc<dyn Fn(&HashMap<String, Value>) -> Result<()> + Send 
 /// inside `run_async` *outside* the message loop.
 pub type PlanHook = Arc<dyn Fn() + Send + Sync + 'static>;
 
+/// Side-channel result from the most recently-processed `Msg`. Producers
+/// that yield `Msg`s (Lua coroutines, future async-fn plans) can poll
+/// `RunEngine::take_msg_result` after each yield to see what the engine
+/// did with the Msg.
+///
+/// `MsgResult` reflects the *engine's* observable effect — it is not a
+/// promise that the operation has fully completed. For grouped
+/// Set/Trigger/Kickoff/Complete, the `Status` is added to the named
+/// wait group; the result reports that group name. For ungrouped
+/// (synchronous) variants, the engine has already awaited completion
+/// before writing the result.
+#[derive(Debug, Clone)]
+pub enum MsgResult {
+    /// No useful result for this Msg kind.
+    None,
+    /// `OpenRun` produced a fresh run-start UID.
+    OpenRun {
+        /// Run-start UID.
+        uid: String,
+    },
+    /// `Set` / `Trigger` / `Kickoff` / `Complete` issued a Status that
+    /// was added to the given wait group. Plans pair this with a
+    /// matching `Msg::Wait { group }`.
+    Status {
+        /// Wait group the Status was added to.
+        group: String,
+    },
+    /// `Read` produced a reading per signal. Same shape as the engine
+    /// stored into the bundler.
+    Reading {
+        /// `field_name` → `ReadingValue`.
+        data: HashMap<String, cirrus_core::reading::ReadingValue>,
+    },
+    /// `Locate` produced a setpoint + readback pair.
+    Location {
+        /// Where the device was last requested to move.
+        setpoint: f64,
+        /// Where the device currently is.
+        readback: f64,
+    },
+    /// `CloseRun` finished. Engine reports the exit status it just
+    /// emitted in the RunStop document.
+    CloseRun {
+        /// `success` / `abort` / `fail` / etc.
+        exit_status: String,
+    },
+}
+
 /// Final state of a finished run.
 #[derive(Debug, Clone)]
 pub struct RunResult {
@@ -139,6 +187,10 @@ pub struct RunEngine {
     /// with `CirrusError::Timeout`. Mirrors bluesky's
     /// `loop_until_completion_timeout`.
     loop_timeout: StdMutex<Option<Duration>>,
+    /// Side-channel for the most recently-processed `Msg`'s result.
+    /// Producers (Lua coroutine bridge, future async-fn plans) poll
+    /// `take_msg_result` between Msg yields.
+    last_msg_result: StdMutex<MsgResult>,
     /// `true` if `install_signal_handler()` has run.
     signal_installed: AtomicBool,
 }
@@ -195,8 +247,15 @@ impl RunEngine {
             before_plan: StdMutex::new(None),
             after_plan: StdMutex::new(None),
             loop_timeout: StdMutex::new(None),
+            last_msg_result: StdMutex::new(MsgResult::None),
             signal_installed: AtomicBool::new(false),
         }
+    }
+
+    /// Take and clear the most recent `Msg` result side channel. Returns
+    /// `MsgResult::None` if nothing was written since the last take.
+    pub fn take_msg_result(&self) -> MsgResult {
+        std::mem::replace(&mut *self.last_msg_result.lock().unwrap(), MsgResult::None)
     }
 
     /// Async entry point — drive a plan to completion.
@@ -607,6 +666,7 @@ impl RunEngine {
         match msg {
             Msg::OpenRun(meta) => {
                 let uid = self.open_run(meta).await?;
+                *self.last_msg_result.lock().unwrap() = MsgResult::OpenRun { uid: uid.clone() };
                 return Ok(Some(uid));
             }
             Msg::CloseRun {
@@ -614,6 +674,9 @@ impl RunEngine {
                 reason,
             } => {
                 self.close_run_if_open(&exit_status, reason).await?;
+                *self.last_msg_result.lock().unwrap() = MsgResult::CloseRun {
+                    exit_status: exit_status.clone(),
+                };
             }
             Msg::Create { stream_name } => {
                 self.state
@@ -662,22 +725,50 @@ impl RunEngine {
             }
             Msg::Read(obj) => {
                 let readings = obj.read_dyn().await?;
+                let result_snapshot = readings.clone();
                 let data_keys = obj.describe_dyn().await?;
                 let object_name = Some(obj.name().to_string());
                 let hint_fields = obj.hint_fields();
-                let mut state = self.state.lock().await;
-                state
-                    .bundler
-                    .as_mut()
-                    .ok_or_else(|| CirrusError::Plan("Read with no open run".into()))?
-                    .add_readings(readings, data_keys, object_name, hint_fields)?;
+                let bundler_present = {
+                    let state = self.state.lock().await;
+                    state.bundler.is_some()
+                };
+                if bundler_present {
+                    let mut state = self.state.lock().await;
+                    state
+                        .bundler
+                        .as_mut()
+                        .ok_or_else(|| CirrusError::Plan("Read with no open run".into()))?
+                        .add_readings(readings, data_keys, object_name, hint_fields)?;
+                }
+                // Surface the reading even when there's no open run; the
+                // coroutine bridge can use it for ad-hoc inspection.
+                *self.last_msg_result.lock().unwrap() = MsgResult::Reading {
+                    data: result_snapshot,
+                };
+                if !bundler_present {
+                    return Err(CirrusError::Plan("Read with no open run".into()));
+                }
+            }
+            Msg::Locate(obj) => {
+                let loc = obj.locate_dyn().await?;
+                *self.last_msg_result.lock().unwrap() = MsgResult::Location {
+                    setpoint: loc.setpoint,
+                    readback: loc.readback,
+                };
             }
             Msg::Set { obj, value, group } => {
                 let status = obj.set_dyn(value).await;
+                if let Some(g) = group.clone() {
+                    *self.last_msg_result.lock().unwrap() = MsgResult::Status { group: g };
+                }
                 self.handle_status(status, group).await?;
             }
             Msg::Trigger { obj, group } => {
                 let status = obj.trigger_dyn().await;
+                if let Some(g) = group.clone() {
+                    *self.last_msg_result.lock().unwrap() = MsgResult::Status { group: g };
+                }
                 self.handle_status(status, group).await?;
             }
             Msg::Stage(obj) => {
@@ -696,10 +787,16 @@ impl RunEngine {
             }
             Msg::Kickoff { obj, group } => {
                 let status = obj.kickoff_dyn().await;
+                if let Some(g) = group.clone() {
+                    *self.last_msg_result.lock().unwrap() = MsgResult::Status { group: g };
+                }
                 self.handle_status(status, group).await?;
             }
             Msg::Complete { obj, group } => {
                 let status = obj.complete_dyn().await;
+                if let Some(g) = group.clone() {
+                    *self.last_msg_result.lock().unwrap() = MsgResult::Status { group: g };
+                }
                 self.handle_status(status, group).await?;
             }
             Msg::Collect { obj, stream_name } => {

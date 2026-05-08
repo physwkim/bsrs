@@ -116,6 +116,12 @@ pub enum Msg {
         stream_name: Option<String>,
     },
 
+    /// Read setpoint + readback from a `LocatableObj`. The result lands
+    /// in the engine's `MsgResult::Location` slot and is surfaced back
+    /// to the plan stream's caller (e.g. the Lua coroutine bridge) on
+    /// the next `Plan::next` poll.
+    Locate(Arc<dyn LocatableObj>),
+
     /// Subscribe a device's monitor stream.
     Monitor {
         /// Device.
@@ -224,6 +230,7 @@ impl Msg {
                 | Msg::Rewindable(_)
                 | Msg::Custom { .. }
                 | Msg::Publish(_)
+                | Msg::Locate(_)
                 | Msg::Null
         )
     }
@@ -316,6 +323,7 @@ impl Clone for Msg {
             // unreachable from the rewind path.
             Msg::Custom { .. } => Msg::Null,
             Msg::Publish(d) => Msg::Publish(d.clone()),
+            Msg::Locate(o) => Msg::Locate(o.clone()),
             Msg::Null => Msg::Null,
         }
     }
@@ -353,6 +361,7 @@ impl std::fmt::Debug for Msg {
             Msg::Rewindable(b) => write!(f, "Rewindable({b})"),
             Msg::Custom { name, .. } => write!(f, "Custom({name})"),
             Msg::Publish(d) => write!(f, "Publish({})", document_label(d)),
+            Msg::Locate(o) => write!(f, "Locate({})", o.name()),
             Msg::Null => write!(f, "Null"),
         }
     }

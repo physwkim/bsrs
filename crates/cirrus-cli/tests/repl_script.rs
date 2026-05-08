@@ -225,15 +225,17 @@ print("result:", result)
 }
 
 #[test]
-fn coroutine_yield_returns_nil_for_other_msgs() {
-    // Currently only OpenRun is bridged. Other Msg yields return nil.
-    // This test pins that behavior so we know if it changes.
+fn coroutine_yield_returns_nil_for_unbridged_msgs() {
+    // create / save / drop / null don't have a meaningful result; verify
+    // they return nil (so users don't depend on accidental side effects).
     let (out, err, code) = run_script(
         r#"
 local function p()
-    coroutine.yield(msg.open_run())                -- uid (bridged)
+    coroutine.yield(msg.open_run())
     local r = coroutine.yield(msg.create("primary"))
     print("create result:", tostring(r))
+    local n = coroutine.yield(msg.null())
+    print("null result:", tostring(n))
     coroutine.yield(msg.close_run("success"))
 end
 RE:run(plan(p))
@@ -241,6 +243,97 @@ RE:run(plan(p))
     );
     assert_eq!(code, 0, "stderr: {err}");
     assert!(out.contains("create result: nil"), "out = {out}");
+    assert!(out.contains("null result: nil"), "out = {out}");
+}
+
+#[test]
+fn coroutine_set_returns_auto_group_string() {
+    // msg.set without an explicit group must auto-allocate one and
+    // return it as a string for use with msg.wait.
+    let (out, err, code) = run_script(
+        r#"
+local m1 = soft_motor("m1", 0.0)
+local function p()
+    coroutine.yield(msg.open_run())
+    local g1 = coroutine.yield(msg.set(m1, 1.0))
+    print("g1:", tostring(g1), type(g1))
+    coroutine.yield(msg.wait(g1))
+    local g2 = coroutine.yield(msg.set(m1, 2.0, "user_group"))
+    print("g2:", tostring(g2), type(g2))
+    coroutine.yield(msg.wait(g2))
+    coroutine.yield(msg.close_run())
+end
+RE:run(plan(p))
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    // Auto group looks like "auto-N"; user group is what we passed.
+    assert!(out.contains("g1: auto-"), "out = {out}");
+    assert!(out.contains("g2: user_group"), "out = {out}");
+    assert!(out.contains("string"), "yield should return a string for set");
+}
+
+#[test]
+fn coroutine_locate_returns_setpoint_readback_table() {
+    let (out, err, code) = run_script(
+        r#"
+local m1 = soft_motor("m1", 0.0)
+local function p()
+    coroutine.yield(msg.open_run())
+    coroutine.yield(msg.set(m1, 2.5, "g"))
+    coroutine.yield(msg.wait("g"))
+    local loc = coroutine.yield(msg.locate(m1))
+    print(string.format("loc.setpoint=%g loc.readback=%g", loc.setpoint, loc.readback))
+    coroutine.yield(msg.close_run())
+end
+RE:run(plan(p))
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("loc.setpoint=2.5") && out.contains("loc.readback=2.5"),
+        "out = {out}"
+    );
+}
+
+#[test]
+fn coroutine_read_returns_reading_table() {
+    let (out, err, code) = run_script(
+        r#"
+local m1 = soft_motor("m1", 0.0)
+local function p()
+    coroutine.yield(msg.open_run())
+    coroutine.yield(msg.set(m1, 1.5, "g"))
+    coroutine.yield(msg.wait("g"))
+    coroutine.yield(msg.create("primary"))
+    local reading = coroutine.yield(msg.read(m1))
+    print("type:", type(reading))
+    print("m1 value:", tostring(reading.m1.value))
+    coroutine.yield(msg.save())
+    coroutine.yield(msg.close_run())
+end
+RE:run(plan(p))
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("type: table"), "out = {out}");
+    assert!(out.contains("m1 value: 1.5"), "out = {out}");
+}
+
+#[test]
+fn coroutine_close_run_returns_exit_status() {
+    let (out, err, code) = run_script(
+        r#"
+local function p()
+    coroutine.yield(msg.open_run())
+    local es = coroutine.yield(msg.close_run("success"))
+    print("es:", tostring(es))
+end
+RE:run(plan(p))
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("es: success"), "out = {out}");
 }
 
 #[test]
