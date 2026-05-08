@@ -399,17 +399,11 @@ async fn lock_blocks_queue_ops_unless_keyed() {
 
     // Without lock_key — must be rejected.
     let r = rpc(&req, "queue_clear", json!({}));
-    assert!(r["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("locked"));
+    assert!(r["error"]["message"].as_str().unwrap().contains("locked"));
 
     // With wrong key — also rejected.
     let r = rpc(&req, "queue_clear", json!({"lock_key": "wrong"}));
-    assert!(r["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("locked"));
+    assert!(r["error"]["message"].as_str().unwrap().contains("locked"));
 
     // With correct key — allowed.
     let r = rpc(&req, "queue_clear", json!({"lock_key": "secret"}));

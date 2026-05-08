@@ -47,8 +47,16 @@ fn spawn_manager() -> Manager {
     // The returned `Manager`'s Drop kills + waits the child, so this
     // does not actually leak. The lint can't see across struct boundaries.
     let id = rand_id();
-    let control = format!("ipc:///tmp/cirrus-cli-it-{}-{}-c.sock", std::process::id(), id);
-    let documents = format!("ipc:///tmp/cirrus-cli-it-{}-{}-d.sock", std::process::id(), id);
+    let control = format!(
+        "ipc:///tmp/cirrus-cli-it-{}-{}-c.sock",
+        std::process::id(),
+        id
+    );
+    let documents = format!(
+        "ipc:///tmp/cirrus-cli-it-{}-{}-d.sock",
+        std::process::id(),
+        id
+    );
     let child = Command::new(cirrus_bin())
         .args([
             "qs-manager",

@@ -248,13 +248,9 @@ fn dispatch(args: ClientArgs) -> Result<Value, String> {
             }),
         ),
         Cmd::Queue(QueueCmd::Get) => ("queue_get".into(), json!({})),
-        Cmd::Queue(QueueCmd::Remove { uid }) => {
-            ("queue_item_remove".into(), json!({"uid": uid}))
-        }
+        Cmd::Queue(QueueCmd::Remove { uid }) => ("queue_item_remove".into(), json!({"uid": uid})),
         Cmd::Queue(QueueCmd::Clear) => ("queue_clear".into(), json!({})),
-        Cmd::Queue(QueueCmd::Item { uid }) => {
-            ("queue_item_get".into(), json!({"uid": uid}))
-        }
+        Cmd::Queue(QueueCmd::Item { uid }) => ("queue_item_get".into(), json!({"uid": uid})),
         Cmd::Queue(QueueCmd::Move { uid, pos_dest }) => {
             let pd = if let Ok(n) = pos_dest.parse::<u64>() {
                 Value::from(n)
@@ -283,8 +279,8 @@ fn dispatch(args: ClientArgs) -> Result<Value, String> {
             json!({"enable": option == "enable"}),
         ),
         Cmd::Queue(QueueCmd::Mode { mode }) => {
-            let parsed: Value = serde_json::from_str(&mode)
-                .map_err(|e| format!("invalid mode JSON: {e}"))?;
+            let parsed: Value =
+                serde_json::from_str(&mode).map_err(|e| format!("invalid mode JSON: {e}"))?;
             ("queue_mode_set".into(), json!({"mode": parsed}))
         }
         Cmd::Re(ReCmd::Pause { deferred }) => (
@@ -298,8 +294,8 @@ fn dispatch(args: ClientArgs) -> Result<Value, String> {
         Cmd::Re(ReCmd::Runs) => ("re_runs".into(), json!({})),
         Cmd::Re(ReCmd::Metadata { set }) => match set {
             Some(s) => {
-                let parsed: Value = serde_json::from_str(&s)
-                    .map_err(|e| format!("invalid metadata JSON: {e}"))?;
+                let parsed: Value =
+                    serde_json::from_str(&s).map_err(|e| format!("invalid metadata JSON: {e}"))?;
                 ("re_metadata".into(), json!({"metadata": parsed}))
             }
             None => ("re_metadata".into(), json!({})),
@@ -329,8 +325,8 @@ fn dispatch(args: ClientArgs) -> Result<Value, String> {
         Cmd::Lock(LockCmd::Info) => ("lock_info".into(), json!({})),
         Cmd::Lock(LockCmd::Release { key }) => ("unlock".into(), json!({"lock_key": key})),
         Cmd::Raw { method, params } => {
-            let parsed: Value = serde_json::from_str(&params)
-                .map_err(|e| format!("invalid params JSON: {e}"))?;
+            let parsed: Value =
+                serde_json::from_str(&params).map_err(|e| format!("invalid params JSON: {e}"))?;
             (method, parsed)
         }
     };
@@ -350,18 +346,24 @@ fn dispatch(args: ClientArgs) -> Result<Value, String> {
         .map_err(|e| format!("set_rcvtimeo: {e}"))?;
     sock.set_sndtimeo(args.timeout_ms)
         .map_err(|e| format!("set_sndtimeo: {e}"))?;
-    sock.set_linger(0)
-        .map_err(|e| format!("set_linger: {e}"))?;
+    sock.set_linger(0).map_err(|e| format!("set_linger: {e}"))?;
     sock.connect(&args.address)
         .map_err(|e| format!("connect {}: {e}", args.address))?;
     sock.send(bytes, 0)
         .map_err(|e| format!("send: {e} (server not running?)"))?;
-    let resp = sock
-        .recv_bytes(0)
-        .map_err(|e| format!("recv: {e} (server not responding within {} ms — start `cirrus qs-manager`?)", args.timeout_ms))?;
+    let resp = sock.recv_bytes(0).map_err(|e| {
+        format!(
+            "recv: {e} (server not responding within {} ms — start `cirrus qs-manager`?)",
+            args.timeout_ms
+        )
+    })?;
     let _ = Duration::from_millis(args.timeout_ms.unsigned_abs() as u64);
-    let value: Value = serde_json::from_slice(&resp)
-        .map_err(|e| format!("decode response: {e}; raw = {:?}", String::from_utf8_lossy(&resp)))?;
+    let value: Value = serde_json::from_slice(&resp).map_err(|e| {
+        format!(
+            "decode response: {e}; raw = {:?}",
+            String::from_utf8_lossy(&resp)
+        )
+    })?;
 
     if let Some(err) = value.get("error") {
         let msg = err

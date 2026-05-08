@@ -627,10 +627,7 @@ pub fn scan_nd(
 
 /// `list_grid_scan(dets, [(motor, [points...]), ...])` — N-D grid where
 /// each axis traces a user-supplied list of positions.
-pub fn list_grid_scan(
-    detectors: Vec<Arc<dyn ReadableObj>>,
-    axes: Vec<ListGridAxis>,
-) -> Plan {
+pub fn list_grid_scan(detectors: Vec<Arc<dyn ReadableObj>>, axes: Vec<ListGridAxis>) -> Plan {
     let lists: Vec<Vec<f64>> = axes.iter().map(|(_, _, l)| l.clone()).collect();
     let pts = patterns::outer_list_product(&lists);
     let motors: Vec<(Arc<dyn MovableObj>, Arc<dyn ReadableObj>)> =

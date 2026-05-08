@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use cirrus_backend_soft::{SoftDetector, SoftMotor};
 use cirrus_core::msg::{
-    FlyableObj, LocatableObj, MovableObj, Msg, MonitorableObj, ReadableObj, RunMetadata,
+    FlyableObj, LocatableObj, MonitorableObj, MovableObj, Msg, ReadableObj, RunMetadata,
     StageableObj, StoppableObj, TriggerableObj,
 };
 use cirrus_core::plan::{plan_box, Plan};
@@ -150,9 +150,10 @@ impl UserData for LuaDevice {
         });
         // motor:set(v)      ->  Status userdata (call :wait() for completion)
         methods.add_method("set", |_, dev, v: f64| {
-            let mv = dev.movable.clone().ok_or_else(|| {
-                mlua::Error::RuntimeError(format!("{} is not movable", dev.name))
-            })?;
+            let mv = dev
+                .movable
+                .clone()
+                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not movable", dev.name)))?;
             let status = cirrus_core::runtime::cirrus_runtime().block_on(mv.set_dyn(v));
             Ok(LuaStatus {
                 inner: TMutex::new(Some(status)),
@@ -161,9 +162,10 @@ impl UserData for LuaDevice {
         });
         // motor:move_to(v)  ->  nil  (set + wait for completion)
         methods.add_method("move_to", |_, dev, v: f64| {
-            let mv = dev.movable.clone().ok_or_else(|| {
-                mlua::Error::RuntimeError(format!("{} is not movable", dev.name))
-            })?;
+            let mv = dev
+                .movable
+                .clone()
+                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not movable", dev.name)))?;
             cirrus_core::runtime::cirrus_runtime()
                 .block_on(async move {
                     let s = mv.set_dyn(v).await;
@@ -224,9 +226,10 @@ impl UserData for LuaDevice {
         });
         // flyer:kickoff() / :complete() -> Status
         methods.add_method("kickoff", |_, dev, ()| {
-            let f = dev.flyable.clone().ok_or_else(|| {
-                mlua::Error::RuntimeError(format!("{} is not flyable", dev.name))
-            })?;
+            let f = dev
+                .flyable
+                .clone()
+                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not flyable", dev.name)))?;
             let status = cirrus_core::runtime::cirrus_runtime().block_on(f.kickoff_dyn());
             Ok(LuaStatus {
                 inner: TMutex::new(Some(status)),
@@ -234,9 +237,10 @@ impl UserData for LuaDevice {
             })
         });
         methods.add_method("complete", |_, dev, ()| {
-            let f = dev.flyable.clone().ok_or_else(|| {
-                mlua::Error::RuntimeError(format!("{} is not flyable", dev.name))
-            })?;
+            let f = dev
+                .flyable
+                .clone()
+                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not flyable", dev.name)))?;
             let status = cirrus_core::runtime::cirrus_runtime().block_on(f.complete_dyn());
             Ok(LuaStatus {
                 inner: TMutex::new(Some(status)),
@@ -260,9 +264,11 @@ impl UserData for LuaStatus {
         // s:wait() — block until the operation completes. Returns nil on
         // success; raises a Lua error on failure.
         methods.add_method("wait", |_, s, ()| {
-            let st = s.inner.blocking_lock().take().ok_or_else(|| {
-                mlua::Error::RuntimeError("Status already awaited".into())
-            })?;
+            let st = s
+                .inner
+                .blocking_lock()
+                .take()
+                .ok_or_else(|| mlua::Error::RuntimeError("Status already awaited".into()))?;
             cirrus_core::runtime::cirrus_runtime()
                 .block_on(st)
                 .map_err(|e| mlua::Error::RuntimeError(format!("status: {e:?}")))?;
@@ -270,9 +276,7 @@ impl UserData for LuaStatus {
         });
         // s:done() — non-blocking: true if no longer pending. Currently
         // Status is single-use; once `wait` consumes it, done()=true.
-        methods.add_method("done", |_, s, ()| {
-            Ok(s.inner.blocking_lock().is_none())
-        });
+        methods.add_method("done", |_, s, ()| Ok(s.inner.blocking_lock().is_none()));
     }
 }
 
@@ -329,11 +333,11 @@ pub struct LuaRunEngine {
 impl UserData for LuaRunEngine {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("run", |_, this, plan: mlua::AnyUserData| {
-            let plan_ud = plan.borrow_mut::<LuaPlan>().map_err(mlua::Error::external)?;
+            let plan_ud = plan
+                .borrow_mut::<LuaPlan>()
+                .map_err(mlua::Error::external)?;
             let kind = plan_ud.kind.blocking_lock().take().ok_or_else(|| {
-                mlua::Error::RuntimeError(
-                    "plan was already consumed (Plans are single-use)".into(),
-                )
+                mlua::Error::RuntimeError("plan was already consumed (Plans are single-use)".into())
             })?;
             let re = this.re.clone();
             let plan = match kind {
@@ -374,9 +378,7 @@ impl UserData for LuaRunEngine {
             this.re.stop();
             Ok(())
         });
-        methods.add_method("state", |_, this, ()| {
-            Ok(format!("{:?}", this.re.state()))
-        });
+        methods.add_method("state", |_, this, ()| Ok(format!("{:?}", this.re.state())));
         methods.add_method("md_get", |_, this, ()| {
             let md = this.re.md();
             let json = serde_json::Value::Object(md.into_iter().collect());
@@ -450,14 +452,7 @@ fn register_plan_factories(lua: &Lua) -> mlua::Result<()> {
 
     // scan(detectors, motor, start, stop, num) -> Plan
     let f = lua.create_function(
-        |_,
-         (dets, motor, start, stop, num): (
-            mlua::Table,
-            mlua::AnyUserData,
-            f64,
-            f64,
-            usize,
-        )| {
+        |_, (dets, motor, start, stop, num): (mlua::Table, mlua::AnyUserData, f64, f64, usize)| {
             let detectors = dets_table_to_readables(&dets)?;
             let m = motor.borrow::<LuaDevice>()?;
             let movable = m
@@ -529,32 +524,30 @@ fn register_plan_factories(lua: &Lua) -> mlua::Result<()> {
     // plan(fn, ...) — defer Plan construction until RE:run so the
     // bridge can capture the engine reference (needed to surface return
     // values back to the coroutine).
-    let f = lua.create_function(
-        |lua, args: Variadic<LuaValue>| {
-            let mut iter = args.into_iter();
-            let fn_value = iter
-                .next()
-                .ok_or_else(|| mlua::Error::RuntimeError("plan(fn, ...) requires a function".into()))?;
-            let fn_obj = match fn_value {
-                LuaValue::Function(f) => f,
-                other => {
-                    return Err(mlua::Error::RuntimeError(format!(
-                        "plan(fn, ...) expected a function, got {other:?}"
-                    )));
-                }
-            };
-            let rest: Vec<LuaValue> = iter.collect();
-            let thread = lua.create_thread(fn_obj)?;
-            Ok(LuaPlan {
-                label: "coroutine".into(),
-                kind: TMutex::new(Some(LuaPlanKind::Coroutine {
-                    lua: lua.clone(),
-                    thread,
-                    args: rest,
-                })),
-            })
-        },
-    )?;
+    let f = lua.create_function(|lua, args: Variadic<LuaValue>| {
+        let mut iter = args.into_iter();
+        let fn_value = iter
+            .next()
+            .ok_or_else(|| mlua::Error::RuntimeError("plan(fn, ...) requires a function".into()))?;
+        let fn_obj = match fn_value {
+            LuaValue::Function(f) => f,
+            other => {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "plan(fn, ...) expected a function, got {other:?}"
+                )));
+            }
+        };
+        let rest: Vec<LuaValue> = iter.collect();
+        let thread = lua.create_thread(fn_obj)?;
+        Ok(LuaPlan {
+            label: "coroutine".into(),
+            kind: TMutex::new(Some(LuaPlanKind::Coroutine {
+                lua: lua.clone(),
+                thread,
+                args: rest,
+            })),
+        })
+    })?;
     lua.globals().set("plan", f)?;
 
     Ok(())
@@ -587,7 +580,11 @@ fn lua_value_repr(v: &LuaValue) -> String {
         LuaValue::Table(t) => {
             let mut parts = Vec::new();
             for pair in t.clone().pairs::<LuaValue, LuaValue>().flatten() {
-                parts.push(format!("{}={}", lua_value_repr(&pair.0), lua_value_repr(&pair.1)));
+                parts.push(format!(
+                    "{}={}",
+                    lua_value_repr(&pair.0),
+                    lua_value_repr(&pair.1)
+                ));
             }
             format!("{{{}}}", parts.join(","))
         }
@@ -698,10 +695,9 @@ fn register_msg_namespace(lua: &Lua) -> mlua::Result<()> {
         lua.create_function(
             |_, (dev, val, group): (mlua::AnyUserData, f64, Option<String>)| {
                 let d = dev.borrow::<LuaDevice>()?;
-                let mv = d
-                    .movable
-                    .clone()
-                    .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not movable", d.name)))?;
+                let mv = d.movable.clone().ok_or_else(|| {
+                    mlua::Error::RuntimeError(format!("{} is not movable", d.name))
+                })?;
                 Ok(LuaMsg(Msg::Set {
                     obj: mv,
                     value: val,
@@ -715,10 +711,9 @@ fn register_msg_namespace(lua: &Lua) -> mlua::Result<()> {
         "trigger",
         lua.create_function(|_, (dev, group): (mlua::AnyUserData, Option<String>)| {
             let d = dev.borrow::<LuaDevice>()?;
-            let t = d
-                .triggerable
-                .clone()
-                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not triggerable", d.name)))?;
+            let t = d.triggerable.clone().ok_or_else(|| {
+                mlua::Error::RuntimeError(format!("{} is not triggerable", d.name))
+            })?;
             Ok(LuaMsg(Msg::Trigger {
                 obj: t,
                 group: Some(group.unwrap_or_else(auto_group)),
@@ -813,10 +808,9 @@ fn register_msg_namespace(lua: &Lua) -> mlua::Result<()> {
         "monitor",
         lua.create_function(|_, (dev, name): (mlua::AnyUserData, Option<String>)| {
             let d = dev.borrow::<LuaDevice>()?;
-            let m = d
-                .monitorable
-                .clone()
-                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not monitorable", d.name)))?;
+            let m = d.monitorable.clone().ok_or_else(|| {
+                mlua::Error::RuntimeError(format!("{} is not monitorable", d.name))
+            })?;
             Ok(LuaMsg(Msg::Monitor { obj: m, name }))
         })?,
     )?;
@@ -824,10 +818,9 @@ fn register_msg_namespace(lua: &Lua) -> mlua::Result<()> {
         "unmonitor",
         lua.create_function(|_, dev: mlua::AnyUserData| {
             let d = dev.borrow::<LuaDevice>()?;
-            let m = d
-                .monitorable
-                .clone()
-                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not monitorable", d.name)))?;
+            let m = d.monitorable.clone().ok_or_else(|| {
+                mlua::Error::RuntimeError(format!("{} is not monitorable", d.name))
+            })?;
             Ok(LuaMsg(Msg::Unmonitor(m)))
         })?,
     )?;
@@ -1154,12 +1147,9 @@ fn register_bp(lua: &Lua) -> mlua::Result<()> {
                 for v in trigs_t.clone().sequence_values::<mlua::AnyUserData>() {
                     let ud = v?;
                     let d = ud.borrow::<LuaDevice>()?;
-                    let t = d
-                        .triggerable
-                        .clone()
-                        .ok_or_else(|| {
-                            mlua::Error::RuntimeError(format!("{} is not triggerable", d.name))
-                        })?;
+                    let t = d.triggerable.clone().ok_or_else(|| {
+                        mlua::Error::RuntimeError(format!("{} is not triggerable", d.name))
+                    })?;
                     trigs.push(t);
                 }
                 Ok(wrap_prebuilt(
@@ -1283,16 +1273,14 @@ fn register_bp(lua: &Lua) -> mlua::Result<()> {
     )?;
     bp.set(
         "inner_product_scan",
-        lua.create_function(
-            |_, (dt, num, axes_t): (mlua::Table, usize, mlua::Table)| {
-                let dets = dets_table_to_readables(&dt)?;
-                let axes = axes_table_to_inner_product(&axes_t)?;
-                Ok(wrap_prebuilt(
-                    format!("inner_product_scan(n={num})"),
-                    cirrus_plans::inner_product_scan(dets, num, axes),
-                ))
-            },
-        )?,
+        lua.create_function(|_, (dt, num, axes_t): (mlua::Table, usize, mlua::Table)| {
+            let dets = dets_table_to_readables(&dt)?;
+            let axes = axes_table_to_inner_product(&axes_t)?;
+            Ok(wrap_prebuilt(
+                format!("inner_product_scan(n={num})"),
+                cirrus_plans::inner_product_scan(dets, num, axes),
+            ))
+        })?,
     )?;
     bp.set(
         "scan_nd",
@@ -1465,21 +1453,9 @@ fn register_bp(lua: &Lua) -> mlua::Result<()> {
     Ok(())
 }
 
-type GridAxisAbs = (
-    Arc<dyn MovableObj>,
-    Arc<dyn ReadableObj>,
-    f64,
-    f64,
-    usize,
-);
+type GridAxisAbs = (Arc<dyn MovableObj>, Arc<dyn ReadableObj>, f64, f64, usize);
 
-type GridAxisRel = (
-    Arc<dyn LocatableObj>,
-    Arc<dyn ReadableObj>,
-    f64,
-    f64,
-    usize,
-);
+type GridAxisRel = (Arc<dyn LocatableObj>, Arc<dyn ReadableObj>, f64, f64, usize);
 
 fn pair_grid_axes(t: &mlua::Table) -> mlua::Result<(GridAxisAbs, GridAxisAbs)> {
     let row1: mlua::Table = t.get(1)?;
@@ -1527,9 +1503,7 @@ fn axes_table_to_list_grid_axes(t: &mlua::Table) -> mlua::Result<Vec<cirrus_plan
 
 type InnerProductAxis = (Arc<dyn MovableObj>, Arc<dyn ReadableObj>, f64, f64);
 
-fn axes_table_to_inner_product(
-    t: &mlua::Table,
-) -> mlua::Result<Vec<InnerProductAxis>> {
+fn axes_table_to_inner_product(t: &mlua::Table) -> mlua::Result<Vec<InnerProductAxis>> {
     let mut out = Vec::new();
     for v in t.clone().sequence_values::<mlua::Table>() {
         let row = v?;
@@ -1655,9 +1629,10 @@ fn register_bps(lua: &Lua) -> mlua::Result<()> {
         "mvr",
         lua.create_function(|_, (mu, delta): (mlua::AnyUserData, f64)| {
             let d = mu.borrow::<LuaDevice>()?;
-            let lo = d.locatable.clone().ok_or_else(|| {
-                mlua::Error::RuntimeError(format!("{} is not locatable", d.name))
-            })?;
+            let lo = d
+                .locatable
+                .clone()
+                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not locatable", d.name)))?;
             Ok(wrap_prebuilt("mvr", stubs::mvr(lo, delta)))
         })?,
     )?;
@@ -1706,7 +1681,9 @@ fn register_bps(lua: &Lua) -> mlua::Result<()> {
     )?;
     bps.set(
         "clear_checkpoint",
-        lua.create_function(|_, ()| Ok(wrap_prebuilt("clear_checkpoint", stubs::clear_checkpoint())))?,
+        lua.create_function(|_, ()| {
+            Ok(wrap_prebuilt("clear_checkpoint", stubs::clear_checkpoint()))
+        })?,
     )?;
     bps.set(
         "pause",
@@ -1809,7 +1786,8 @@ fn register_bps(lua: &Lua) -> mlua::Result<()> {
         "trigger_and_read",
         lua.create_function(|_, (dt, name): (mlua::Table, Option<String>)| {
             let (trigs, reads) = split_trig_read(&dt)?;
-            let plan = stubs::trigger_and_read(trigs, reads, name.unwrap_or_else(|| "primary".into()));
+            let plan =
+                stubs::trigger_and_read(trigs, reads, name.unwrap_or_else(|| "primary".into()));
             Ok(wrap_prebuilt("trigger_and_read", plan))
         })?,
     )?;
@@ -1947,11 +1925,13 @@ fn register_bpp(lua: &Lua) -> mlua::Result<()> {
 
     bpp.set(
         "run_wrapper",
-        lua.create_function(|_, (plan_ud, md): (mlua::AnyUserData, Option<mlua::Table>)| {
-            let inner = take_inner_plan(&plan_ud)?;
-            let m = lua_table_to_metadata(md)?;
-            Ok(wrap_prebuilt("run_wrapper", pp::run_wrapper(inner, m)))
-        })?,
+        lua.create_function(
+            |_, (plan_ud, md): (mlua::AnyUserData, Option<mlua::Table>)| {
+                let inner = take_inner_plan(&plan_ud)?;
+                let m = lua_table_to_metadata(md)?;
+                Ok(wrap_prebuilt("run_wrapper", pp::run_wrapper(inner, m)))
+            },
+        )?,
     )?;
     bpp.set(
         "inject_md",
@@ -1979,13 +1959,15 @@ fn register_bpp(lua: &Lua) -> mlua::Result<()> {
     )?;
     bpp.set(
         "monitor_during",
-        lua.create_function(|_, (plan_ud, signals_t): (mlua::AnyUserData, mlua::Table)| {
-            let inner = take_inner_plan(&plan_ud)?;
-            Ok(wrap_prebuilt(
-                "monitor_during_wrapper",
-                pp::monitor_during_wrapper(inner, monitors_of(&signals_t)?),
-            ))
-        })?,
+        lua.create_function(
+            |_, (plan_ud, signals_t): (mlua::AnyUserData, mlua::Table)| {
+                let inner = take_inner_plan(&plan_ud)?;
+                Ok(wrap_prebuilt(
+                    "monitor_during_wrapper",
+                    pp::monitor_during_wrapper(inner, monitors_of(&signals_t)?),
+                ))
+            },
+        )?,
     )?;
     bpp.set(
         "stage_wrapper",
@@ -2027,10 +2009,7 @@ fn register_bpp(lua: &Lua) -> mlua::Result<()> {
         "subs_wrapper",
         lua.create_function(|_, plan_ud: mlua::AnyUserData| {
             let inner = take_inner_plan(&plan_ud)?;
-            Ok(wrap_prebuilt(
-                "subs_wrapper",
-                pp::subs_wrapper(inner, ()),
-            ))
+            Ok(wrap_prebuilt("subs_wrapper", pp::subs_wrapper(inner, ())))
         })?,
     )?;
     bpp.set(
@@ -2090,30 +2069,28 @@ fn register_bpp(lua: &Lua) -> mlua::Result<()> {
     // userdata across the call boundary.
     bpp.set(
         "msg_mutator",
-        lua.create_function(
-            |lua, (plan_ud, f): (mlua::AnyUserData, mlua::Function)| {
-                let inner = take_inner_plan(&plan_ud)?;
-                let lua_clone = lua.clone();
-                let mutated = pp::msg_mutator(inner, move |m: Msg| {
-                    let ud = match lua_clone.create_userdata(LuaMsg(m.clone())) {
-                        Ok(u) => u,
-                        Err(_) => return m,
-                    };
-                    let result: mlua::Result<mlua::AnyUserData> = f.call(ud);
-                    match result {
-                        Ok(out) => match out.borrow::<LuaMsg>() {
-                            Ok(om) => om.0.clone(),
-                            Err(_) => m,
-                        },
-                        Err(e) => {
-                            eprintln!("bpp.msg_mutator error: {e}");
-                            m
-                        }
+        lua.create_function(|lua, (plan_ud, f): (mlua::AnyUserData, mlua::Function)| {
+            let inner = take_inner_plan(&plan_ud)?;
+            let lua_clone = lua.clone();
+            let mutated = pp::msg_mutator(inner, move |m: Msg| {
+                let ud = match lua_clone.create_userdata(LuaMsg(m.clone())) {
+                    Ok(u) => u,
+                    Err(_) => return m,
+                };
+                let result: mlua::Result<mlua::AnyUserData> = f.call(ud);
+                match result {
+                    Ok(out) => match out.borrow::<LuaMsg>() {
+                        Ok(om) => om.0.clone(),
+                        Err(_) => m,
+                    },
+                    Err(e) => {
+                        eprintln!("bpp.msg_mutator error: {e}");
+                        m
                     }
-                });
-                Ok(wrap_prebuilt("msg_mutator", mutated))
-            },
-        )?,
+                }
+            });
+            Ok(wrap_prebuilt("msg_mutator", mutated))
+        })?,
     )?;
 
     lua.globals().set("bpp", bpp)?;

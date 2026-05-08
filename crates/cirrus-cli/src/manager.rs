@@ -2,10 +2,10 @@
 
 use std::sync::Arc;
 
-use clap::Args;
 use cirrus_backend_soft::{SoftDetector, SoftMotor};
 use cirrus_core::msg::{MovableObj, ReadableObj};
 use cirrus_qs::{Registry, Server};
+use clap::Args;
 
 /// Arguments for `cirrus qs-manager`.
 #[derive(Args, Debug)]

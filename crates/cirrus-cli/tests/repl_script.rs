@@ -270,7 +270,10 @@ RE:run(plan(p))
     // Auto group looks like "auto-N"; user group is what we passed.
     assert!(out.contains("g1: auto-"), "out = {out}");
     assert!(out.contains("g2: user_group"), "out = {out}");
-    assert!(out.contains("string"), "yield should return a string for set");
+    assert!(
+        out.contains("string"),
+        "yield should return a string for set"
+    );
 }
 
 #[test]

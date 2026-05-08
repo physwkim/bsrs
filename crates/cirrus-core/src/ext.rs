@@ -20,7 +20,7 @@ use async_trait::async_trait;
 
 use crate::error::Result;
 use crate::msg::{
-    DynLocation, FlyableObj, LocatableObj, MovableObj, MonitorableObj, ReadableObj, StageableObj,
+    DynLocation, FlyableObj, LocatableObj, MonitorableObj, MovableObj, ReadableObj, StageableObj,
     StoppableObj, TriggerableObj,
 };
 use crate::reading::ReadingValue;
@@ -53,9 +53,8 @@ pub trait MovableExt: MovableObj {
     /// Convenience: `set` + await the Status to completion.
     async fn move_to(&self, value: f64) -> Result<()> {
         let s = self.set_dyn(value).await;
-        s.await.map_err(|e| {
-            crate::error::CirrusError::Backend(format!("move failed: {e:?}"))
-        })
+        s.await
+            .map_err(|e| crate::error::CirrusError::Backend(format!("move failed: {e:?}")))
     }
 }
 impl<T: MovableObj + ?Sized> MovableExt for T {}
@@ -143,4 +142,3 @@ pub trait FlyableExt: FlyableObj {
     }
 }
 impl<T: FlyableObj + ?Sized> FlyableExt for T {}
-

@@ -899,9 +899,7 @@ impl RunEngine {
                         h(payload.as_ref()).await?;
                     }
                     None => {
-                        return Err(CirrusError::Plan(format!(
-                            "unknown custom command: {name}"
-                        )));
+                        return Err(CirrusError::Plan(format!("unknown custom command: {name}")));
                     }
                 }
             }
@@ -1038,8 +1036,7 @@ impl RunEngine {
                 m.insert(k.clone(), v.clone());
             }
             if let Some(scan_id) = scan_id {
-                m.entry("scan_id".into())
-                    .or_insert(Value::from(scan_id));
+                m.entry("scan_id".into()).or_insert(Value::from(scan_id));
             }
             if let Some(ref pn) = meta.plan_name {
                 m.entry("plan_name".into())

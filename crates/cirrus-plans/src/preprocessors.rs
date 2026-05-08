@@ -290,10 +290,7 @@ pub fn print_summary_wrapper(inner: Plan) -> Plan {
 /// `suspend_wrapper(plan, suspender)` — install `suspender` for the
 /// duration of `plan`, remove on exit. Mirrors bluesky's
 /// `suspend_wrapper`.
-pub fn suspend_wrapper(
-    inner: Plan,
-    suspender: Arc<dyn cirrus_core::Suspender>,
-) -> Plan {
+pub fn suspend_wrapper(inner: Plan, suspender: Arc<dyn cirrus_core::Suspender>) -> Plan {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(1);
     let id = SEQ.fetch_add(1, Ordering::Relaxed);

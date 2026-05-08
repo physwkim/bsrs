@@ -96,7 +96,9 @@ impl LockInfo {
 
 fn now_iso8601() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let secs = now.as_secs();
     // Cheap UTC ISO8601 without chrono.
     let (y, mo, d, h, mi, s) = secs_to_ymdhms(secs as i64);

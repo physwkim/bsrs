@@ -86,7 +86,9 @@ async fn md_validator_rejects_run() {
     let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
     re.set_md_validator(Some(Arc::new(|md| {
         if md.contains_key("forbidden") {
-            Err(cirrus_core::error::CirrusError::Plan("forbidden key".into()))
+            Err(cirrus_core::error::CirrusError::Plan(
+                "forbidden key".into(),
+            ))
         } else {
             Ok(())
         }

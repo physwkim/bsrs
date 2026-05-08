@@ -24,8 +24,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::Args;
 use cirrus_engine::RunEngine;
+use clap::Args;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
@@ -94,13 +94,15 @@ fn interactive_loop(lua: &mlua::Lua) -> i32 {
     };
     let _ = rl.load_history(&history_path());
 
-    println!(
-        "cirrus repl (Lua 5.4) — type `:help` for commands, Ctrl-D to exit"
-    );
+    println!("cirrus repl (Lua 5.4) — type `:help` for commands, Ctrl-D to exit");
 
     let mut buffer = String::new();
     loop {
-        let prompt = if buffer.is_empty() { "cirrus> " } else { "    ... " };
+        let prompt = if buffer.is_empty() {
+            "cirrus> "
+        } else {
+            "    ... "
+        };
         match rl.readline(prompt) {
             Ok(line) => {
                 let _ = rl.add_history_entry(&line);

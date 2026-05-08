@@ -269,9 +269,8 @@ fn lock_check(method: &str, state: &Arc<StdMutex<EngineState>>, params: &Value) 
         method,
         "environment_open" | "environment_close" | "environment_destroy" | "environment_update"
     );
-    let queue_method = method.starts_with("queue_")
-        || method.starts_with("history_")
-        || method.starts_with("re_");
+    let queue_method =
+        method.starts_with("queue_") || method.starts_with("history_") || method.starts_with("re_");
     let blocked = (st.lock.environment && env_method) || (st.lock.queue && queue_method);
     if !blocked {
         return true;
