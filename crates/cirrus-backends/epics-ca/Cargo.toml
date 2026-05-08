@@ -24,5 +24,5 @@ cirrus-event-model.workspace = true
 cirrus-protocols-async.workspace = true
 cirrus-devices.workspace = true
 
-epics-ca-rs    = { path = "../../../../epics-rs/crates/epics-ca-rs", optional = true }
-epics-base-rs  = { path = "../../../../epics-rs/crates/epics-base-rs", optional = true }
+epics-ca-rs    = { version = "0.15.0", optional = true }
+epics-base-rs  = { version = "0.15.0", optional = true }

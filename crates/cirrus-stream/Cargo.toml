@@ -26,5 +26,5 @@ default = []
 pva = ["dep:epics-pva-rs"]
 
 [dependencies.epics-pva-rs]
-path = "../../../epics-rs/crates/epics-pva-rs"
+version = "0.15.0"
 optional = true
