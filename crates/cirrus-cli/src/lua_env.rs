@@ -1,12 +1,41 @@
 //! Lua environment for the cirrus REPL. Wraps cirrus types and plan
 //! factories as `mlua::UserData` and globals.
+//!
+//! ## Concurrency note for Lua callbacks
+//!
+//! mlua holds a reentrant mutex while a callback is in flight. The
+//! REPL thread acquires it during `RE:run` and keeps it parked during
+//! `block_on`. A worker thread (monitor pump, suspender watcher,
+//! `RE:suspend_until_seconds` auto-resume) that tries to acquire the
+//! mutex would block forever → deadlock if the engine awaits the
+//! worker's progress.
+//!
+//! `RE:subscribe` and `msg.subscribe` solve this with thread-aware
+//! routing in [`make_lua_subscriber_cb`]: same-thread callbacks fire
+//! synchronously (reentrant lock OK); other-thread callbacks push
+//! into a per-subscriber buffer and are replayed on the REPL thread
+//! after `RE:run`'s `block_on` returns (see
+//! [`drain_lua_subscriber_buffers`]). This means worker-emitted docs
+//! are still delivered to Lua subscribers, just batched to run end —
+//! sufficient for the prototype/debug workflow.
+//!
+//! The other Lua callbacks ([`RE:set_input_handler`],
+//! [`RE:set_md_validator`], [`RE:set_md_normalizer`],
+//! [`RE:set_scan_id_source`], [`RE:set_before_plan`],
+//! [`RE:set_after_plan`], [`RE:register_command`]) are still subject
+//! to the original constraint: they MUST fire on the REPL thread.
+//! That holds in practice because the engine invokes them inline
+//! during `run_async` (driven by the REPL's `block_on`), never from
+//! a spawned task. A future contributor who routes any of those
+//! through `tokio::spawn` would break that assumption.
 
 use std::sync::Arc;
 
 use cirrus_backend_soft::{SoftDetector, SoftMotor};
 use cirrus_core::msg::{
-    FlyableObj, LocatableObj, MonitorableObj, MovableObj, Msg, ReadableObj, RunMetadata,
-    StageableObj, StoppableObj, TriggerableObj,
+    CollectableObj, ConfigurableObj, ConfigureArgs, FlyableObj, LocatableObj, MonitorableObj,
+    MovableObj, Msg, PausableObj, PreparableObj, ReadableObj, RunMetadata, StageableObj,
+    StoppableObj, SubscribeCallback, TriggerableObj,
 };
 use cirrus_core::plan::{plan_box, Plan};
 use cirrus_engine::{DocumentSink, RunEngine};
@@ -26,6 +55,10 @@ pub struct LuaDevice {
     pub stageable: Option<Arc<dyn StageableObj>>,
     pub monitorable: Option<Arc<dyn MonitorableObj>>,
     pub flyable: Option<Arc<dyn FlyableObj>>,
+    pub preparable: Option<Arc<dyn PreparableObj>>,
+    pub configurable: Option<Arc<dyn ConfigurableObj>>,
+    pub collectable: Option<Arc<dyn CollectableObj>>,
+    pub pausable: Option<Arc<dyn PausableObj>>,
 }
 
 impl UserData for LuaDevice {
@@ -247,8 +280,35 @@ impl UserData for LuaDevice {
                 label: format!("complete({})", dev.name),
             })
         });
+        // pause_count / resume_count — only meaningful for
+        // soft_pausable test devices. Reads are routed through the
+        // PAUSE_COUNTERS side-channel keyed by device name.
+        methods.add_method("pause_count", |_, dev, ()| {
+            Ok(PAUSE_COUNTERS
+                .lock()
+                .unwrap()
+                .get(&dev.name)
+                .map(|c| c.paused.load(std::sync::atomic::Ordering::SeqCst))
+                .unwrap_or(0))
+        });
+        methods.add_method("resume_count", |_, dev, ()| {
+            Ok(PAUSE_COUNTERS
+                .lock()
+                .unwrap()
+                .get(&dev.name)
+                .map(|c| c.resumed.load(std::sync::atomic::Ordering::SeqCst))
+                .unwrap_or(0))
+        });
     }
 }
+
+/// Side-channel registry of test-only `LuaPausableCounter` instances,
+/// keyed by device name, so `LuaDevice:pause_count()` /
+/// `:resume_count()` can read the underlying atomic counters without
+/// trait-object downcasting.
+static PAUSE_COUNTERS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, Arc<LuaPausableCounter>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// Lua-side `Status` handle. Wraps a single-use `cirrus_core::Status` so
 /// users can `s:wait()` to block on completion. Returned by
@@ -324,6 +384,45 @@ impl UserData for LuaMsg {
     }
 }
 
+/// Tiny in-process `PausableObj` impl for verifying
+/// `RE:register_pausable` plumbing from Lua tests. Counts pause/resume
+/// hook invocations atomically.
+pub struct LuaPausableCounter {
+    name: String,
+    paused: std::sync::atomic::AtomicU64,
+    resumed: std::sync::atomic::AtomicU64,
+}
+
+impl LuaPausableCounter {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            paused: std::sync::atomic::AtomicU64::new(0),
+            resumed: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl cirrus_core::msg::NamedObj for LuaPausableCounter {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[async_trait::async_trait]
+impl cirrus_core::msg::PausableObj for LuaPausableCounter {
+    async fn pause_dyn(&self) -> Result<(), cirrus_core::error::CirrusError> {
+        self.paused
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    async fn resume_dyn(&self) -> Result<(), cirrus_core::error::CirrusError> {
+        self.resumed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
 /// `RunEngine` wrapper exposed as the `RE` global.
 #[derive(Clone)]
 pub struct LuaRunEngine {
@@ -352,6 +451,11 @@ impl UserData for LuaRunEngine {
             let result = cirrus_core::runtime::cirrus_runtime()
                 .block_on(re.run_async(plan))
                 .map_err(|e| mlua::Error::RuntimeError(format!("plan failed: {e}")))?;
+            // Replay any buffered Lua subscriber callbacks emitted
+            // from worker threads (monitor pumps, suspender watchers)
+            // — running on the REPL thread now that block_on has
+            // returned, so mlua's reentrant lock won't deadlock.
+            drain_lua_subscriber_buffers();
             Ok(format!(
                 "exit_status={} run_uid={}",
                 result.exit_status,
@@ -389,15 +493,520 @@ impl UserData for LuaRunEngine {
             this.re.md_set(k, json);
             Ok(())
         });
+        methods.add_method("md_remove", |_, this, k: String| {
+            this.re.md_remove(&k);
+            Ok(())
+        });
+        methods.add_method("md_replace", |_, this, t: mlua::Table| {
+            let mut md = std::collections::HashMap::new();
+            for pair in t.pairs::<String, LuaValue>().flatten() {
+                md.insert(pair.0, lua_value_to_json(&pair.1)?);
+            }
+            this.re.md_replace(md);
+            Ok(())
+        });
+        methods.add_method("is_paused", |_, this, ()| Ok(this.re.is_paused()));
+        methods.add_method("current_run_uid", |_, this, ()| {
+            // current_run_uid is async; block on cirrus runtime — safe
+            // from Lua REPL thread.
+            let uid = cirrus_core::runtime::cirrus_runtime().block_on(this.re.current_run_uid());
+            Ok(uid)
+        });
+        methods.add_method("set_loop_timeout", |_, this, secs: Option<f64>| {
+            this.re
+                .set_loop_timeout(secs.map(std::time::Duration::from_secs_f64));
+            Ok(())
+        });
+        methods.add_method("request_pause", |_, this, defer: Option<bool>| {
+            this.re.request_pause(defer.unwrap_or(false));
+            Ok(())
+        });
+        methods.add_method("request_suspend", |_, this, reason: Option<String>| {
+            this.re
+                .request_suspend(reason.unwrap_or_else(|| "user-suspend".into()));
+            Ok(())
+        });
+        methods.add_method("set_record_interruptions", |_, this, on: bool| {
+            this.re.set_record_interruptions(on);
+            Ok(())
+        });
+        methods.add_method("record_interruptions_enabled", |_, this, ()| {
+            Ok(this.re.record_interruptions_enabled())
+        });
+        methods.add_method("install_signal_handler", |_, this, ()| {
+            this.re.install_signal_handler();
+            Ok(())
+        });
+        methods.add_method("next_suspender_id", |_, this, ()| {
+            Ok(this.re.next_suspender_id())
+        });
+        methods.add_method("clear_preprocessors", |_, this, ()| {
+            this.re.clear_preprocessors();
+            Ok(())
+        });
+        methods.add_method("unsubscribe", |_, this, id: u64| {
+            this.re.unsubscribe(id);
+            Ok(())
+        });
+        methods.add_method("unregister_command", |_, this, name: String| {
+            if name == BRIDGE_ERROR_CMD {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "{name:?} is reserved by the cirrus Lua bridge for error \
+                     propagation; unregistering it would silently swallow Lua \
+                     coroutine errors"
+                )));
+            }
+            this.re.unregister_command(&name);
+            Ok(())
+        });
+        // take_msg_result returns the most recent MsgResult side-channel
+        // value as a Lua-friendly value. Returns nil when MsgResult::None.
+        methods.add_method("take_msg_result", |lua, this, ()| {
+            Ok(msg_result_to_lua(lua, this.re.take_msg_result()))
+        });
+
+        // -- callback-heavy methods --------------------------------------
+
+        // subscribe(callback, [name]) -> id. callback signature:
+        //   function(name, body_json_string) ... end
+        // Optional `name` filters by document type ("start" / "stop" /
+        // "event" / "descriptor" / "resource" / "datum" / "event_page" /
+        // "datum_page" / "stream_resource" / "stream_datum"). Pass
+        // `"all"` or omit to match every document. Mirrors bluesky's
+        // `RE.subscribe(func, name="all")`.
+        //
+        // Worker-thread emissions (monitor pumps, suspender watchers)
+        // are routed through a buffer and replayed on the REPL thread
+        // after `RE:run` returns — see [`make_lua_subscriber_cb`].
+        methods.add_method(
+            "subscribe",
+            |_, this, (cb, name): (mlua::Function, Option<String>)| {
+                let dcb = make_lua_subscriber_cb(cb, name);
+                Ok(this.re.subscribe(dcb))
+            },
+        );
+
+        // register_command(name, callback). callback signature:
+        //   function(payload_string) ... end
+        // The payload is downcast-cloned into a string when possible
+        // (callers typically pass String/JSON). Non-string payloads
+        // surface as the Debug-formatted Rust value.
+        methods.add_method(
+            "register_command",
+            |_, this, (name, cb): (String, mlua::Function)| {
+                if name == BRIDGE_ERROR_CMD {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "{name:?} is reserved by the cirrus Lua bridge; \
+                         overriding it would silently swallow Lua coroutine errors"
+                    )));
+                }
+                let f = cb;
+                let handler: cirrus_engine::CustomCommandHandler =
+                    Arc::new(move |payload: &(dyn std::any::Any + Send + Sync)| {
+                        let f = f.clone();
+                        let txt = if let Some(s) = payload.downcast_ref::<String>() {
+                            s.clone()
+                        } else if let Some(s) = payload.downcast_ref::<&str>() {
+                            (*s).to_string()
+                        } else if let Some(j) = payload.downcast_ref::<serde_json::Value>() {
+                            j.to_string()
+                        } else {
+                            "<opaque>".to_string()
+                        };
+                        Box::pin(async move {
+                            f.call::<()>(txt).map_err(|e| {
+                                cirrus_core::error::CirrusError::Plan(format!(
+                                    "Lua command handler: {e}"
+                                ))
+                            })
+                        })
+                    });
+                this.re.register_command(name, handler);
+                Ok(())
+            },
+        );
+
+        // set_md_validator(callback). callback receives a table; returns
+        // nil for OK or a string error message to reject the run.
+        methods.add_method(
+            "set_md_validator",
+            |lua, this, cb: Option<mlua::Function>| {
+                match cb {
+                    None => {
+                        this.re.set_md_validator(None);
+                    }
+                    Some(f) => {
+                        let lua = lua.clone();
+                        let v: cirrus_engine::MdValidator = Arc::new(move |md| {
+                            let table = json_md_to_lua_table(&lua, md.clone())?;
+                            match f.call::<Option<String>>(table) {
+                                Ok(None) => Ok(()),
+                                Ok(Some(msg)) => Err(cirrus_core::error::CirrusError::Plan(msg)),
+                                Err(e) => Err(cirrus_core::error::CirrusError::Plan(format!(
+                                    "Lua md_validator: {e}"
+                                ))),
+                            }
+                        });
+                        this.re.set_md_validator(Some(v));
+                    }
+                }
+                Ok(())
+            },
+        );
+
+        // set_md_normalizer(callback). callback receives a table, returns
+        // a (possibly new) table.
+        methods.add_method(
+            "set_md_normalizer",
+            |lua, this, cb: Option<mlua::Function>| {
+                match cb {
+                    None => this.re.set_md_normalizer(None),
+                    Some(f) => {
+                        let lua = lua.clone();
+                        let n: cirrus_engine::MdNormalizer = Arc::new(move |md| {
+                            let table = json_md_to_lua_table(&lua, md.clone())?;
+                            match f.call::<mlua::Table>(table) {
+                                Ok(t) => lua_table_to_json_md(&t).map_err(|e| {
+                                    cirrus_core::error::CirrusError::Plan(format!(
+                                        "Lua md_normalizer: {e}"
+                                    ))
+                                }),
+                                Err(e) => Err(cirrus_core::error::CirrusError::Plan(format!(
+                                    "Lua md_normalizer: {e}"
+                                ))),
+                            }
+                        });
+                        this.re.set_md_normalizer(Some(n));
+                    }
+                }
+                Ok(())
+            },
+        );
+
+        // set_scan_id_source(callback). callback receives a table, returns
+        // an integer.
+        methods.add_method(
+            "set_scan_id_source",
+            |lua, this, cb: Option<mlua::Function>| {
+                match cb {
+                    None => this.re.set_scan_id_source(None),
+                    Some(f) => {
+                        let lua = lua.clone();
+                        let s: cirrus_engine::ScanIdSource = Arc::new(move |md| {
+                            let table = json_md_to_lua_table(&lua, md.clone())?;
+                            f.call::<u64>(table).map_err(|e| {
+                                cirrus_core::error::CirrusError::Plan(format!(
+                                    "Lua scan_id_source: {e}"
+                                ))
+                            })
+                        });
+                        this.re.set_scan_id_source(Some(s));
+                    }
+                }
+                Ok(())
+            },
+        );
+
+        // set_before_plan(callback) — synchronous Lua function, no args.
+        methods.add_method("set_before_plan", |_, this, cb: Option<mlua::Function>| {
+            match cb {
+                None => this.re.set_before_plan(None),
+                Some(f) => {
+                    let h: cirrus_engine::PlanHook = Arc::new(move || {
+                        let _ = f.call::<()>(());
+                    });
+                    this.re.set_before_plan(Some(h));
+                }
+            }
+            Ok(())
+        });
+        methods.add_method("set_after_plan", |_, this, cb: Option<mlua::Function>| {
+            match cb {
+                None => this.re.set_after_plan(None),
+                Some(f) => {
+                    let h: cirrus_engine::PlanHook = Arc::new(move || {
+                        let _ = f.call::<()>(());
+                    });
+                    this.re.set_after_plan(Some(h));
+                }
+            }
+            Ok(())
+        });
+
+        // set_input_handler(callback) — callback(prompt_string) -> string.
+        methods.add_method(
+            "set_input_handler",
+            |_, this, cb: Option<mlua::Function>| {
+                match cb {
+                    None => this.re.set_input_handler(None),
+                    Some(f) => {
+                        let h: cirrus_engine::InputHandler = Arc::new(move |prompt| {
+                            let f = f.clone();
+                            Box::pin(async move {
+                                f.call::<String>(prompt).map_err(|e| {
+                                    cirrus_core::error::CirrusError::Plan(format!(
+                                        "Lua input handler: {e}"
+                                    ))
+                                })
+                            })
+                        });
+                        this.re.set_input_handler(Some(h));
+                    }
+                }
+                Ok(())
+            },
+        );
+
+        // register_pausable(device) — device must have the pausable role.
+        methods.add_method("register_pausable", |_, this, dev: mlua::AnyUserData| {
+            let d = dev.borrow::<LuaDevice>()?;
+            let p = d
+                .pausable
+                .clone()
+                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not pausable", d.name)))?;
+            cirrus_core::runtime::cirrus_runtime().block_on(this.re.register_pausable(p));
+            Ok(())
+        });
+        // unregister_pausable(arg) — accept either a device userdata
+        // (in which case its name is used) or a string. Mirrors the
+        // register_pausable(device) shape so users don't have to
+        // remember the lookup key.
+        methods.add_method("unregister_pausable", |_, this, arg: LuaValue| {
+            let name = match arg {
+                LuaValue::String(s) => s.to_str()?.to_string(),
+                LuaValue::UserData(ud) => {
+                    let d = ud.borrow::<LuaDevice>().map_err(|_| {
+                        mlua::Error::RuntimeError(
+                            "unregister_pausable: argument must be a device or a name string"
+                                .into(),
+                        )
+                    })?;
+                    d.name.clone()
+                }
+                _ => {
+                    return Err(mlua::Error::RuntimeError(
+                        "unregister_pausable: argument must be a device or a name string".into(),
+                    ))
+                }
+            };
+            cirrus_core::runtime::cirrus_runtime().block_on(this.re.unregister_pausable(&name));
+            Ok(())
+        });
+
+        // suspend_until_seconds(secs, [justification]) — convenience for
+        // tests/debug. The full `suspend_until(BoxFuture)` API isn't
+        // expressible from Lua, so we expose the common "pause then
+        // auto-resume after N seconds" form.
+        methods.add_method(
+            "suspend_until_seconds",
+            |_, this, (secs, just): (f64, Option<String>)| {
+                let fut = Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs_f64(secs)).await;
+                });
+                this.re.suspend_until_with(fut, just);
+                Ok(())
+            },
+        );
+
+        // run_async_with(plan, opts) where opts = {md = {...}, subs = {f1, f2}}.
+        methods.add_method(
+            "run_async_with",
+            |_, this, (plan, opts): (mlua::AnyUserData, mlua::Table)| {
+                let plan_ud = plan
+                    .borrow_mut::<LuaPlan>()
+                    .map_err(mlua::Error::external)?;
+                let kind = plan_ud.kind.blocking_lock().take().ok_or_else(|| {
+                    mlua::Error::RuntimeError(
+                        "plan was already consumed (Plans are single-use)".into(),
+                    )
+                })?;
+                let re = this.re.clone();
+                let plan = match kind {
+                    LuaPlanKind::Prebuilt(p) => p,
+                    LuaPlanKind::Coroutine { lua, thread, args } => {
+                        coroutine_to_plan(lua, thread, args, re.clone())
+                    }
+                };
+                let mut md = std::collections::HashMap::new();
+                // Validate opts.md type up-front so a typo (e.g.
+                // `md = 42`) surfaces as a clear error instead of
+                // being silently dropped.
+                match opts.get::<LuaValue>("md") {
+                    Ok(LuaValue::Nil) => {}
+                    Ok(LuaValue::Table(t)) => {
+                        for pair in t.pairs::<String, LuaValue>().flatten() {
+                            md.insert(pair.0, lua_value_to_json(&pair.1)?);
+                        }
+                    }
+                    Ok(_) => {
+                        return Err(mlua::Error::RuntimeError(
+                            "run_async_with: opts.md must be a table".into(),
+                        ));
+                    }
+                    Err(e) => return Err(e),
+                }
+                let mut subs: Vec<cirrus_engine::DocumentCallback> = Vec::new();
+                match opts.get::<LuaValue>("subs") {
+                    Ok(LuaValue::Nil) => {}
+                    Ok(LuaValue::Table(t)) => {
+                        for v in t.sequence_values::<mlua::Function>().flatten() {
+                            let f = v;
+                            let dcb: cirrus_engine::DocumentCallback =
+                                Arc::new(move |doc: &cirrus_event_model::Document| {
+                                    let (name, body) = document_to_name_body(doc);
+                                    if let Err(e) = f.call::<()>((name, body.to_string())) {
+                                        tracing::warn!(
+                                            "run_async_with subs Lua callback error: {e}"
+                                        );
+                                    }
+                                });
+                            subs.push(dcb);
+                        }
+                    }
+                    Ok(_) => {
+                        return Err(mlua::Error::RuntimeError(
+                            "run_async_with: opts.subs must be a sequence of functions".into(),
+                        ));
+                    }
+                    Err(e) => return Err(e),
+                }
+                let opts = cirrus_engine::RunOptions { md, subs };
+                let result = cirrus_core::runtime::cirrus_runtime()
+                    .block_on(re.run_async_with(plan, opts))
+                    .map_err(|e| mlua::Error::RuntimeError(format!("plan failed: {e}")))?;
+                drain_lua_subscriber_buffers();
+                Ok(format!(
+                    "exit_status={} run_uid={}",
+                    result.exit_status,
+                    result.run_uid.unwrap_or_else(|| "—".into())
+                ))
+            },
+        );
     }
 }
 
 /// Build a fresh Lua state with cirrus globals registered.
+/// Custom-command name used by [`coroutine_to_plan`] to surface a Lua
+/// coroutine error as a run failure. The handler downcasts the
+/// payload (a `String`) and returns `Err(CirrusError::Plan(msg))` so
+/// the engine marks the run `exit_status="fail"`.
+const BRIDGE_ERROR_CMD: &str = "_cirrus_lua_bridge_error";
+
+/// REPL thread id, captured by [`build_lua`]. Lua subscribers compare
+/// `current().id()` against this to decide whether to call Lua
+/// synchronously (same thread → reentrant lock OK) or buffer for
+/// post-`RE:run` drain (different thread → deadlock avoidance).
+static REPL_THREAD_ID: std::sync::OnceLock<std::thread::ThreadId> = std::sync::OnceLock::new();
+
+/// Per-subscriber state: the Lua callback, an optional document-name
+/// filter, and a worker-thread buffer drained after `RE:run` returns.
+struct LuaSubscriberInner {
+    lua_fn: mlua::Function,
+    /// Document-name filter. `None` or `"all"` matches all docs;
+    /// otherwise only docs whose name equals this string fire.
+    filter: Option<String>,
+    /// Buffer for (name, body_json) pairs pushed by worker threads.
+    /// Drained after `RE:run` returns.
+    buffer: std::sync::Mutex<Vec<(&'static str, String)>>,
+}
+
+/// Global registry of Lua subscribers needing post-`RE:run` drain.
+/// Entries persist across runs (subscribers added via `RE:subscribe`
+/// are persistent); per-run subscribers added via `Msg::Subscribe`
+/// are removed by the engine's `temp_subscribers` cleanup, but their
+/// buffer entries here remain only while their `Arc` is alive.
+static SUBSCRIBER_BUFFERS: std::sync::LazyLock<std::sync::Mutex<Vec<Arc<LuaSubscriberInner>>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+/// Build a `DocumentCallback` for a Lua subscriber. Routes calls based
+/// on the current thread:
+/// - same as REPL: call the Lua fn synchronously (no deadlock — same
+///   thread re-enters mlua's reentrant mutex)
+/// - different thread (worker — monitor pumps, suspend tasks): push
+///   `(name, body_json)` into the per-subscriber buffer; the next
+///   `drain_lua_subscriber_buffers()` (run after `RE:run`'s
+///   `block_on` returns) replays the buffered entries on the REPL
+///   thread.
+fn make_lua_subscriber_cb(
+    f: mlua::Function,
+    filter: Option<String>,
+) -> cirrus_engine::DocumentCallback {
+    let inner = Arc::new(LuaSubscriberInner {
+        lua_fn: f,
+        filter,
+        buffer: std::sync::Mutex::new(Vec::new()),
+    });
+    SUBSCRIBER_BUFFERS.lock().unwrap().push(inner.clone());
+    Arc::new(move |doc: &cirrus_event_model::Document| {
+        let (name, body) = document_to_name_body(doc);
+        if let Some(ref f) = inner.filter {
+            if f != name && f != "all" {
+                return;
+            }
+        }
+        let on_repl = REPL_THREAD_ID
+            .get()
+            .copied()
+            .map(|id| std::thread::current().id() == id)
+            .unwrap_or(false);
+        if on_repl {
+            // Same thread as REPL — mlua reentrant lock allows the
+            // call. Errors are warned (not propagated; subscribers
+            // shouldn't fail the run).
+            if let Err(e) = inner.lua_fn.call::<()>((name, body.to_string())) {
+                tracing::warn!("Lua subscriber callback error: {e}");
+            }
+        } else {
+            inner.buffer.lock().unwrap().push((name, body.to_string()));
+        }
+    })
+}
+
+/// Drain every Lua subscriber's buffered (name, body) entries by
+/// calling its Lua fn on the current (REPL) thread. Cleans up dead
+/// registry entries (those whose only owner is the registry itself).
+fn drain_lua_subscriber_buffers() {
+    let snapshot: Vec<_> = SUBSCRIBER_BUFFERS.lock().unwrap().iter().cloned().collect();
+    for inner in snapshot {
+        let entries: Vec<(&'static str, String)> =
+            std::mem::take(&mut *inner.buffer.lock().unwrap());
+        for (name, body) in entries {
+            if let Err(e) = inner.lua_fn.call::<()>((name, body)) {
+                tracing::warn!("Lua subscriber drain callback error: {e}");
+            }
+        }
+    }
+    // Reap entries the engine has unsubscribed (Arc strong = 1, only
+    // the registry holds it).
+    SUBSCRIBER_BUFFERS
+        .lock()
+        .unwrap()
+        .retain(|a| Arc::strong_count(a) > 1);
+}
+
 pub fn build_lua(re: Arc<RunEngine>) -> mlua::Result<Lua> {
+    // Capture the calling thread as the "REPL thread" — the only
+    // thread that's safe to invoke Lua callbacks on while a run is
+    // in progress (mlua reentrant lock). Worker threads buffer.
+    let _ = REPL_THREAD_ID.set(std::thread::current().id());
+
     let lua = Lua::new();
 
     // RE global.
     lua.globals().set("RE", LuaRunEngine { re: re.clone() })?;
+
+    // Install the bridge-error command. Yielded by coroutine_to_plan
+    // when the Lua coroutine raises; the engine processes it as a
+    // fail-Msg, propagating the failure into RE:run's RunResult.
+    let bridge_handler: cirrus_engine::CustomCommandHandler =
+        Arc::new(|payload: &(dyn std::any::Any + Send + Sync)| {
+            let msg = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .unwrap_or_else(|| "Lua coroutine error (no detail)".into());
+            Box::pin(async move { Err(cirrus_core::error::CirrusError::Plan(msg)) })
+        });
+    re.register_command(BRIDGE_ERROR_CMD, bridge_handler);
 
     // Device factories.
     let f = lua.create_function(|_, name: String| {
@@ -412,6 +1021,10 @@ pub fn build_lua(re: Arc<RunEngine>) -> mlua::Result<Lua> {
             stageable: None,
             monitorable: None,
             flyable: None,
+            preparable: None,
+            configurable: None,
+            collectable: None,
+            pausable: None,
         })
     })?;
     lua.globals().set("soft_detector", f)?;
@@ -428,9 +1041,41 @@ pub fn build_lua(re: Arc<RunEngine>) -> mlua::Result<Lua> {
             stageable: None,
             monitorable: None,
             flyable: None,
+            preparable: None,
+            configurable: None,
+            collectable: None,
+            pausable: None,
         })
     })?;
     lua.globals().set("soft_motor", f)?;
+
+    // Pausable test device — counts pause/resume hook invocations into
+    // an internal AtomicU64 pair, exposed to Lua via :pause_count() /
+    // :resume_count(). Only useful for validating register_pausable
+    // plumbing; not a production device.
+    let f = lua.create_function(|_, name: String| {
+        let counter = Arc::new(LuaPausableCounter::new(name.clone()));
+        PAUSE_COUNTERS
+            .lock()
+            .unwrap()
+            .insert(name.clone(), counter.clone());
+        Ok(LuaDevice {
+            name,
+            readable: None,
+            movable: None,
+            locatable: None,
+            stoppable: None,
+            triggerable: None,
+            stageable: None,
+            monitorable: None,
+            flyable: None,
+            preparable: None,
+            configurable: None,
+            collectable: None,
+            pausable: Some(counter as Arc<dyn PausableObj>),
+        })
+    })?;
+    lua.globals().set("soft_pausable", f)?;
 
     // Plan factories. Each returns a `LuaPlan` userdata.
     register_plan_factories(&lua)?;
@@ -619,6 +1264,238 @@ fn lua_value_to_json(v: &LuaValue) -> mlua::Result<serde_json::Value> {
             }
         }
         _ => serde_json::Value::String(format!("{v:?}")),
+    })
+}
+
+/// Build a minimal `DataKey` from a Lua table:
+/// `{source = "...", dtype = "number"|"string"|"boolean"|"integer"|"array",
+///   shape = {1, 2, 3}, units = "...", precision = 3}`.
+fn lua_table_to_data_key(t: &mlua::Table) -> mlua::Result<cirrus_event_model::DataKey> {
+    let source: String = t.get("source").unwrap_or_else(|_| "lua".into());
+    let dtype_str: String = t.get("dtype").unwrap_or_else(|_| "number".into());
+    let dtype = match dtype_str.as_str() {
+        "number" => cirrus_event_model::Dtype::Number,
+        "string" => cirrus_event_model::Dtype::String,
+        "boolean" => cirrus_event_model::Dtype::Boolean,
+        "integer" => cirrus_event_model::Dtype::Integer,
+        "array" => cirrus_event_model::Dtype::Array,
+        other => {
+            return Err(mlua::Error::RuntimeError(format!(
+                "unknown dtype {other:?} (expected number/string/boolean/integer/array)"
+            )))
+        }
+    };
+    let shape: Vec<Option<u64>> = if let Ok(s) = t.get::<mlua::Table>("shape") {
+        let mut v = Vec::new();
+        for x in s.sequence_values::<i64>().flatten() {
+            v.push(if x < 0 { None } else { Some(x as u64) });
+        }
+        v
+    } else {
+        Vec::new()
+    };
+    Ok(cirrus_event_model::DataKey {
+        source,
+        dtype,
+        shape,
+        dtype_numpy: t.get::<String>("dtype_numpy").ok(),
+        external: None,
+        units: t.get::<String>("units").ok(),
+        precision: t.get::<i64>("precision").ok(),
+        object_name: t.get::<String>("object_name").ok(),
+        dims: None,
+        limits: None,
+    })
+}
+
+/// Required-field hints for each publishable Document kind. Used to
+/// generate friendly error messages when the Lua-supplied `body` table
+/// is missing fields, before serde gives a cryptic message.
+///
+/// Lists must match `cirrus-event-model` structs: only fields without
+/// `#[serde(default)]` (and that aren't `Option<T>` with a default) go
+/// here. Verified against `crates/cirrus-event-model/src/documents.rs`.
+fn publish_required_fields(kind: &str) -> Option<&'static [&'static str]> {
+    match kind {
+        // Resource: resource_kwargs has #[serde(default)]; run_start
+        // is Option + default. Required = the five strings.
+        "resource" => Some(&["uid", "spec", "root", "resource_path", "path_semantics"]),
+        // Datum: datum_kwargs has #[serde(default)].
+        "datum" => Some(&["datum_id", "resource"]),
+        // StreamResource: parameters has #[serde(default)]; run_start
+        // is Option + default.
+        "stream_resource" => Some(&["uid", "data_key", "mimetype", "uri"]),
+        // StreamDatum: all required.
+        "stream_datum" => Some(&[
+            "uid",
+            "stream_resource",
+            "descriptor",
+            "indices",
+            "seq_nums",
+        ]),
+        // EventPage: all required. Note: there is NO `filled` field
+        // on cirrus's EventPage.
+        "event_page" => Some(&["uid", "descriptor", "time", "seq_num", "data", "timestamps"]),
+        // DatumPage: datum_kwargs has #[serde(default)].
+        "datum_page" => Some(&["datum_id", "resource"]),
+        _ => None,
+    }
+}
+
+/// Reconstruct a `Document` variant from a Lua-supplied JSON body. Only
+/// the variants useful for `Msg::Publish` from Lua (Resource, Datum,
+/// StreamResource, StreamDatum, EventPage, DatumPage) are supported.
+/// Pre-validates required fields so the user gets an actionable error
+/// instead of serde's cryptic deserialization failure.
+fn lua_publish_to_document(
+    kind: &str,
+    body: serde_json::Value,
+) -> Result<cirrus_event_model::Document, String> {
+    use cirrus_event_model::Document as D;
+    let required = publish_required_fields(kind).ok_or_else(|| {
+        format!(
+            "unsupported publish kind {kind:?} (use one of: resource, datum, \
+             stream_resource, stream_datum, event_page, datum_page)"
+        )
+    })?;
+    if let Some(obj) = body.as_object() {
+        let missing: Vec<&str> = required
+            .iter()
+            .filter(|k| !obj.contains_key(**k))
+            .copied()
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "publish kind={kind:?} body missing required fields: {missing:?} \
+                 (required: {required:?})"
+            ));
+        }
+    } else {
+        return Err(format!(
+            "publish body must be a Lua table (got {kind:?} body of non-object type)"
+        ));
+    }
+    let parsed = match kind {
+        "resource" => D::Resource(serde_json::from_value(body).map_err(|e| e.to_string())?),
+        "datum" => D::Datum(serde_json::from_value(body).map_err(|e| e.to_string())?),
+        "stream_resource" => {
+            D::StreamResource(serde_json::from_value(body).map_err(|e| e.to_string())?)
+        }
+        "stream_datum" => D::StreamDatum(serde_json::from_value(body).map_err(|e| e.to_string())?),
+        "event_page" => D::EventPage(serde_json::from_value(body).map_err(|e| e.to_string())?),
+        "datum_page" => D::DatumPage(serde_json::from_value(body).map_err(|e| e.to_string())?),
+        _ => unreachable!("kind already validated by publish_required_fields"),
+    };
+    Ok(parsed)
+}
+
+/// Helper for `msg.subscribe`: turn a Document into `(name, json_body)`.
+fn document_to_name_body(d: &cirrus_event_model::Document) -> (&'static str, serde_json::Value) {
+    use cirrus_event_model::Document::*;
+    match d {
+        Start(s) => (
+            "start",
+            serde_json::to_value(s).unwrap_or(serde_json::Value::Null),
+        ),
+        Descriptor(d) => (
+            "descriptor",
+            serde_json::to_value(d).unwrap_or(serde_json::Value::Null),
+        ),
+        Event(e) => (
+            "event",
+            serde_json::to_value(e).unwrap_or(serde_json::Value::Null),
+        ),
+        EventPage(e) => (
+            "event_page",
+            serde_json::to_value(e).unwrap_or(serde_json::Value::Null),
+        ),
+        Resource(r) => (
+            "resource",
+            serde_json::to_value(r).unwrap_or(serde_json::Value::Null),
+        ),
+        Datum(d) => (
+            "datum",
+            serde_json::to_value(d).unwrap_or(serde_json::Value::Null),
+        ),
+        DatumPage(d) => (
+            "datum_page",
+            serde_json::to_value(d).unwrap_or(serde_json::Value::Null),
+        ),
+        StreamResource(r) => (
+            "stream_resource",
+            serde_json::to_value(r).unwrap_or(serde_json::Value::Null),
+        ),
+        StreamDatum(d) => (
+            "stream_datum",
+            serde_json::to_value(d).unwrap_or(serde_json::Value::Null),
+        ),
+        Stop(s) => (
+            "stop",
+            serde_json::to_value(s).unwrap_or(serde_json::Value::Null),
+        ),
+    }
+}
+
+/// Convert a `HashMap<String, serde_json::Value>` md dict into a fresh
+/// Lua table for callback hand-off, using a captured Lua handle.
+fn json_md_to_lua_table(
+    lua: &Lua,
+    md: std::collections::HashMap<String, serde_json::Value>,
+) -> cirrus_core::error::Result<mlua::Table> {
+    let table = lua
+        .create_table()
+        .map_err(|e| cirrus_core::error::CirrusError::Plan(format!("Lua table create: {e}")))?;
+    for (k, v) in md {
+        let lv = json_to_lua_value(lua, &v)
+            .map_err(|e| cirrus_core::error::CirrusError::Plan(format!("Lua convert: {e}")))?;
+        table
+            .set(k, lv)
+            .map_err(|e| cirrus_core::error::CirrusError::Plan(format!("Lua set: {e}")))?;
+    }
+    Ok(table)
+}
+
+/// Convert a Lua table back into a md HashMap.
+fn lua_table_to_json_md(
+    t: &mlua::Table,
+) -> mlua::Result<std::collections::HashMap<String, serde_json::Value>> {
+    let mut out = std::collections::HashMap::new();
+    for pair in t.pairs::<String, LuaValue>().flatten() {
+        out.insert(pair.0, lua_value_to_json(&pair.1)?);
+    }
+    Ok(out)
+}
+
+/// JSON Value -> Lua Value (used for md callbacks). Nested objects
+/// become tables, arrays become 1-indexed sequence tables.
+fn json_to_lua_value(lua: &Lua, v: &serde_json::Value) -> mlua::Result<LuaValue> {
+    Ok(match v {
+        serde_json::Value::Null => LuaValue::Nil,
+        serde_json::Value::Bool(b) => LuaValue::Boolean(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                LuaValue::Integer(i)
+            } else if let Some(f) = n.as_f64() {
+                LuaValue::Number(f)
+            } else {
+                LuaValue::Nil
+            }
+        }
+        serde_json::Value::String(s) => LuaValue::String(lua.create_string(s)?),
+        serde_json::Value::Array(a) => {
+            let t = lua.create_table()?;
+            for (i, x) in a.iter().enumerate() {
+                t.set(i + 1, json_to_lua_value(lua, x)?)?;
+            }
+            LuaValue::Table(t)
+        }
+        serde_json::Value::Object(o) => {
+            let t = lua.create_table()?;
+            for (k, x) in o {
+                t.set(k.clone(), json_to_lua_value(lua, x)?)?;
+            }
+            LuaValue::Table(t)
+        }
     })
 }
 
@@ -867,6 +1744,203 @@ fn register_msg_namespace(lua: &Lua) -> mlua::Result<()> {
             }))
         })?,
     )?;
+    // prepare(device, value, [group]) — value is any Lua value (number,
+    // string, table). Auto-group if not supplied.
+    msg.set(
+        "prepare",
+        lua.create_function(
+            |_, (dev, value, group): (mlua::AnyUserData, LuaValue, Option<String>)| {
+                let d = dev.borrow::<LuaDevice>()?;
+                let p = d.preparable.clone().ok_or_else(|| {
+                    mlua::Error::RuntimeError(format!("{} is not preparable", d.name))
+                })?;
+                Ok(LuaMsg(Msg::Prepare {
+                    obj: p,
+                    value: lua_value_to_json(&value)?,
+                    group: Some(group.unwrap_or_else(auto_group)),
+                }))
+            },
+        )?,
+    )?;
+    // wait_for(factories_table, [timeout_secs]) — factories is a Lua
+    // sequence of functions. Semantics IS NOT bluesky's "produce a
+    // future to await" — Lua has no native async. Each factory runs
+    // *synchronously* on the engine task thread when the WaitFor Msg
+    // is processed; its return value drives the surrogate future:
+    //   - return nil  → factory's future resolves Ok(())
+    //   - return "<err string>" → resolves Err(CirrusError::Plan(s))
+    //   - raise lua error → resolves Err with the formatted error
+    // Run order: factories execute in sequence, NOT in parallel.
+    // Sufficient for test/debug; for true async waits, port to Rust.
+    msg.set(
+        "wait_for",
+        lua.create_function(|_, (factories, timeout_secs): (mlua::Table, Option<f64>)| {
+            let mut fs: Vec<
+                Arc<
+                    dyn Fn() -> futures::future::BoxFuture<'static, cirrus_core::error::Result<()>>
+                        + Send
+                        + Sync,
+                >,
+            > = Vec::new();
+            for v in factories.sequence_values::<LuaValue>().flatten() {
+                if let LuaValue::Function(f) = v {
+                    let owned = f.clone();
+                    let f_arc: Arc<
+                        dyn Fn() -> futures::future::BoxFuture<
+                                'static,
+                                cirrus_core::error::Result<()>,
+                            > + Send
+                            + Sync,
+                    > = Arc::new(move || {
+                        // Call the Lua factory synchronously each
+                        // time the Msg is processed. Lua function is
+                        // !Send across threads, so we use blocking
+                        // call via mlua's typical pattern — accept
+                        // the constraint that wait_for from Lua is
+                        // limited to non-blocking factories.
+                        let res: mlua::Result<Option<String>> = owned.call(());
+                        Box::pin(async move {
+                            match res {
+                                Ok(None) => Ok(()),
+                                Ok(Some(err)) => Err(cirrus_core::error::CirrusError::Plan(err)),
+                                Err(e) => Err(cirrus_core::error::CirrusError::Plan(format!(
+                                    "wait_for factory: {e}"
+                                ))),
+                            }
+                        })
+                    });
+                    fs.push(f_arc);
+                }
+            }
+            Ok(LuaMsg(Msg::WaitFor {
+                factories: fs,
+                timeout: timeout_secs.map(std::time::Duration::from_secs_f64),
+            }))
+        })?,
+    )?;
+    // input(prompt) — Msg::Input { prompt }
+    msg.set(
+        "input",
+        lua.create_function(|_, prompt: Option<String>| {
+            Ok(LuaMsg(Msg::Input {
+                prompt: prompt.unwrap_or_default(),
+            }))
+        })?,
+    )?;
+    // re_class()
+    msg.set(
+        "re_class",
+        lua.create_function(|_, ()| Ok(LuaMsg(Msg::ReClass)))?,
+    )?;
+    // configure(device, args_table) — args_table is {key=value, ...}
+    msg.set(
+        "configure",
+        lua.create_function(|_, (dev, args): (mlua::AnyUserData, mlua::Table)| {
+            let d = dev.borrow::<LuaDevice>()?;
+            let c = d.configurable.clone().ok_or_else(|| {
+                mlua::Error::RuntimeError(format!("{} is not configurable", d.name))
+            })?;
+            let mut values = std::collections::HashMap::new();
+            for pair in args.pairs::<String, LuaValue>().flatten() {
+                values.insert(pair.0, lua_value_to_json(&pair.1)?);
+            }
+            Ok(LuaMsg(Msg::Configure {
+                obj: c,
+                args: ConfigureArgs { values },
+            }))
+        })?,
+    )?;
+    // declare_stream(name, data_keys_table) — data_keys is
+    // {field = {source=, dtype="number"|"string"|..., shape={...}}, ...}
+    msg.set(
+        "declare_stream",
+        lua.create_function(|_, (stream_name, keys_t): (String, mlua::Table)| {
+            let mut data_keys = std::collections::HashMap::new();
+            for pair in keys_t.pairs::<String, mlua::Table>().flatten() {
+                let dk = lua_table_to_data_key(&pair.1)?;
+                data_keys.insert(pair.0, dk);
+            }
+            Ok(LuaMsg(Msg::DeclareStream {
+                stream_name,
+                data_keys,
+            }))
+        })?,
+    )?;
+    // collect(device, [stream_name])
+    msg.set(
+        "collect",
+        lua.create_function(|_, (dev, name): (mlua::AnyUserData, Option<String>)| {
+            let d = dev.borrow::<LuaDevice>()?;
+            let c = d.collectable.clone().ok_or_else(|| {
+                mlua::Error::RuntimeError(format!("{} is not collectable", d.name))
+            })?;
+            Ok(LuaMsg(Msg::Collect {
+                obj: c,
+                stream_name: name,
+            }))
+        })?,
+    )?;
+    // publish(doc_table) — only minimal Document variants are
+    // constructible from Lua: Resource, Datum, StreamResource,
+    // StreamDatum. Take a `kind` field plus the variant payload as a
+    // Lua table; serialize via serde_json round-trip.
+    msg.set(
+        "publish",
+        lua.create_function(|_, t: mlua::Table| {
+            let kind: String = t.get("kind")?;
+            let body: LuaValue = t.get("body")?;
+            let body_json = lua_value_to_json(&body)?;
+            let doc = lua_publish_to_document(&kind, body_json)
+                .map_err(|e| mlua::Error::RuntimeError(format!("publish: {e}")))?;
+            Ok(LuaMsg(Msg::Publish(Box::new(doc))))
+        })?,
+    )?;
+    // subscribe(callback, [name]) — same shape as `RE:subscribe`. The
+    // subscription id lands in `MsgResult::SubscriptionId` on yield;
+    // the subscription is auto-removed at run end (temp_subscribers).
+    // Worker-thread emissions are buffered and replayed after RE:run.
+    msg.set(
+        "subscribe",
+        lua.create_function(|_, (cb, name): (mlua::Function, Option<String>)| {
+            let cb_arc: SubscribeCallback = make_lua_subscriber_cb(cb, name);
+            Ok(LuaMsg(Msg::Subscribe(cb_arc)))
+        })?,
+    )?;
+    // unsubscribe(id)
+    msg.set(
+        "unsubscribe",
+        lua.create_function(|_, id: u64| Ok(LuaMsg(Msg::Unsubscribe(id))))?,
+    )?;
+    // register_pausable(device)
+    msg.set(
+        "register_pausable",
+        lua.create_function(|_, dev: mlua::AnyUserData| {
+            let d = dev.borrow::<LuaDevice>()?;
+            let p = d
+                .pausable
+                .clone()
+                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not pausable", d.name)))?;
+            Ok(LuaMsg(Msg::RegisterPausable(p)))
+        })?,
+    )?;
+    msg.set(
+        "unregister_pausable",
+        lua.create_function(|_, dev: mlua::AnyUserData| {
+            let d = dev.borrow::<LuaDevice>()?;
+            let p = d
+                .pausable
+                .clone()
+                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not pausable", d.name)))?;
+            Ok(LuaMsg(Msg::UnregisterPausable(p)))
+        })?,
+    )?;
+    // install_suspender — not exposable from Lua without a Lua-defined
+    // Suspender impl (Send/Sync trait object). Document the gap; keep
+    // remove_suspender(id) only.
+    msg.set(
+        "remove_suspender",
+        lua.create_function(|_, id: u64| Ok(LuaMsg(Msg::RemoveSuspender { id })))?,
+    )?;
     lua.globals().set("msg", msg)?;
     Ok(())
 }
@@ -936,8 +2010,17 @@ fn coroutine_to_plan(
                     tracing::warn!("coroutine plan: yielded a non-Msg value, skipping");
                 }
                 Err(e) => {
+                    let msg = format!("Lua coroutine error: {e}");
                     eprintln!("coroutine plan error: {e}");
                     tracing::error!("coroutine plan: lua error: {e}");
+                    // Surface as a run failure: yield the bridge-error
+                    // Custom Msg whose handler returns Err. The engine
+                    // marks the run exit_status="fail" and RE:run
+                    // bubbles that to the caller's stdout.
+                    yield Msg::Custom {
+                        name: BRIDGE_ERROR_CMD,
+                        payload: Box::new(msg),
+                    };
                     break;
                 }
             }

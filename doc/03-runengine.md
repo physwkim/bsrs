@@ -125,6 +125,15 @@ This is enforced by a master `CancellationToken` (rule **K8**): when the RunEngi
 dropped, the token is cancelled and every owned task observes the cancellation and runs
 its own cleanup chain.
 
+> **Multi-process deployments (D21).** When the frame data plane runs in a
+> separate process from the RunEngine (the production pattern for high-rate
+> detectors and rogue), step 4 does not apply locally — the FramePipe lives
+> in the source process. The RunEngine's `RunStop` (step 5) still completes
+> first; the source process then quiesces its own FramePipe on receiving the
+> `RunStop` over the Document plane (D17/D18) and flushes any in-flight
+> writes before acking. Cancellation crosses the process boundary via a
+> ZMQ control message, not the local `CancellationToken`.
+
 ## Pause / Resume / Suspend / Halt
 
 | Action | Trigger | Effect |

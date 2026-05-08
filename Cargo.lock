@@ -341,13 +341,16 @@ name = "cirrus-cli"
 version = "0.1.0"
 dependencies = [
  "async-stream",
+ "async-trait",
  "cirrus-backend-soft",
  "cirrus-callbacks",
  "cirrus-core",
  "cirrus-engine",
+ "cirrus-event-model",
  "cirrus-plans",
  "cirrus-qs",
  "clap",
+ "futures",
  "mlua",
  "rustyline",
  "serde_json",

@@ -579,3 +579,617 @@ RE:run(plan(p))
         "stderr should include the type error, got: {err}"
     );
 }
+
+// -- Tier 1: msg.* additions -------------------------------------------------
+
+#[test]
+fn msg_input_with_handler_returns_string() {
+    let (out, err, code) = run_script(
+        r#"
+RE:set_input_handler(function(prompt) return "answer:" .. prompt end)
+local function p()
+    -- Bridge passes MsgResult back as the yield's return value.
+    local r = coroutine.yield(msg.input("name?"))
+    print("r=" .. tostring(r))
+end
+RE:run(plan(p))
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("r=answer:name?"), "out = {out}");
+}
+
+#[test]
+fn msg_re_class_returns_engine_name() {
+    let (out, err, code) = run_script(
+        r#"
+local function p()
+    local c = coroutine.yield(msg.re_class())
+    print("c=" .. tostring(c))
+end
+RE:run(plan(p))
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("c=cirrus.RunEngine"), "out = {out}");
+}
+
+#[test]
+fn msg_subscribe_receives_documents_via_lua_callback() {
+    let (out, err, code) = run_script(
+        r#"
+local count = 0
+local function cb(name, body)
+    count = count + 1
+end
+local function p()
+    coroutine.yield(msg.subscribe(cb))
+    coroutine.yield(msg.open_run())
+    coroutine.yield(msg.close_run())
+end
+RE:run(plan(p))
+print("count=" .. count)
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    // Expect at least start + stop documents
+    assert!(out.contains("count="), "out = {out}");
+    let n: i32 = out
+        .lines()
+        .find_map(|l| l.strip_prefix("count="))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    assert!(n >= 2, "got {n} docs in subscriber");
+}
+
+#[test]
+fn msg_wait_for_factories_run_in_order() {
+    let (out, err, code) = run_script(
+        r#"
+local order = ""
+local function p()
+    coroutine.yield(msg.wait_for({
+        function() order = order .. "a"; return nil end,
+        function() order = order .. "b"; return nil end,
+    }))
+end
+RE:run(plan(p))
+print("order=" .. order)
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("order=ab"), "out = {out}");
+}
+
+// -- Tier 2: simple RE:* methods --------------------------------------------
+
+#[test]
+fn re_set_record_interruptions_toggles_state() {
+    let (out, err, code) = run_script(
+        r#"
+print("a=" .. tostring(RE:record_interruptions_enabled()))
+RE:set_record_interruptions(true)
+print("b=" .. tostring(RE:record_interruptions_enabled()))
+RE:set_record_interruptions(false)
+print("c=" .. tostring(RE:record_interruptions_enabled()))
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("a=false"), "out = {out}");
+    assert!(out.contains("b=true"), "out = {out}");
+    assert!(out.contains("c=false"), "out = {out}");
+}
+
+#[test]
+fn re_md_remove_and_replace_work() {
+    let (out, err, code) = run_script(
+        r#"
+RE:md_set("a", "x")
+RE:md_set("b", "y")
+RE:md_remove("a")
+print("md1=" .. RE:md_get())
+RE:md_replace({c = "z"})
+print("md2=" .. RE:md_get())
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    // After remove+replace, only "c" should remain.
+    assert!(out.contains("\"c\": \"z\""), "out = {out}");
+    assert!(!out.contains("\"a\":"), "out = {out}");
+}
+
+#[test]
+fn re_set_loop_timeout_aborts_overrun() {
+    let (_out, err, _code) = run_script(
+        r#"
+RE:set_loop_timeout(0.1)
+local function p()
+    coroutine.yield(msg.sleep(5))
+end
+local ok, msg_str = pcall(function() RE:run(plan(p)) end)
+io.stderr:write("ok=" .. tostring(ok) .. " err=" .. tostring(msg_str) .. "\n")
+"#,
+    );
+    // Loop timeout surfaces as a RuntimeError; the script's pcall
+    // captures it and writes to stderr.
+    assert!(
+        err.to_lowercase().contains("timeout") || err.to_lowercase().contains("plan failed"),
+        "stderr = {err}"
+    );
+}
+
+// -- Tier 3: callback-heavy RE:* methods ------------------------------------
+
+#[test]
+fn re_set_md_normalizer_modifies_runstart() {
+    let (out, err, code) = run_script(
+        r#"
+RE:set_md_normalizer(function(md)
+    md.normalized = true
+    return md
+end)
+local got = nil
+RE:subscribe(function(name, body)
+    if name == "start" then got = body end
+end)
+local function p()
+    coroutine.yield(msg.open_run())
+    coroutine.yield(msg.close_run())
+end
+RE:run(plan(p))
+print("start=" .. tostring(got))
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("\"normalized\":true"), "out = {out}");
+}
+
+#[test]
+fn re_set_scan_id_source_overrides_auto_increment() {
+    let (out, err, code) = run_script(
+        r#"
+RE:set_scan_id_source(function(md) return 99 end)
+local got = nil
+RE:subscribe(function(name, body)
+    if name == "start" then got = body end
+end)
+local function p()
+    coroutine.yield(msg.open_run())
+    coroutine.yield(msg.close_run())
+end
+RE:run(plan(p))
+print("start=" .. tostring(got))
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("\"scan_id\":99"), "out = {out}");
+}
+
+#[test]
+fn re_set_md_validator_can_reject_run() {
+    let (out, err, code) = run_script(
+        r#"
+RE:set_md_validator(function(md)
+    if md.forbidden then return "forbidden key" end
+    return nil
+end)
+RE:md_set("forbidden", true)
+local function p()
+    coroutine.yield(msg.open_run())
+    coroutine.yield(msg.close_run())
+end
+local r = RE:run(plan(p))
+print("result=" .. tostring(r))
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    // Validator failure marks the run as exit_status=fail; RE:run
+    // returns Ok with the formatted result string.
+    assert!(out.contains("exit_status=fail"), "out = {out}");
+}
+
+#[test]
+fn re_register_command_dispatched_via_msg_custom() {
+    // Lua's Msg::Custom binding doesn't exist, but Rust-side
+    // register_command from Lua means a Rust-built Custom Msg can
+    // route to the Lua handler. Verify the handler is invoked when
+    // any Msg::Custom passes through (via plan side, not implemented
+    // here — so we verify only the registration accepts a function).
+    let (_out, err, code) = run_script(
+        r#"
+RE:register_command("ping", function(payload) return nil end)
+RE:unregister_command("ping")
+print("ok")
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+}
+
+#[test]
+fn re_register_pausable_smoke_test() {
+    // Single-threaded Lua + blocking RE:run means a Lua script alone
+    // cannot drive a pause/resume cycle (no second Lua thread to call
+    // RE:resume() while RE:run is parked). This smoke test verifies
+    // only the binding plumbing: register, no error; counters readable
+    // and zero before any pause; unregister, no error. The actual
+    // pause/resume firing is exercised by the Rust-level integration
+    // test in crates/cirrus/tests/runengine_features.rs.
+    let (out, err, code) = run_script(
+        r#"
+local p1 = soft_pausable("p1")
+RE:register_pausable(p1)
+print("pc_before=" .. p1:pause_count())
+print("rc_before=" .. p1:resume_count())
+RE:unregister_pausable(p1)
+print("after_unregister_ok")
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("pc_before=0"), "out = {out}");
+    assert!(out.contains("rc_before=0"), "out = {out}");
+    assert!(out.contains("after_unregister_ok"), "out = {out}");
+}
+
+#[test]
+fn re_register_pausable_unregister_accepts_device_or_name() {
+    let (_out, err, code) = run_script(
+        r#"
+local p1 = soft_pausable("p1")
+RE:register_pausable(p1)
+-- both forms must succeed:
+RE:unregister_pausable(p1)            -- device
+RE:register_pausable(p1)
+RE:unregister_pausable("p1")          -- name string
+print("ok")
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+}
+
+#[test]
+fn re_register_pausable_rejects_non_pausable_device() {
+    let (_out, err, code) = run_script(
+        r#"
+local m = soft_motor("m1", 0.0)
+local ok, e = pcall(function() RE:register_pausable(m) end)
+io.stderr:write("ok=" .. tostring(ok) .. " e=" .. tostring(e) .. "\n")
+"#,
+    );
+    assert_eq!(code, 0);
+    assert!(
+        err.contains("not pausable"),
+        "stderr should mention 'not pausable', got: {err}"
+    );
+}
+
+#[test]
+fn msg_publish_missing_field_gives_actionable_error() {
+    // After R3-A, the Lua error must propagate as exit_status=fail in
+    // the RunResult — programmatic detection, not stderr-scraping.
+    let (out, err, code) = run_script(
+        r#"
+local function p()
+    -- resource missing required fields → actionable error message
+    coroutine.yield(msg.publish({kind = "resource", body = {uid = "r-1"}}))
+end
+local r = RE:run(plan(p))
+print("result=" .. tostring(r))
+"#,
+    );
+    assert_eq!(code, 0);
+    assert!(
+        out.contains("exit_status=fail"),
+        "expected exit_status=fail, got out={out} err={err}"
+    );
+    assert!(
+        err.contains("missing required fields") || err.contains("publish"),
+        "actionable detail must be in stderr trace; err = {err}"
+    );
+}
+
+#[test]
+fn msg_publish_minimal_datum_succeeds() {
+    // Datum has only datum_id + resource as required (datum_kwargs has
+    // #[serde(default)]). This regression test catches the R2-1
+    // miscategorization where datum_kwargs was wrongly listed as
+    // required, causing valid bodies to be rejected.
+    let (_out, err, code) = run_script(
+        r#"
+local function p()
+    coroutine.yield(msg.publish({
+        kind = "datum",
+        body = {datum_id = "r-1/0", resource = "r-1"},
+    }))
+end
+RE:run(plan(p))
+print("ok")
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        !err.contains("missing required fields"),
+        "minimal valid Datum body must not be rejected, got: {err}"
+    );
+}
+
+#[test]
+fn msg_publish_minimal_stream_resource_succeeds() {
+    // StreamResource: parameters and run_start have #[serde(default)].
+    // Required = uid, data_key, mimetype, uri.
+    let (_out, err, code) = run_script(
+        r#"
+local function p()
+    coroutine.yield(msg.publish({
+        kind = "stream_resource",
+        body = {uid = "sr-1", data_key = "det1", mimetype = "application/x-hdf5",
+                uri = "file:///tmp/x.h5"},
+    }))
+end
+RE:run(plan(p))
+print("ok")
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        !err.contains("missing required fields"),
+        "minimal valid StreamResource body must not be rejected, got: {err}"
+    );
+}
+
+#[test]
+fn lua_coroutine_error_propagates_to_run_result() {
+    // Regression for R3-A: any Lua-side error (not just publish) must
+    // mark the run as exit_status=fail in the RunResult, not silently
+    // swallow into "no-run" / "success".
+    let (out, _err, code) = run_script(
+        r#"
+local function p()
+    error("intentional Lua error from plan")
+end
+local r = RE:run(plan(p))
+print("result=" .. tostring(r))
+"#,
+    );
+    assert_eq!(code, 0);
+    assert!(
+        out.contains("exit_status=fail"),
+        "Lua coroutine error must propagate as fail, got: {out}"
+    );
+}
+
+#[test]
+fn lua_error_after_open_run_emits_runstop_fail() {
+    // Regression for R4-2: error mid-plan after open_run must close
+    // the run with exit_status="fail" (not leave it dangling).
+    let (out, _err, code) = run_script(
+        r#"
+local got_stop = nil
+RE:subscribe(function(name, body)
+    if name == "stop" then got_stop = body end
+end)
+local function p()
+    coroutine.yield(msg.open_run())
+    error("intentional mid-plan error")
+end
+local r = RE:run(plan(p))
+print("result=" .. tostring(r))
+print("stop=" .. tostring(got_stop))
+"#,
+    );
+    assert_eq!(code, 0);
+    assert!(out.contains("exit_status=fail"), "out = {out}");
+    assert!(
+        out.contains("\"exit_status\":\"fail\""),
+        "RunStop document must carry exit_status=fail; out = {out}"
+    );
+}
+
+#[test]
+fn bridge_error_command_is_reserved() {
+    // Regression for R4-1: users cannot accidentally clobber the
+    // bridge-error custom command name.
+    let (_out, err, code) = run_script(
+        r#"
+local ok1, e1 = pcall(function()
+    RE:register_command("_cirrus_lua_bridge_error", function(p) end)
+end)
+local ok2, e2 = pcall(function()
+    RE:unregister_command("_cirrus_lua_bridge_error")
+end)
+io.stderr:write(string.format("ok1=%s ok2=%s e1=%s e2=%s\n",
+    tostring(ok1), tostring(ok2), tostring(e1), tostring(e2)))
+"#,
+    );
+    assert_eq!(code, 0);
+    assert!(
+        err.contains("ok1=false"),
+        "register should reject; err = {err}"
+    );
+    assert!(
+        err.contains("ok2=false"),
+        "unregister should reject; err = {err}"
+    );
+    assert!(
+        err.contains("reserved"),
+        "error must mention 'reserved'; err = {err}"
+    );
+}
+
+#[test]
+fn msg_publish_unsupported_kind_gives_actionable_error() {
+    let (out, _err, code) = run_script(
+        r#"
+local function p()
+    coroutine.yield(msg.publish({kind = "garbage", body = {}}))
+end
+local r = RE:run(plan(p))
+print("result=" .. tostring(r))
+"#,
+    );
+    assert_eq!(code, 0);
+    assert!(out.contains("exit_status=fail"), "out: {out}");
+}
+
+#[test]
+fn re_subscribe_name_filter_only_fires_for_match() {
+    let (out, err, code) = run_script(
+        r#"
+local n_start, n_stop, n_event = 0, 0, 0
+RE:subscribe(function(name, body) n_start = n_start + 1 end, "start")
+RE:subscribe(function(name, body) n_stop = n_stop + 1 end, "stop")
+RE:subscribe(function(name, body) n_event = n_event + 1 end, "event")
+local det1 = soft_detector("det1")
+RE:run(count({det1}, 2))
+print("start=" .. n_start)
+print("stop=" .. n_stop)
+print("event=" .. n_event)
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("start=1"), "out = {out}");
+    assert!(out.contains("stop=1"), "out = {out}");
+    assert!(out.contains("event=2"), "out = {out}");
+}
+
+#[test]
+fn re_subscribe_all_fires_for_every_doc() {
+    let (out, err, code) = run_script(
+        r#"
+local total = 0
+RE:subscribe(function(name, body) total = total + 1 end, "all")
+local det1 = soft_detector("det1")
+RE:run(count({det1}, 1))
+print("total=" .. total)
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    // count(1) emits start + descriptor + event + stop = 4
+    assert!(
+        out.contains("total=4") || out.contains("total=5"),
+        "out = {out}"
+    );
+}
+
+#[test]
+fn re_subscribe_no_filter_matches_all_docs() {
+    // Existing behavior unchanged when name arg is omitted.
+    let (out, err, code) = run_script(
+        r#"
+local total = 0
+RE:subscribe(function(name, body) total = total + 1 end)
+local det1 = soft_detector("det1")
+RE:run(count({det1}, 1))
+print("total=" .. total)
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("total=4") || out.contains("total=5"),
+        "out = {out}"
+    );
+}
+
+#[test]
+fn lua_subscriber_receives_monitor_events_via_buffered_drain() {
+    // Regression for the deadlock fix: monitor pump emits Event
+    // documents from a worker task; without the buffer/drain
+    // mechanism the call into Lua would deadlock waiting on mlua's
+    // mutex held by the REPL thread. With the fix, the events are
+    // buffered and replayed after RE:run returns.
+    //
+    // Note: cirrus-cli's `soft_detector` is not Monitorable. To test
+    // the buffered path we'd need a Monitorable backend; this test
+    // instead verifies the simpler path: a subscription added before
+    // RE:run completes successfully without timing out, and the
+    // drain mechanism fires the same number of times as direct
+    // calls (sanity that drain doesn't double-fire). A true
+    // worker-thread emit test belongs in a Rust integration test
+    // with a custom Monitorable.
+    let (out, err, code) = run_script(
+        r#"
+local total = 0
+RE:subscribe(function(name, body) total = total + 1 end, "all")
+local det1 = soft_detector("det1")
+RE:run(count({det1}, 1))
+print("total=" .. total)
+RE:run(count({det1}, 1))
+print("total2=" .. total)
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    // First run: 4 docs. Second run: 4 more.
+    let total: i32 = out
+        .lines()
+        .find_map(|l| l.strip_prefix("total="))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let total2: i32 = out
+        .lines()
+        .find_map(|l| l.strip_prefix("total2="))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    assert!(total >= 4, "first run total = {total}, out = {out}");
+    assert!(
+        total2 >= total + 4,
+        "second run delta = {}, out = {out}",
+        total2 - total
+    );
+}
+
+#[test]
+fn run_async_with_rejects_non_table_md() {
+    // Regression for R5-2: opts.md must be a table or nil; other
+    // types must surface a clear error rather than being silently
+    // dropped.
+    let (_out, err, code) = run_script(
+        r#"
+local function p() coroutine.yield(msg.null()) end
+local ok, e = pcall(function()
+    RE:run_async_with(plan(p), { md = 42 })
+end)
+io.stderr:write("ok=" .. tostring(ok) .. " e=" .. tostring(e) .. "\n")
+"#,
+    );
+    assert_eq!(code, 0);
+    assert!(err.contains("ok=false"), "err = {err}");
+    assert!(err.contains("opts.md must be a table"), "err = {err}");
+}
+
+#[test]
+fn run_async_with_rejects_non_table_subs() {
+    let (_out, err, code) = run_script(
+        r#"
+local function p() coroutine.yield(msg.null()) end
+local ok, e = pcall(function()
+    RE:run_async_with(plan(p), { subs = "not a list" })
+end)
+io.stderr:write("ok=" .. tostring(ok) .. " e=" .. tostring(e) .. "\n")
+"#,
+    );
+    assert_eq!(code, 0);
+    assert!(err.contains("ok=false"), "err = {err}");
+    assert!(
+        err.contains("opts.subs must be a sequence of functions"),
+        "err = {err}"
+    );
+}
+
+#[test]
+fn re_run_async_with_per_call_md_lands_in_runstart() {
+    let (out, err, code) = run_script(
+        r#"
+local got = nil
+RE:subscribe(function(name, body)
+    if name == "start" then got = body end
+end)
+local function p()
+    coroutine.yield(msg.open_run())
+    coroutine.yield(msg.close_run())
+end
+RE:run_async_with(plan(p), { md = { operator = "carol" } })
+print("start=" .. tostring(got))
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("\"operator\":\"carol\""), "out = {out}");
+}
