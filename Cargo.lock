@@ -340,6 +340,7 @@ dependencies = [
 name = "cirrus-cli"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "cirrus-backend-soft",
  "cirrus-callbacks",
  "cirrus-core",

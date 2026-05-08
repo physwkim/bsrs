@@ -4,10 +4,13 @@
 use std::sync::Arc;
 
 use cirrus_backend_soft::{SoftDetector, SoftMotor};
-use cirrus_core::msg::{LocatableObj, MovableObj, ReadableObj, StoppableObj};
-use cirrus_core::plan::Plan;
+use cirrus_core::msg::{
+    LocatableObj, MovableObj, Msg, MonitorableObj, ReadableObj, RunMetadata, StageableObj,
+    StoppableObj, TriggerableObj,
+};
+use cirrus_core::plan::{plan_box, Plan};
 use cirrus_engine::{DocumentSink, RunEngine};
-use mlua::{Lua, UserData, UserDataMethods, Value as LuaValue, Variadic};
+use mlua::{Lua, ThreadStatus, UserData, UserDataMethods, Value as LuaValue, Variadic};
 use tokio::sync::Mutex as TMutex;
 
 /// Holder for an opaque cirrus device. Wraps the trait-object Arc and
@@ -19,6 +22,9 @@ pub struct LuaDevice {
     pub movable: Option<Arc<dyn MovableObj>>,
     pub locatable: Option<Arc<dyn LocatableObj>>,
     pub stoppable: Option<Arc<dyn StoppableObj>>,
+    pub triggerable: Option<Arc<dyn TriggerableObj>>,
+    pub stageable: Option<Arc<dyn StageableObj>>,
+    pub monitorable: Option<Arc<dyn MonitorableObj>>,
 }
 
 impl UserData for LuaDevice {
@@ -54,6 +60,17 @@ impl UserData for LuaPlan {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_meta_method("__tostring", |_, p, ()| Ok(format!("Plan({})", p.label)));
         methods.add_method("label", |_, p, ()| Ok(p.label.clone()));
+    }
+}
+
+/// Single `Msg` value, yielded from a Lua coroutine. Constructed via
+/// `msg.*` factories.
+#[derive(Clone)]
+pub struct LuaMsg(pub Msg);
+
+impl UserData for LuaMsg {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_meta_method("__tostring", |_, m, ()| Ok(format!("Msg({:?})", m.0)));
     }
 }
 
@@ -138,6 +155,9 @@ pub fn build_lua(re: Arc<RunEngine>) -> mlua::Result<Lua> {
             movable: None,
             locatable: None,
             stoppable: None,
+            triggerable: None,
+            stageable: None,
+            monitorable: None,
         })
     })?;
     lua.globals().set("soft_detector", f)?;
@@ -149,7 +169,10 @@ pub fn build_lua(re: Arc<RunEngine>) -> mlua::Result<Lua> {
             readable: Some(motor.clone() as Arc<dyn ReadableObj>),
             movable: Some(motor.clone() as Arc<dyn MovableObj>),
             locatable: Some(motor.clone() as Arc<dyn LocatableObj>),
-            stoppable: None,
+            stoppable: Some(motor.clone() as Arc<dyn StoppableObj>),
+            triggerable: None,
+            stageable: None,
+            monitorable: None,
         })
     })?;
     lua.globals().set("soft_motor", f)?;
@@ -244,6 +267,35 @@ fn register_plan_factories(lua: &Lua) -> mlua::Result<()> {
     })?;
     lua.globals().set("print", f)?;
 
+    // msg.* — Msg constructors for use INSIDE coroutine plans.
+    register_msg_namespace(lua)?;
+
+    // plan(fn, ...) — wrap a Lua coroutine into a Plan.
+    let f = lua.create_function(
+        |lua, args: Variadic<LuaValue>| {
+            let mut iter = args.into_iter();
+            let fn_value = iter
+                .next()
+                .ok_or_else(|| mlua::Error::RuntimeError("plan(fn, ...) requires a function".into()))?;
+            let fn_obj = match fn_value {
+                LuaValue::Function(f) => f,
+                other => {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "plan(fn, ...) expected a function, got {other:?}"
+                    )));
+                }
+            };
+            let rest: Vec<LuaValue> = iter.collect();
+            let thread = lua.create_thread(fn_obj)?;
+            let plan = coroutine_to_plan(thread, rest);
+            Ok(LuaPlan {
+                label: "coroutine".into(),
+                plan: TMutex::new(Some(plan)),
+            })
+        },
+    )?;
+    lua.globals().set("plan", f)?;
+
     Ok(())
 }
 
@@ -315,3 +367,260 @@ fn lua_value_to_json(v: &LuaValue) -> mlua::Result<serde_json::Value> {
 /// `_used` is here to silence unused-imports without exposing the full API.
 #[allow(dead_code)]
 pub fn _used(_d: Arc<dyn DocumentSink>) {}
+
+// ---------------------------------------------------------------------------
+// Msg constructors — used inside `plan(fn, ...)` coroutines via `coroutine.yield`.
+// ---------------------------------------------------------------------------
+
+fn register_msg_namespace(lua: &Lua) -> mlua::Result<()> {
+    let msg = lua.create_table()?;
+
+    // open_run({plan_name=, scan_id=, ...}) -> Msg::OpenRun
+    msg.set(
+        "open_run",
+        lua.create_function(|_, meta: Option<mlua::Table>| {
+            let mut m = RunMetadata::default();
+            if let Some(t) = meta {
+                if let Ok(s) = t.get::<String>("plan_name") {
+                    m.plan_name = Some(s);
+                }
+                if let Ok(n) = t.get::<u64>("scan_id") {
+                    m.scan_id = Some(n);
+                }
+                for pair in t.pairs::<String, LuaValue>().flatten() {
+                    if pair.0 != "plan_name" && pair.0 != "scan_id" {
+                        m.extra.insert(pair.0, lua_value_to_json(&pair.1)?);
+                    }
+                }
+            }
+            Ok(LuaMsg(Msg::OpenRun(m)))
+        })?,
+    )?;
+    // close_run([exit_status, [reason]]) -> Msg::CloseRun
+    msg.set(
+        "close_run",
+        lua.create_function(|_, (es, rs): (Option<String>, Option<String>)| {
+            Ok(LuaMsg(Msg::CloseRun {
+                exit_status: es.unwrap_or_else(|| "success".into()),
+                reason: rs,
+            }))
+        })?,
+    )?;
+    // create([stream]) -> Msg::Create
+    msg.set(
+        "create",
+        lua.create_function(|_, name: Option<String>| {
+            Ok(LuaMsg(Msg::Create {
+                stream_name: name.unwrap_or_else(|| "primary".into()),
+            }))
+        })?,
+    )?;
+    msg.set("save", lua.create_function(|_, ()| Ok(LuaMsg(Msg::Save)))?)?;
+    msg.set("drop", lua.create_function(|_, ()| Ok(LuaMsg(Msg::Drop)))?)?;
+    // read(device) -> Msg::Read
+    msg.set(
+        "read",
+        lua.create_function(|_, dev: mlua::AnyUserData| {
+            let d = dev.borrow::<LuaDevice>()?;
+            let r = d
+                .readable
+                .clone()
+                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not readable", d.name)))?;
+            Ok(LuaMsg(Msg::Read(r)))
+        })?,
+    )?;
+    // set(device, value, [group]) -> Msg::Set
+    msg.set(
+        "set",
+        lua.create_function(
+            |_, (dev, val, group): (mlua::AnyUserData, f64, Option<String>)| {
+                let d = dev.borrow::<LuaDevice>()?;
+                let mv = d
+                    .movable
+                    .clone()
+                    .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not movable", d.name)))?;
+                Ok(LuaMsg(Msg::Set {
+                    obj: mv,
+                    value: val,
+                    group,
+                }))
+            },
+        )?,
+    )?;
+    // trigger(device, [group])
+    msg.set(
+        "trigger",
+        lua.create_function(|_, (dev, group): (mlua::AnyUserData, Option<String>)| {
+            let d = dev.borrow::<LuaDevice>()?;
+            let t = d
+                .triggerable
+                .clone()
+                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not triggerable", d.name)))?;
+            Ok(LuaMsg(Msg::Trigger { obj: t, group }))
+        })?,
+    )?;
+    // wait(group, [timeout_secs], [error_on_timeout])
+    msg.set(
+        "wait",
+        lua.create_function(
+            |_, (group, timeout_secs, err): (String, Option<f64>, Option<bool>)| {
+                Ok(LuaMsg(Msg::Wait {
+                    group,
+                    timeout: timeout_secs.map(std::time::Duration::from_secs_f64),
+                    error_on_timeout: err.unwrap_or(true),
+                }))
+            },
+        )?,
+    )?;
+    // sleep(seconds) — inside-coroutine sleep Msg.
+    msg.set(
+        "sleep",
+        lua.create_function(|_, secs: f64| {
+            Ok(LuaMsg(Msg::Sleep(std::time::Duration::from_secs_f64(secs))))
+        })?,
+    )?;
+    msg.set(
+        "checkpoint",
+        lua.create_function(|_, ()| Ok(LuaMsg(Msg::Checkpoint)))?,
+    )?;
+    msg.set(
+        "clear_checkpoint",
+        lua.create_function(|_, ()| Ok(LuaMsg(Msg::ClearCheckpoint)))?,
+    )?;
+    msg.set(
+        "rewindable",
+        lua.create_function(|_, b: bool| Ok(LuaMsg(Msg::Rewindable(b))))?,
+    )?;
+    msg.set(
+        "pause",
+        lua.create_function(|_, defer: Option<bool>| {
+            Ok(LuaMsg(Msg::Pause {
+                defer: defer.unwrap_or(false),
+            }))
+        })?,
+    )?;
+    msg.set(
+        "resume",
+        lua.create_function(|_, ()| Ok(LuaMsg(Msg::Resume)))?,
+    )?;
+    msg.set("null", lua.create_function(|_, ()| Ok(LuaMsg(Msg::Null)))?)?;
+    // stage / unstage
+    msg.set(
+        "stage",
+        lua.create_function(|_, dev: mlua::AnyUserData| {
+            let d = dev.borrow::<LuaDevice>()?;
+            let s = d
+                .stageable
+                .clone()
+                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not stageable", d.name)))?;
+            Ok(LuaMsg(Msg::Stage(s)))
+        })?,
+    )?;
+    msg.set(
+        "unstage",
+        lua.create_function(|_, dev: mlua::AnyUserData| {
+            let d = dev.borrow::<LuaDevice>()?;
+            let s = d
+                .stageable
+                .clone()
+                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not stageable", d.name)))?;
+            Ok(LuaMsg(Msg::Unstage(s)))
+        })?,
+    )?;
+    // stop_dev(device, [success])
+    msg.set(
+        "stop_dev",
+        lua.create_function(|_, (dev, success): (mlua::AnyUserData, Option<bool>)| {
+            let d = dev.borrow::<LuaDevice>()?;
+            let s = d
+                .stoppable
+                .clone()
+                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not stoppable", d.name)))?;
+            Ok(LuaMsg(Msg::Stop {
+                obj: s,
+                success: success.unwrap_or(true),
+            }))
+        })?,
+    )?;
+    // monitor(device, [stream_name])
+    msg.set(
+        "monitor",
+        lua.create_function(|_, (dev, name): (mlua::AnyUserData, Option<String>)| {
+            let d = dev.borrow::<LuaDevice>()?;
+            let m = d
+                .monitorable
+                .clone()
+                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not monitorable", d.name)))?;
+            Ok(LuaMsg(Msg::Monitor { obj: m, name }))
+        })?,
+    )?;
+    msg.set(
+        "unmonitor",
+        lua.create_function(|_, dev: mlua::AnyUserData| {
+            let d = dev.borrow::<LuaDevice>()?;
+            let m = d
+                .monitorable
+                .clone()
+                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not monitorable", d.name)))?;
+            Ok(LuaMsg(Msg::Unmonitor(m)))
+        })?,
+    )?;
+    lua.globals().set("msg", msg)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Lua coroutine ↔ Plan bridge.
+//
+// Each call to the resulting Plan's `next()` resumes the coroutine
+// once. Yielded `LuaMsg` values become `Msg`s; non-`LuaMsg` yields are
+// logged and skipped. When the coroutine returns, the Plan ends.
+//
+// `mlua::Thread` is `Send` because we built the Lua state with the
+// `send` feature; no extra synchronization needed inside the stream.
+// ---------------------------------------------------------------------------
+fn coroutine_to_plan(thread: mlua::Thread, args: Vec<LuaValue>) -> Plan {
+    plan_box(async_stream::stream! {
+        let mut started = false;
+        loop {
+            let resume_args: Variadic<LuaValue> = if started {
+                Variadic::new()
+            } else {
+                started = true;
+                Variadic::from_iter(args.iter().cloned())
+            };
+            // Resume on the same task; Lua resume is a fast in-process
+            // call. If the script ends up doing I/O it should yield.
+            let resume_result: mlua::Result<LuaValue> =
+                thread.resume(resume_args);
+            match resume_result {
+                Ok(v) => {
+                    // If the thread is still resumable, `v` is the yielded value.
+                    // If finished, the thread is in `Finished` state.
+                    let still_running = thread.status() == ThreadStatus::Resumable;
+                    if let LuaValue::UserData(ud) = &v {
+                        if let Ok(m) = ud.borrow::<LuaMsg>() {
+                            yield m.0.clone();
+                            if !still_running {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                    if !still_running {
+                        // Returned non-Msg — finish silently.
+                        break;
+                    }
+                    tracing::warn!(
+                        "coroutine plan: yielded a non-Msg value, skipping"
+                    );
+                }
+                Err(e) => {
+                    eprintln!("coroutine plan error: {e}");
+                    tracing::error!("coroutine plan: lua error: {e}");
+                    break;
+                }
+            }
+        }
+    })
+}

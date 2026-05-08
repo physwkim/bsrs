@@ -208,6 +208,37 @@ Lua globals registered:
   mvr(motor, delta)
   sleep(seconds)
   null()                        no-op plan
+  plan(fn, ...)                 wrap a Lua coroutine into a Plan
+
+Coroutine plans (generator-style) — yield Msg values via the `msg.*`
+namespace:
+
+  msg.open_run([{{plan_name=...}}])    msg.close_run([exit_status, [reason]])
+  msg.create([stream])                 msg.save()        msg.drop()
+  msg.read(device)                     msg.set(device, value, [group])
+  msg.trigger(device, [group])         msg.wait(group, [timeout], [err])
+  msg.checkpoint()                     msg.clear_checkpoint()
+  msg.rewindable(bool)                 msg.pause([deferred])  msg.resume()
+  msg.stage(device)                    msg.unstage(device)
+  msg.stop_dev(device, [success])
+  msg.monitor(device, [stream])        msg.unmonitor(device)
+  msg.sleep(seconds)                   msg.null()
+
+Example:
+  local function my_scan(detectors, motor, n)
+    coroutine.yield(msg.open_run({{plan_name="x"}}))
+    for i = 0, n-1 do
+      local pos = i / (n-1)
+      coroutine.yield(msg.set(motor, pos, "g"))
+      coroutine.yield(msg.wait("g"))
+      coroutine.yield(msg.create("primary"))
+      coroutine.yield(msg.read(motor))
+      for _, d in ipairs(detectors) do coroutine.yield(msg.read(d)) end
+      coroutine.yield(msg.save())
+    end
+    coroutine.yield(msg.close_run("success"))
+  end
+  RE:run(plan(my_scan, {{det1}}, m1, 5))
 
 Multi-line: incomplete input keeps the prompt at `... `; type `:reset` to drop.
 "#

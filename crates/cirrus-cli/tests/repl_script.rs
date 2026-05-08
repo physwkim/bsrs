@@ -13,14 +13,19 @@ fn cirrus_bin() -> std::path::PathBuf {
 }
 
 fn run_script(src: &str) -> (String, String, i32) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
     let dir = std::env::temp_dir();
     let path = dir.join(format!(
-        "cirrus_repl_test_{}_{}.lua",
+        "cirrus_repl_test_{}_{}_{}.lua",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        nanos.wrapping_add(n.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+        n,
     ));
     {
         let mut f = std::fs::File::create(&path).unwrap();
@@ -111,4 +116,93 @@ print(RE:run(sleep(0.01)))
     let success_lines = out.matches("no-run").count();
     // Both null() and sleep() are no-run plans (no OpenRun).
     assert!(success_lines >= 1, "out = {out}");
+}
+
+#[test]
+fn coroutine_plan_runs_to_completion() {
+    let (out, err, code) = run_script(
+        r#"
+local det1 = soft_detector("det1")
+local m1 = soft_motor("m1", 0.0)
+
+local function my_scan(detectors, motor, n)
+    coroutine.yield(msg.open_run({plan_name = "lua_coro_scan"}))
+    for i = 0, n - 1 do
+        local pos = i / (n - 1)
+        coroutine.yield(msg.set(motor, pos, "main"))
+        coroutine.yield(msg.wait("main"))
+        coroutine.yield(msg.create("primary"))
+        coroutine.yield(msg.read(motor))
+        for _, d in ipairs(detectors) do
+            coroutine.yield(msg.read(d))
+        end
+        coroutine.yield(msg.save())
+    end
+    coroutine.yield(msg.close_run("success"))
+end
+
+print(RE:run(plan(my_scan, {det1}, m1, 4)))
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("exit_status=success"), "out = {out}");
+}
+
+#[test]
+fn coroutine_plan_open_close_only() {
+    // Smallest coroutine plan: just open / close. Verifies the bridge
+    // doesn't drop the final close_run msg.
+    let (out, err, code) = run_script(
+        r#"
+local function p()
+    coroutine.yield(msg.open_run())
+    coroutine.yield(msg.close_run("success"))
+end
+print(RE:run(plan(p)))
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("exit_status=success"), "out = {out}");
+}
+
+#[test]
+fn coroutine_plan_with_args() {
+    let (out, err, code) = run_script(
+        r#"
+local function p(label, count)
+    coroutine.yield(msg.open_run({plan_name = label}))
+    for _ = 1, count do
+        coroutine.yield(msg.null())
+    end
+    coroutine.yield(msg.close_run())
+end
+print(RE:run(plan(p, "argpassed", 3)))
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("exit_status=success"), "out = {out}");
+}
+
+#[test]
+fn coroutine_msg_constructor_type_errors_clearly() {
+    // soft_detector is not movable; msg.set on it must raise a clear
+    // error inside the coroutine that the bridge surfaces to stderr.
+    let (_out, err, code) = run_script(
+        r#"
+local det1 = soft_detector("det1")
+local function p()
+    coroutine.yield(msg.set(det1, 1.0))   -- should fail: not movable
+    coroutine.yield(msg.close_run())
+end
+RE:run(plan(p))
+"#,
+    );
+    // Script exits 0 because RE:run returns Ok(RunResult{exit_status="no-run"}).
+    // What we verify is that the Lua error was surfaced to stderr so the
+    // user actually sees the cause.
+    assert_eq!(code, 0);
+    assert!(
+        err.contains("not movable"),
+        "stderr should include the type error, got: {err}"
+    );
 }
