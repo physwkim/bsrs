@@ -70,6 +70,8 @@
 
 mod dispatch;
 mod methods;
+#[cfg(feature = "metrics")]
+mod metrics;
 mod queue;
 mod registry;
 mod server;

@@ -30,6 +30,13 @@ pub struct ManagerArgs {
     /// to skip.
     #[arg(long, default_value_t = 1)]
     soft_motors: usize,
+
+    /// Optional Prometheus `/metrics` HTTP listener address (e.g.
+    /// `127.0.0.1:9090`). Requires cirrus-qs built with the
+    /// `metrics` feature; otherwise this flag logs a warning and
+    /// is ignored.
+    #[arg(long)]
+    metrics: Option<String>,
 }
 
 /// Entry point — returns a process exit code.
@@ -56,12 +63,14 @@ pub async fn run(args: ManagerArgs) -> i32 {
     }
     reg.register_plan_count("count");
 
-    let server = match Server::builder()
+    let mut sb = Server::builder()
         .control_address(&args.control)
         .document_address(&args.documents)
-        .registry(reg)
-        .build()
-    {
+        .registry(reg);
+    if let Some(addr) = &args.metrics {
+        sb = sb.metrics_address(addr);
+    }
+    let server = match sb.build() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("cirrus qs-manager: bind failed: {e}");

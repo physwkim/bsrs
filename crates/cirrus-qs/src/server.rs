@@ -22,6 +22,10 @@ pub struct ServerBuilder {
     control_address: String,
     document_address: Option<String>,
     registry: Option<Registry>,
+    /// Optional Prometheus `/metrics` HTTP listener address (e.g.
+    /// `127.0.0.1:9090`). Only honored when the `metrics` feature
+    /// is built.
+    metrics_address: Option<String>,
 }
 
 impl Default for ServerBuilder {
@@ -30,6 +34,7 @@ impl Default for ServerBuilder {
             control_address: "tcp://*:60615".into(),
             document_address: Some("tcp://*:60625".into()),
             registry: None,
+            metrics_address: None,
         }
     }
 }
@@ -50,6 +55,13 @@ impl ServerBuilder {
         self.registry = Some(r);
         self
     }
+    /// Configure the Prometheus `/metrics` listener address (e.g.
+    /// `127.0.0.1:9090`). Requires the `metrics` Cargo feature.
+    /// Without the feature this is a no-op.
+    pub fn metrics_address(mut self, addr: impl Into<String>) -> Self {
+        self.metrics_address = Some(addr.into());
+        self
+    }
     /// Commit. Binds the REP / PUB sockets but does not yet start serving.
     pub fn build(self) -> Result<Server> {
         let registry = self
@@ -63,6 +75,27 @@ impl ServerBuilder {
                 Ok(Arc::new(ZmqDocumentSink::bind(a)?) as Arc<dyn DocumentSink>)
             })
             .transpose()?;
+        // Install the Prometheus exporter if a metrics_address was
+        // configured AND the feature is built. Idempotent: once
+        // installed, subsequent ServerBuilder builds with the same
+        // address are no-ops (the recorder is global per-process).
+        #[cfg(feature = "metrics")]
+        if let Some(addr) = self.metrics_address.as_deref() {
+            let parsed: std::net::SocketAddr = addr
+                .parse()
+                .map_err(|e| CirrusError::State(format!("metrics_address parse: {e}")))?;
+            if let Err(e) = crate::metrics::install(parsed) {
+                tracing::warn!("metrics endpoint not installed: {e}");
+            } else {
+                tracing::info!("metrics: Prometheus /metrics on http://{parsed}");
+            }
+        }
+        #[cfg(not(feature = "metrics"))]
+        if self.metrics_address.is_some() {
+            tracing::warn!(
+                "metrics_address set but cirrus-qs was built without --features metrics; ignoring"
+            );
+        }
         Ok(Server {
             socket,
             document_sink,

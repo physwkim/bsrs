@@ -72,6 +72,9 @@ jobs:
       # Kafka document sink — pure-Rust kafka crate, no librdkafka.
       - name: build/test cirrus-callbacks --features kafka
         run: cargo test -p cirrus-callbacks --features kafka --no-fail-fast
+      # Prometheus metrics endpoint for cirrus-qs.
+      - name: build/test cirrus-qs --features metrics
+        run: cargo test -p cirrus-qs --features metrics --no-fail-fast
       # HDF5 detector frame sink — pure-Rust rust-hdf5, no system libhdf5.
       - name: build/test cirrus-stream --features hdf5
         run: cargo test -p cirrus-stream --features hdf5 --no-fail-fast

@@ -37,6 +37,9 @@ pub(crate) fn dispatch(
     let id = req.id.clone();
     let m = req.method.as_str();
 
+    #[cfg(feature = "metrics")]
+    crate::metrics::rpc_call(m);
+
     // Lock check: any method that mutates queue / environment is gated
     // by lock state (mirrors bluesky's lock semantics).
     if !lock_check(m, &state, &req.params) {
