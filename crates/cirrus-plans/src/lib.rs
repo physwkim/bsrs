@@ -1098,3 +1098,58 @@ pub fn tune_centroid(
         };
     })
 }
+
+/// `rel_adaptive_scan(...)` — relative variant of [`adaptive_scan`].
+/// Reads the motor's current readback once at start, adds the
+/// supplied `start`/`stop` offsets, and runs `adaptive_scan` over
+/// that absolute range. After the scan, the motor remains at its
+/// last position; pair with `reset_positions_wrapper` if you want
+/// to restore the original.
+#[allow(clippy::too_many_arguments)]
+pub fn rel_adaptive_scan(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    signal_field: impl Into<String>,
+    motor: Arc<dyn LocatableObj>,
+    motor_reader: Arc<dyn ReadableObj>,
+    start_offset: f64,
+    stop_offset: f64,
+    min_step: f64,
+    max_step: f64,
+    target_delta: f64,
+    backstep: bool,
+) -> Plan {
+    let signal_field = signal_field.into();
+    plan_box(async_stream::stream! {
+        let center = match motor.locate_dyn().await {
+            Ok(loc) => loc.readback,
+            Err(e) => {
+                yield Msg::Fail(format!(
+                    "rel_adaptive_scan({}): locate_dyn failed: {e}",
+                    motor.name()
+                ));
+                return;
+            }
+        };
+        let abs_start = center + start_offset;
+        let abs_stop = center + stop_offset;
+        let movable: Arc<dyn MovableObj> = motor;
+        let mut inner = adaptive_scan(
+            detectors,
+            signal_field,
+            movable,
+            motor_reader,
+            abs_start,
+            abs_stop,
+            min_step,
+            max_step,
+            target_delta,
+            backstep,
+        );
+        use futures::StreamExt;
+        while let Some(item) = inner.next().await {
+            if let cirrus_core::plan::PlanItem::Bare(m) = item {
+                yield m;
+            }
+        }
+    })
+}

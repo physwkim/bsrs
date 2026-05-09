@@ -374,6 +374,40 @@ pub fn reset_positions_wrapper(inner: Plan, motors: Vec<Arc<dyn LocatableObj>>) 
     })
 }
 
+/// `configure_count_time_wrapper(plan, time, detectors)` — yields a
+/// one-shot `Msg::Configure` for each detector setting the
+/// `"count_time"` field to `time`, then runs `inner`. Mirrors
+/// bluesky's `configure_count_time_wrapper`. Useful as a quick
+/// "all-detectors-set-the-same-exposure" knob without having to
+/// bake it into every detector device's API.
+///
+/// Detectors that don't accept `"count_time"` will surface as
+/// `Configure`-time errors via the engine; this wrapper does not
+/// suppress them.
+pub fn configure_count_time_wrapper(
+    inner: Plan,
+    time: f64,
+    detectors: Vec<Arc<dyn cirrus_core::msg::ConfigurableObj>>,
+) -> Plan {
+    plan_box(async_stream::stream! {
+        for d in &detectors {
+            let mut values = HashMap::new();
+            values.insert("count_time".to_string(), Value::from(time));
+            yield Msg::Configure {
+                obj: d.clone(),
+                args: cirrus_core::msg::ConfigureArgs { values },
+            };
+        }
+        let mut inner = inner;
+        use futures::StreamExt;
+        while let Some(item) = inner.next().await {
+            if let cirrus_core::plan::PlanItem::Bare(m) = item {
+                yield m;
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
