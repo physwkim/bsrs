@@ -189,8 +189,7 @@ fn decode_envelope(serializer: Serializer, raw: &[u8]) -> Result<Document> {
         Serializer::Msgpack => rmp_serde::from_slice(body)
             .map_err(|e| CirrusError::Backend(format!("zmq msgpack decode: {e}")))?,
     };
-    let map_err =
-        |e: serde_json::Error| CirrusError::Backend(format!("zmq decode {name}: {e}"));
+    let map_err = |e: serde_json::Error| CirrusError::Backend(format!("zmq decode {name}: {e}"));
 
     use cirrus_event_model as em;
     let doc = match name {

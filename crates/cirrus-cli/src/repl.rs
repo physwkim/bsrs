@@ -26,10 +26,194 @@ use std::sync::Arc;
 
 use cirrus_engine::RunEngine;
 use clap::Args;
+use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::history::FileHistory;
+use rustyline::validate::Validator;
+use rustyline::{Context, Editor, Helper};
 
 use crate::lua_env::build_lua;
+
+/// Static completion of cirrus's well-known Lua globals + namespaces.
+///
+/// rustyline lets us register a `Helper` that provides Tab completions.
+/// We don't introspect the Lua state at completion time (that would
+/// require sharing a `!Send` Lua handle into the editor); instead we
+/// expose the curated list of globals we register at REPL startup.
+struct CirrusReplHelper {
+    keywords: Vec<&'static str>,
+}
+
+impl Default for CirrusReplHelper {
+    fn default() -> Self {
+        let keywords = vec![
+            // Engine handle.
+            "RE",
+            "RE:run",
+            "RE:run_async_with",
+            "RE:pause",
+            "RE:resume",
+            "RE:abort",
+            "RE:halt",
+            "RE:stop",
+            "RE:state",
+            "RE:md_get",
+            "RE:md_set",
+            "RE:md_remove",
+            "RE:md_replace",
+            "RE:is_paused",
+            "RE:current_run_uid",
+            "RE:set_loop_timeout",
+            "RE:set_record_interruptions",
+            "RE:record_interruptions_enabled",
+            "RE:set_input_handler",
+            "RE:set_md_validator",
+            "RE:set_md_normalizer",
+            "RE:set_scan_id_source",
+            "RE:set_before_plan",
+            "RE:set_after_plan",
+            "RE:register_command",
+            "RE:unregister_command",
+            "RE:subscribe",
+            "RE:unsubscribe",
+            "RE:register_pausable",
+            "RE:unregister_pausable",
+            "RE:suspend_until_seconds",
+            "RE:install_signal_handler",
+            "RE:next_suspender_id",
+            "RE:request_pause",
+            "RE:request_suspend",
+            "RE:take_msg_result",
+            "RE:clear_preprocessors",
+            // Device factories.
+            "soft_detector",
+            "soft_motor",
+            "soft_pausable",
+            // Plan factories.
+            "count",
+            "scan",
+            "mvr",
+            "sleep",
+            "null",
+            "plan",
+            "print",
+            // Bluesky-style namespaces (top-level globals).
+            "msg",
+            "bp",
+            "bps",
+            "bpt",
+            "bpp",
+            "tiled",
+            // Common msg.* tokens.
+            "msg.open_run",
+            "msg.close_run",
+            "msg.create",
+            "msg.save",
+            "msg.drop",
+            "msg.read",
+            "msg.set",
+            "msg.trigger",
+            "msg.wait",
+            "msg.sleep",
+            "msg.checkpoint",
+            "msg.clear_checkpoint",
+            "msg.rewindable",
+            "msg.pause",
+            "msg.resume",
+            "msg.null",
+            "msg.stage",
+            "msg.unstage",
+            "msg.stop_dev",
+            "msg.monitor",
+            "msg.unmonitor",
+            "msg.locate",
+            "msg.kickoff",
+            "msg.complete",
+            "msg.prepare",
+            "msg.wait_for",
+            "msg.input",
+            "msg.re_class",
+            "msg.configure",
+            "msg.declare_stream",
+            "msg.collect",
+            "msg.publish",
+            "msg.subscribe",
+            "msg.unsubscribe",
+            "msg.register_pausable",
+            "msg.unregister_pausable",
+            "msg.remove_suspender",
+            // Lua keywords commonly typed.
+            "function",
+            "local",
+            "return",
+            "coroutine.yield",
+            "coroutine.create",
+            "if",
+            "then",
+            "else",
+            "elseif",
+            "end",
+            "for",
+            "while",
+            "do",
+            "repeat",
+            "until",
+            // Slash commands.
+            ":help",
+            ":quit",
+            ":exit",
+            ":reset",
+            ":script",
+        ];
+        Self { keywords }
+    }
+}
+
+impl Completer for CirrusReplHelper {
+    type Candidate = Pair;
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        // Find the start of the word being completed (last whitespace,
+        // `(`, `,`, `=`, `{`, `[`, or BOL).
+        let prefix_end = pos.min(line.len());
+        let bytes = &line.as_bytes()[..prefix_end];
+        let mut start = prefix_end;
+        for (i, &b) in bytes.iter().enumerate().rev() {
+            if matches!(b, b' ' | b'\t' | b'(' | b',' | b'=' | b'{' | b'[' | b'\n') {
+                start = i + 1;
+                break;
+            }
+            start = i;
+        }
+        let word = &line[start..prefix_end];
+        if word.is_empty() {
+            return Ok((start, Vec::new()));
+        }
+        let candidates: Vec<Pair> = self
+            .keywords
+            .iter()
+            .filter(|k| k.starts_with(word))
+            .map(|k| Pair {
+                display: (*k).to_string(),
+                replacement: (*k).to_string(),
+            })
+            .collect();
+        Ok((start, candidates))
+    }
+}
+
+impl Hinter for CirrusReplHelper {
+    type Hint = String;
+}
+impl Highlighter for CirrusReplHelper {}
+impl Validator for CirrusReplHelper {}
+impl Helper for CirrusReplHelper {}
 
 /// Arguments for `cirrus repl`.
 #[derive(Args, Debug)]
@@ -85,13 +269,14 @@ fn run_file(lua: &mlua::Lua, path: &std::path::Path) -> Result<(), String> {
 }
 
 fn interactive_loop(lua: &mlua::Lua) -> i32 {
-    let mut rl: DefaultEditor = match DefaultEditor::new() {
+    let mut rl: Editor<CirrusReplHelper, FileHistory> = match Editor::new() {
         Ok(r) => r,
         Err(e) => {
             eprintln!("cirrus repl: rustyline init failed: {e}");
             return 2;
         }
     };
+    rl.set_helper(Some(CirrusReplHelper::default()));
     let _ = rl.load_history(&history_path());
 
     println!("cirrus repl (Lua 5.4) — type `:help` for commands, Ctrl-D to exit");
