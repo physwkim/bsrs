@@ -203,19 +203,64 @@ pub(crate) fn dispatch(
         ),
         "unlock" => lock_release(id, &state, &req.params),
 
+        // -- bluesky-queueserver wire compat: many clients always
+        //    call these even when the server side does the work
+        //    synchronously. Return a "completed / no-op" shape so
+        //    naive clients don't error.
+        "task_status" => RpcResponse::ok(
+            id,
+            json!({
+                "success": true,
+                "msg": "",
+                "status": "completed",
+                "task_uid": req.params.get("task_uid").cloned().unwrap_or(Value::Null),
+            }),
+        ),
+        "task_result" => RpcResponse::ok(
+            id,
+            json!({
+                "success": true,
+                "msg": "",
+                "status": "completed",
+                "result": {
+                    "return_value": null,
+                    "traceback": "",
+                    "msg": "",
+                    "success": true,
+                    "task_uid": req.params.get("task_uid").cloned().unwrap_or(Value::Null),
+                },
+            }),
+        ),
+        "manager_test" => RpcResponse::ok(
+            id,
+            json!({"success": true, "msg": ""}),
+        ),
+        "permissions_get" => RpcResponse::ok(
+            id,
+            json!({
+                "success": true,
+                "msg": "",
+                // cirrus-qs has no RBAC layer yet — return the
+                // permissive default that allows everything.
+                "user_group_permissions": {
+                    "user_groups": {
+                        "root": {"allowed_plans": [".*"], "allowed_devices": [".*"]},
+                        "primary": {"allowed_plans": [".*"], "allowed_devices": [".*"]},
+                    },
+                },
+                "user_group_permissions_uid": "static",
+            }),
+        ),
+
         // -- not-implemented stubs (registered so clients see the method
         //    name but get a defined error). --------------------------------
         "permissions_reload"
-        | "permissions_get"
         | "permissions_set"
         | "script_upload"
         | "function_execute"
-        | "task_result"
-        | "task_status"
         | "kernel_interrupt"
         | "manager_stop"
-        | "manager_kill"
-        | "manager_test" => RpcResponse::err(
+        | "manager_kill" => RpcResponse::err(
             id,
             codes::NOT_IMPLEMENTED,
             format!(
@@ -305,6 +350,8 @@ fn status_response(
             "success": true,
             "msg": "",
             "manager_state": st.state.map(|s| s.as_str()).unwrap_or("environment_closed"),
+            "manager_version": env!("CARGO_PKG_VERSION"),
+            "msg_recv": "",
             "items_in_queue": q.len(),
             "items_in_history": q.history_size(),
             "running_item_uid": st.current_run_uid,

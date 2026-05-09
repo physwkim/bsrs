@@ -500,3 +500,40 @@ async fn status_includes_bluesky_fields() {
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn task_status_returns_completed_for_any_uid() {
+    // bluesky-queueserver clients always poll task_status after
+    // queue_item_execute. cirrus-qs runs synchronously, so we don't
+    // track tasks — but returning a clean "completed" shape keeps
+    // those clients happy.
+    let port = rand_port();
+    let reg = Registry::new();
+    let shutdown = spawn_server(reg, port);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(port);
+    let r = rpc(&req, "task_status", json!({"task_uid": "anything"}));
+    assert_eq!(r["result"]["status"], "completed");
+    let r = rpc(&req, "task_result", json!({"task_uid": "anything"}));
+    assert_eq!(r["result"]["status"], "completed");
+    let r = rpc(&req, "manager_test", json!({}));
+    assert_eq!(r["result"]["success"], true);
+    let r = rpc(&req, "permissions_get", json!({}));
+    assert!(r["result"]["user_group_permissions"].is_object());
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_includes_manager_version() {
+    let port = rand_port();
+    let reg = Registry::new();
+    let shutdown = spawn_server(reg, port);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(port);
+    let s = rpc(&req, "status", json!({}));
+    let v = &s["result"]["manager_version"];
+    assert!(v.is_string(), "manager_version should be a string, got {v}");
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
