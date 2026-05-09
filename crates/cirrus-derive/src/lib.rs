@@ -288,7 +288,7 @@ pub fn lua_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
         for (i, ty) in arg_types.iter().enumerate() {
             let ident = quote::format_ident!("arg{}", i);
             arg_parses.push(quote! {
-                let #ident: #ty = ::serde_json::from_value(args[#i].clone())
+                let #ident: #ty = ::cirrus_core::lua_exposable::__macro_support::serde_json::from_value(args[#i].clone())
                     .map_err(|e| format!(
                         concat!("lua_method '", #fn_name_str, "': arg #", stringify!(#i), ": {}"),
                         e
@@ -317,14 +317,14 @@ pub fn lua_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     quote! {
                         let r = #call;
                         match r {
-                            Ok(v) => ::serde_json::to_value(v).map_err(|e| e.to_string()),
+                            Ok(v) => ::cirrus_core::lua_exposable::__macro_support::serde_json::to_value(v).map_err(|e| e.to_string()),
                             Err(e) => Err(::std::string::ToString::to_string(&e)),
                         }
                     }
                 } else {
                     quote! {
                         let v = #call;
-                        ::serde_json::to_value(v).map_err(|e| e.to_string())
+                        ::cirrus_core::lua_exposable::__macro_support::serde_json::to_value(v).map_err(|e| e.to_string())
                     }
                 }
             }
