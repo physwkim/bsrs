@@ -263,6 +263,23 @@ pub fn lua_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
         .into();
     }
 
+    // Trait impls (`impl SomeTrait for Foo { ... }`) would silently
+    // generate an `impl LuaExposable for Foo` while the user expected
+    // the macro to operate on the trait. Two such tagged impls on
+    // the same type would also conflict (only one `LuaExposable` impl
+    // is allowed per type). Reject — `#[lua_methods]` is for inherent
+    // `impl Type { ... }` blocks only.
+    if let Some((_, trait_path, _)) = &input.trait_ {
+        return syn::Error::new_spanned(
+            trait_path.clone(),
+            "#[lua_methods] applies to inherent impl blocks only \
+             (`impl Type { ... }`), not trait impls. Move the tagged \
+             methods into a separate inherent impl on the same type.",
+        )
+        .to_compile_error()
+        .into();
+    }
+
     let mut entries: Vec<TokenStream2> = Vec::new();
 
     for it in &input.items {

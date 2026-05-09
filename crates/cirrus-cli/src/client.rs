@@ -276,26 +276,13 @@ mod repl {
         };
 
         let ctx = zmq::Context::new();
-        let sock = match ctx.socket(zmq::REQ) {
+        let mut sock = match build_req_socket(&ctx, &args.address, args.timeout_ms) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("cirrus qs repl: zmq REQ socket: {e}");
+                eprintln!("cirrus qs repl: {e}");
                 return 1;
             }
         };
-        if let Err(e) = sock.set_rcvtimeo(args.timeout_ms) {
-            eprintln!("set_rcvtimeo: {e}");
-            return 1;
-        }
-        if let Err(e) = sock.set_sndtimeo(args.timeout_ms) {
-            eprintln!("set_sndtimeo: {e}");
-            return 1;
-        }
-        let _ = sock.set_linger(0);
-        if let Err(e) = sock.connect(&args.address) {
-            eprintln!("connect {}: {e}", args.address);
-            return 1;
-        }
 
         // Optional: open environment.
         if !no_env_open {
@@ -303,7 +290,14 @@ mod repl {
                 Some(k) => json!({"api_key": k}),
                 None => json!({}),
             };
-            match send_one(&sock, "environment_open", env_params) {
+            match send_resilient(
+                &mut sock,
+                &ctx,
+                &args.address,
+                args.timeout_ms,
+                "environment_open",
+                env_params,
+            ) {
                 Ok(v) => {
                     if v.get("error").is_some()
                         && !v["error"]["message"]
@@ -366,7 +360,14 @@ mod repl {
             if let Some(k) = &api_key {
                 params["api_key"] = json!(k);
             }
-            let resp = match send_one(&sock, "lua_eval", params) {
+            let resp = match send_resilient(
+                &mut sock,
+                &ctx,
+                &args.address,
+                args.timeout_ms,
+                "lua_eval",
+                params,
+            ) {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("lua_eval: {e}");
@@ -392,7 +393,14 @@ mod repl {
             }
             loop {
                 std::thread::sleep(Duration::from_millis(poll_ms));
-                let s = match send_one(&sock, "task_status", status_params.clone()) {
+                let s = match send_resilient(
+                    &mut sock,
+                    &ctx,
+                    &args.address,
+                    args.timeout_ms,
+                    "task_status",
+                    status_params.clone(),
+                ) {
                     Ok(v) => v,
                     Err(e) => {
                         eprintln!("task_status: {e}");
@@ -404,7 +412,14 @@ mod repl {
                     continue;
                 }
                 // Fetch the result.
-                let r = match send_one(&sock, "task_result", status_params.clone()) {
+                let r = match send_resilient(
+                    &mut sock,
+                    &ctx,
+                    &args.address,
+                    args.timeout_ms,
+                    "task_result",
+                    status_params.clone(),
+                ) {
                     Ok(v) => v,
                     Err(e) => {
                         eprintln!("task_result: {e}");
@@ -435,6 +450,56 @@ mod repl {
             let _ = rl.save_history(p);
         }
         0
+    }
+
+    fn build_req_socket(
+        ctx: &zmq::Context,
+        address: &str,
+        timeout_ms: i32,
+    ) -> Result<zmq::Socket, String> {
+        let s = ctx
+            .socket(zmq::REQ)
+            .map_err(|e| format!("zmq REQ socket: {e}"))?;
+        s.set_rcvtimeo(timeout_ms)
+            .map_err(|e| format!("set_rcvtimeo: {e}"))?;
+        s.set_sndtimeo(timeout_ms)
+            .map_err(|e| format!("set_sndtimeo: {e}"))?;
+        let _ = s.set_linger(0);
+        s.connect(address)
+            .map_err(|e| format!("connect {address}: {e}"))?;
+        Ok(s)
+    }
+
+    /// Try `send_one`; on a finite-state-machine error (REQ socket
+    /// stuck after a prior recv timeout) or send/recv timeout, drop
+    /// the socket and recreate it once. Daemon restarts mid-session
+    /// otherwise wedge the REPL until the user exits.
+    pub(super) fn send_resilient(
+        sock: &mut zmq::Socket,
+        ctx: &zmq::Context,
+        address: &str,
+        timeout_ms: i32,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, String> {
+        match send_one(sock, method, params.clone()) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                // Recreate the socket and retry once. The error
+                // string covers both EFSM ("Operation cannot be
+                // performed in this state") and timeout shapes.
+                if e.contains("EFSM")
+                    || e.contains("Operation cannot")
+                    || e.contains("Resource temporarily unavailable")
+                    || e.contains("EAGAIN")
+                {
+                    *sock = build_req_socket(ctx, address, timeout_ms)?;
+                    send_one(sock, method, params)
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 
     fn send_one(sock: &zmq::Socket, method: &str, params: Value) -> Result<Value, String> {
