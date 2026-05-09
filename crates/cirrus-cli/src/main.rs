@@ -15,6 +15,7 @@
 
 mod client;
 mod doctor;
+mod frame_source;
 mod lua_env;
 #[cfg(feature = "tiled")]
 mod lua_tiled;
@@ -48,6 +49,10 @@ enum TopCmd {
     /// Inspect / migrate cirrus's on-disk state directory between
     /// versions.
     Migrate(migrate::MigrateArgs),
+    /// Run a frame-source process: D21 multi-process IPC. The frame
+    /// data plane stays local (writes to disk); only Document-plane
+    /// messages cross to the RunEngine via ZMQ PUB.
+    FrameSource(frame_source::FrameSourceArgs),
 }
 
 fn main() {
@@ -74,6 +79,7 @@ fn main() {
         }
         TopCmd::Doctor(a) => doctor::run(a),
         TopCmd::Migrate(a) => migrate::run(a),
+        TopCmd::FrameSource(a) => frame_source::run(a),
     };
     std::process::exit(exit);
 }

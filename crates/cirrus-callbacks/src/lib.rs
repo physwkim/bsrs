@@ -18,6 +18,11 @@ mod zmq_sink;
 #[cfg(feature = "zmq")]
 pub use zmq_sink::{Serializer, ZmqDocumentSink};
 
+#[cfg(feature = "zmq")]
+mod zmq_source;
+#[cfg(feature = "zmq")]
+pub use zmq_source::ZmqDocumentSource;
+
 #[cfg(feature = "tiled")]
 mod tiled_sink;
 #[cfg(feature = "tiled")]

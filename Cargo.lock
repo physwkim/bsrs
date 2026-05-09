@@ -635,6 +635,7 @@ dependencies = [
  "serde_json",
  "tiled-client",
  "tokio",
+ "tokio-util",
  "tracing",
  "url",
  "zmq",
