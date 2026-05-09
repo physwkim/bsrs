@@ -26,11 +26,27 @@ cirrus-qs.workspace = true
 cirrus-backend-soft.workspace = true
 tiled-client = { git = "https://github.com/physwkim/tiled-rs.git", branch = "main", optional = true }
 url = { version = "2", optional = true }
+cirrus-stream = { workspace = true, optional = true }
+cirrus-protocols-async = { workspace = true, optional = true }
+epics-pva-rs = { version = "0.15.0", optional = true }
+bytes = { workspace = true, optional = true }
 
 [features]
 default = []
 # Expose `tiled.*` Lua bindings (from_uri / keys / metadata / get).
 tiled = ["dep:tiled-client", "dep:url"]
+# Wire real backends (PvaMonitorSource + Hdf5FrameSink) into the
+# `cirrus frame-source` subcommand. Without this feature the
+# subcommand is a scaffolded stub that prints args and exits.
+frame-source = [
+    "dep:cirrus-stream",
+    "dep:cirrus-protocols-async",
+    "dep:epics-pva-rs",
+    "dep:bytes",
+    "cirrus-stream/pva",
+    "cirrus-stream/hdf5",
+    "cirrus-callbacks/zmq",
+]
 
 [[bin]]
 name = "cirrus"

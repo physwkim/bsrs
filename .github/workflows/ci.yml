@@ -89,3 +89,6 @@ jobs:
       # Real EPICS PVA backend.
       - name: build cirrus-backend-epics-pva --features real
         run: cargo build -p cirrus-backend-epics-pva --features real
+      # Wired `cirrus frame-source` (PVA + HDF5 + ZMQ).
+      - name: build cirrus-cli --features frame-source
+        run: cargo build -p cirrus-cli --features frame-source
