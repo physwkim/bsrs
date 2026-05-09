@@ -20,7 +20,7 @@
 //! lifetime of the daemon process — globals set by previous evals
 //! survive across calls.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
 use cirrus_engine::RunEngine;
@@ -32,8 +32,12 @@ use crate::lua_env::{build_lua, LuaDevice};
 
 /// Daemon-side Lua bridge.
 pub struct ManagerLuaState {
-    /// Built lazily on first eval (needs an open engine).
-    lua: TMutex<Option<Lua>>,
+    /// Built lazily on first eval (needs an open engine). Held
+    /// behind a `std::sync::Mutex` (not tokio's) so we can move the
+    /// `Arc` into a `spawn_blocking` task — eval is sync work and
+    /// often calls back into `cirrus_runtime().block_on(...)`,
+    /// which deadlocks / panics from a tokio async context.
+    lua: Arc<StdMutex<Option<Lua>>>,
     /// Engine slot — populated by `environment_open`. We snapshot
     /// the Arc on lazy build.
     engine_slot: Arc<TMutex<Option<Arc<RunEngine>>>>,
@@ -47,7 +51,7 @@ impl ManagerLuaState {
     /// the first `eval()` call (when the engine is guaranteed open).
     pub fn new(engine_slot: Arc<TMutex<Option<Arc<RunEngine>>>>, registry: Arc<Registry>) -> Self {
         Self {
-            lua: TMutex::new(None),
+            lua: Arc::new(StdMutex::new(None)),
             engine_slot,
             registry,
         }
@@ -86,9 +90,10 @@ impl ManagerLuaState {
 #[async_trait]
 impl LuaEvaluator for ManagerLuaState {
     async fn eval(&self, source: &str) -> EvalResult {
-        let mut lua_lock = self.lua.lock().await;
-
-        if lua_lock.is_none() {
+        // Lazy-build the Lua state if it doesn't exist yet. We need
+        // to do this on the async side because we lock the engine
+        // slot (a tokio mutex).
+        if self.lua.lock().unwrap().is_none() {
             let re = match self.engine_slot.lock().await.as_ref() {
                 Some(e) => e.clone(),
                 None => {
@@ -104,7 +109,7 @@ impl LuaEvaluator for ManagerLuaState {
                 }
             };
             match Self::build_state(re, &self.registry) {
-                Ok(l) => *lua_lock = Some(l),
+                Ok(l) => *self.lua.lock().unwrap() = Some(l),
                 Err(e) => {
                     return EvalResult {
                         stdout: String::new(),
@@ -115,8 +120,22 @@ impl LuaEvaluator for ManagerLuaState {
             }
         }
 
-        let lua = lua_lock.as_mut().unwrap();
-        eval_in(lua, source)
+        // Run the sync eval on a blocking thread. Lua callbacks may
+        // call `cirrus_runtime().block_on(...)` (RE:run, motor:set,
+        // etc.) which would deadlock if executed on a tokio worker.
+        let lua = self.lua.clone();
+        let src = source.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut g = lua.lock().unwrap();
+            let lua_ref = g.as_mut().expect("lua state was built above");
+            eval_in(lua_ref, &src)
+        })
+        .await
+        .unwrap_or_else(|e| EvalResult {
+            stdout: String::new(),
+            return_value: None,
+            error: Some(format!("lua_eval task join: {e}")),
+        })
     }
 }
 

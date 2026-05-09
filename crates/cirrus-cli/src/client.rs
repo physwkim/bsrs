@@ -54,6 +54,23 @@ enum Cmd {
         /// Device name as registered server-side.
         name: String,
     },
+    /// Attach to a running cirrus-qs daemon for an interactive Lua
+    /// REPL. Each line is sent to the server's `lua_eval` RPC; the
+    /// server runs it against the daemon's shared mlua state and the
+    /// client polls `task_status` / `task_result` until the eval
+    /// completes. Requires the server to be built with a Lua
+    /// evaluator (the default `cirrus qs-manager` does this).
+    Repl {
+        /// API key for RBAC (`lua_eval` is admin-class).
+        #[arg(long)]
+        api_key: Option<String>,
+        /// Skip the auto `environment_open` at start.
+        #[arg(long)]
+        no_env_open: bool,
+        /// Polling interval (ms) between `task_status` checks.
+        #[arg(long, default_value_t = 50)]
+        poll_ms: u64,
+    },
     /// Send a raw JSON-RPC method by name. Fallback for any method not
     /// exposed by a dedicated subcommand.
     Raw {
@@ -217,6 +234,13 @@ enum LockCmd {
 
 /// Entry point — returns process exit code.
 pub async fn run(args: ClientArgs) -> i32 {
+    // Repl takes its own long-lived loop; everything else is a
+    // single REQ-REP round-trip.
+    if let Cmd::Repl { .. } = &args.cmd {
+        return tokio::task::spawn_blocking(move || repl::run_repl(args))
+            .await
+            .unwrap_or(1);
+    }
     let result = tokio::task::spawn_blocking(move || dispatch(args))
         .await
         .unwrap_or_else(|_| Err("client task panicked".into()));
@@ -233,6 +257,197 @@ pub async fn run(args: ClientArgs) -> i32 {
             eprintln!("cirrus qs: {e}");
             1
         }
+    }
+}
+
+mod repl {
+    use super::{ClientArgs, Cmd};
+    use serde_json::{json, Value};
+    use std::time::Duration;
+
+    pub fn run_repl(args: ClientArgs) -> i32 {
+        let (api_key, no_env_open, poll_ms) = match &args.cmd {
+            Cmd::Repl {
+                api_key,
+                no_env_open,
+                poll_ms,
+            } => (api_key.clone(), *no_env_open, *poll_ms),
+            _ => unreachable!(),
+        };
+
+        let ctx = zmq::Context::new();
+        let sock = match ctx.socket(zmq::REQ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("cirrus qs repl: zmq REQ socket: {e}");
+                return 1;
+            }
+        };
+        if let Err(e) = sock.set_rcvtimeo(args.timeout_ms) {
+            eprintln!("set_rcvtimeo: {e}");
+            return 1;
+        }
+        if let Err(e) = sock.set_sndtimeo(args.timeout_ms) {
+            eprintln!("set_sndtimeo: {e}");
+            return 1;
+        }
+        let _ = sock.set_linger(0);
+        if let Err(e) = sock.connect(&args.address) {
+            eprintln!("connect {}: {e}", args.address);
+            return 1;
+        }
+
+        // Optional: open environment.
+        if !no_env_open {
+            let env_params = match &api_key {
+                Some(k) => json!({"api_key": k}),
+                None => json!({}),
+            };
+            match send_one(&sock, "environment_open", env_params) {
+                Ok(v) => {
+                    if v.get("error").is_some()
+                        && !v["error"]["message"]
+                            .as_str()
+                            .unwrap_or("")
+                            .contains("already")
+                    {
+                        eprintln!("environment_open warning: {v}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("environment_open: {e}");
+                    return 1;
+                }
+            }
+        }
+
+        println!(
+            "cirrus qs repl — connected to {}\n  type Lua expressions, Ctrl-D to exit",
+            args.address
+        );
+
+        let mut rl = match rustyline::DefaultEditor::new() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("rustyline: {e}");
+                return 1;
+            }
+        };
+        let history_path = std::env::var_os("HOME").map(|h| {
+            let mut p = std::path::PathBuf::from(h);
+            p.push(".cirrus_qs_repl_history");
+            p
+        });
+        if let Some(p) = &history_path {
+            let _ = rl.load_history(p);
+        }
+
+        loop {
+            let line = match rl.readline("qs> ") {
+                Ok(l) => l,
+                Err(rustyline::error::ReadlineError::Eof)
+                | Err(rustyline::error::ReadlineError::Interrupted) => {
+                    println!();
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("readline: {e}");
+                    break;
+                }
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let _ = rl.add_history_entry(trimmed);
+
+            // Submit lua_eval and poll until done.
+            let mut params = json!({"source": trimmed});
+            if let Some(k) = &api_key {
+                params["api_key"] = json!(k);
+            }
+            let resp = match send_one(&sock, "lua_eval", params) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("lua_eval: {e}");
+                    continue;
+                }
+            };
+            if let Some(err) = resp.get("error") {
+                eprintln!("error: {err}");
+                continue;
+            }
+            let task_uid = match resp["result"]["task_uid"].as_str() {
+                Some(s) => s.to_string(),
+                None => {
+                    eprintln!("lua_eval: no task_uid in response: {resp}");
+                    continue;
+                }
+            };
+
+            // Poll task_status.
+            let mut status_params = json!({"task_uid": &task_uid});
+            if let Some(k) = &api_key {
+                status_params["api_key"] = json!(k);
+            }
+            loop {
+                std::thread::sleep(Duration::from_millis(poll_ms));
+                let s = match send_one(&sock, "task_status", status_params.clone()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("task_status: {e}");
+                        break;
+                    }
+                };
+                let st = s["result"]["status"].as_str().unwrap_or("?");
+                if st == "running" {
+                    continue;
+                }
+                // Fetch the result.
+                let r = match send_one(&sock, "task_result", status_params.clone()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("task_result: {e}");
+                        break;
+                    }
+                };
+                let stdout = r["result"]["result"]["stdout"].as_str().unwrap_or("");
+                let return_value = r["result"]["result"]["return_value"].as_str();
+                let success = r["result"]["result"]["success"].as_bool().unwrap_or(false);
+                let traceback = r["result"]["result"]["traceback"].as_str().unwrap_or("");
+                if !stdout.is_empty() {
+                    println!("{stdout}");
+                }
+                if success {
+                    if let Some(rv) = return_value {
+                        if rv != "nil" {
+                            println!("=> {rv}");
+                        }
+                    }
+                } else {
+                    eprintln!("error: {traceback}");
+                }
+                break;
+            }
+        }
+
+        if let Some(p) = &history_path {
+            let _ = rl.save_history(p);
+        }
+        0
+    }
+
+    fn send_one(sock: &zmq::Socket, method: &str, params: Value) -> Result<Value, String> {
+        let req = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+            "id": 1,
+        });
+        let bytes = serde_json::to_vec(&req).map_err(|e| format!("encode: {e}"))?;
+        sock.send(bytes, 0).map_err(|e| format!("send: {e}"))?;
+        let resp = sock.recv_bytes(0).map_err(|e| format!("recv: {e}"))?;
+        serde_json::from_slice(&resp).map_err(|e| format!("decode: {e}"))
     }
 }
 
@@ -332,6 +547,8 @@ fn dispatch(args: ClientArgs) -> Result<Value, String> {
         Cmd::Lock(LockCmd::Info) => ("lock_info".into(), json!({})),
         Cmd::Lock(LockCmd::Release { key }) => ("unlock".into(), json!({"lock_key": key})),
         Cmd::Inspect { name } => ("device_inspect".into(), json!({"name": name})),
+        // Repl is handled in `run()` before dispatch(); unreachable here.
+        Cmd::Repl { .. } => return Err("internal: Repl reached dispatch".into()),
         Cmd::Raw { method, params } => {
             let parsed: Value =
                 serde_json::from_str(&params).map_err(|e| format!("invalid params JSON: {e}"))?;
