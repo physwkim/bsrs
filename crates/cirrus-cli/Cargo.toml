@@ -6,7 +6,7 @@ license.workspace = true
 description = "cirrus CLI — qs-manager (server) and qs (client) subcommands."
 
 [dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "rt-multi-thread", "macros", "sync", "time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 mlua.workspace = true

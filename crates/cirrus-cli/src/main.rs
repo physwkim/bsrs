@@ -14,10 +14,12 @@
 #![deny(missing_docs)]
 
 mod client;
+mod doctor;
 mod lua_env;
 #[cfg(feature = "tiled")]
 mod lua_tiled;
 mod manager;
+mod migrate;
 mod repl;
 
 use clap::{Parser, Subcommand};
@@ -40,6 +42,12 @@ enum TopCmd {
     /// in-process `RunEngine`; no qs-manager required. IPython-like
     /// development surface for plans.
     Repl(repl::ReplArgs),
+    /// Validate the local environment for running cirrus: tokio,
+    /// EPICS env vars, optional Tiled / Kafka reachability.
+    Doctor(doctor::DoctorArgs),
+    /// Inspect / migrate cirrus's on-disk state directory between
+    /// versions.
+    Migrate(migrate::MigrateArgs),
 }
 
 fn main() {
@@ -64,6 +72,8 @@ fn main() {
                 .expect("tokio runtime");
             rt.block_on(client::run(a))
         }
+        TopCmd::Doctor(a) => doctor::run(a),
+        TopCmd::Migrate(a) => migrate::run(a),
     };
     std::process::exit(exit);
 }
