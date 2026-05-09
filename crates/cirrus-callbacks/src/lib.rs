@@ -23,4 +23,9 @@ mod tiled_sink;
 #[cfg(feature = "tiled")]
 pub use tiled_sink::TiledSink;
 
+#[cfg(feature = "kafka")]
+mod kafka_sink;
+#[cfg(feature = "kafka")]
+pub use kafka_sink::{KafkaDocumentSink, Serializer as KafkaSerializer};
+
 pub use doc_name::document_name;
