@@ -1082,6 +1082,10 @@ pub fn build_lua(re: Arc<RunEngine>) -> mlua::Result<Lua> {
     // Plan factories. Each returns a `LuaPlan` userdata.
     register_plan_factories(&lua)?;
 
+    // Optional read-side `tiled.*` namespace.
+    #[cfg(feature = "tiled")]
+    crate::lua_tiled::register(&lua)?;
+
     Ok(lua)
 }
 

@@ -1231,3 +1231,21 @@ print("start=" .. tostring(got))
     assert_eq!(code, 0, "stderr: {err}");
     assert!(out.contains("\"operator\":\"carol\""), "out = {out}");
 }
+
+#[cfg(feature = "tiled")]
+#[test]
+fn tiled_global_namespace_exists() {
+    // Smoke test for the tiled.* Lua surface: when the cirrus-cli
+    // binary is built with --features tiled, the global `tiled`
+    // table is available with `from_uri` callable. We don't reach
+    // a real Tiled server here — just verify the binding compiles
+    // and the namespace resolves.
+    let (_out, err, code) = run_script(
+        r#"
+assert(type(tiled) == "table", "tiled global must be a table")
+assert(type(tiled.from_uri) == "function", "tiled.from_uri must be a function")
+print("ok")
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+}

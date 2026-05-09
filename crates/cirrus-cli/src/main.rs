@@ -15,6 +15,8 @@
 
 mod client;
 mod lua_env;
+#[cfg(feature = "tiled")]
+mod lua_tiled;
 mod manager;
 mod repl;
 

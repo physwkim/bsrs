@@ -657,9 +657,11 @@ dependencies = [
  "mlua",
  "rustyline",
  "serde_json",
+ "tiled-client",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
  "zmq",
 ]
 

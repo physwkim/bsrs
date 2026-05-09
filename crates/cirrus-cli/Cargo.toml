@@ -24,6 +24,13 @@ cirrus-callbacks.workspace = true
 cirrus-plans.workspace = true
 cirrus-qs.workspace = true
 cirrus-backend-soft.workspace = true
+tiled-client = { git = "https://github.com/physwkim/tiled-rs.git", branch = "main", optional = true }
+url = { version = "2", optional = true }
+
+[features]
+default = []
+# Expose `tiled.*` Lua bindings (from_uri / keys / metadata / get).
+tiled = ["dep:tiled-client", "dep:url"]
 
 [[bin]]
 name = "cirrus"
