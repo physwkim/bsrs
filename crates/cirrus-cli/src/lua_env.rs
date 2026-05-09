@@ -64,6 +64,35 @@ pub struct LuaDevice {
 impl UserData for LuaDevice {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("name", |_, dev, ()| Ok(dev.name.clone()));
+        // dev:inspect()  -> table of current state (sync, no I/O)
+        // Calls NamedObj::inspect_dyn on the first attached role.
+        // Always succeeds (default impl returns {name, type:"Unknown"}).
+        methods.add_method("inspect", |lua, dev, ()| {
+            let v: serde_json::Value = if let Some(r) = &dev.readable {
+                r.inspect_dyn()
+            } else if let Some(m) = &dev.movable {
+                m.inspect_dyn()
+            } else if let Some(l) = &dev.locatable {
+                l.inspect_dyn()
+            } else if let Some(t) = &dev.triggerable {
+                t.inspect_dyn()
+            } else if let Some(s) = &dev.stageable {
+                s.inspect_dyn()
+            } else if let Some(s) = &dev.stoppable {
+                s.inspect_dyn()
+            } else if let Some(m) = &dev.monitorable {
+                m.inspect_dyn()
+            } else if let Some(f) = &dev.flyable {
+                f.inspect_dyn()
+            } else if let Some(c) = &dev.collectable {
+                c.inspect_dyn()
+            } else if let Some(p) = &dev.pausable {
+                p.inspect_dyn()
+            } else {
+                serde_json::json!({"name": dev.name, "type": "Unknown"})
+            };
+            Ok(json_to_lua(lua, &v))
+        });
         methods.add_meta_method("__tostring", |_, dev, ()| {
             let mut roles = Vec::new();
             if dev.readable.is_some() {

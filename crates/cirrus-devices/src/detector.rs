@@ -180,6 +180,14 @@ where
     fn name(&self) -> &str {
         &self.name
     }
+    fn inspect_dyn(&self) -> serde_json::Value {
+        serde_json::json!({
+            "name": self.name,
+            "type": "StandardDetector",
+            "control": std::any::type_name::<C>(),
+            "writer": std::any::type_name::<W>(),
+        })
+    }
 }
 
 #[async_trait]

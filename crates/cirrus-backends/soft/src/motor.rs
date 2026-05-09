@@ -65,6 +65,18 @@ impl NamedObj for SoftMotor {
     fn name(&self) -> &str {
         &self.name
     }
+    fn inspect_dyn(&self) -> serde_json::Value {
+        serde_json::json!({
+            "name": self.name,
+            "type": "SoftMotor",
+            "setpoint": self.backend.current_setpoint(),
+            "readback": self.backend.current_value(),
+            "units": self.units,
+            "kind": format!("{:?}", self.kind),
+            "subscribers": self.backend.subscriber_count(),
+            "connected": true,
+        })
+    }
 }
 
 #[async_trait]

@@ -522,6 +522,29 @@ fn document_label(d: &cirrus_event_model::Document) -> &'static str {
 pub trait NamedObj: Send + Sync {
     /// Stable identifier for logs and error messages.
     fn name(&self) -> &str;
+
+    /// Dump the device's current state as a JSON value, for
+    /// debugging and operational inspection. The default returns
+    /// `{ "name": <name>, "type": "Unknown" }`. Devices should
+    /// override to surface readback / setpoint / connection state /
+    /// pending status / error fields — whatever a debugger needs to
+    /// answer "is this device healthy and what is it doing?".
+    ///
+    /// The shape is unspecified beyond the `name` and `type` fields;
+    /// downstream consumers (`obj:inspect()` in Lua, `cirrus qs
+    /// inspect <name>` over RPC) treat it as an opaque JSON object
+    /// for display.
+    ///
+    /// This method is sync and best-effort: it must not block on I/O
+    /// or hold heavy locks. For values requiring I/O (e.g. fresh
+    /// readback from a real PV), prefer caching the last observed
+    /// value rather than blocking the inspect call.
+    fn inspect_dyn(&self) -> serde_json::Value {
+        serde_json::json!({
+            "name": self.name(),
+            "type": "Unknown",
+        })
+    }
 }
 
 /// Anything that can be `read()`.

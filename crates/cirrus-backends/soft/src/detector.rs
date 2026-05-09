@@ -50,6 +50,15 @@ impl NamedObj for SoftDetector {
     fn name(&self) -> &str {
         &self.name
     }
+    fn inspect_dyn(&self) -> serde_json::Value {
+        serde_json::json!({
+            "name": self.name,
+            "type": "SoftDetector",
+            "counts": self.counts.load(Ordering::SeqCst),
+            "data_key": format!("{}_counts", self.name),
+            "connected": true,
+        })
+    }
 }
 
 #[async_trait]

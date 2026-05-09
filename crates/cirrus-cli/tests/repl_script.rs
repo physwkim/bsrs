@@ -1249,3 +1249,28 @@ print("ok")
     );
     assert_eq!(code, 0, "stderr: {err}");
 }
+
+#[test]
+fn inspect_dumps_soft_motor_state() {
+    let (out, err, code) = run_script(
+        r#"
+local m1 = soft_motor("m1", 0.5)
+local s = m1:inspect()
+assert(s.name == "m1", "name should be m1, got " .. tostring(s.name))
+assert(s.type == "SoftMotor", "type should be SoftMotor, got " .. tostring(s.type))
+assert(s.readback == 0.5, "readback should be 0.5, got " .. tostring(s.readback))
+assert(s.connected == true, "connected should be true")
+print("motor.inspect ok")
+
+local d1 = soft_detector("d1")
+local sd = d1:inspect()
+assert(sd.name == "d1")
+assert(sd.type == "SoftDetector")
+assert(type(sd.counts) == "number")
+print("detector.inspect ok")
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}\nstdout: {out}");
+    assert!(out.contains("motor.inspect ok"), "out = {out}");
+    assert!(out.contains("detector.inspect ok"), "out = {out}");
+}

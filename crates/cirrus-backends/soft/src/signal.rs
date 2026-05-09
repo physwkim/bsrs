@@ -101,6 +101,22 @@ where
         Self { inner }
     }
 
+    /// Read the current value synchronously, for inspect/debug paths
+    /// that must not block. Returns a clone.
+    pub fn current_value(&self) -> T {
+        self.inner.value.lock().unwrap().clone()
+    }
+
+    /// Read the last setpoint synchronously.
+    pub fn current_setpoint(&self) -> T {
+        self.inner.setpoint.lock().unwrap().clone()
+    }
+
+    /// Number of subscribers currently registered on this backend.
+    pub fn subscriber_count(&self) -> usize {
+        self.inner.callbacks.lock().unwrap().len()
+    }
+
     /// Synchronously poke a new value (for sim drivers).
     pub fn write_now(&self, v: T) {
         *self.inner.value.lock().unwrap() = v.clone();
