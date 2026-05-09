@@ -14,4 +14,6 @@ pub use engine::{
     SubscriptionId, SuspendCallback,
 };
 pub use sink::{BroadcastSink, DocumentSink};
-pub use suspender::Suspender;
+pub use suspender::{
+    SuspendBoolHigh, SuspendBoolLow, SuspendThreshold, Suspender, ThresholdDirection,
+};

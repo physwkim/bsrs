@@ -242,6 +242,101 @@ async fn unknown_custom_command_errors() {
 }
 
 #[tokio::test]
+async fn suspend_bool_high_pauses_on_high_resumes_on_low() {
+    use cirrus_engine::SuspendBoolHigh;
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let re = Arc::new(RunEngine::new(vec![]));
+    let _watcher = SuspendBoolHigh::new("shutter", rx).install(re.clone());
+
+    let re2 = re.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::Sleep(Duration::from_millis(50));
+    });
+    let join = tokio::spawn(async move { re2.run_async(plan).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Trigger BAD: signal goes high → engine should pause.
+    tx.send(true).unwrap();
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert_eq!(
+        re.state(),
+        EngineRunState::Paused,
+        "SuspendBoolHigh must pause when signal goes high"
+    );
+
+    // Restore GOOD: signal goes low → engine should auto-resume.
+    tx.send(false).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("auto-resume in time")
+        .unwrap()
+        .unwrap();
+    let _ = result;
+    assert_eq!(re.state(), EngineRunState::Idle);
+}
+
+#[tokio::test]
+async fn suspend_bool_low_pauses_on_low_resumes_on_high() {
+    use cirrus_engine::SuspendBoolLow;
+    let (tx, rx) = tokio::sync::watch::channel(true);
+    let re = Arc::new(RunEngine::new(vec![]));
+    let _watcher = SuspendBoolLow::new("beam", rx).install(re.clone());
+
+    let re2 = re.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::Sleep(Duration::from_millis(50));
+    });
+    let join = tokio::spawn(async move { re2.run_async(plan).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    tx.send(false).unwrap();
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert_eq!(re.state(), EngineRunState::Paused);
+
+    tx.send(true).unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("auto-resume in time")
+        .unwrap()
+        .unwrap();
+    assert_eq!(re.state(), EngineRunState::Idle);
+}
+
+#[tokio::test]
+async fn suspend_threshold_floor_pauses_when_below() {
+    use cirrus_engine::{SuspendThreshold, ThresholdDirection};
+    let (tx, rx) = tokio::sync::watch::channel(100.0_f64);
+    let re = Arc::new(RunEngine::new(vec![]));
+    let _watcher = SuspendThreshold::new("beam_current", rx, 50.0, ThresholdDirection::BadIfBelow)
+        .install(re.clone());
+
+    let re2 = re.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::Sleep(Duration::from_millis(50));
+    });
+    let join = tokio::spawn(async move { re2.run_async(plan).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    tx.send(40.0).unwrap();
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert_eq!(re.state(), EngineRunState::Paused);
+
+    tx.send(80.0).unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("auto-resume in time")
+        .unwrap()
+        .unwrap();
+    assert_eq!(re.state(), EngineRunState::Idle);
+}
+
+#[tokio::test]
 async fn msg_fail_marks_run_failed_with_reason() {
     // Regression for R2-1: Msg::Fail aborts the plan cleanly with
     // a Plan-level error and exit_status="fail". Used by plans like
