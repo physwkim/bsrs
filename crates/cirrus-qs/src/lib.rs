@@ -102,7 +102,7 @@ pub use lua_eval::LuaEvaluator;
 pub use methods::{JsonRpcError, RpcRequest, RpcResponse};
 pub use permissions::{MethodClass, Permissions};
 pub use queue::{PlanQueue, QueuedItem};
-pub use registry::{PlanFactory, Registry};
+pub use registry::{LuaExposedEntry, PlanFactory, Registry};
 pub use server::{Server, ServerBuilder, ServerShutdown};
 pub use state::{EState, EngineState, LockInfo};
 pub use tasks::{EvalResult, TaskTracker};

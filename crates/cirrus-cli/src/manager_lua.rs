@@ -24,8 +24,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
 use cirrus_engine::RunEngine;
-use cirrus_qs::{EvalResult, LuaEvaluator, Registry};
-use mlua::Lua;
+use cirrus_qs::{EvalResult, LuaEvaluator, LuaExposedEntry, Registry};
+use mlua::{Lua, ObjectLike, Table, Value as LuaValue, Variadic};
+
 use tokio::sync::Mutex as TMutex;
 
 use crate::lua_env::{build_lua, LuaDevice};
@@ -81,7 +82,15 @@ impl ManagerLuaState {
                 collectable: registry.collectable(&name).cloned(),
                 pausable: None,
             };
-            lua.globals().set(name.as_str(), dev)?;
+            // If the registry has #[lua_methods] for this name, wrap
+            // the userdata in a Lua table that adds the custom
+            // methods and falls back to the userdata for built-ins.
+            if let Some(entry) = registry.lua_exposed(&name) {
+                let proxy = make_method_proxy(&lua, dev, entry)?;
+                lua.globals().set(name.as_str(), proxy)?;
+            } else {
+                lua.globals().set(name.as_str(), dev)?;
+            }
         }
         Ok(lua)
     }
@@ -196,15 +205,134 @@ fn eval_in(lua: &Lua, source: &str) -> EvalResult {
 }
 
 fn run_chunk(lua: &Lua, source: &str) -> Result<Option<String>, String> {
-    // Try as expression first.
+    // First, try `return <source>` so bare expressions yield a value.
     let as_expr = format!("return {source}");
-    match lua.load(&as_expr).eval::<mlua::Value>() {
-        Ok(v) => Ok(Some(value_to_string(&v))),
-        Err(_) => match lua.load(source).exec() {
-            Ok(()) => Ok(None),
-            Err(e) => Err(format!("{e}")),
-        },
+    if let Ok(v) = lua.load(&as_expr).eval::<mlua::Value>() {
+        return Ok(Some(value_to_string(&v)));
     }
+    // Fall back to running source as a chunk. Use call() so an
+    // explicit `return` statement inside the chunk still propagates.
+    match lua.load(source).call::<mlua::MultiValue>(()) {
+        Ok(mv) => {
+            let mut iter = mv.into_iter();
+            match iter.next() {
+                Some(v) => Ok(Some(value_to_string(&v))),
+                None => Ok(None),
+            }
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+/// Wrap a `LuaDevice` userdata in a Lua table that adds each
+/// `#[lua_methods]`-exposed method. The `__index` metamethod
+/// delegates unknown keys to the underlying userdata so the standard
+/// methods (`:read`, `:set`, `:inspect`, ...) keep working.
+fn make_method_proxy(lua: &Lua, dev: LuaDevice, entry: &LuaExposedEntry) -> mlua::Result<Table> {
+    let t = lua.create_table()?;
+    let dev_ud = lua.create_userdata(dev)?;
+    t.set("_device", dev_ud.clone())?;
+
+    // Each #[lua_method] becomes a Lua function on the table. The
+    // closure captures the device Arc (downcasted via Any in the
+    // dispatch fn) and the static method entry.
+    for method in entry.methods.iter().copied() {
+        let device_arc = entry.device.clone();
+        let f = lua.create_function(move |lua, args: Variadic<LuaValue>| {
+            // First arg is the table itself (from `dev:method(...)`);
+            // skip it. Remaining args are the user-supplied params.
+            let mut json_args: Vec<serde_json::Value> = Vec::with_capacity(args.len());
+            for v in args.iter().skip(1) {
+                json_args.push(lua_value_to_json(v)?);
+            }
+            let r =
+                (method.dispatch)(&*device_arc, &json_args).map_err(mlua::Error::RuntimeError)?;
+            json_to_lua_value(lua, &r)
+        })?;
+        t.set(method.name, f)?;
+    }
+
+    // Metatable: missing keys delegate to the userdata, with self
+    // re-bound to the userdata so existing add_method handlers see
+    // the correct receiver.
+    let meta = lua.create_table()?;
+    let dev_ud_for_meta = dev_ud.clone();
+    let __index = lua.create_function(move |lua, (_t, key): (Table, mlua::String)| {
+        let key_str = key.to_str()?.to_string();
+        let val: mlua::Value = dev_ud_for_meta.get(&*key_str).unwrap_or(mlua::Value::Nil);
+        if let mlua::Value::Function(f) = val {
+            // Re-bind self: when called as `proxy:method(args)`, Lua
+            // passes the proxy table as the first arg, but `f` was
+            // built expecting the userdata. Wrap to substitute.
+            let dev_for_call = dev_ud_for_meta.clone();
+            let wrapped = lua.create_function(
+                move |_lua, args: Variadic<mlua::Value>| -> mlua::Result<Variadic<mlua::Value>> {
+                    let mut new_args: Vec<mlua::Value> = Vec::with_capacity(args.len());
+                    new_args.push(mlua::Value::UserData(dev_for_call.clone()));
+                    for a in args.into_iter().skip(1) {
+                        new_args.push(a);
+                    }
+                    f.call::<Variadic<mlua::Value>>(Variadic::from_iter(new_args))
+                },
+            )?;
+            Ok(mlua::Value::Function(wrapped))
+        } else {
+            Ok(val)
+        }
+    })?;
+    meta.set("__index", __index)?;
+    t.set_metatable(Some(meta))?;
+    Ok(t)
+}
+
+fn lua_value_to_json(v: &LuaValue) -> mlua::Result<serde_json::Value> {
+    Ok(match v {
+        LuaValue::Nil => serde_json::Value::Null,
+        LuaValue::Boolean(b) => serde_json::Value::Bool(*b),
+        LuaValue::Integer(i) => serde_json::Value::Number((*i).into()),
+        LuaValue::Number(n) => serde_json::Number::from_f64(*n)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        LuaValue::String(s) => {
+            serde_json::Value::String(s.to_str().map(|s| s.to_string()).unwrap_or_default())
+        }
+        other => {
+            return Err(mlua::Error::RuntimeError(format!(
+                "lua_method: unsupported arg type: {other:?}"
+            )))
+        }
+    })
+}
+
+fn json_to_lua_value(lua: &Lua, v: &serde_json::Value) -> mlua::Result<LuaValue> {
+    Ok(match v {
+        serde_json::Value::Null => LuaValue::Nil,
+        serde_json::Value::Bool(b) => LuaValue::Boolean(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                LuaValue::Integer(i)
+            } else if let Some(f) = n.as_f64() {
+                LuaValue::Number(f)
+            } else {
+                LuaValue::Nil
+            }
+        }
+        serde_json::Value::String(s) => LuaValue::String(lua.create_string(s)?),
+        serde_json::Value::Array(arr) => {
+            let t = lua.create_table()?;
+            for (i, x) in arr.iter().enumerate() {
+                t.set(i + 1, json_to_lua_value(lua, x)?)?;
+            }
+            LuaValue::Table(t)
+        }
+        serde_json::Value::Object(map) => {
+            let t = lua.create_table()?;
+            for (k, x) in map {
+                t.set(k.as_str(), json_to_lua_value(lua, x)?)?;
+            }
+            LuaValue::Table(t)
+        }
+    })
 }
 
 fn value_to_string(v: &mlua::Value) -> String {
@@ -274,5 +402,132 @@ mod tests {
         let r = state.eval("error('boom')").await;
         assert!(r.error.is_some());
         assert!(r.error.as_deref().unwrap().contains("boom"));
+    }
+
+    // -- #[lua_methods] proc-macro round-trip -------------------------------
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub struct Diffractometer {
+        name: String,
+        h: AtomicU64,
+        k: AtomicU64,
+        l: AtomicU64,
+    }
+
+    impl cirrus_core::msg::NamedObj for Diffractometer {
+        fn name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    #[cirrus_derive::lua_methods]
+    impl Diffractometer {
+        #[lua_method]
+        pub fn set_orientation(&self, h: f64, k: f64, l: f64) -> Result<(), String> {
+            self.h.store(h.to_bits(), Ordering::SeqCst);
+            self.k.store(k.to_bits(), Ordering::SeqCst);
+            self.l.store(l.to_bits(), Ordering::SeqCst);
+            Ok(())
+        }
+        #[lua_method]
+        pub fn current_hkl(&self) -> (f64, f64, f64) {
+            (
+                f64::from_bits(self.h.load(Ordering::SeqCst)),
+                f64::from_bits(self.k.load(Ordering::SeqCst)),
+                f64::from_bits(self.l.load(Ordering::SeqCst)),
+            )
+        }
+        #[lua_method]
+        pub fn label(&self) -> String {
+            self.name.clone()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lua_methods_proc_macro_round_trip() {
+        // Build a registry with the custom device + its lua methods.
+        let dx = Arc::new(Diffractometer {
+            name: "dx".into(),
+            h: AtomicU64::new(0_f64.to_bits()),
+            k: AtomicU64::new(0_f64.to_bits()),
+            l: AtomicU64::new(0_f64.to_bits()),
+        });
+        let mut reg = Registry::new();
+        // Register a NamedObj-only role so device_names() includes it.
+        // We piggy-back on the readables map via a dummy ReadableObj
+        // would be heavy; just call register_lua_methods and add a
+        // synthetic readable via a no-op shim.
+        // Simpler: just call register_lua_methods, but then the loop in
+        // build_state walks registry.device_names() (union of role
+        // tables) and won't see "dx". Add a lua-only registration
+        // helper here.
+        reg.register_lua_methods("dx", dx.clone());
+        // device_names() doesn't index lua_exposed; add a stub
+        // readable so the device is published. Production code
+        // registers concrete role traits anyway.
+        struct StubReadable;
+        impl cirrus_core::msg::NamedObj for StubReadable {
+            fn name(&self) -> &str {
+                "dx"
+            }
+        }
+        #[async_trait::async_trait]
+        impl cirrus_core::msg::ReadableObj for StubReadable {
+            async fn read_dyn(
+                &self,
+            ) -> cirrus_core::error::Result<
+                std::collections::HashMap<String, cirrus_core::reading::ReadingValue>,
+            > {
+                Ok(std::collections::HashMap::new())
+            }
+            async fn describe_dyn(
+                &self,
+            ) -> cirrus_core::error::Result<
+                std::collections::HashMap<String, cirrus_event_model::DataKey>,
+            > {
+                Ok(std::collections::HashMap::new())
+            }
+        }
+        reg.register_readable(
+            "dx",
+            Arc::new(StubReadable) as Arc<dyn cirrus_core::msg::ReadableObj>,
+        );
+
+        let engine_slot = Arc::new(TMutex::new(Some(Arc::new(RunEngine::new(vec![])))));
+        let state = ManagerLuaState::new(engine_slot.clone(), Arc::new(reg));
+
+        // Custom method round-trip.
+        let r = state.eval("dx:set_orientation(1.5, 2.5, 3.5)").await;
+        assert!(r.error.is_none(), "{r:?}");
+
+        let r = state.eval("dx:current_hkl()").await;
+        assert!(r.error.is_none(), "{r:?}");
+        // Tuple return → JSON array → Lua table; render as an array.
+        // value_to_string falls through to Debug for Table; the test
+        // just checks it succeeded — we'll parse parts via a follow-up.
+        let r = state
+            .eval("local h,k,l = table.unpack(dx:current_hkl()); return h")
+            .await;
+        assert_eq!(r.return_value.as_deref(), Some("1.5"), "{r:?}");
+        let r = state
+            .eval("local h,k,l = table.unpack(dx:current_hkl()); return l")
+            .await;
+        assert_eq!(r.return_value.as_deref(), Some("3.5"), "{r:?}");
+
+        // Standard userdata methods still work via __index fallback
+        // (read_dyn is a no-op stub here, but the dispatch path is
+        // exercised — name() returns the device name).
+        let r = state.eval("dx:name()").await;
+        assert_eq!(r.return_value.as_deref(), Some("dx"), "{r:?}");
+
+        // Custom method with String return.
+        let r = state.eval("dx:label()").await;
+        assert_eq!(r.return_value.as_deref(), Some("dx"));
+
+        // Arity error surfaces as a clean Lua error.
+        let r = state.eval("dx:set_orientation(1.0)").await;
+        assert!(r.error.is_some());
+        assert!(r.error.as_deref().unwrap().contains("expected 3 args"));
     }
 }

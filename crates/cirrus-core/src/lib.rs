@@ -5,6 +5,7 @@
 pub mod error;
 pub mod ext;
 pub mod kind;
+pub mod lua_exposable;
 pub mod msg;
 pub mod plan;
 pub mod reading;
@@ -19,6 +20,7 @@ pub use ext::{
     TriggerableExt,
 };
 pub use kind::Kind;
+pub use lua_exposable::{LuaExposable, LuaMethodEntry};
 pub use msg::{ConfigureArgs, GroupId, Msg, RunMetadata};
 pub use plan::{plan_box, Plan, PlanItem};
 pub use reading::{ReadingF64, ReadingValue, TypedReading};

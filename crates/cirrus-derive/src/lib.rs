@@ -218,3 +218,187 @@ fn strip_arc(ty: &syn::Type) -> syn::Type {
     }
     ty.clone()
 }
+
+// ===========================================================================
+// #[lua_methods] — expose device methods to the daemon Lua REPL.
+// ===========================================================================
+//
+// Apply to an `impl Type { ... }` block; tag each method to expose with
+// `#[lua_method]`. The macro emits the original block plus an
+// `impl LuaExposable for Type` whose `lua_methods()` returns a static
+// slice of dispatchers.
+//
+// Accepted method shapes (first-cut subset; broaden later):
+//
+// - `&self` only (Arc-shared devices, no `&mut`)
+// - args: f64, i64, u64, i32, u32, bool, String
+// - return: any `serde::Serialize` type, `()`, or `Result<T, E>` where
+//   `T: Serialize` and `E: ToString`
+// - `async fn` is wrapped through `cirrus_core::cirrus_runtime().block_on`
+//
+// Unsupported shapes produce a compile error pointing at the method.
+
+use syn::{ImplItem, ItemImpl, ReturnType, Type};
+
+/// `#[lua_methods]` attribute on an `impl` block.
+#[proc_macro_attribute]
+pub fn lua_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as ItemImpl);
+    let self_ty = &input.self_ty;
+
+    let mut entries: Vec<TokenStream2> = Vec::new();
+
+    for it in &input.items {
+        let ImplItem::Fn(f) = it else { continue };
+        let has_lua_method = f.attrs.iter().any(|a| a.path().is_ident("lua_method"));
+        if !has_lua_method {
+            continue;
+        }
+        let sig = &f.sig;
+        let fn_name = &sig.ident;
+        let fn_name_str = fn_name.to_string();
+        let is_async = sig.asyncness.is_some();
+
+        // Inputs: must start with `&self` (no &mut, no Self by value).
+        let mut inputs = sig.inputs.iter();
+        match inputs.next() {
+            Some(syn::FnArg::Receiver(r)) if r.reference.is_some() && r.mutability.is_none() => {
+                // ok
+            }
+            _ => {
+                return syn::Error::new_spanned(
+                    sig,
+                    "#[lua_method] requires `&self` (no &mut, no Self by value)",
+                )
+                .to_compile_error()
+                .into();
+            }
+        }
+        let arg_types: Vec<&Type> = inputs
+            .filter_map(|a| match a {
+                syn::FnArg::Typed(t) => Some(&*t.ty),
+                _ => None,
+            })
+            .collect();
+        let arity = arg_types.len();
+
+        // Build per-arg parsing: serde_json::from_value(args[i].clone())
+        let mut arg_parses: Vec<TokenStream2> = Vec::with_capacity(arity);
+        let mut arg_idents: Vec<TokenStream2> = Vec::with_capacity(arity);
+        for (i, ty) in arg_types.iter().enumerate() {
+            let ident = quote::format_ident!("arg{}", i);
+            arg_parses.push(quote! {
+                let #ident: #ty = ::serde_json::from_value(args[#i].clone())
+                    .map_err(|e| format!(
+                        concat!("lua_method '", #fn_name_str, "': arg #", stringify!(#i), ": {}"),
+                        e
+                    ))?;
+            });
+            arg_idents.push(quote! { #ident });
+        }
+
+        let call = if is_async {
+            quote! {
+                ::cirrus_core::runtime::cirrus_runtime()
+                    .block_on(this_typed.#fn_name(#(#arg_idents),*))
+            }
+        } else {
+            quote! { this_typed.#fn_name(#(#arg_idents),*) }
+        };
+
+        // Map the return into Result<serde_json::Value, String>.
+        let return_handling = match &sig.output {
+            ReturnType::Default => quote! {
+                let _ = #call;
+                Ok(::serde_json::Value::Null)
+            },
+            ReturnType::Type(_, ret_ty) => {
+                if is_result_type(ret_ty) {
+                    quote! {
+                        let r = #call;
+                        match r {
+                            Ok(v) => ::serde_json::to_value(v).map_err(|e| e.to_string()),
+                            Err(e) => Err(::std::string::ToString::to_string(&e)),
+                        }
+                    }
+                } else {
+                    quote! {
+                        let v = #call;
+                        ::serde_json::to_value(v).map_err(|e| e.to_string())
+                    }
+                }
+            }
+        };
+
+        entries.push(quote! {
+            ::cirrus_core::lua_exposable::LuaMethodEntry {
+                name: #fn_name_str,
+                arity: #arity,
+                dispatch: |this, args| {
+                    if args.len() != #arity {
+                        return Err(format!(
+                            "lua_method '{}': expected {} args, got {}",
+                            #fn_name_str, #arity, args.len()
+                        ));
+                    }
+                    let this_typed: &#self_ty = match this.downcast_ref::<#self_ty>() {
+                        Some(v) => v,
+                        None => return Err(format!(
+                            "lua_method '{}': downcast failed (wrong concrete type)",
+                            #fn_name_str
+                        )),
+                    };
+                    #(#arg_parses)*
+                    #return_handling
+                },
+            }
+        });
+    }
+
+    // Strip `#[lua_method]` from the original impl so the compiler
+    // doesn't error on an unknown attribute.
+    let stripped_items: Vec<ImplItem> = input
+        .items
+        .iter()
+        .map(|it| match it {
+            ImplItem::Fn(f) => {
+                let mut f = f.clone();
+                f.attrs.retain(|a| !a.path().is_ident("lua_method"));
+                ImplItem::Fn(f)
+            }
+            other => other.clone(),
+        })
+        .collect();
+
+    let mut original = input.clone();
+    original.items = stripped_items;
+
+    let lua_impl = quote! {
+        impl ::cirrus_core::lua_exposable::LuaExposable for #self_ty {
+            fn lua_methods() -> &'static [::cirrus_core::lua_exposable::LuaMethodEntry] {
+                static METHODS: &[::cirrus_core::lua_exposable::LuaMethodEntry] = &[
+                    #(#entries),*
+                ];
+                METHODS
+            }
+        }
+    };
+
+    let expanded = quote! {
+        #original
+        #lua_impl
+    };
+    expanded.into()
+}
+
+/// True if the type literally starts with `Result` (we don't try to
+/// resolve aliases). Good enough for `Result<T, E>` and
+/// `cirrus_core::Result<T>` — the latter still has the `Result` ident.
+fn is_result_type(ty: &Type) -> bool {
+    if let Type::Path(tp) = ty {
+        if let Some(last) = tp.path.segments.last() {
+            return last.ident == "Result";
+        }
+    }
+    false
+}

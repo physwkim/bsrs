@@ -48,6 +48,9 @@ frame-source = [
     "cirrus-callbacks/zmq",
 ]
 
+[dev-dependencies]
+cirrus-derive.workspace = true
+
 [[bin]]
 name = "cirrus"
 path = "src/main.rs"

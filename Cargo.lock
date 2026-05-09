@@ -691,6 +691,7 @@ dependencies = [
  "cirrus-backend-soft",
  "cirrus-callbacks",
  "cirrus-core",
+ "cirrus-derive",
  "cirrus-engine",
  "cirrus-event-model",
  "cirrus-plans",
