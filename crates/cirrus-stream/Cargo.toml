@@ -24,7 +24,18 @@ serde_json.workspace = true
 default = []
 # Enables PvaMonitorSource by linking epics-pva-rs.
 pva = ["dep:epics-pva-rs"]
+# Enables Hdf5FrameSink (pure-Rust, no system libhdf5).
+hdf5 = ["dep:rust-hdf5"]
 
 [dependencies.epics-pva-rs]
 version = "0.15.0"
 optional = true
+
+[dependencies.rust-hdf5]
+version = "0.2"
+features = ["deflate"]
+optional = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
