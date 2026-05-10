@@ -6,6 +6,7 @@
 
 - [Quickstart](./quickstart.md)
 - [Migration from bluesky](./migration.md)
+- [Cookbook](./cookbook.md)
 
 # Reference
 

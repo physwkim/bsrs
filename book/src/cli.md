@@ -39,12 +39,48 @@ binary must be built with `--features cirrus-qs/metrics`.
 
 ```sh
 cirrus qs status
-cirrus qs queue-add count det1 5
-cirrus qs queue-start
-cirrus qs re-pause
+cirrus qs queue add count det1 5
+cirrus qs queue start
+cirrus qs re pause
 ```
 
 REQ-side client. Mirrors the `qserver` command palette.
+
+### qs inspect
+
+```sh
+cirrus qs inspect m1
+# {"success": true, "name": "m1", "state": {
+#   "type": "SoftMotor", "setpoint": 1.5, "readback": 1.5,
+#   "units": "mm", "kind": "Hinted", "subscribers": 0,
+#   "connected": true
+# }}
+```
+
+Dumps a registered device's live state via `device_inspect` RPC.
+Calls `NamedObj::inspect_dyn()` server-side; sync, no I/O. The
+JSON shape varies by device — the `name` and `type` fields are
+always present.
+
+### qs repl
+
+```sh
+cirrus qs repl
+cirrus qs repl --api-key <KEY>           # for RBAC-gated daemons
+cirrus qs repl --no-env-open             # skip auto environment_open
+cirrus qs repl --poll-ms 100             # adjust task poll interval
+```
+
+Attach an interactive Lua REPL to a running daemon. Each line is
+sent to the server's `lua_eval` RPC; the daemon's shared mlua state
+runs it and the client polls `task_status` / `task_result`. The
+attached state has every registered device pre-published as a Lua
+global, so `motor:inspect()`, `motor:set(1.5):wait()`, and
+`RE:run(count({det1}, 100))` all work the same as in the local
+`cirrus repl`.
+
+`lua_eval` is admin-class under RBAC — pass `--api-key` for an
+admin api_key when permissions.toml is configured.
 
 ## repl
 

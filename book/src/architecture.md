@@ -13,7 +13,7 @@ cirrus                    # umbrella re-exports + binary entry points
 ├── cirrus-plans          # bp.* / bps.* / bpp.* mirrors (count, scan, grid_scan, ...)
 ├── cirrus-protocols      # Movable, Triggerable, Stageable, Readable (sync facade)
 ├── cirrus-protocols-async # ophyd-async-style traits over async fns
-├── cirrus-derive         # #[derive(Device)], #[signal(...)] proc-macros
+├── cirrus-derive         # #[derive(Device)], #[signal(...)], #[lua_methods] proc-macros
 ├── cirrus-devices        # SoftMotor, SoftDetector, NDSimDetector, ...
 ├── cirrus-backend-epics-ca   # SignalBackend over CA  (feature: real)
 ├── cirrus-backend-epics-pva  # SignalBackend over PVA (feature: real)
