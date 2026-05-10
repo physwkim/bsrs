@@ -22,6 +22,7 @@ members = [
     "crates/cirrus",
     "crates/cirrus-cli",
     "crates/cirrus-qs",
+    "crates/cirrus-py",
 ]
 
 [workspace.package]

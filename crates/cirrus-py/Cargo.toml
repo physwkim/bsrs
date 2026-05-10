@@ -1,0 +1,18 @@
+[package]
+name = "cirrus-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Python bindings (PyO3) for cirrus — RunEngine + soft devices + plan factories."
+
+[lib]
+name = "cirrus_native"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"] }
+cirrus-core.workspace = true
+cirrus-engine.workspace = true
+cirrus-plans.workspace = true
+cirrus-backend-soft.workspace = true
+serde_json.workspace = true
