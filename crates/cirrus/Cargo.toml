@@ -26,6 +26,7 @@ async-stream.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
 cirrus-engine.workspace = true
+cirrus-backend-epics-ca = { path = "../cirrus-backends/epics-ca", features = ["real"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
 
 [[bench]]

@@ -8,12 +8,26 @@ bottom for reference.
 ## Tier 1 — production-blocking residue
 
 ### 1.1 Live IOC integration test
-- **Status**: build-only CI for `--features real` exists (M3); no
-  test that actually opens a CA channel against a running IOC.
-- **Plan**: spawn `epics-base-rs::IocBuilder` + a CA server protocol
-  runner inside a Rust integration test; connect via the cirrus CA
-  backend; exercise put/get/subscribe. Estimated 2-3 hours once the
-  epics-rs server protocol-runner API is settled.
+- **Status**: manual end-to-end verified — `crates/cirrus/examples/mini_beamline_scan.rs`
+  drives `epics-rs/examples/mini-beamline` IOC via cirrus's CA backend,
+  runs a 17-point scan, and asserts a Gaussian profile from the
+  PinHole point detector. Captured docs land in
+  `/tmp/cirrus_mini_beamline_*.jsonl`. Run with:
+  ```
+  cd ~/codes/epics-rs && ./target/release/mini_ioc \
+      examples/mini-beamline/ioc/st.cmd &
+  cd ~/codes/cirrus && cargo run --example mini_beamline_scan
+  ```
+- **Remaining**: wrap as a CI-automated test (spawn `mini_ioc`
+  inside the test fixture). Blocked on either packaging the IOC
+  binary alongside cirrus or vendoring `epics-rs::IocBuilder`.
+- **Side fix needed**: `cirrus_backend_epics_ca::ca_context()`
+  panics with "Cannot start a runtime from within a runtime" when
+  called from inside a tokio runtime — bootstrap path uses
+  `block_on` directly. The example works around it by calling
+  `ca_context()` once from a sync `main` before spawning the
+  runtime; the backend itself should detect `Handle::try_current()`
+  and route via `spawn_blocking` when already in a runtime.
 
 ## Tier 2 — ecosystem residue
 

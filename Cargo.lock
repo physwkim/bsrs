@@ -574,6 +574,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "bytes",
+ "cirrus-backend-epics-ca",
  "cirrus-backend-mock",
  "cirrus-backend-soft",
  "cirrus-callbacks",
