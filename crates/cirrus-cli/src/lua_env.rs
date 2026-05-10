@@ -1160,6 +1160,55 @@ pub fn build_lua(re: Arc<RunEngine>) -> mlua::Result<Lua> {
         lua.globals().set("ca_detector", f)?;
     }
 
+    // PVA-backed motor / detector factories — `pva` Cargo feature.
+    // Symmetric to the `ca_*` shape; PvaClient bootstrap is sync,
+    // so no separate `bootstrap_pva()` call is needed.
+    #[cfg(feature = "pva")]
+    {
+        use crate::pva_devices::{PvaDetector, PvaMotor};
+        let f = lua.create_function(|_, (name, val_pv, rbv_pv): (String, String, String)| {
+            let m = PvaMotor::connect_blocking(&name, &val_pv, &rbv_pv)
+                .map_err(|e| mlua::Error::RuntimeError(format!("pva_motor: connect: {e}")))?;
+            Ok(LuaDevice {
+                name,
+                readable: Some(m.clone() as Arc<dyn ReadableObj>),
+                movable: Some(m.clone() as Arc<dyn MovableObj>),
+                locatable: Some(m.clone() as Arc<dyn LocatableObj>),
+                stoppable: Some(m as Arc<dyn StoppableObj>),
+                triggerable: None,
+                stageable: None,
+                monitorable: None,
+                flyable: None,
+                preparable: None,
+                configurable: None,
+                collectable: None,
+                pausable: None,
+            })
+        })?;
+        lua.globals().set("pva_motor", f)?;
+
+        let f = lua.create_function(|_, (name, value_pv): (String, String)| {
+            let d = PvaDetector::connect_blocking(&name, &value_pv)
+                .map_err(|e| mlua::Error::RuntimeError(format!("pva_detector: connect: {e}")))?;
+            Ok(LuaDevice {
+                name,
+                readable: Some(d as Arc<dyn ReadableObj>),
+                movable: None,
+                locatable: None,
+                stoppable: None,
+                triggerable: None,
+                stageable: None,
+                monitorable: None,
+                flyable: None,
+                preparable: None,
+                configurable: None,
+                collectable: None,
+                pausable: None,
+            })
+        })?;
+        lua.globals().set("pva_detector", f)?;
+    }
+
     // Pausable test device — counts pause/resume hook invocations into
     // an internal AtomicU64 pair, exposed to Lua via :pause_count() /
     // :resume_count(). Only useful for validating register_pausable

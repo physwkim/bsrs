@@ -25,6 +25,8 @@ mod lua_tiled;
 mod manager;
 mod manager_lua;
 mod migrate;
+#[cfg(feature = "pva")]
+mod pva_devices;
 mod repl;
 
 use clap::{Parser, Subcommand};

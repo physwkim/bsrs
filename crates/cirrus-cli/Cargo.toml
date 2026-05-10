@@ -32,9 +32,10 @@ cirrus-protocols-async = { workspace = true, optional = true }
 epics-pva-rs = { version = "0.15.0", optional = true }
 bytes = { workspace = true, optional = true }
 cirrus-backend-epics-ca = { path = "../cirrus-backends/epics-ca", optional = true }
+cirrus-backend-epics-pva = { path = "../cirrus-backends/epics-pva", optional = true }
 
 [features]
-default = ["ca"]
+default = ["ca", "pva"]
 # Expose `tiled.*` Lua bindings (from_uri / keys / metadata / get).
 tiled = ["dep:tiled-client", "dep:url"]
 # Wire real backends (PvaMonitorSource + Hdf5FrameSink) into the
@@ -56,6 +57,13 @@ frame-source = [
 ca = [
     "dep:cirrus-backend-epics-ca",
     "cirrus-backend-epics-ca/real",
+    "dep:cirrus-protocols-async",
+]
+# Symmetric for PV Access — `pva_motor` / `pva_detector` Lua
+# factories on top of `cirrus-backend-epics-pva`.
+pva = [
+    "dep:cirrus-backend-epics-pva",
+    "cirrus-backend-epics-pva/real",
     "dep:cirrus-protocols-async",
 ]
 

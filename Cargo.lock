@@ -690,6 +690,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "cirrus-backend-epics-ca",
+ "cirrus-backend-epics-pva",
  "cirrus-backend-soft",
  "cirrus-callbacks",
  "cirrus-core",
