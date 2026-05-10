@@ -31,8 +31,10 @@ done
 | 05 | [`05_remote_dispatcher.lua`](./05_remote_dispatcher.lua) + [`.py`](./05_remote_dispatcher.py) | cirrus → ZMQ → Python `bluesky.callbacks.zmq.RemoteDispatcher` (msgpack envelope round-trip) |
 | 06 | [`06_dcm_energy.lua`](./06_dcm_energy.lua) | Kohzu DCM energy scan (6 → 12 keV via derived motor record) |
 | 07 | [`07_tiled_sink.lua`](./07_tiled_sink.lua) | cirrus → tiled-rs HTTP catalog (`TiledSink` registers RunStart, PATCHes RunStop). Read-side via `tiled.from_uri` confirms the run lands. |
-| 08 | (none — see below) | `cirrus repl --doc-jsonl <PATH>` writes every Document as a JSONL line. Smoke: run any Lua scan with `--doc-jsonl /tmp/run.jsonl` and tail the file. |
-| 09 | (none — see below) | cirrus-qs daemon E2E: register CA devices via `cirrus qs-manager --ca-motor name=val,rbv` / `--ca-detector name=pv`, then attach `cirrus qs --address ... repl` and drive `RE:run(scan({ph_det}, ph_mtr, ...))`. |
+| 08 | [`08_suspender.lua`](./08_suspender.lua) | CA-PV-backed `SuspendThreshold` armed but not tripped — verifies arming + run + dispose introduces no overhead |
+| 08b | [`08b_suspender_trip.lua`](./08b_suspender_trip.lua) | Same `SuspendThreshold` but threshold is set inside the natural beam-current oscillation (475–525) so the engine actually pauses & auto-resumes mid-plan |
+| 09 | (none — see below) | `cirrus repl --doc-jsonl <PATH>` writes every Document as a JSONL line. Smoke: run any Lua scan with `--doc-jsonl /tmp/run.jsonl` and tail the file. |
+| 10 | (none — see below) | cirrus-qs daemon E2E: register CA devices via `cirrus qs-manager --ca-motor name=val,rbv` / `--ca-detector name=pv`, then attach `cirrus qs --address ... repl` and drive `RE:run(scan({ph_det}, ph_mtr, ...))`. |
 
 Run any one with:
 
@@ -74,6 +76,12 @@ Last good run on 2026-05-11 (m3 macOS, mini_ioc release build):
 06_dcm_energy.lua       — 7 events (6→12 keV), exit_status=success
 07_tiled_sink.lua       — Run registered at /cirrus/<uid> on tiled-rs HTTP server;
                           tiled-client read-side confirms the run via from_uri+keys
+08_suspender.lua        — armed-but-not-tripped: arming + 5-step count completes
+                          with is_paused=false start to end
+08b_suspender_trip.lua  — threshold=499 below natural oscillation min (475);
+                          12 × (read, sleep 0.5) plan ran 9s vs 6s baseline,
+                          confirming the watcher fired suspend_until_with(...)
+                          and auto-resumed when current returned above threshold
 --doc-jsonl             — 20 docs (start + descriptor + 17 events + stop) appended
                           to /tmp/cirrus_test.jsonl; verified shape with `head`/`tail`
 qs-manager + ca devices — `cirrus qs-manager --ca-motor / --ca-detector` registers

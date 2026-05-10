@@ -15,6 +15,8 @@
 
 #[cfg(feature = "ca")]
 mod ca_devices;
+#[cfg(feature = "ca")]
+mod ca_suspender;
 mod checkpoint_store;
 mod client;
 mod doctor;

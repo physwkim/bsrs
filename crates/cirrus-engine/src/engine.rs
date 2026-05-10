@@ -1471,7 +1471,15 @@ impl RunEngine {
         }
     }
 
-    async fn install_suspender(&self, id: u64, susp: Arc<dyn Any + Send + Sync>) -> Result<()> {
+    /// Install a `Suspender` at the engine level (outside any
+    /// active plan). The suspender's monitor task starts immediately
+    /// and is removed via [`Msg::RemoveSuspender`]. Use
+    /// [`Self::next_suspender_id`] to allocate `id`.
+    pub async fn install_suspender(
+        &self,
+        id: u64,
+        susp: Arc<dyn Any + Send + Sync>,
+    ) -> Result<()> {
         // Recover the typed handle. The plan-side Msg carried `Arc<dyn Any>`
         // wrapping an `Arc<dyn Suspender>`.
         let typed: Arc<dyn Suspender> = susp

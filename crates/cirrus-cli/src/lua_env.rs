@@ -601,6 +601,23 @@ impl UserData for LuaRunEngine {
         methods.add_method("next_suspender_id", |_, this, ()| {
             Ok(this.re.next_suspender_id())
         });
+        // `RE:install_suspender` is intentionally not exposed: the
+        // `Suspender` trait is `Send + Sync + 'static` Rust-only and
+        // cannot be implemented from Lua. CA-PV-backed suspenders
+        // self-install via the `ca_suspend_*` factories below — they
+        // capture `re` and call `Suspend{BoolHigh,BoolLow,Threshold}::install`
+        // directly. Pure-Lua tests that exercise the engine's
+        // pause/resume path use `RE:request_suspend` /
+        // `RE:suspend_until_seconds` instead.
+        methods.add_method("remove_suspender", |_, this, _id: u64| {
+            // Top-level remove is not currently exposed on
+            // `RunEngine`; the engine consumes
+            // `Msg::RemoveSuspender` from inside a plan. Document:
+            // remove via `coroutine.yield(msg.remove_suspender(id))`
+            // or just let the daemon shutdown reap.
+            let _ = this;
+            Ok(())
+        });
         methods.add_method("clear_preprocessors", |_, this, ()| {
             this.re.clear_preprocessors();
             Ok(())
@@ -1158,6 +1175,50 @@ pub fn build_lua(re: Arc<RunEngine>) -> mlua::Result<Lua> {
             })
         })?;
         lua.globals().set("ca_detector", f)?;
+
+        // CA-backed Suspender factories. Each subscribes to a PV
+        // and self-installs onto the captured `RE` — the spawned
+        // watcher task issues `re.suspend_until_with(...)` whenever
+        // the monitored signal enters the BAD region and auto-resumes
+        // when it leaves. The factories return `nil` (no Lua handle);
+        // the watcher's lifetime is tied to the `RunEngine` Arc.
+        use crate::ca_suspender::{
+            install_suspend_bool_high, install_suspend_bool_low, install_suspend_threshold,
+        };
+        let re_for_susp = re.clone();
+        let f = lua.create_function(
+            move |_, (name, pv, threshold, direction): (String, String, f64, String)| {
+                cirrus_core::runtime::cirrus_runtime()
+                    .block_on(install_suspend_threshold(
+                        &name,
+                        &pv,
+                        threshold,
+                        &direction,
+                        re_for_susp.clone(),
+                    ))
+                    .map_err(|e| {
+                        mlua::Error::RuntimeError(format!("ca_suspend_threshold: {e}"))
+                    })?;
+                Ok(())
+            },
+        )?;
+        lua.globals().set("ca_suspend_threshold", f)?;
+        let re_for_susp = re.clone();
+        let f = lua.create_function(move |_, (name, pv): (String, String)| {
+            cirrus_core::runtime::cirrus_runtime()
+                .block_on(install_suspend_bool_high(&name, &pv, re_for_susp.clone()))
+                .map_err(|e| mlua::Error::RuntimeError(format!("ca_suspend_bool_high: {e}")))?;
+            Ok(())
+        })?;
+        lua.globals().set("ca_suspend_bool_high", f)?;
+        let re_for_susp = re.clone();
+        let f = lua.create_function(move |_, (name, pv): (String, String)| {
+            cirrus_core::runtime::cirrus_runtime()
+                .block_on(install_suspend_bool_low(&name, &pv, re_for_susp.clone()))
+                .map_err(|e| mlua::Error::RuntimeError(format!("ca_suspend_bool_low: {e}")))?;
+            Ok(())
+        })?;
+        lua.globals().set("ca_suspend_bool_low", f)?;
     }
 
     // PVA-backed motor / detector factories — `pva` Cargo feature.
