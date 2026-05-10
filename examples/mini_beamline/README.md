@@ -30,6 +30,7 @@ done
 | 04 | [`04_abort.lua`](./04_abort.lua) | `RE:abort()` mid-run cuts a 5 s plan short, sets `exit_status=abort` |
 | 05 | [`05_remote_dispatcher.lua`](./05_remote_dispatcher.lua) + [`.py`](./05_remote_dispatcher.py) | cirrus → ZMQ → Python `bluesky.callbacks.zmq.RemoteDispatcher` (msgpack envelope round-trip) |
 | 06 | [`06_dcm_energy.lua`](./06_dcm_energy.lua) | Kohzu DCM energy scan (6 → 12 keV via derived motor record) |
+| 07 | [`07_tiled_sink.lua`](./07_tiled_sink.lua) | cirrus → tiled-rs HTTP catalog (`TiledSink` registers RunStart, PATCHes RunStop). Read-side via `tiled.from_uri` confirms the run lands. |
 
 Run any one with:
 
@@ -69,4 +70,23 @@ Last good run on 2026-05-11 (m3 macOS, mini_ioc release build):
 05_remote_dispatcher    — Python RemoteDispatcher receives 5 events + descriptor + stop;
                           run_uid matches cirrus side; exit_status=success
 06_dcm_energy.lua       — 7 events (6→12 keV), exit_status=success
+07_tiled_sink.lua       — Run registered at /cirrus/<uid> on tiled-rs HTTP server;
+                          tiled-client read-side confirms the run via from_uri+keys
+```
+
+## tiled-rs setup (one-shot for #07)
+
+```sh
+# 1. Start tiled-rs with a sqlite catalog (write endpoints enabled
+#    via --catalog-uri).
+TILED_SINGLE_USER_API_KEY=test123 \
+    ~/codes/tiled-rs/target/debug/tiled serve --port 8765 \
+    --catalog-uri 'sqlite:///tmp/cirrus-tiled.db' --api-key test123 &
+
+# 2. Pre-create the `cirrus` container at the catalog root.
+#    cirrus's TiledSink registers each run as a child (cirrus/<run_uid>),
+#    so the parent must exist first.
+curl -H "Authorization: Apikey test123" -H "Content-Type: application/json" \
+    -X POST 'http://localhost:8765/api/v1/register/' \
+    -d '{"structure_family":"container","metadata":{},"specs":[],"key":"cirrus"}'
 ```

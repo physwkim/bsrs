@@ -235,6 +235,26 @@ pub struct ReplArgs {
     /// side to consume them. Example: `--doc-zmq tcp://*:5577`.
     #[arg(long, value_name = "ADDR")]
     pub doc_zmq: Option<String>,
+
+    /// Optional Tiled HTTP endpoint. When set, every Document the
+    /// engine emits is registered into the named container on the
+    /// Tiled catalog. Example: `--doc-tiled http://localhost:8000`.
+    /// Requires the `tiled` Cargo feature.
+    #[cfg(feature = "tiled")]
+    #[arg(long, value_name = "URL")]
+    pub doc_tiled: Option<String>,
+
+    /// Container name under the Tiled catalog (default `cirrus`).
+    /// Used only when `--doc-tiled` is set.
+    #[cfg(feature = "tiled")]
+    #[arg(long, value_name = "NAME", default_value = "cirrus")]
+    pub doc_tiled_container: String,
+
+    /// Single-user API key for the Tiled server. Reads
+    /// `TILED_SINGLE_USER_API_KEY` env var if not given.
+    #[cfg(feature = "tiled")]
+    #[arg(long, value_name = "KEY")]
+    pub doc_tiled_key: Option<String>,
 }
 
 /// Entry point — returns process exit code.
@@ -263,6 +283,29 @@ pub fn run(args: ReplArgs) -> i32 {
                 return 2;
             }
         }
+    }
+
+    #[cfg(feature = "tiled")]
+    if let Some(url) = &args.doc_tiled {
+        let mut sink = match cirrus_callbacks::TiledSink::new(url, &args.doc_tiled_container) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("cirrus repl: failed to build TiledSink for {url}: {e}");
+                return 2;
+            }
+        };
+        let key = args
+            .doc_tiled_key
+            .clone()
+            .or_else(|| std::env::var("TILED_SINGLE_USER_API_KEY").ok());
+        if let Some(k) = key {
+            sink = sink.with_api_key(k);
+        }
+        eprintln!(
+            "cirrus repl: registering Documents into Tiled at {url} container={:?}",
+            args.doc_tiled_container
+        );
+        sinks.push(Arc::new(sink) as Arc<dyn cirrus_engine::DocumentSink>);
     }
 
     let re = Arc::new(RunEngine::new(sinks));

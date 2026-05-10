@@ -36,8 +36,11 @@ cirrus-backend-epics-pva = { path = "../cirrus-backends/epics-pva", optional = t
 
 [features]
 default = ["ca", "pva"]
-# Expose `tiled.*` Lua bindings (from_uri / keys / metadata / get).
-tiled = ["dep:tiled-client", "dep:url"]
+# Expose `tiled.*` Lua bindings (read-side: from_uri / keys /
+# metadata / get) AND the `--doc-tiled` repl flag that wires
+# `cirrus-callbacks::TiledSink` (write-side: register Documents
+# into a Tiled catalog).
+tiled = ["dep:tiled-client", "dep:url", "cirrus-callbacks/tiled"]
 # Wire real backends (PvaMonitorSource + Hdf5FrameSink) into the
 # `cirrus frame-source` subcommand. Without this feature the
 # subcommand is a scaffolded stub that prints args and exits.
