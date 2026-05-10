@@ -35,6 +35,11 @@ jobs:
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
+        with:
+          # Auto-enable Pages on the repo on first run so the workflow
+          # doesn't 404 against the Pages REST endpoint. Once enabled,
+          # this is a no-op on subsequent runs.
+          enablement: true
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3

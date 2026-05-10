@@ -1,6 +1,15 @@
 //! Drive the compiled `cirrus_native` Python extension via a `python3`
 //! subprocess. Ensures the `dylib` actually loads as a Python module
 //! and round-trips RunEngine.run for `count` and `scan` plans.
+//!
+//! Gated behind the `python-tests` feature so default workspace
+//! `cargo test` doesn't try to link a test binary that needs Python
+//! ABI symbols on platforms (e.g. CI Linux) that don't provide them
+//! via `dynamic_lookup`. Run explicitly with:
+//!
+//!     cargo test -p cirrus-py --features python-tests
+
+#![cfg(feature = "python-tests")]
 
 use std::process::{Command, Stdio};
 
