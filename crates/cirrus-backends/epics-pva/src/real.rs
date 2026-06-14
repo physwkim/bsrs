@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use cirrus_core::error::{CirrusError, Result};
 use cirrus_core::reading::ReadingValue;
-use cirrus_core::status::{Status, StatusError, SubToken};
+use cirrus_core::status::SubToken;
 use cirrus_event_model::{DataKey, Dtype};
 use cirrus_protocols_async::{ReadingValueCallback, SignalBackend};
 use epics_pva_rs::client::PvaClient;
@@ -166,12 +166,12 @@ impl SignalBackend<f64> for EpicsPvaBackend<f64> {
             .map(|_| ())
             .map_err(|e| CirrusError::Backend(format!("pva connect {}: {e}", self.pv)))
     }
-    async fn put(&self, value: f64, _wait: bool, _timeout: Option<Duration>) -> Status {
-        let f = PvField::Scalar(ScalarValue::Double(value));
-        match self.client.pvput_pv_field(&self.pv, &f).await {
-            Ok(()) => Status::done(),
-            Err(e) => Status::fail(StatusError::Failed(format!("pva put: {e}"))),
-        }
+    async fn put(&self, value: Option<f64>) -> Result<()> {
+        let f = PvField::Scalar(ScalarValue::Double(value.unwrap_or_default()));
+        self.client
+            .pvput_pv_field(&self.pv, &f)
+            .await
+            .map_err(|e| CirrusError::Backend(format!("pva put: {e}")))
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         Ok(DataKey {
@@ -276,12 +276,12 @@ impl SignalBackend<String> for EpicsPvaBackend<String> {
             .map(|_| ())
             .map_err(|e| CirrusError::Backend(format!("pva connect {}: {e}", self.pv)))
     }
-    async fn put(&self, value: String, _wait: bool, _timeout: Option<Duration>) -> Status {
-        let f = PvField::Scalar(ScalarValue::String(value));
-        match self.client.pvput_pv_field(&self.pv, &f).await {
-            Ok(()) => Status::done(),
-            Err(e) => Status::fail(StatusError::Failed(format!("pva put: {e}"))),
-        }
+    async fn put(&self, value: Option<String>) -> Result<()> {
+        let f = PvField::Scalar(ScalarValue::String(value.unwrap_or_default()));
+        self.client
+            .pvput_pv_field(&self.pv, &f)
+            .await
+            .map_err(|e| CirrusError::Backend(format!("pva put: {e}")))
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         Ok(DataKey {
@@ -376,12 +376,12 @@ impl SignalBackend<i64> for EpicsPvaBackend<i64> {
             .map(|_| ())
             .map_err(|e| CirrusError::Backend(format!("pva connect {}: {e}", self.pv)))
     }
-    async fn put(&self, value: i64, _wait: bool, _timeout: Option<Duration>) -> Status {
-        let f = PvField::Scalar(ScalarValue::Long(value));
-        match self.client.pvput_pv_field(&self.pv, &f).await {
-            Ok(()) => Status::done(),
-            Err(e) => Status::fail(StatusError::Failed(format!("pva put: {e}"))),
-        }
+    async fn put(&self, value: Option<i64>) -> Result<()> {
+        let f = PvField::Scalar(ScalarValue::Long(value.unwrap_or_default()));
+        self.client
+            .pvput_pv_field(&self.pv, &f)
+            .await
+            .map_err(|e| CirrusError::Backend(format!("pva put: {e}")))
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         Ok(DataKey {
@@ -475,12 +475,12 @@ impl SignalBackend<bool> for EpicsPvaBackend<bool> {
             .map(|_| ())
             .map_err(|e| CirrusError::Backend(format!("pva connect {}: {e}", self.pv)))
     }
-    async fn put(&self, value: bool, _wait: bool, _timeout: Option<Duration>) -> Status {
-        let f = PvField::Scalar(ScalarValue::Boolean(value));
-        match self.client.pvput_pv_field(&self.pv, &f).await {
-            Ok(()) => Status::done(),
-            Err(e) => Status::fail(StatusError::Failed(format!("pva put: {e}"))),
-        }
+    async fn put(&self, value: Option<bool>) -> Result<()> {
+        let f = PvField::Scalar(ScalarValue::Boolean(value.unwrap_or_default()));
+        self.client
+            .pvput_pv_field(&self.pv, &f)
+            .await
+            .map_err(|e| CirrusError::Backend(format!("pva put: {e}")))
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         Ok(DataKey {

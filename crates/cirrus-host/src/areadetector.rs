@@ -36,7 +36,7 @@
 
 use cirrus_backend_epics_ca::EpicsCaBackend;
 use cirrus_core::error::{CirrusError, Result};
-use cirrus_core::status::{Status, StatusError};
+use cirrus_core::status::StatusError;
 use cirrus_protocols_async::SignalBackend;
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,10 +58,19 @@ fn join(prefix: &str, suffix: &str) -> String {
     format!("{prefix}{suffix}")
 }
 
-async fn await_put(status: Status, what: &str) -> Result<()> {
-    match status.await {
-        Ok(()) => Ok(()),
-        Err(e) => Err(CirrusError::Backend(format!("{what}: {e:?}"))),
+/// Run a backend `put` to completion, bounding it with [`PUT_TIMEOUT`].
+/// The backend `put` always waits for completion (CP-11); the per-put
+/// timeout lives here, at the call layer, not in the backend.
+async fn await_put<F>(put: F, what: &str) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    match tokio::time::timeout(PUT_TIMEOUT, put).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(CirrusError::Backend(format!("{what}: {e}"))),
+        Err(_) => Err(CirrusError::Backend(format!(
+            "{what}: put timed out after {PUT_TIMEOUT:?}"
+        ))),
     }
 }
 
@@ -154,18 +163,12 @@ impl AreaDetectorCam {
         let prev_num_images = SignalBackend::<i64>::get_value(self.num_images.as_ref()).await?;
 
         await_put(
-            SignalBackend::<i64>::put(
-                self.image_mode.as_ref(),
-                AD_IMAGE_MODE_SINGLE,
-                true,
-                Some(PUT_TIMEOUT),
-            )
-            .await,
+            SignalBackend::<i64>::put(self.image_mode.as_ref(), Some(AD_IMAGE_MODE_SINGLE)),
             "warmup: set ImageMode=Single",
         )
         .await?;
         await_put(
-            SignalBackend::<i64>::put(self.num_images.as_ref(), 1, true, Some(PUT_TIMEOUT)).await,
+            SignalBackend::<i64>::put(self.num_images.as_ref(), Some(1)),
             "warmup: set NumImages=1",
         )
         .await?;
@@ -177,7 +180,7 @@ impl AreaDetectorCam {
         // samples a stale Idle and returns immediately — the test
         // sees zero frames acquired.
         await_put(
-            SignalBackend::<bool>::put(self.acquire.as_ref(), true, true, Some(PUT_TIMEOUT)).await,
+            SignalBackend::<bool>::put(self.acquire.as_ref(), Some(true)),
             "warmup: trigger Acquire",
         )
         .await?;
@@ -189,24 +192,12 @@ impl AreaDetectorCam {
         // Restore. Failures here are best-effort: log via Err in the
         // outer Result so callers see them.
         await_put(
-            SignalBackend::<i64>::put(
-                self.image_mode.as_ref(),
-                prev_image_mode,
-                true,
-                Some(PUT_TIMEOUT),
-            )
-            .await,
+            SignalBackend::<i64>::put(self.image_mode.as_ref(), Some(prev_image_mode)),
             "warmup: restore ImageMode",
         )
         .await?;
         await_put(
-            SignalBackend::<i64>::put(
-                self.num_images.as_ref(),
-                prev_num_images,
-                true,
-                Some(PUT_TIMEOUT),
-            )
-            .await,
+            SignalBackend::<i64>::put(self.num_images.as_ref(), Some(prev_num_images)),
             "warmup: restore NumImages",
         )
         .await?;
@@ -269,13 +260,7 @@ impl NdPlugin {
     /// Set `EnableCallbacks`.
     pub async fn set_enabled(&self, enabled: bool) -> Result<()> {
         await_put(
-            SignalBackend::<bool>::put(
-                self.enable_callbacks.as_ref(),
-                enabled,
-                true,
-                Some(PUT_TIMEOUT),
-            )
-            .await,
+            SignalBackend::<bool>::put(self.enable_callbacks.as_ref(), Some(enabled)),
             "NdPlugin::set_enabled",
         )
         .await
@@ -284,13 +269,7 @@ impl NdPlugin {
     /// Set `BlockingCallbacks`.
     pub async fn set_blocking(&self, blocking: bool) -> Result<()> {
         await_put(
-            SignalBackend::<bool>::put(
-                self.blocking_callbacks.as_ref(),
-                blocking,
-                true,
-                Some(PUT_TIMEOUT),
-            )
-            .await,
+            SignalBackend::<bool>::put(self.blocking_callbacks.as_ref(), Some(blocking)),
             "NdPlugin::set_blocking",
         )
         .await
@@ -300,13 +279,7 @@ impl NdPlugin {
     /// from a different upstream.
     pub async fn set_source_port(&self, port: &str) -> Result<()> {
         await_put(
-            SignalBackend::<String>::put(
-                self.nd_array_port.as_ref(),
-                port.to_string(),
-                true,
-                Some(PUT_TIMEOUT),
-            )
-            .await,
+            SignalBackend::<String>::put(self.nd_array_port.as_ref(), Some(port.to_string())),
             "NdPlugin::set_source_port",
         )
         .await
@@ -383,13 +356,7 @@ impl NdFile {
     /// Set `FilePath` — directory the writer drops files into.
     pub async fn set_path(&self, path: &str) -> Result<()> {
         await_put(
-            SignalBackend::<String>::put(
-                self.file_path.as_ref(),
-                path.to_string(),
-                true,
-                Some(PUT_TIMEOUT),
-            )
-            .await,
+            SignalBackend::<String>::put(self.file_path.as_ref(), Some(path.to_string())),
             "NdFile::set_path",
         )
         .await
@@ -398,13 +365,7 @@ impl NdFile {
     /// Set `FileName` — basename pre-template.
     pub async fn set_name(&self, name: &str) -> Result<()> {
         await_put(
-            SignalBackend::<String>::put(
-                self.file_name.as_ref(),
-                name.to_string(),
-                true,
-                Some(PUT_TIMEOUT),
-            )
-            .await,
+            SignalBackend::<String>::put(self.file_name.as_ref(), Some(name.to_string())),
             "NdFile::set_name",
         )
         .await
@@ -413,13 +374,7 @@ impl NdFile {
     /// Set `FileTemplate` — typical value `"%s%s_%6.6d.h5"`.
     pub async fn set_template(&self, template: &str) -> Result<()> {
         await_put(
-            SignalBackend::<String>::put(
-                self.file_template.as_ref(),
-                template.to_string(),
-                true,
-                Some(PUT_TIMEOUT),
-            )
-            .await,
+            SignalBackend::<String>::put(self.file_template.as_ref(), Some(template.to_string())),
             "NdFile::set_template",
         )
         .await
@@ -490,13 +445,7 @@ impl NdStats {
     pub async fn force_enable_stats(&self) -> Result<()> {
         self.plugin.set_enabled(true).await?;
         await_put(
-            SignalBackend::<bool>::put(
-                self.compute_statistics.as_ref(),
-                true,
-                true,
-                Some(PUT_TIMEOUT),
-            )
-            .await,
+            SignalBackend::<bool>::put(self.compute_statistics.as_ref(), Some(true)),
             "NdStats::force_enable_stats",
         )
         .await
@@ -562,22 +511,22 @@ impl NdRoi {
     /// Set the four ROI bounds at once.
     pub async fn set_bounds(&self, min_x: i64, min_y: i64, size_x: i64, size_y: i64) -> Result<()> {
         await_put(
-            SignalBackend::<i64>::put(self.min_x.as_ref(), min_x, true, Some(PUT_TIMEOUT)).await,
+            SignalBackend::<i64>::put(self.min_x.as_ref(), Some(min_x)),
             "NdRoi::set_bounds: MinX",
         )
         .await?;
         await_put(
-            SignalBackend::<i64>::put(self.min_y.as_ref(), min_y, true, Some(PUT_TIMEOUT)).await,
+            SignalBackend::<i64>::put(self.min_y.as_ref(), Some(min_y)),
             "NdRoi::set_bounds: MinY",
         )
         .await?;
         await_put(
-            SignalBackend::<i64>::put(self.size_x.as_ref(), size_x, true, Some(PUT_TIMEOUT)).await,
+            SignalBackend::<i64>::put(self.size_x.as_ref(), Some(size_x)),
             "NdRoi::set_bounds: SizeX",
         )
         .await?;
         await_put(
-            SignalBackend::<i64>::put(self.size_y.as_ref(), size_y, true, Some(PUT_TIMEOUT)).await,
+            SignalBackend::<i64>::put(self.size_y.as_ref(), Some(size_y)),
             "NdRoi::set_bounds: SizeY",
         )
         .await?;
@@ -587,12 +536,12 @@ impl NdRoi {
     /// Set per-axis enable flags.
     pub async fn set_enabled_xy(&self, x: bool, y: bool) -> Result<()> {
         await_put(
-            SignalBackend::<bool>::put(self.enable_x.as_ref(), x, true, Some(PUT_TIMEOUT)).await,
+            SignalBackend::<bool>::put(self.enable_x.as_ref(), Some(x)),
             "NdRoi::set_enabled_xy: EnableX",
         )
         .await?;
         await_put(
-            SignalBackend::<bool>::put(self.enable_y.as_ref(), y, true, Some(PUT_TIMEOUT)).await,
+            SignalBackend::<bool>::put(self.enable_y.as_ref(), Some(y)),
             "NdRoi::set_enabled_xy: EnableY",
         )
         .await

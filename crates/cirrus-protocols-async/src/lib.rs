@@ -34,8 +34,12 @@ pub type ReadingValueCallback<T> = Box<dyn Fn(&T, f64) + Send + Sync>;
 pub trait SignalBackend<T: Clone + Send + Sync + 'static>: Send + Sync {
     /// Connect to the underlying transport.
     async fn connect(&self, timeout: Duration) -> Result<()>;
-    /// Put a value, optionally waiting for completion.
-    async fn put(&self, value: T, wait: bool, timeout: Option<Duration>) -> Status;
+    /// Put a value to the signal, awaiting completion. `None` writes the
+    /// backend's default value (used by trigger-style `SignalX` puts).
+    /// Mirrors `ophyd_async/core/_signal_backend.py:82` `put(value: T | None)`:
+    /// waiting-for-completion is implicit, and any timeout lives on the
+    /// `Signal` layer (`SignalW::set` / `SignalX::trigger`), not here.
+    async fn put(&self, value: Option<T>) -> Result<()>;
     /// Describe the signal as a `DataKey`.
     async fn get_datakey(&self, source: &str) -> Result<DataKey>;
     /// Read current value as a `Reading` (JSON-erased).

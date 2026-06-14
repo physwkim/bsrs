@@ -19,7 +19,7 @@ cirrus-backend-soft = { path = "../cirrus-backends/soft" }
 cirrus-backend-mock = { path = "../cirrus-backends/mock" }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 bytes.workspace = true
 futures.workspace = true
 async-stream.workspace = true

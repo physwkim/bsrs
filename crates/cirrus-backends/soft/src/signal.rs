@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use cirrus_core::error::Result;
 use cirrus_core::reading::ReadingValue;
-use cirrus_core::status::{Status, SubToken};
+use cirrus_core::status::SubToken;
 use cirrus_event_model::{DataKey, Dtype};
 use cirrus_protocols_async::{ReadingValueCallback, SignalBackend};
 use serde::Serialize;
@@ -21,6 +21,9 @@ fn now_ts() -> f64 {
 struct Inner<T: Clone + Send + Sync + 'static> {
     value: Mutex<T>,
     setpoint: Mutex<T>,
+    /// Value written by `put(None)` — the ophyd-async `initial_value`
+    /// (`_soft_signal_backend.py:164`). Fixed at construction.
+    initial: T,
     callbacks: Mutex<Vec<(u64, Arc<ReadingValueCallback<T>>)>>,
     next_id: AtomicU64,
     units: Option<String>,
@@ -60,7 +63,8 @@ where
         Self {
             inner: Arc::new(Inner {
                 value: Mutex::new(initial.clone()),
-                setpoint: Mutex::new(initial),
+                setpoint: Mutex::new(initial.clone()),
+                initial,
                 callbacks: Mutex::new(Vec::new()),
                 next_id: AtomicU64::new(0),
                 units: None,
@@ -76,6 +80,7 @@ where
         let inner = Arc::new(Inner {
             value: Mutex::new(self.inner.value.lock().unwrap().clone()),
             setpoint: Mutex::new(self.inner.setpoint.lock().unwrap().clone()),
+            initial: self.inner.initial.clone(),
             callbacks: Mutex::new(Vec::new()),
             next_id: AtomicU64::new(0),
             units: Some(units.into()),
@@ -91,6 +96,7 @@ where
         let inner = Arc::new(Inner {
             value: Mutex::new(self.inner.value.lock().unwrap().clone()),
             setpoint: Mutex::new(self.inner.setpoint.lock().unwrap().clone()),
+            initial: self.inner.initial.clone(),
             callbacks: Mutex::new(Vec::new()),
             next_id: AtomicU64::new(0),
             units: self.inner.units.clone(),
@@ -143,7 +149,10 @@ where
     async fn connect(&self, _timeout: Duration) -> Result<()> {
         Ok(())
     }
-    async fn put(&self, value: T, _wait: bool, _timeout: Option<Duration>) -> Status {
+    async fn put(&self, value: Option<T>) -> Result<()> {
+        // `None` writes the configured initial value (ophyd-async
+        // `_soft_signal_backend.py:164`).
+        let value = value.unwrap_or_else(|| self.inner.initial.clone());
         *self.inner.setpoint.lock().unwrap() = value.clone();
         *self.inner.value.lock().unwrap() = value.clone();
         let ts = now_ts();
@@ -158,7 +167,7 @@ where
         for cb in cbs {
             cb(&value, ts);
         }
-        Status::done()
+        Ok(())
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         Ok(DataKey {
@@ -209,5 +218,32 @@ where
     }
     fn source(&self, name: &str) -> String {
         format!("soft://{name}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cirrus_protocols_async::SignalBackend;
+    use futures::executor::block_on;
+
+    // CP-11 invariant boundary: `put(Some(v))` writes `v`; `put(None)`
+    // writes the configured initial value (SignalX-style default put).
+    #[test]
+    fn put_some_writes_value_and_setpoint() {
+        let b = SoftSignalBackend::new(0.0_f64, Dtype::Number);
+        block_on(SignalBackend::put(&b, Some(3.5))).unwrap();
+        assert_eq!(b.current_value(), 3.5);
+        assert_eq!(b.current_setpoint(), 3.5);
+    }
+
+    #[test]
+    fn put_none_writes_initial() {
+        let b = SoftSignalBackend::new(7.0_f64, Dtype::Number);
+        block_on(SignalBackend::put(&b, Some(3.0))).unwrap();
+        assert_eq!(b.current_value(), 3.0);
+        block_on(SignalBackend::put(&b, None)).unwrap();
+        assert_eq!(b.current_value(), 7.0);
+        assert_eq!(b.current_setpoint(), 7.0);
     }
 }

@@ -5,7 +5,7 @@
 use async_trait::async_trait;
 use cirrus_core::error::Result;
 use cirrus_core::reading::ReadingValue;
-use cirrus_core::status::{Status, SubToken};
+use cirrus_core::status::SubToken;
 use cirrus_event_model::{DataKey, Dtype};
 use cirrus_protocols_async::{ReadingValueCallback, SignalBackend};
 use serde::Serialize;
@@ -34,8 +34,8 @@ impl<T: Clone + Send + Sync + Serialize + 'static> SignalBackend<T> for MockBack
     async fn connect(&self, _timeout: Duration) -> Result<()> {
         Ok(())
     }
-    async fn put(&self, _value: T, _wait: bool, _timeout: Option<Duration>) -> Status {
-        Status::done()
+    async fn put(&self, _value: Option<T>) -> Result<()> {
+        Ok(())
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         Ok(DataKey {

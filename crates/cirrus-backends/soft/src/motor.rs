@@ -6,7 +6,7 @@ use cirrus_core::msg::{
     DynLocation, LocatableObj, MovableObj, NamedObj, ReadableObj, StoppableObj,
 };
 use cirrus_core::reading::ReadingValue;
-use cirrus_core::status::Status;
+use cirrus_core::status::{Status, StatusError};
 use cirrus_core::Kind;
 use cirrus_event_model::{DataKey, Dtype};
 use cirrus_protocols_async::{AsyncMovable, AsyncReadable, Locatable, Location, SignalBackend};
@@ -98,7 +98,10 @@ impl AsyncMovable<f64> for SoftMotor {
         &self.name
     }
     async fn set(&self, value: f64) -> Status {
-        self.backend.put(value, true, None).await
+        match self.backend.put(Some(value)).await {
+            Ok(()) => Status::done(),
+            Err(e) => Status::fail(StatusError::Failed(e.to_string())),
+        }
     }
 }
 

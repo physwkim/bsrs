@@ -13,7 +13,7 @@
 use async_trait::async_trait;
 use cirrus_core::error::{CirrusError, Result};
 use cirrus_core::reading::ReadingValue;
-use cirrus_core::status::{Status, StatusError, SubToken};
+use cirrus_core::status::SubToken;
 use cirrus_event_model::{DataKey, Dtype};
 use cirrus_protocols_async::{ReadingValueCallback, SignalBackend};
 use epics_ca_rs::client::{CaChannel, CaClient};
@@ -321,28 +321,19 @@ impl SignalBackend<f64> for EpicsCaBackend<f64> {
     async fn connect(&self, timeout: Duration) -> Result<()> {
         self.ensure_channel(timeout).await.map(|_| ())
     }
-    async fn put(&self, value: f64, wait: bool, timeout: Option<Duration>) -> Status {
-        let ch = match self
-            .ensure_channel(timeout.unwrap_or(Duration::from_secs(2)))
+    async fn put(&self, value: Option<f64>) -> Result<()> {
+        let value = value.unwrap_or_default();
+        let ch = self
+            .ensure_channel(Duration::from_secs(2))
             .await
-        {
-            Ok(c) => c,
-            Err(e) => return Status::fail(StatusError::Failed(format!("{e}"))),
-        };
-        let native = match channel_native_type(&ch).await {
-            Ok(t) => t,
-            Err(e) => return Status::fail(StatusError::Failed(format!("{e}"))),
-        };
+            .map_err(|e| CirrusError::Backend(format!("{e}")))?;
+        let native = channel_native_type(&ch)
+            .await
+            .map_err(|e| CirrusError::Backend(format!("{e}")))?;
         let v = f64_to_wire(native, value);
-        let res = if wait {
-            ch.put(&v).await
-        } else {
-            ch.put_nowait(&v).await
-        };
-        match res {
-            Ok(()) => Status::done(),
-            Err(e) => Status::fail(StatusError::Failed(format!("ca put: {e}"))),
-        }
+        ch.put(&v)
+            .await
+            .map_err(|e| CirrusError::Backend(format!("ca put: {e}")))
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
@@ -437,24 +428,16 @@ impl SignalBackend<String> for EpicsCaBackend<String> {
     async fn connect(&self, timeout: Duration) -> Result<()> {
         self.ensure_channel(timeout).await.map(|_| ())
     }
-    async fn put(&self, value: String, wait: bool, timeout: Option<Duration>) -> Status {
-        let ch = match self
-            .ensure_channel(timeout.unwrap_or(Duration::from_secs(2)))
+    async fn put(&self, value: Option<String>) -> Result<()> {
+        let value = value.unwrap_or_default();
+        let ch = self
+            .ensure_channel(Duration::from_secs(2))
             .await
-        {
-            Ok(c) => c,
-            Err(e) => return Status::fail(StatusError::Failed(format!("{e}"))),
-        };
+            .map_err(|e| CirrusError::Backend(format!("{e}")))?;
         let v = string_to_epics(&value, self.string_kind);
-        let res = if wait {
-            ch.put(&v).await
-        } else {
-            ch.put_nowait(&v).await
-        };
-        match res {
-            Ok(()) => Status::done(),
-            Err(e) => Status::fail(StatusError::Failed(format!("ca put: {e}"))),
-        }
+        ch.put(&v)
+            .await
+            .map_err(|e| CirrusError::Backend(format!("ca put: {e}")))
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
@@ -548,28 +531,19 @@ impl SignalBackend<i64> for EpicsCaBackend<i64> {
     async fn connect(&self, timeout: Duration) -> Result<()> {
         self.ensure_channel(timeout).await.map(|_| ())
     }
-    async fn put(&self, value: i64, wait: bool, timeout: Option<Duration>) -> Status {
-        let ch = match self
-            .ensure_channel(timeout.unwrap_or(Duration::from_secs(2)))
+    async fn put(&self, value: Option<i64>) -> Result<()> {
+        let value = value.unwrap_or_default();
+        let ch = self
+            .ensure_channel(Duration::from_secs(2))
             .await
-        {
-            Ok(c) => c,
-            Err(e) => return Status::fail(StatusError::Failed(format!("{e}"))),
-        };
-        let native = match channel_native_type(&ch).await {
-            Ok(t) => t,
-            Err(e) => return Status::fail(StatusError::Failed(format!("{e}"))),
-        };
+            .map_err(|e| CirrusError::Backend(format!("{e}")))?;
+        let native = channel_native_type(&ch)
+            .await
+            .map_err(|e| CirrusError::Backend(format!("{e}")))?;
         let v = i64_to_wire(native, value);
-        let res = if wait {
-            ch.put(&v).await
-        } else {
-            ch.put_nowait(&v).await
-        };
-        match res {
-            Ok(()) => Status::done(),
-            Err(e) => Status::fail(StatusError::Failed(format!("ca put: {e}"))),
-        }
+        ch.put(&v)
+            .await
+            .map_err(|e| CirrusError::Backend(format!("ca put: {e}")))
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
@@ -661,28 +635,19 @@ impl SignalBackend<bool> for EpicsCaBackend<bool> {
     async fn connect(&self, timeout: Duration) -> Result<()> {
         self.ensure_channel(timeout).await.map(|_| ())
     }
-    async fn put(&self, value: bool, wait: bool, timeout: Option<Duration>) -> Status {
-        let ch = match self
-            .ensure_channel(timeout.unwrap_or(Duration::from_secs(2)))
+    async fn put(&self, value: Option<bool>) -> Result<()> {
+        let value = value.unwrap_or_default();
+        let ch = self
+            .ensure_channel(Duration::from_secs(2))
             .await
-        {
-            Ok(c) => c,
-            Err(e) => return Status::fail(StatusError::Failed(format!("{e}"))),
-        };
-        let native = match channel_native_type(&ch).await {
-            Ok(t) => t,
-            Err(e) => return Status::fail(StatusError::Failed(format!("{e}"))),
-        };
+            .map_err(|e| CirrusError::Backend(format!("{e}")))?;
+        let native = channel_native_type(&ch)
+            .await
+            .map_err(|e| CirrusError::Backend(format!("{e}")))?;
         let v = bool_to_wire(native, value);
-        let res = if wait {
-            ch.put(&v).await
-        } else {
-            ch.put_nowait(&v).await
-        };
-        match res {
-            Ok(()) => Status::done(),
-            Err(e) => Status::fail(StatusError::Failed(format!("ca put: {e}"))),
-        }
+        ch.put(&v)
+            .await
+            .map_err(|e| CirrusError::Backend(format!("ca put: {e}")))
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         Ok(DataKey {

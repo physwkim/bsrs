@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use cirrus_core::error::{CirrusError, Result};
 use cirrus_core::reading::ReadingValue;
-use cirrus_core::status::{Status, StatusError, SubToken};
+use cirrus_core::status::SubToken;
 use cirrus_event_model::DataKey;
 use cirrus_protocols_async::{ReadingValueCallback, SignalBackend};
 use serde::Serialize;
@@ -38,8 +38,8 @@ impl<T: Clone + Send + Sync + Serialize + 'static> SignalBackend<T> for EpicsPva
     async fn connect(&self, _timeout: Duration) -> Result<()> {
         Err(CirrusError::Backend(DISABLED.into()))
     }
-    async fn put(&self, _value: T, _wait: bool, _timeout: Option<Duration>) -> Status {
-        Status::fail(StatusError::Failed(DISABLED.into()))
+    async fn put(&self, _value: Option<T>) -> Result<()> {
+        Err(CirrusError::Backend(DISABLED.into()))
     }
     async fn get_datakey(&self, _source: &str) -> Result<DataKey> {
         Err(CirrusError::Backend(DISABLED.into()))

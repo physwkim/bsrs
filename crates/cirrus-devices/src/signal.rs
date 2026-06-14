@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use cirrus_core::error::Result;
 use cirrus_core::reading::ReadingValue;
-use cirrus_core::status::{Status, SubToken};
+use cirrus_core::status::{Status, StatusError, SubToken};
 use cirrus_core::Kind;
 use cirrus_event_model::DataKey;
 use cirrus_protocols_async::{
@@ -69,14 +69,15 @@ where
         self.backend.get_setpoint().await
     }
 
-    /// Put a value, returning a `Status`.
+    /// Put a value, awaiting completion. Returns a resolved `Status`
+    /// reflecting success or failure. The backend `put` always waits for
+    /// completion (CP-11); a per-call timeout, when needed, is applied by
+    /// the caller (mirrors `SignalW::set(value, timeout)`).
     pub async fn put(&self, value: T) -> Status {
-        self.backend.put(value, true, None).await
-    }
-
-    /// Put a value without waiting for completion.
-    pub async fn put_no_wait(&self, value: T) -> Status {
-        self.backend.put(value, false, None).await
+        match self.backend.put(Some(value)).await {
+            Ok(()) => Status::done(),
+            Err(e) => Status::fail(StatusError::Failed(e.to_string())),
+        }
     }
 
     /// Read a `(key, ReadingValue)` map containing this one signal.

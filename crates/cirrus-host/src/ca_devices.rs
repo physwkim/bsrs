@@ -127,20 +127,18 @@ impl ReadableObj for CaMotor {
 #[async_trait::async_trait]
 impl MovableObj for CaMotor {
     async fn set_dyn(&self, value: f64) -> Status {
-        let put_status = self
-            .setpoint
-            .put(value, true, Some(Duration::from_secs(30)))
-            .await;
-        let (status, setter) = Status::new();
-        cirrus_core::runtime::cirrus_runtime().spawn(async move {
-            match put_status.await {
-                Ok(()) => setter.success(),
-                Err(e) => setter.fail(cirrus_core::status::StatusError::Failed(format!(
-                    "ca_motor set: {e:?}"
-                ))),
-            }
-        });
-        status
+        // The backend `put` awaits the motor settle (WRITE_NOTIFY). The
+        // 30 s move-timeout lives here, at the device layer (CP-11), not
+        // in the backend's channel-ensure step.
+        match tokio::time::timeout(Duration::from_secs(30), self.setpoint.put(Some(value))).await {
+            Ok(Ok(())) => Status::done(),
+            Ok(Err(e)) => Status::fail(cirrus_core::status::StatusError::Failed(format!(
+                "ca_motor set: {e}"
+            ))),
+            Err(_) => Status::fail(cirrus_core::status::StatusError::Failed(
+                "ca_motor set: timed out after 30s".into(),
+            )),
+        }
     }
 }
 

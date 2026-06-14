@@ -3496,33 +3496,28 @@ impl UserData for LuaAdCam {
             )
         });
         m.add_method("set_image_mode", |_, this, n: i64| {
-            ad_block("ad_cam:set_image_mode", async move {
-                let s = SignalBackend::<i64>::put(this.0.image_mode.as_ref(), n, true, None).await;
-                s.await
-                    .map_err(|e| cirrus_core::error::CirrusError::Backend(format!("{e:?}")))
-            })
+            ad_block(
+                "ad_cam:set_image_mode",
+                SignalBackend::<i64>::put(this.0.image_mode.as_ref(), Some(n)),
+            )
         });
         m.add_method("set_num_images", |_, this, n: i64| {
-            ad_block("ad_cam:set_num_images", async move {
-                let s = SignalBackend::<i64>::put(this.0.num_images.as_ref(), n, true, None).await;
-                s.await
-                    .map_err(|e| cirrus_core::error::CirrusError::Backend(format!("{e:?}")))
-            })
+            ad_block(
+                "ad_cam:set_num_images",
+                SignalBackend::<i64>::put(this.0.num_images.as_ref(), Some(n)),
+            )
         });
         m.add_method("set_acquire", |_, this, b: bool| {
-            ad_block("ad_cam:set_acquire", async move {
-                let s = SignalBackend::<bool>::put(this.0.acquire.as_ref(), b, false, None).await;
-                s.await
-                    .map_err(|e| cirrus_core::error::CirrusError::Backend(format!("{e:?}")))
-            })
+            ad_block(
+                "ad_cam:set_acquire",
+                SignalBackend::<bool>::put(this.0.acquire.as_ref(), Some(b)),
+            )
         });
         m.add_method("set_acquire_time", |_, this, t: f64| {
-            ad_block("ad_cam:set_acquire_time", async move {
-                let s =
-                    SignalBackend::<f64>::put(this.0.acquire_time.as_ref(), t, true, None).await;
-                s.await
-                    .map_err(|e| cirrus_core::error::CirrusError::Backend(format!("{e:?}")))
-            })
+            ad_block(
+                "ad_cam:set_acquire_time",
+                SignalBackend::<f64>::put(this.0.acquire_time.as_ref(), Some(t)),
+            )
         });
     }
 }
@@ -3586,29 +3581,22 @@ impl UserData for LuaAdStats {
             ad_block("ad_stats:force_enable_stats", this.0.force_enable_stats())
         });
         m.add_method("set_compute_centroid", |_, this, b: bool| {
-            ad_block("ad_stats:set_compute_centroid", async move {
-                let s = SignalBackend::<bool>::put(this.0.compute_centroid.as_ref(), b, true, None)
-                    .await;
-                s.await
-                    .map_err(|e| cirrus_core::error::CirrusError::Backend(format!("{e:?}")))
-            })
+            ad_block(
+                "ad_stats:set_compute_centroid",
+                SignalBackend::<bool>::put(this.0.compute_centroid.as_ref(), Some(b)),
+            )
         });
         m.add_method("set_compute_profiles", |_, this, b: bool| {
-            ad_block("ad_stats:set_compute_profiles", async move {
-                let s = SignalBackend::<bool>::put(this.0.compute_profiles.as_ref(), b, true, None)
-                    .await;
-                s.await
-                    .map_err(|e| cirrus_core::error::CirrusError::Backend(format!("{e:?}")))
-            })
+            ad_block(
+                "ad_stats:set_compute_profiles",
+                SignalBackend::<bool>::put(this.0.compute_profiles.as_ref(), Some(b)),
+            )
         });
         m.add_method("set_compute_histogram", |_, this, b: bool| {
-            ad_block("ad_stats:set_compute_histogram", async move {
-                let s =
-                    SignalBackend::<bool>::put(this.0.compute_histogram.as_ref(), b, true, None)
-                        .await;
-                s.await
-                    .map_err(|e| cirrus_core::error::CirrusError::Backend(format!("{e:?}")))
-            })
+            ad_block(
+                "ad_stats:set_compute_histogram",
+                SignalBackend::<bool>::put(this.0.compute_histogram.as_ref(), Some(b)),
+            )
         });
     }
 }

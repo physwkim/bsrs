@@ -112,24 +112,18 @@ impl ReadableObj for CaMotor {
 #[async_trait::async_trait]
 impl MovableObj for CaMotor {
     async fn set_dyn(&self, value: f64) -> Status {
-        let put_fut = self
-            .setpoint
-            .put(value, true, Some(Duration::from_secs(30)));
-        // Spawn a tracker task that fires the cb after settling.
-        let (status, setter) = Status::new();
-        let put_status = put_fut.await;
-        // The CA backend's put with wait=true blocks until the
-        // motor record settles (DBR_PUT_ACK semantics). Once that
-        // future resolves, mark our outer status done.
-        cirrus_core::runtime::cirrus_runtime().spawn(async move {
-            match put_status.await {
-                Ok(()) => setter.success(),
-                Err(e) => setter.fail(cirrus_core::status::StatusError::Failed(format!(
-                    "set: {e:?}"
-                ))),
-            }
-        });
-        status
+        // The backend `put` blocks until the motor record settles
+        // (WRITE_NOTIFY). The 30 s move-timeout lives here, at the device
+        // layer (CP-11).
+        match tokio::time::timeout(Duration::from_secs(30), self.setpoint.put(Some(value))).await {
+            Ok(Ok(())) => Status::done(),
+            Ok(Err(e)) => Status::fail(cirrus_core::status::StatusError::Failed(format!(
+                "set: {e}"
+            ))),
+            Err(_) => Status::fail(cirrus_core::status::StatusError::Failed(
+                "set: timed out after 30s".into(),
+            )),
+        }
     }
 }
 
@@ -238,10 +232,7 @@ async fn async_main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // timeout. Real beamlines configure this once during setup.
     let velo = Arc::new(EpicsCaBackend::<f64>::new("mini:ph:mtr.VELO"));
     velo.connect(Duration::from_secs(5)).await?;
-    let _ = velo
-        .put(5.0, false, Some(Duration::from_secs(5)))
-        .await
-        .await;
+    let _ = velo.put(Some(5.0)).await;
     eprintln!("[cirrus] set mini:ph:mtr.VELO = 5.0");
 
     eprintln!("[cirrus] motor={:?}", motor.inspect_dyn());
