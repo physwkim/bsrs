@@ -6,6 +6,9 @@
 # kodex tool caches (generated locally, not part of source)
 /kodex-out/
 
+# caucus multi-agent session scratch
+/.caucus/
+
 # editor / OS misc
 .idea/
 .vscode/
