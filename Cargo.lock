@@ -633,6 +633,7 @@ name = "cirrus-backend-mock"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "cirrus-backend-soft",
  "cirrus-core",
  "cirrus-devices",
  "cirrus-event-model",
