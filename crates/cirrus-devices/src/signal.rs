@@ -18,11 +18,9 @@ use cirrus_protocols_async::{
     Triggerable,
 };
 use serde::Serialize;
-use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::watch;
 
 /// Re-export so users don't have to depend on cirrus-core directly.
 pub use cirrus_core::Kind as SignalKind;
@@ -103,6 +101,10 @@ where
 {
     backend: Arc<B>,
     config: SignalConfig,
+    /// Lazily created shared monitor (CP-08). `None` until the signal is first
+    /// subscribed or staged; afterwards the cache fans one backend monitor out
+    /// to every subscriber and holds the latest value.
+    cache: std::sync::Mutex<Option<Arc<crate::signal_cache::SignalCache<T, B>>>>,
     _marker: std::marker::PhantomData<(T, A)>,
 }
 
@@ -119,6 +121,7 @@ where
         Self {
             backend,
             config,
+            cache: std::sync::Mutex::new(None),
             _marker: std::marker::PhantomData,
         }
     }
@@ -152,12 +155,57 @@ where
         self.backend.get_value().await
     }
 
-    /// Read a `(key, ReadingValue)` map containing this one signal.
+    /// Get (or lazily create) the shared monitor cache for this signal (CP-08).
+    fn cache(&self) -> Arc<crate::signal_cache::SignalCache<T, B>> {
+        let mut g = self.cache.lock().unwrap();
+        if let Some(c) = g.as_ref() {
+            return c.clone();
+        }
+        let c = crate::signal_cache::SignalCache::new(self.backend.clone());
+        *g = Some(c.clone());
+        c
+    }
+
+    /// Latest cached reading if a cache exists and has seen a value.
+    fn cache_snapshot(&self) -> Option<ReadingValue> {
+        self.cache
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|c| c.cached_reading())
+    }
+
+    /// Read a `(key, ReadingValue)` map containing this one signal, defaulting
+    /// to the cached value when one is available (`cached = None`).
     pub async fn read(&self) -> Result<HashMap<String, ReadingValue>> {
-        let r = self.backend.get_reading().await?;
+        self.read_cached(None).await
+    }
+
+    /// Read with explicit cache control (mirrors ophyd-async `read(cached=)`):
+    /// `Some(false)` always hits the backend; `Some(true)` / `None` return the
+    /// cached value when present, else fall back to a backend read.
+    pub async fn read_cached(&self, cached: Option<bool>) -> Result<HashMap<String, ReadingValue>> {
+        let r = match cached {
+            Some(false) => self.backend.get_reading().await?,
+            _ => match self.cache_snapshot() {
+                Some(rv) => rv,
+                None => self.backend.get_reading().await?,
+            },
+        };
         let mut out = HashMap::new();
         out.insert(self.config.name.clone(), r);
         Ok(out)
+    }
+
+    /// Stage: open and hold the shared monitor across subscriber churn (CP-08).
+    pub fn stage(&self) {
+        self.cache().set_staged(true);
+    }
+
+    /// Unstage: release the staged hold; the monitor is torn down once no
+    /// listeners remain.
+    pub fn unstage(&self) {
+        self.cache().set_staged(false);
     }
 
     /// Describe this one signal as a `(key, DataKey)` map.
@@ -276,29 +324,11 @@ where
         &self.config.name
     }
     async fn subscribe(&self) -> Result<Subscription> {
-        let (tx, rx) = watch::channel(ReadingValue {
-            value: Value::Null,
-            timestamp: 0.0,
-            alarm_severity: None,
-            message: None,
-        });
-        let tx = Arc::new(tx);
-        let cb: ReadingValueCallback<T> = {
-            let tx = tx.clone();
-            Box::new(move |v: &T, ts: f64| {
-                if let Ok(json) = serde_json::to_value(v) {
-                    let _ = tx.send(ReadingValue {
-                        value: json,
-                        timestamp: ts,
-                        alarm_severity: None,
-                        message: None,
-                    });
-                }
-            })
-        };
-        // K2: SubToken lives inside Subscription. Drop of Subscription removes
-        // the backend slot via the token's Drop impl.
-        let token = self.backend.set_callback(Some(cb));
+        // CP-08: route through the shared cache so N subscribers demultiplex
+        // one backend monitor instead of opening one each. K2: the returned
+        // SubToken decrements the cache's listener count on Subscription drop
+        // (and tears the monitor down if it was the last and unstaged).
+        let (rx, token) = self.cache().add_listener();
         Ok(Subscription::new(rx, token))
     }
 }
@@ -344,6 +374,45 @@ where
         } else {
             None
         }
+    }
+}
+
+// -- Stageable: staging a readable signal holds its shared monitor (CP-08) ----
+
+#[async_trait]
+impl<T, B, A> cirrus_protocols_async::Stageable for Signal<T, B, A>
+where
+    T: Clone + Send + Sync + Serialize + 'static,
+    B: SignalBackend<T>,
+    A: Readable,
+{
+    fn name(&self) -> &str {
+        &self.config.name
+    }
+    async fn stage(&self) -> Result<()> {
+        self.cache().set_staged(true);
+        Ok(())
+    }
+    async fn unstage(&self) -> Result<()> {
+        self.cache().set_staged(false);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl<T, B, A> cirrus_core::msg::StageableObj for Signal<T, B, A>
+where
+    T: Clone + Send + Sync + Serialize + 'static,
+    B: SignalBackend<T>,
+    A: Readable,
+{
+    async fn stage_dyn(&self) -> Result<()> {
+        self.cache().set_staged(true);
+        Ok(())
+    }
+    async fn unstage_dyn(&self) -> Result<()> {
+        self.cache().set_staged(false);
+        Ok(())
     }
 }
 
@@ -418,5 +487,57 @@ mod tests {
         // Triggerable trait object path resolves to the same behavior.
         let dynx: &dyn Triggerable = &x;
         assert_eq!(dynx.name(), "proc");
+    }
+
+    // CP-08: staging opens one shared backend monitor; multiple subscriptions
+    // demultiplex it; cached reads return the monitored value; cached=false
+    // forces a backend read; unstaging with no listeners tears the monitor down.
+    #[tokio::test]
+    async fn staged_signal_caches_reads_and_shares_one_monitor() {
+        use cirrus_event_model::Dtype;
+
+        let backend = Arc::new(cirrus_backend_soft::SoftSignalBackend::new(
+            1.0_f64,
+            Dtype::Number,
+        ));
+        let s: SignalR<f64, _> = Signal::new(
+            backend.clone(),
+            SignalConfig {
+                source: "x".into(),
+                kind: Kind::Normal,
+                name: "x".into(),
+            },
+        );
+
+        s.stage();
+        assert_eq!(backend.subscriber_count(), 1, "stage opens the monitor");
+
+        let sub1 = AsyncSubscribable::subscribe(&s).await.unwrap();
+        let sub2 = AsyncSubscribable::subscribe(&s).await.unwrap();
+        assert_eq!(
+            backend.subscriber_count(),
+            1,
+            "subscriptions share the staged monitor"
+        );
+
+        backend.write_now(9.0);
+        let cached = s.read_cached(Some(true)).await.unwrap();
+        assert_eq!(cached["x"].value, serde_json::json!(9.0));
+        let live = s.read_cached(Some(false)).await.unwrap();
+        assert_eq!(live["x"].value, serde_json::json!(9.0));
+
+        drop(sub1);
+        drop(sub2);
+        assert_eq!(
+            backend.subscriber_count(),
+            1,
+            "still staged: monitor survives dropped subscriptions"
+        );
+        s.unstage();
+        assert_eq!(
+            backend.subscriber_count(),
+            0,
+            "unstaged + no listeners: torn down"
+        );
     }
 }
