@@ -85,6 +85,16 @@ impl<T> WatcherUpdate<T> {
     }
 }
 
+/// Structured progress-update sink — the cirrus equivalent of ophyd-async's
+/// `Watcher` protocol (`core/_protocol.py:124`). A `LiveTable` / progress bar
+/// implements this and is driven from a [`Status`] via
+/// [`Status::observe_watcher`]: called immediately with the last update if one
+/// already exists, then on every subsequent update until the status completes.
+pub trait Watcher: Send {
+    /// Receive the latest progress update.
+    fn watch(&mut self, update: &WatcherUpdate);
+}
+
 type StatusCallback = Box<dyn FnOnce(&StatusOutcome) + Send>;
 
 struct Inner {
@@ -305,6 +315,46 @@ impl Status {
     /// first [`StatusSetter::update_watcher`] call, then the latest update.
     pub fn watch_updates(&self) -> watch::Receiver<Option<WatcherUpdate>> {
         self.watcher_rx.clone()
+    }
+
+    /// Drive a [`Watcher`] from this status's structured updates — the cirrus
+    /// equivalent of ophyd-async `WatchableAsyncStatus.watch` (`_status.py:220`).
+    ///
+    /// Calls `watcher.watch(&update)` immediately if an update has already been
+    /// posted (via [`StatusSetter::update_watcher`]), then on every subsequent
+    /// update, returning once the status completes. A final update that lands
+    /// together with completion is delivered exactly once.
+    pub async fn observe_watcher<W: Watcher>(&self, watcher: &mut W) {
+        let mut rx = self.watch_updates();
+        // "called immediately if there has already been an update".
+        if let Some(update) = rx.borrow_and_update().clone() {
+            watcher.watch(&update);
+        }
+        let mut done = self.clone();
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut done => {
+                    // A final update posted together with completion is
+                    // delivered here; the immediate/changed paths already
+                    // cleared the "seen" flag, so this fires only on new data.
+                    if rx.has_changed().unwrap_or(false) {
+                        if let Some(update) = rx.borrow_and_update().clone() {
+                            watcher.watch(&update);
+                        }
+                    }
+                    return;
+                }
+                res = rx.changed() => {
+                    if res.is_err() {
+                        return;
+                    }
+                    if let Some(update) = rx.borrow_and_update().clone() {
+                        watcher.watch(&update);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -596,5 +646,66 @@ mod tests {
         drop(s2.cancel_on_drop());
         assert!(s2.success());
         assert!(!s2.cancelled());
+    }
+
+    struct RecordingWatcher(Arc<Mutex<Vec<WatcherUpdate>>>);
+    impl Watcher for RecordingWatcher {
+        fn watch(&mut self, update: &WatcherUpdate) {
+            self.0.lock().unwrap().push(update.clone());
+        }
+    }
+
+    fn frac(f: f64) -> WatcherUpdate {
+        WatcherUpdate {
+            fraction: Some(f),
+            ..WatcherUpdate::new(f * 10.0, 0.0, 10.0)
+        }
+    }
+
+    // Boundary: an update already posted before observe → delivered immediately;
+    // a later update → delivered too; completion ends the driver.
+    #[tokio::test]
+    async fn observe_watcher_immediate_and_subsequent() {
+        let (s, setter) = Status::new();
+        let rec = Arc::new(Mutex::new(Vec::<WatcherUpdate>::new()));
+        setter.update_watcher(frac(0.2)); // posted BEFORE observing
+
+        let rec2 = rec.clone();
+        let sd = s.clone();
+        let driver = tokio::spawn(async move {
+            let mut w = RecordingWatcher(rec2);
+            sd.observe_watcher(&mut w).await;
+        });
+
+        // Let the immediate delivery run before posting the next update.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        setter.update_watcher(frac(0.8));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        setter.success();
+        driver.await.unwrap();
+
+        let fracs: Vec<_> = rec.lock().unwrap().iter().map(|u| u.fraction).collect();
+        assert!(fracs.contains(&Some(0.2)), "immediate update: {fracs:?}");
+        assert!(fracs.contains(&Some(0.8)), "subsequent update: {fracs:?}");
+    }
+
+    // Boundary: no update ever posted → watcher never called, driver still
+    // returns cleanly on completion.
+    #[tokio::test]
+    async fn observe_watcher_no_update_completes_cleanly() {
+        let (s, setter) = Status::new();
+        let rec = Arc::new(Mutex::new(Vec::<WatcherUpdate>::new()));
+        let rec2 = rec.clone();
+        let sd = s.clone();
+        let driver = tokio::spawn(async move {
+            let mut w = RecordingWatcher(rec2);
+            sd.observe_watcher(&mut w).await;
+        });
+        setter.success();
+        driver.await.unwrap();
+        assert!(
+            rec.lock().unwrap().is_empty(),
+            "no updates → watcher unused"
+        );
     }
 }

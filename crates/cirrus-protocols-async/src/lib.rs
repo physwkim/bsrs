@@ -13,7 +13,7 @@ pub use cirrus_core::Subscription;
 use cirrus_core::{
     error::Result,
     reading::ReadingValue,
-    status::{Status, SubToken, WatcherUpdate},
+    status::{Status, SubToken},
     ConfigureArgs,
 };
 use cirrus_event_model::{DataKey, StreamDatum, StreamResource};
@@ -76,16 +76,12 @@ pub trait AsyncMovable<T = f64>: Send + Sync {
     async fn set(&self, value: T) -> Status;
 }
 
-/// Structured progress-update sink — the cirrus equivalent of ophyd-async's
-/// `Watcher` protocol (`core/_protocol.py:124`). A `LiveTable` / progress bar
-/// implements this and is driven from a [`Status`]'s
-/// [`watch_updates`](cirrus_core::status::Status::watch_updates) stream: called
-/// immediately with the last update if one exists, then on every subsequent
-/// change.
-pub trait Watcher: Send {
-    /// Receive the latest progress update.
-    fn watch(&mut self, update: &WatcherUpdate);
-}
+/// Structured progress-update sink — re-exported from `cirrus-core`, where it
+/// lives alongside [`WatcherUpdate`](cirrus_core::status::WatcherUpdate) and
+/// [`Status`] so a status can drive it directly via
+/// [`observe_watcher`](cirrus_core::status::Status::observe_watcher). A
+/// `LiveTable` / progress bar implements this.
+pub use cirrus_core::status::Watcher;
 
 /// Anything that can be triggered.
 #[async_trait]

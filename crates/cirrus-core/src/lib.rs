@@ -25,7 +25,7 @@ pub use msg::{ConfigureArgs, GroupId, Msg, RunMetadata};
 pub use plan::{plan_box, Plan, PlanItem};
 pub use reading::{ReadingF64, ReadingValue, TypedReading};
 pub use runtime::{cirrus_runtime, runtime_handle};
-pub use status::{Status, StatusError, StatusOutcome, SubToken, WatcherUpdate};
+pub use status::{Status, StatusError, StatusOutcome, SubToken, Watcher, WatcherUpdate};
 pub use subscription::Subscription;
 pub use suspender::Suspender;
 
