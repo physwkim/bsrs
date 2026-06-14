@@ -197,6 +197,22 @@ pub fn derive_device(input: TokenStream) -> TokenStream {
                 #connect_block
             }
         }
+
+        impl #impl_g ::cirrus_devices::Device for #name #ty_g #where_g {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn connect_all_boxed<'a>(
+                &'a self,
+                timeout: ::std::time::Duration,
+            ) -> ::std::pin::Pin<::std::boxed::Box<
+                dyn ::std::future::Future<Output = ::cirrus_core::error::Result<()>>
+                    + ::std::marker::Send
+                    + 'a,
+            >> {
+                ::std::boxed::Box::pin(self.connect_all(timeout))
+            }
+        }
     };
     TokenStream::from(expanded)
 }

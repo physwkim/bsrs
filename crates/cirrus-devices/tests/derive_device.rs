@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use cirrus_backend_soft::SoftSignalBackend;
 use cirrus_core::Kind;
-use cirrus_devices::{Device, SignalR, SignalRW};
+use cirrus_devices::{Device, DeviceVector, SignalR, SignalRW};
 
 #[derive(Device)]
 struct Motor {
@@ -92,4 +92,25 @@ async fn new_named_propagates_bluesky_names() {
     );
 
     stage.connect_all(Duration::from_millis(100)).await.unwrap();
+}
+
+#[tokio::test]
+async fn device_vector_holds_and_connects_derived_devices() {
+    // CP-07: a DeviceVector of derived Motors connects through the derive's
+    // `impl Device`, indexes by key, and yields bluesky `children()` pairs.
+    let mut cams: DeviceVector<std::sync::Arc<Motor>> = DeviceVector::new();
+    for i in 1..=3u32 {
+        cams.insert(
+            i,
+            Motor::new_named(&format!("BL10C:m{i}"), &format!("m{i}")),
+        );
+    }
+    assert_eq!(cams.len(), 3);
+    // Index + Device::name through Arc<Motor>.
+    assert_eq!(cams[2].name(), "m2");
+    // children() yields ascending ("1", ..), ("2", ..), ("3", ..).
+    let keys: Vec<_> = cams.children().map(|(k, _)| k).collect();
+    assert_eq!(keys, vec!["1", "2", "3"]);
+    // connect_all drives every child's derived connect.
+    cams.connect_all(Duration::from_millis(100)).await.unwrap();
 }

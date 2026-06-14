@@ -4,11 +4,13 @@
 #![deny(missing_docs)]
 
 pub mod detector;
+pub mod device;
 pub mod observe;
 pub mod signal;
 pub mod standard_readable;
 
 pub use detector::{StandardDetector, TriggerInfo};
+pub use device::{Device, DeviceVector};
 pub use observe::{observe_value, wait_for_value};
 pub use signal::{
     Access, Execute, Read, ReadWrite, Readable, Signal, SignalConfig, SignalKind, SignalR,
@@ -16,7 +18,8 @@ pub use signal::{
 };
 pub use standard_readable::{StandardReadable, StandardReadableFormat};
 
-/// Re-export of the `#[derive(Device)]` proc-macro.
+/// Re-export of the `#[derive(Device)]` proc-macro. (The like-named [`Device`]
+/// trait lives in a separate namespace, as with `serde::Serialize`.)
 pub use cirrus_derive::Device;
 
 /// Trait implemented by every `SignalBackend` that can be constructed from
