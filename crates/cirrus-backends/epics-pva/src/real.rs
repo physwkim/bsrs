@@ -110,14 +110,62 @@ fn pv_field_to_bool(p: &PvField) -> Option<bool> {
     }
 }
 
+// Extract an array of strings (e.g. an NTEnum's `choices`) regardless of
+// whether the client decoded it as the legacy `ScalarArray` or the typed
+// `ScalarArrayTyped` fast-path. Returns None if any element is non-string.
+fn pv_string_array(p: &PvField) -> Option<Vec<String>> {
+    let values = match p {
+        PvField::ScalarArray(items) => items.clone(),
+        PvField::ScalarArrayTyped(arr) => arr.to_scalar_values(),
+        _ => return None,
+    };
+    values
+        .iter()
+        .map(|v| match v {
+            ScalarValue::String(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+// Decode an NTEnum value substructure `{ index: int, choices: [string] }` to
+// its selected label `choices[index]`, mirroring ophyd-async's
+// `PvaEnumConverter` (`value["choices"][value["index"]]`, _p4p.py:168-178). An
+// index outside the choices range falls back to its decimal string (matching
+// the CA enum backend's out-of-range behaviour). Returns None when `fields` is
+// not an NTEnum value (missing `index` or `choices`).
+fn pv_enum_to_label(fields: &[(String, PvField)]) -> Option<String> {
+    let index = fields
+        .iter()
+        .find(|(n, _)| n == "index")
+        .and_then(|(_, f)| pv_field_to_i64(f))?;
+    let choices = fields
+        .iter()
+        .find(|(n, _)| n == "choices")
+        .and_then(|(_, f)| pv_string_array(f))?;
+    Some(
+        usize::try_from(index)
+            .ok()
+            .and_then(|i| choices.get(i).cloned())
+            .unwrap_or_else(|| index.to_string()),
+    )
+}
+
 fn pv_field_to_string(p: &PvField) -> Option<String> {
     match p {
         PvField::Scalar(ScalarValue::String(s)) => Some(s.clone()),
-        PvField::Structure(s) => s
-            .fields
-            .iter()
-            .find(|(name, _)| name == "value")
-            .and_then(|(_, f)| pv_field_to_string(f)),
+        PvField::Structure(s) => {
+            // NTEnum value substructure `{ index, choices }`: decode the
+            // selected label. Checked before the NTScalar `value` recursion
+            // because an NTEnum's `value` is itself this substructure.
+            if let Some(label) = pv_enum_to_label(&s.fields) {
+                return Some(label);
+            }
+            s.fields
+                .iter()
+                .find(|(name, _)| name == "value")
+                .and_then(|(_, f)| pv_field_to_string(f))
+        }
         _ => None,
     }
 }
@@ -561,6 +609,59 @@ mod tests {
             .push(("value".into(), PvField::Scalar(ScalarValue::Double(value))));
         nt.fields.push(("timeStamp".into(), PvField::Structure(ts)));
         PvField::Structure(nt)
+    }
+
+    // Build an NTEnum `{ value: { index, choices }, ... }`. `typed` selects
+    // the real-wire `ScalarArrayTyped(String)` representation vs the legacy
+    // `ScalarArray(Vec<ScalarValue::String>)` form.
+    fn ntenum(index: i32, choices: &[&str], typed: bool) -> PvField {
+        let choices_field = if typed {
+            PvField::ScalarArrayTyped(epics_pva_rs::pvdata::TypedScalarArray::String(
+                choices
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .into(),
+            ))
+        } else {
+            PvField::ScalarArray(
+                choices
+                    .iter()
+                    .map(|s| ScalarValue::String(s.to_string()))
+                    .collect(),
+            )
+        };
+        let mut ev = PvStructure::new("enum_t");
+        ev.fields
+            .push(("index".into(), PvField::Scalar(ScalarValue::Int(index))));
+        ev.fields.push(("choices".into(), choices_field));
+        let mut nt = PvStructure::new("epics:nt/NTEnum:1.0");
+        nt.fields.push(("value".into(), PvField::Structure(ev)));
+        PvField::Structure(nt)
+    }
+
+    #[test]
+    fn nt_enum_decodes_typed_choices_to_label() {
+        // Real-wire shape: choices arrive as ScalarArrayTyped(String).
+        let f = ntenum(1, &["OFF", "ON"], true);
+        assert_eq!(pv_field_to_string(&f), Some("ON".into()));
+    }
+
+    #[test]
+    fn nt_enum_out_of_range_index_falls_back_to_decimal() {
+        // Legacy ScalarArray choices + index past the end → decimal fallback.
+        let f = ntenum(5, &["OFF"], false);
+        assert_eq!(pv_field_to_string(&f), Some("5".into()));
+        // A plain NTScalar string is unaffected by the new enum arm.
+        let mut nt = PvStructure::new("epics:nt/NTScalar:1.0");
+        nt.fields.push((
+            "value".into(),
+            PvField::Scalar(ScalarValue::String("hi".into())),
+        ));
+        assert_eq!(
+            pv_field_to_string(&PvField::Structure(nt)),
+            Some("hi".into())
+        );
     }
 
     #[test]
