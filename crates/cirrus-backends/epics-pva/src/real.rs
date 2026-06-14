@@ -8,6 +8,7 @@ use cirrus_event_model::{make_datakey, DataKey, Dtype, SignalMetadata};
 use cirrus_protocols_async::{ReadingValueCallback, SignalBackend};
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::pv_request::PvRequestExpr;
+use epics_pva_rs::pvdata::TypedScalarArray;
 use epics_pva_rs::{PvField, ScalarValue};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -52,21 +53,28 @@ impl<T: Clone + Send + Sync + 'static> cirrus_devices::BackendFromPv for EpicsPv
     }
 }
 
+// Coerce one scalar to f64. The single source of truth for numeric→f64
+// widening, shared by the scalar `pv_field_to_f64` and the array
+// `pv_field_to_vec_f64` so both accept the same element types.
+fn scalar_to_f64(s: &ScalarValue) -> Option<f64> {
+    match s {
+        ScalarValue::Double(d) => Some(*d),
+        ScalarValue::Float(f) => Some(*f as f64),
+        ScalarValue::Int(i) => Some(*i as f64),
+        ScalarValue::Long(l) => Some(*l as f64),
+        ScalarValue::Short(s) => Some(*s as f64),
+        ScalarValue::Byte(b) => Some(*b as f64),
+        ScalarValue::UByte(b) => Some(*b as f64),
+        ScalarValue::UShort(s) => Some(*s as f64),
+        ScalarValue::UInt(u) => Some(*u as f64),
+        ScalarValue::ULong(u) => Some(*u as f64),
+        _ => None,
+    }
+}
+
 fn pv_field_to_f64(p: &PvField) -> Option<f64> {
     match p {
-        PvField::Scalar(s) => match s {
-            ScalarValue::Double(d) => Some(*d),
-            ScalarValue::Float(f) => Some(*f as f64),
-            ScalarValue::Int(i) => Some(*i as f64),
-            ScalarValue::Long(l) => Some(*l as f64),
-            ScalarValue::Short(s) => Some(*s as f64),
-            ScalarValue::Byte(b) => Some(*b as f64),
-            ScalarValue::UByte(b) => Some(*b as f64),
-            ScalarValue::UShort(s) => Some(*s as f64),
-            ScalarValue::UInt(u) => Some(*u as f64),
-            ScalarValue::ULong(u) => Some(*u as f64),
-            _ => None,
-        },
+        PvField::Scalar(s) => scalar_to_f64(s),
         PvField::Structure(s) => {
             // NTScalar shape: { value: scalar, ... }. Try `.value` first.
             s.fields
@@ -74,6 +82,27 @@ fn pv_field_to_f64(p: &PvField) -> Option<f64> {
                 .find(|(name, _)| name == "value")
                 .and_then(|(_, f)| pv_field_to_f64(f))
         }
+        _ => None,
+    }
+}
+
+// Decode a numeric NTScalarArray (`{ value: [...] }`) or a bare scalar array
+// into `Vec<f64>`, coercing every element through [`scalar_to_f64`] so any
+// numeric element type (Double/Float/Int/Long/…), in either the legacy
+// `ScalarArray` or the typed `ScalarArrayTyped` representation, reads
+// uniformly. Returns None if the field is not an array or any element is
+// non-numeric.
+fn pv_field_to_vec_f64(p: &PvField) -> Option<Vec<f64>> {
+    match p {
+        PvField::ScalarArray(items) => items.iter().map(scalar_to_f64).collect(),
+        PvField::ScalarArrayTyped(arr) => {
+            arr.to_scalar_values().iter().map(scalar_to_f64).collect()
+        }
+        PvField::Structure(s) => s
+            .fields
+            .iter()
+            .find(|(name, _)| name == "value")
+            .and_then(|(_, f)| pv_field_to_vec_f64(f)),
         _ => None,
     }
 }
@@ -315,6 +344,116 @@ impl SignalBackend<f64> for EpicsPvaBackend<f64> {
                             }
                         };
                         cb(&f, ts);
+                    }
+                })
+                .await;
+            if let Err(e) = res {
+                tracing::error!("pva monitor on {pv}: {e}");
+            }
+        });
+        let abort = handle.abort_handle();
+        SubToken::new(move || abort.abort())
+    }
+    fn source(&self, name: &str) -> String {
+        format!("pva://{name}")
+    }
+}
+
+#[async_trait]
+impl SignalBackend<Vec<f64>> for EpicsPvaBackend<Vec<f64>> {
+    async fn connect(&self, _timeout: Duration) -> Result<()> {
+        self.client
+            .pvconnect(&self.pv)
+            .await
+            .map(|_| ())
+            .map_err(|e| CirrusError::Backend(format!("pva connect {}: {e}", self.pv)))
+    }
+    async fn put(&self, value: Option<Vec<f64>>) -> Result<()> {
+        // Written as a typed Double array; an EPICS waveform record coerces to
+        // its FTVL element type server-side.
+        let f =
+            PvField::ScalarArrayTyped(TypedScalarArray::Double(value.unwrap_or_default().into()));
+        self.client
+            .pvput_pv_field(&self.pv, &f)
+            .await
+            .map_err(|e| CirrusError::Backend(format!("pva put: {e}")))
+    }
+    async fn get_datakey(&self, source: &str) -> Result<DataKey> {
+        // The descriptor shape needs the element count; pvget once (describe is
+        // rare). Reports the waveform's current length.
+        let f = self
+            .client
+            .pvget(&self.pv)
+            .await
+            .map_err(|e| CirrusError::Backend(format!("pva get: {e}")))?;
+        let len = pv_field_to_vec_f64(&f)
+            .ok_or_else(|| CirrusError::Backend(format!("pva: not a numeric array: {f:?}")))?
+            .len();
+        Ok(make_datakey(
+            format!("pva://{source}"),
+            Dtype::Number,
+            vec![Some(len as u64)],
+            Some("<f8".into()),
+            SignalMetadata::default(),
+        ))
+    }
+    async fn get_reading(&self) -> Result<ReadingValue> {
+        let f = self
+            .client
+            .pvget(&self.pv)
+            .await
+            .map_err(|e| CirrusError::Backend(format!("pva get: {e}")))?;
+        let v = pv_field_to_vec_f64(&f)
+            .ok_or_else(|| CirrusError::Backend(format!("pva: not a numeric array: {f:?}")))?;
+        Ok(ReadingValue {
+            value: serde_json::Value::from(v),
+            timestamp: now_ts(),
+            alarm_severity: pv_field_to_alarm_severity(&f),
+            message: None,
+        })
+    }
+    async fn get_value(&self) -> Result<Vec<f64>> {
+        let f = self
+            .client
+            .pvget(&self.pv)
+            .await
+            .map_err(|e| CirrusError::Backend(format!("pva get: {e}")))?;
+        pv_field_to_vec_f64(&f)
+            .ok_or_else(|| CirrusError::Backend(format!("pva: not a numeric array: {f:?}")))
+    }
+    async fn get_setpoint(&self) -> Result<Vec<f64>> {
+        SignalBackend::<Vec<f64>>::get_value(self).await
+    }
+    fn set_callback(&self, cb: Option<ReadingValueCallback<Vec<f64>>>) -> SubToken {
+        let cb = match cb {
+            None => return SubToken::noop(),
+            Some(cb) => Arc::new(cb),
+        };
+        let client = self.client.clone();
+        let pv = self.pv.clone();
+        let request = PvRequestExpr::parse("field(value,timeStamp)").unwrap_or_default();
+        let warned_local_clock = Arc::new(AtomicBool::new(false));
+        let pv_for_cb = pv.clone();
+        let warned_for_cb = warned_local_clock.clone();
+        let handle = tokio::spawn(async move {
+            let res = client
+                .pvmonitor_with_request(&pv, &request, move |field: &PvField| {
+                    if let Some(v) = pv_field_to_vec_f64(field) {
+                        let ts = match pv_field_to_ts(field) {
+                            Some(t) => t,
+                            None => {
+                                if !warned_for_cb.swap(true, Ordering::SeqCst) {
+                                    tracing::warn!(
+                                        target: "cirrus_backend_epics_pva",
+                                        "pva {}: monitor frame has no server timeStamp; \
+                                         falling back to local clock for this PV (one-shot)",
+                                        pv_for_cb,
+                                    );
+                                }
+                                now_ts()
+                            }
+                        };
+                        cb(&v, ts);
                     }
                 })
                 .await;
@@ -736,6 +875,47 @@ mod tests {
         assert!(pv_field_to_alarm_severity(&PvField::Scalar(ScalarValue::Double(1.0))).is_none());
         let f = ntscalar_with_ts(42.0, 1, 0); // has timeStamp but no alarm
         assert!(pv_field_to_alarm_severity(&f).is_none());
+    }
+
+    // Build an NTScalarArray `{ value: <array> }`. `typed` selects the
+    // real-wire `ScalarArrayTyped(Double)` vs the legacy `ScalarArray`.
+    fn ntscalararray_doubles(values: &[f64], typed: bool) -> PvField {
+        let value = if typed {
+            PvField::ScalarArrayTyped(TypedScalarArray::Double(values.to_vec().into()))
+        } else {
+            PvField::ScalarArray(values.iter().map(|x| ScalarValue::Double(*x)).collect())
+        };
+        let mut nt = PvStructure::new("epics:nt/NTScalarArray:1.0");
+        nt.fields.push(("value".into(), value));
+        PvField::Structure(nt)
+    }
+
+    #[test]
+    fn ntscalararray_decodes_typed_and_legacy_doubles() {
+        let typed = ntscalararray_doubles(&[1.0, 2.5, -3.0], true);
+        assert_eq!(pv_field_to_vec_f64(&typed), Some(vec![1.0, 2.5, -3.0]));
+        let legacy = ntscalararray_doubles(&[4.0, 5.0], false);
+        assert_eq!(pv_field_to_vec_f64(&legacy), Some(vec![4.0, 5.0]));
+    }
+
+    #[test]
+    fn ntscalararray_coerces_integer_elements_and_rejects_scalar() {
+        // A legacy mixed-integer array coerces element-wise to f64.
+        let mut nt = PvStructure::new("epics:nt/NTScalarArray:1.0");
+        nt.fields.push((
+            "value".into(),
+            PvField::ScalarArray(vec![
+                ScalarValue::Int(7),
+                ScalarValue::Long(8),
+                ScalarValue::Short(9),
+            ]),
+        ));
+        assert_eq!(
+            pv_field_to_vec_f64(&PvField::Structure(nt)),
+            Some(vec![7.0, 8.0, 9.0])
+        );
+        // A plain scalar NTScalar is not a numeric array.
+        assert!(pv_field_to_vec_f64(&ntscalar_with_ts(1.0, 0, 0)).is_none());
     }
 
     #[test]
