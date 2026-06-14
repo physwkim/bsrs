@@ -412,6 +412,56 @@ pub mod stubs {
             }
         })
     }
+
+    /// `repeat(plan_fn, num, delay)` — repeat `plan_fn` `num` times, emitting a
+    /// `Msg::Checkpoint` *before* each repetition and a time-compensated
+    /// `Msg::Sleep` *after* each when `delay > 0`. Mirrors bluesky
+    /// `plan_stubs.repeat`; distinct from [`repeater`], which only chains
+    /// copies with no checkpoint or delay. Intended for users who want the
+    /// control-flow shape of `count` without reimplementing it.
+    ///
+    /// `delay` is a *target cadence*: the emitted sleep is `delay` minus the
+    /// wall-clock time that iteration's own messages took to process, so a
+    /// slow plan shortens the sleep and never lengthens it; a plan that
+    /// already overran `delay` emits no sleep. Matching bluesky's scalar-delay
+    /// control flow, a sleep is emitted after *every* repetition (including the
+    /// last) whenever `delay > 0`.
+    ///
+    /// `num = None` repeats forever (until the run is aborted).
+    pub fn repeat<F>(mut plan_fn: F, num: Option<usize>, delay: Duration) -> Plan
+    where
+        F: FnMut() -> Plan + Send + 'static,
+    {
+        plan_box(async_stream::stream! {
+            let mut i: usize = 0;
+            loop {
+                if let Some(n) = num {
+                    if i >= n {
+                        break;
+                    }
+                }
+                // Captured before the checkpoint; the stream stays suspended at
+                // each `yield` until the engine polls again, so `elapsed`
+                // includes the engine's processing of this iteration's messages
+                // (matching bluesky's `now = time.time()` span).
+                let start = std::time::Instant::now();
+                yield Msg::Checkpoint;
+                let mut p = plan_fn();
+                while let Some(item) = futures::StreamExt::next(&mut p).await {
+                    if let cirrus_core::plan::PlanItem::Bare(m) = item {
+                        yield m;
+                    }
+                }
+                if !delay.is_zero() {
+                    let elapsed = start.elapsed();
+                    if delay > elapsed {
+                        yield Msg::Sleep(delay - elapsed);
+                    }
+                }
+                i += 1;
+            }
+        })
+    }
 }
 
 // ===========================================================================
@@ -1928,5 +1978,80 @@ mod tests {
         let msgs = drain(stubs::prepare(preparable("det"), val, None, false)).await;
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Msg::Prepare { group: None, .. }));
+    }
+
+    // delay > 0: a Checkpoint precedes each repetition's messages and a
+    // time-compensated Sleep follows each (including the last, per bluesky's
+    // scalar-delay flow). The compensated sleep never exceeds the target delay.
+    #[tokio::test]
+    async fn repeat_checkpoints_each_iteration_and_sleeps_when_delay_positive() {
+        let delay = Duration::from_millis(100);
+        // Inner plan yields exactly one Msg::Null per repetition.
+        let msgs = drain(stubs::repeat(stubs::null, Some(3), delay)).await;
+
+        let checkpoints = msgs.iter().filter(|m| matches!(m, Msg::Checkpoint)).count();
+        let nulls = msgs.iter().filter(|m| matches!(m, Msg::Null)).count();
+        let sleeps: Vec<Duration> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                Msg::Sleep(d) => Some(*d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(checkpoints, 3);
+        assert_eq!(nulls, 3);
+        assert_eq!(
+            sleeps.len(),
+            3,
+            "scalar delay sleeps after every repetition"
+        );
+        for d in &sleeps {
+            assert!(
+                *d <= delay,
+                "compensated sleep never exceeds the target cadence"
+            );
+            assert!(
+                *d > Duration::ZERO,
+                "a fast no-op plan leaves nearly the full delay to sleep"
+            );
+        }
+        // Every Null repetition is immediately preceded by its Checkpoint.
+        for (idx, m) in msgs.iter().enumerate() {
+            if matches!(m, Msg::Null) {
+                assert!(
+                    idx > 0 && matches!(msgs[idx - 1], Msg::Checkpoint),
+                    "Null at index {idx} not immediately preceded by Checkpoint"
+                );
+            }
+        }
+    }
+
+    // delay == 0: checkpoints still bracket each repetition, but no Sleep.
+    #[tokio::test]
+    async fn repeat_zero_delay_emits_no_sleep() {
+        let msgs = drain(stubs::repeat(stubs::null, Some(2), Duration::ZERO)).await;
+        // Exact sequence: Checkpoint, Null, Checkpoint, Null.
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(
+            msgs.iter().filter(|m| matches!(m, Msg::Checkpoint)).count(),
+            2
+        );
+        assert_eq!(msgs.iter().filter(|m| matches!(m, Msg::Null)).count(), 2);
+        assert!(
+            !msgs.iter().any(|m| matches!(m, Msg::Sleep(_))),
+            "delay=0 emits no Sleep"
+        );
+    }
+
+    // num == 0: zero repetitions, nothing emitted (not even a checkpoint).
+    #[tokio::test]
+    async fn repeat_num_zero_yields_nothing() {
+        let msgs = drain(stubs::repeat(
+            stubs::null,
+            Some(0),
+            Duration::from_millis(10),
+        ))
+        .await;
+        assert!(msgs.is_empty(), "num=0 runs no iterations");
     }
 }
