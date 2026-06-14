@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use cirrus_core::error::{CirrusError, Result};
 use cirrus_core::reading::ReadingValue;
 use cirrus_core::status::SubToken;
-use cirrus_event_model::{DataKey, Dtype};
+use cirrus_event_model::{make_datakey, DataKey, Dtype, SignalMetadata};
 use cirrus_protocols_async::{ReadingValueCallback, SignalBackend};
 use epics_ca_rs::client::{CaChannel, CaClient};
 use epics_ca_rs::{DbFieldType, EpicsValue};
@@ -341,23 +341,17 @@ impl SignalBackend<f64> for EpicsCaBackend<f64> {
             .info()
             .await
             .map_err(|e| CirrusError::Backend(format!("ca info: {e}")))?;
-        Ok(DataKey {
-            source: format!("ca://{source}"),
-            dtype: Dtype::Number,
-            shape: if info.element_count > 1 {
+        Ok(make_datakey(
+            format!("ca://{source}"),
+            Dtype::Number,
+            if info.element_count > 1 {
                 vec![Some(info.element_count as u64)]
             } else {
                 vec![]
             },
-            dtype_numpy: Some("<f8".into()),
-            external: None,
-            units: None,
-            precision: None,
-            object_name: None,
-            dims: None,
-            limits: None,
-            choices: None,
-        })
+            Some("<f8".into()),
+            SignalMetadata::default(),
+        ))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
@@ -449,19 +443,13 @@ impl SignalBackend<String> for EpicsCaBackend<String> {
             CaStringKind::Long if info.element_count > 1 => vec![Some(info.element_count as u64)],
             _ => vec![],
         };
-        Ok(DataKey {
-            source: format!("ca://{source}"),
-            dtype: Dtype::String,
+        Ok(make_datakey(
+            format!("ca://{source}"),
+            Dtype::String,
             shape,
-            dtype_numpy: Some("|S".into()),
-            external: None,
-            units: None,
-            precision: None,
-            object_name: None,
-            dims: None,
-            limits: None,
-            choices: None,
-        })
+            Some("|S".into()),
+            SignalMetadata::default(),
+        ))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
@@ -551,23 +539,17 @@ impl SignalBackend<i64> for EpicsCaBackend<i64> {
             .info()
             .await
             .map_err(|e| CirrusError::Backend(format!("ca info: {e}")))?;
-        Ok(DataKey {
-            source: format!("ca://{source}"),
-            dtype: Dtype::Integer,
-            shape: if info.element_count > 1 {
+        Ok(make_datakey(
+            format!("ca://{source}"),
+            Dtype::Integer,
+            if info.element_count > 1 {
                 vec![Some(info.element_count as u64)]
             } else {
                 vec![]
             },
-            dtype_numpy: Some("<i8".into()),
-            external: None,
-            units: None,
-            precision: None,
-            object_name: None,
-            dims: None,
-            limits: None,
-            choices: None,
-        })
+            Some("<i8".into()),
+            SignalMetadata::default(),
+        ))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
@@ -650,19 +632,13 @@ impl SignalBackend<bool> for EpicsCaBackend<bool> {
             .map_err(|e| CirrusError::Backend(format!("ca put: {e}")))
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
-        Ok(DataKey {
-            source: format!("ca://{source}"),
-            dtype: Dtype::Boolean,
-            shape: vec![],
-            dtype_numpy: Some("|b1".into()),
-            external: None,
-            units: None,
-            precision: None,
-            object_name: None,
-            dims: None,
-            limits: None,
-            choices: None,
-        })
+        Ok(make_datakey(
+            format!("ca://{source}"),
+            Dtype::Boolean,
+            vec![],
+            Some("|b1".into()),
+            SignalMetadata::default(),
+        ))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;

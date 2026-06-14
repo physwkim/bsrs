@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use cirrus_core::error::{CirrusError, Result};
 use cirrus_core::reading::ReadingValue;
 use cirrus_core::status::SubToken;
-use cirrus_event_model::{DataKey, Dtype};
+use cirrus_event_model::{make_datakey, DataKey, Dtype, SignalMetadata};
 use cirrus_protocols_async::{ReadingValueCallback, SignalBackend};
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::pv_request::PvRequestExpr;
@@ -174,19 +174,13 @@ impl SignalBackend<f64> for EpicsPvaBackend<f64> {
             .map_err(|e| CirrusError::Backend(format!("pva put: {e}")))
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
-        Ok(DataKey {
-            source: format!("pva://{source}"),
-            dtype: Dtype::Number,
-            shape: vec![],
-            dtype_numpy: Some("<f8".into()),
-            external: None,
-            units: None,
-            precision: None,
-            object_name: None,
-            dims: None,
-            limits: None,
-            choices: None,
-        })
+        Ok(make_datakey(
+            format!("pva://{source}"),
+            Dtype::Number,
+            vec![],
+            Some("<f8".into()),
+            SignalMetadata::default(),
+        ))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
         let f = self
@@ -284,19 +278,13 @@ impl SignalBackend<String> for EpicsPvaBackend<String> {
             .map_err(|e| CirrusError::Backend(format!("pva put: {e}")))
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
-        Ok(DataKey {
-            source: format!("pva://{source}"),
-            dtype: Dtype::String,
-            shape: vec![],
-            dtype_numpy: Some("|S".into()),
-            external: None,
-            units: None,
-            precision: None,
-            object_name: None,
-            dims: None,
-            limits: None,
-            choices: None,
-        })
+        Ok(make_datakey(
+            format!("pva://{source}"),
+            Dtype::String,
+            vec![],
+            Some("|S".into()),
+            SignalMetadata::default(),
+        ))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
         let f = self
@@ -384,19 +372,13 @@ impl SignalBackend<i64> for EpicsPvaBackend<i64> {
             .map_err(|e| CirrusError::Backend(format!("pva put: {e}")))
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
-        Ok(DataKey {
-            source: format!("pva://{source}"),
-            dtype: Dtype::Integer,
-            shape: vec![],
-            dtype_numpy: Some("<i8".into()),
-            external: None,
-            units: None,
-            precision: None,
-            object_name: None,
-            dims: None,
-            limits: None,
-            choices: None,
-        })
+        Ok(make_datakey(
+            format!("pva://{source}"),
+            Dtype::Integer,
+            vec![],
+            Some("<i8".into()),
+            SignalMetadata::default(),
+        ))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
         let f = self
@@ -483,19 +465,13 @@ impl SignalBackend<bool> for EpicsPvaBackend<bool> {
             .map_err(|e| CirrusError::Backend(format!("pva put: {e}")))
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
-        Ok(DataKey {
-            source: format!("pva://{source}"),
-            dtype: Dtype::Boolean,
-            shape: vec![],
-            dtype_numpy: Some("|b1".into()),
-            external: None,
-            units: None,
-            precision: None,
-            object_name: None,
-            dims: None,
-            limits: None,
-            choices: None,
-        })
+        Ok(make_datakey(
+            format!("pva://{source}"),
+            Dtype::Boolean,
+            vec![],
+            Some("|b1".into()),
+            SignalMetadata::default(),
+        ))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
         let f = self
