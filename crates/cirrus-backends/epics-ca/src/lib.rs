@@ -20,4 +20,4 @@ pub use stub::EpicsCaBackend;
 #[cfg(feature = "real")]
 mod real;
 #[cfg(feature = "real")]
-pub use real::{ca_context, EpicsCaBackend};
+pub use real::{ca_context, CaEnumBackend, EpicsCaBackend};

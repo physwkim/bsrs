@@ -16,6 +16,7 @@ use cirrus_core::reading::ReadingValue;
 use cirrus_core::status::SubToken;
 use cirrus_event_model::{make_datakey, DataKey, Dtype, SignalMetadata};
 use cirrus_protocols_async::{ReadingValueCallback, SignalBackend};
+use epics_base_rs::server::snapshot::DbrClass;
 use epics_ca_rs::client::{CaChannel, CaClient};
 use epics_ca_rs::{DbFieldType, EpicsValue};
 use std::array;
@@ -701,6 +702,214 @@ impl SignalBackend<bool> for EpicsCaBackend<bool> {
     }
 }
 
+// -- DBR_ENUM backend (mbbi/mbbo, areaDetector ImageMode/TriggerMode/...) -----
+
+/// Map a `DBR_ENUM` index to its choice label, falling back to the decimal
+/// index when the index is out of range or the choice list is unknown — a
+/// monitor must never silently drop a value.
+fn enum_index_to_label(idx: u16, choices: &[String]) -> String {
+    choices
+        .get(idx as usize)
+        .cloned()
+        .unwrap_or_else(|| idx.to_string())
+}
+
+/// Map a put request — a choice label or a decimal index string — to its
+/// `DBR_ENUM` index. Errors when a non-numeric label is not among the choices,
+/// or a numeric index is out of range of a known (non-empty) choice list.
+fn enum_label_to_index(req: &str, choices: &[String]) -> Result<u16> {
+    if let Some(i) = choices.iter().position(|c| c == req) {
+        return Ok(i as u16);
+    }
+    if let Ok(i) = req.parse::<u16>() {
+        if choices.is_empty() || (i as usize) < choices.len() {
+            return Ok(i);
+        }
+    }
+    Err(CirrusError::Backend(format!(
+        "ca enum: '{req}' is not a valid choice (choices: {choices:?})"
+    )))
+}
+
+/// Decode an `EpicsValue` read from an enum PV into its label. Accepts a raw
+/// `Enum` index (mapped via `choices`), an integer index, or a `String` the
+/// server already resolved to a label.
+fn epics_to_enum_label(v: &EpicsValue, choices: &[String]) -> Option<String> {
+    match v {
+        EpicsValue::Enum(idx) => Some(enum_index_to_label(*idx, choices)),
+        EpicsValue::Short(i) => Some(enum_index_to_label(*i as u16, choices)),
+        EpicsValue::Long(i) => Some(enum_index_to_label(*i as u16, choices)),
+        EpicsValue::String(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// CA backend for `DBR_ENUM` PVs (`mbbi`/`mbbo`, areaDetector `ImageMode`,
+/// `TriggerMode`, `FileWriteMode`, `DetectorState_RBV`, …). Presents the enum
+/// as its label `String`, mirroring ophyd-async `CaEnumConverter`: get and
+/// subscribe map the wire index to the choice label; put maps a label (or a
+/// decimal index string) back to the `DBR_ENUM` index. The choice list is
+/// fetched once at connect via `DbrClass::Ctrl`, cached, and surfaced in
+/// `DataKey.choices` so plans validate against the choice set.
+pub struct CaEnumBackend {
+    pv: String,
+    ctx: Arc<CaContext>,
+    channel: tokio::sync::OnceCell<Arc<CaChannel>>,
+    choices: OnceLock<Vec<String>>,
+}
+
+impl CaEnumBackend {
+    /// Build with a PV name.
+    pub fn new(pv: impl Into<String>) -> Self {
+        Self {
+            pv: pv.into(),
+            ctx: ca_context(),
+            channel: tokio::sync::OnceCell::new(),
+            choices: OnceLock::new(),
+        }
+    }
+
+    async fn ensure_channel(&self, timeout: Duration) -> Result<Arc<CaChannel>> {
+        self.channel
+            .get_or_try_init(|| self.ctx.get_or_open(&self.pv, timeout))
+            .await
+            .cloned()
+    }
+
+    /// Fetch the enum choice labels via a `DbrClass::Ctrl` read and cache them.
+    /// Returns the cached list on subsequent calls (no further network I/O).
+    async fn ensure_choices(&self, ch: &CaChannel) -> Result<Vec<String>> {
+        if let Some(c) = self.choices.get() {
+            return Ok(c.clone());
+        }
+        let snap = ch
+            .get_with_metadata(DbrClass::Ctrl)
+            .await
+            .map_err(|e| CirrusError::Backend(format!("ca enum ctrl get {}: {e}", self.pv)))?;
+        let choices = snap.enums.map(|e| e.strings).unwrap_or_default();
+        // First writer wins; a concurrent fetch resolves to the same labels.
+        let _ = self.choices.set(choices);
+        Ok(self.choices.get().cloned().unwrap_or_default())
+    }
+
+    /// Read the current value and resolve it to its choice label.
+    async fn read_label(&self) -> Result<String> {
+        let ch = self.ensure_channel(Duration::from_secs(2)).await?;
+        let choices = self.ensure_choices(&ch).await?;
+        let (_ty, v) = ch
+            .get()
+            .await
+            .map_err(|e| CirrusError::Backend(format!("ca enum get: {e}")))?;
+        epics_to_enum_label(&v, &choices)
+            .ok_or_else(|| CirrusError::Backend(format!("ca enum: not enum-decodable: {v:?}")))
+    }
+}
+
+impl cirrus_devices::BackendFromPv for CaEnumBackend {
+    fn from_pv(pv: &str) -> Self {
+        Self::new(pv)
+    }
+}
+
+#[async_trait]
+impl SignalBackend<String> for CaEnumBackend {
+    async fn connect(&self, timeout: Duration) -> Result<()> {
+        let ch = self.ensure_channel(timeout).await?;
+        // Warm the choice cache so describe()/get() never block on it later.
+        self.ensure_choices(&ch).await?;
+        Ok(())
+    }
+    async fn put(&self, value: Option<String>) -> Result<()> {
+        let value = value.unwrap_or_default();
+        let ch = self
+            .ensure_channel(Duration::from_secs(2))
+            .await
+            .map_err(|e| CirrusError::Backend(format!("{e}")))?;
+        let choices = self.ensure_choices(&ch).await?;
+        let idx = enum_label_to_index(&value, &choices)?;
+        // Enum PVs are DBR_ENUM on the wire; put writes with native_type, so the
+        // payload must be the 2-byte index, not a 40-byte DBR_STRING.
+        ch.put(&EpicsValue::Enum(idx))
+            .await
+            .map_err(|e| CirrusError::Backend(format!("ca enum put: {e}")))
+    }
+    async fn get_datakey(&self, source: &str) -> Result<DataKey> {
+        let ch = self.ensure_channel(Duration::from_secs(2)).await?;
+        let choices = self.ensure_choices(&ch).await?;
+        Ok(make_datakey(
+            format!("ca://{source}"),
+            Dtype::String,
+            vec![],
+            Some("|S".into()),
+            SignalMetadata {
+                choices: Some(choices),
+                ..SignalMetadata::default()
+            },
+        ))
+    }
+    async fn get_reading(&self) -> Result<ReadingValue> {
+        let label = self.read_label().await?;
+        Ok(ReadingValue {
+            value: serde_json::Value::from(label),
+            timestamp: now_ts(),
+            alarm_severity: None,
+            message: None,
+        })
+    }
+    async fn get_value(&self) -> Result<String> {
+        self.read_label().await
+    }
+    async fn get_setpoint(&self) -> Result<String> {
+        self.read_label().await
+    }
+    fn set_callback(&self, cb: Option<ReadingValueCallback<String>>) -> SubToken {
+        let cb = match cb {
+            None => return SubToken::noop(),
+            Some(cb) => Arc::new(cb),
+        };
+        let ctx = self.ctx.clone();
+        let pv = self.pv.clone();
+        let cached = self.choices.get().cloned();
+        let handle = tokio::spawn(async move {
+            let ch = match ctx.get_or_open(&pv, Duration::from_secs(2)).await {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            // Resolve the choice list once (the cached value if connect warmed
+            // it, else a one-shot Ctrl read) so each update maps the wire index
+            // to its label.
+            let choices = match cached {
+                Some(c) => c,
+                None => ch
+                    .get_with_metadata(DbrClass::Ctrl)
+                    .await
+                    .ok()
+                    .and_then(|s| s.enums.map(|e| e.strings))
+                    .unwrap_or_default(),
+            };
+            let mut sub = match ch.subscribe().await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            while let Some(Ok(snap)) = sub.recv().await {
+                if let Some(label) = epics_to_enum_label(&snap.value, &choices) {
+                    let ts = snap
+                        .timestamp
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs_f64())
+                        .unwrap_or_default();
+                    cb(&label, ts);
+                }
+            }
+        });
+        let abort = handle.abort_handle();
+        SubToken::new(move || abort.abort())
+    }
+    fn source(&self, name: &str) -> String {
+        format!("ca://{name}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -804,5 +1013,63 @@ mod tests {
         assert_eq!(epics_to_bool(&EpicsValue::Enum(1)), Some(true));
         assert_eq!(epics_to_bool(&EpicsValue::Char(0)), Some(false));
         assert_eq!(epics_to_bool(&EpicsValue::String("x".into())), None);
+    }
+
+    // -- DB-05: DBR_ENUM label/index mapping --------------------------------
+
+    fn image_mode_choices() -> Vec<String> {
+        vec![
+            "Single".to_string(),
+            "Multiple".to_string(),
+            "Continuous".to_string(),
+        ]
+    }
+
+    #[test]
+    fn enum_label_round_trips_via_choices() {
+        let choices = image_mode_choices();
+        assert_eq!(enum_index_to_label(1, &choices), "Multiple");
+        assert_eq!(enum_label_to_index("Continuous", &choices).unwrap(), 2);
+        // A decimal index string is accepted in range.
+        assert_eq!(enum_label_to_index("0", &choices).unwrap(), 0);
+        // An unknown label is rejected.
+        assert!(enum_label_to_index("Bogus", &choices).is_err());
+        // A numeric index outside a known choice list is rejected.
+        assert!(enum_label_to_index("9", &choices).is_err());
+    }
+
+    #[test]
+    fn enum_index_out_of_range_falls_back_to_decimal() {
+        let choices = image_mode_choices();
+        // Out-of-range index never panics or drops — decimal fallback.
+        assert_eq!(enum_index_to_label(7, &choices), "7");
+        // With no choice list (server gave none) the index passes through, and
+        // a numeric put is still accepted.
+        assert_eq!(enum_index_to_label(3, &[]), "3");
+        assert_eq!(enum_label_to_index("3", &[]).unwrap(), 3);
+    }
+
+    #[test]
+    fn epics_value_decodes_to_enum_label() {
+        let choices = image_mode_choices();
+        assert_eq!(
+            epics_to_enum_label(&EpicsValue::Enum(2), &choices).as_deref(),
+            Some("Continuous")
+        );
+        // Servers that hand back the index as a plain integer still map.
+        assert_eq!(
+            epics_to_enum_label(&EpicsValue::Long(0), &choices).as_deref(),
+            Some("Single")
+        );
+        // An already-resolved label string passes through.
+        assert_eq!(
+            epics_to_enum_label(&EpicsValue::String("Multiple".into()), &choices).as_deref(),
+            Some("Multiple")
+        );
+        // A non-enum-shaped value is not decodable.
+        assert_eq!(
+            epics_to_enum_label(&EpicsValue::Double(1.5), &choices),
+            None
+        );
     }
 }
