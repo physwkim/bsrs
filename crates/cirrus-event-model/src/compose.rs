@@ -127,6 +127,37 @@ impl RunBundle {
         })
     }
 
+    /// Compose an `EventPage` (bulk events) for `stream_name` from column-store
+    /// `data`/`timestamps`, assigning `n` contiguous 1-based `seq_num`s from the
+    /// stream's running counter (advancing it by `n`, so single `event()`s and
+    /// pages share one sequence). Mirrors `ComposeRunBundle.compose_event_page`.
+    /// Returns `None` if the stream is not declared. `n` is the row count; the
+    /// caller ensures every `data`/`timestamps` column has `n` rows (matching
+    /// the unvalidated [`ResourceComposer::datum_page`] contract).
+    pub fn event_page(
+        &self,
+        stream_name: &str,
+        data: HashMap<String, Vec<Value>>,
+        timestamps: HashMap<String, Vec<f64>>,
+        n: usize,
+    ) -> Option<EventPage> {
+        let streams = self.streams.lock().unwrap();
+        let st = streams.get(stream_name)?;
+        let start = st.seq_num.fetch_add(n as u64, Ordering::SeqCst);
+        let seq_num = (1..=n as u64).map(|j| start + j).collect();
+        let uid = (0..n).map(|_| new_uid()).collect();
+        let time = vec![now(); n];
+        Some(EventPage {
+            uid,
+            descriptor: st.descriptor.uid.clone(),
+            time,
+            seq_num,
+            data,
+            timestamps,
+            filled: HashMap::new(),
+        })
+    }
+
     /// Compose a `RunStop` document. Closes the bundle.
     pub fn stop(&self, exit_status: &str, reason: Option<String>) -> RunStop {
         let streams = self.streams.lock().unwrap();
@@ -496,5 +527,62 @@ mod tests {
             format!("{}/0", b.stream_resource().uid)
         );
         assert_ne!(a.stream_resource().uid, b.stream_resource().uid);
+    }
+
+    // compose_event_page parity: a page draws contiguous 1-based seq_nums from
+    // the SAME stream counter as single event()s, so singles and pages share
+    // one monotone sequence; one uid/time per row; descriptor matches.
+    #[test]
+    fn event_page_assigns_contiguous_seqnums_sharing_the_event_counter() {
+        let start = RunBundle::start(Some(1), None);
+        let bundle = RunBundle::open(&start);
+        let (desc, _) = bundle.descriptor(
+            "primary",
+            HashMap::new(),
+            HashMap::new(),
+            None,
+            HashMap::new(),
+        );
+
+        // One single event first (seq_num 1).
+        let e1 = bundle
+            .event("primary", HashMap::new(), HashMap::new())
+            .unwrap();
+        assert_eq!(e1.seq_num, 1);
+
+        // A page of 2 continues the sequence: 2, 3.
+        let page = bundle
+            .event_page(
+                "primary",
+                HashMap::from([("x".to_string(), vec![Value::from(10), Value::from(20)])]),
+                HashMap::from([("x".to_string(), vec![1.0, 2.0])]),
+                2,
+            )
+            .expect("stream declared");
+        assert_eq!(page.seq_num, vec![2, 3]);
+        assert_eq!(page.uid.len(), 2, "one uid per row");
+        assert_ne!(page.uid[0], page.uid[1], "row uids are distinct");
+        assert_eq!(page.time.len(), 2, "one time per row");
+        assert_eq!(page.descriptor, desc.uid);
+        assert_eq!(page.data["x"], vec![Value::from(10), Value::from(20)]);
+
+        // A subsequent single event continues from where the page left off: 4.
+        let e2 = bundle
+            .event("primary", HashMap::new(), HashMap::new())
+            .unwrap();
+        assert_eq!(e2.seq_num, 4);
+
+        // RunStop counts all four events across singles and the page.
+        let stop = bundle.stop("success", None);
+        assert_eq!(stop.num_events["primary"], 4);
+    }
+
+    #[test]
+    fn event_page_unknown_stream_returns_none() {
+        let start = RunBundle::start(Some(1), None);
+        let bundle = RunBundle::open(&start);
+        assert!(bundle
+            .event_page("nope", HashMap::new(), HashMap::new(), 3)
+            .is_none());
     }
 }
