@@ -25,7 +25,7 @@ pub fn new_uid() -> String {
     Uuid::new_v4().to_string()
 }
 
-/// Per-run composer: caches descriptors by data-key shape, increments seq nums.
+/// Per-run composer: caches one descriptor per stream name, increments seq nums.
 #[derive(Debug)]
 pub struct RunBundle {
     start_uid: String,
@@ -34,7 +34,11 @@ pub struct RunBundle {
 
 #[derive(Debug)]
 struct StreamState {
-    descriptor_uid: String,
+    /// The one descriptor for this stream. Minted on the first
+    /// [`RunBundle::descriptor`] call for the stream name and returned unchanged
+    /// on every later call, so the uid that `event()`/`stop()` stamp always
+    /// matches the descriptor that was emitted (CBEM-21).
+    descriptor: EventDescriptor,
     seq_num: AtomicU64,
 }
 
@@ -58,8 +62,17 @@ impl RunBundle {
         }
     }
 
-    /// Compose a stream descriptor. If a descriptor with the same shape already
-    /// exists for this stream name, returns its UID and emits no new descriptor.
+    /// Compose a stream descriptor. The first call for a given stream name mints
+    /// the stream's one and only descriptor and returns it with `is_new == true`.
+    /// Every later call for the same name returns that same cached descriptor
+    /// unchanged with `is_new == false` — its uid therefore always matches the
+    /// uid that `event()` stamps on the stream's events and that
+    /// `descriptor_uid_for()`/`stop()` report.
+    ///
+    /// A stream's descriptor is fixed at first declaration: re-composing with a
+    /// different `data_keys` shape returns the original descriptor (first
+    /// definition wins), matching bluesky's one-descriptor-per-stream model. A
+    /// caller that needs a different schema must use a different stream name.
     pub fn descriptor(
         &self,
         name: &str,
@@ -69,6 +82,9 @@ impl RunBundle {
         object_keys: HashMap<String, Vec<String>>,
     ) -> (EventDescriptor, bool) {
         let mut streams = self.streams.lock().unwrap();
+        if let Some(st) = streams.get(name) {
+            return (st.descriptor.clone(), false);
+        }
         let descriptor = EventDescriptor {
             uid: new_uid(),
             run_start: self.start_uid.clone(),
@@ -79,14 +95,14 @@ impl RunBundle {
             hints,
             object_keys,
         };
-        let is_new = !streams.contains_key(name);
-        streams
-            .entry(name.to_string())
-            .or_insert_with(|| StreamState {
-                descriptor_uid: descriptor.uid.clone(),
+        streams.insert(
+            name.to_string(),
+            StreamState {
+                descriptor: descriptor.clone(),
                 seq_num: AtomicU64::new(0),
-            });
-        (descriptor, is_new)
+            },
+        );
+        (descriptor, true)
     }
 
     /// Compose an `Event` document for a stream that already has a descriptor.
@@ -102,7 +118,7 @@ impl RunBundle {
         let n = st.seq_num.fetch_add(1, Ordering::SeqCst) + 1;
         Some(Event {
             uid: new_uid(),
-            descriptor: st.descriptor_uid.clone(),
+            descriptor: st.descriptor.uid.clone(),
             time: now(),
             seq_num: n,
             data,
@@ -202,7 +218,7 @@ impl RunBundle {
             .lock()
             .unwrap()
             .get(stream_name)
-            .map(|s| s.descriptor_uid.clone())
+            .map(|s| s.descriptor.uid.clone())
     }
 }
 
@@ -252,6 +268,111 @@ pub type SharedBundle = Arc<RunBundle>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal scalar `DataKey` for schema-shape tests.
+    fn data_key(source: &str) -> DataKey {
+        DataKey {
+            source: source.to_string(),
+            dtype: Dtype::Number,
+            shape: vec![],
+            dtype_numpy: None,
+            external: None,
+            units: None,
+            precision: None,
+            object_name: None,
+            dims: None,
+            limits: None,
+            choices: None,
+        }
+    }
+
+    // CBEM-21 invariant: for a stream name there is exactly one descriptor uid,
+    // and the value `descriptor()` returns must equal the uid `event()`/
+    // `descriptor_uid_for()` read — on the first call AND on every re-compose.
+
+    #[test]
+    fn first_compose_is_new_recompose_returns_cached_uid() {
+        let start = RunBundle::start(Some(1), None);
+        let bundle = RunBundle::open(&start);
+        let (d1, new1) = bundle.descriptor(
+            "primary",
+            HashMap::new(),
+            HashMap::new(),
+            None,
+            HashMap::new(),
+        );
+        assert!(new1, "first compose of a stream name is new");
+        let (d2, new2) = bundle.descriptor(
+            "primary",
+            HashMap::new(),
+            HashMap::new(),
+            None,
+            HashMap::new(),
+        );
+        assert!(!new2, "re-compose of an existing stream is not new");
+        // The defect: re-compose must return the SAME uid, not a fresh one.
+        assert_eq!(d1.uid, d2.uid, "re-compose must return the cached uid");
+        // And that uid is exactly what event() stamps and descriptor_uid_for reports.
+        let ev = bundle
+            .event("primary", HashMap::new(), HashMap::new())
+            .expect("stream declared");
+        assert_eq!(ev.descriptor, d1.uid);
+        assert_eq!(
+            bundle.descriptor_uid_for("primary").as_deref(),
+            Some(d1.uid.as_str())
+        );
+    }
+
+    #[test]
+    fn recompose_keeps_original_schema_and_seq_num() {
+        let start = RunBundle::start(Some(1), None);
+        let bundle = RunBundle::open(&start);
+        let keys_a = HashMap::from([("x".to_string(), data_key("ca://X"))]);
+        let (d1, _) = bundle.descriptor("primary", keys_a, HashMap::new(), None, HashMap::new());
+        // Advance the seq counter before re-composing.
+        bundle.event("primary", HashMap::new(), HashMap::new());
+        bundle.event("primary", HashMap::new(), HashMap::new());
+        // Re-compose with a DIFFERENT data_keys shape.
+        let keys_b = HashMap::from([("y".to_string(), data_key("ca://Y"))]);
+        let (d2, new2) = bundle.descriptor("primary", keys_b, HashMap::new(), None, HashMap::new());
+        assert!(!new2);
+        assert_eq!(d1.uid, d2.uid, "re-compose must not mint a new uid");
+        // First definition wins: schema stays the original (x), not the re-composed (y).
+        assert!(
+            d2.data_keys.contains_key("x") && !d2.data_keys.contains_key("y"),
+            "re-compose must keep the original schema, not adopt the new keys"
+        );
+        // Re-compose must NOT reset the stream's seq counter.
+        let ev = bundle
+            .event("primary", HashMap::new(), HashMap::new())
+            .expect("stream declared");
+        assert_eq!(ev.seq_num, 3, "re-compose must not reset the seq_num");
+    }
+
+    #[test]
+    fn distinct_stream_names_get_distinct_descriptors() {
+        let start = RunBundle::start(Some(1), None);
+        let bundle = RunBundle::open(&start);
+        let (p, pnew) = bundle.descriptor(
+            "primary",
+            HashMap::new(),
+            HashMap::new(),
+            None,
+            HashMap::new(),
+        );
+        let (b, bnew) = bundle.descriptor(
+            "baseline",
+            HashMap::new(),
+            HashMap::new(),
+            None,
+            HashMap::new(),
+        );
+        assert!(pnew && bnew);
+        assert_ne!(
+            p.uid, b.uid,
+            "different stream names get different descriptors"
+        );
+    }
 
     #[test]
     fn resource_composer_mints_sequential_datum_ids() {
