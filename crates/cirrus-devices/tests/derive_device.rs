@@ -55,3 +55,41 @@ async fn nested_device_propagates_prefix() {
     assert_eq!(stage.y.name(), "BL10C:y");
     stage.connect_all(Duration::from_millis(100)).await.unwrap();
 }
+
+#[tokio::test]
+async fn new_named_propagates_bluesky_names() {
+    // CP-06: new_named names the device and propagates `{name}-{field}`
+    // recursively to sub-devices and signals (the bluesky convention),
+    // while PVs still resolve from `prefix`.
+    let stage = XYStage::new_named("BL10C", "stage");
+    assert_eq!(stage.name(), "stage");
+    // Sub-devices: name = "{dev}-{field}", PV still expanded from prefix.
+    assert_eq!(stage.x.name(), "stage-x");
+    assert_eq!(stage.y.name(), "stage-y");
+
+    // Signals on a sub-device: name = "{subdev}-{field}". A signal's read key
+    // is its name, so describe()/read() now key on the bluesky name.
+    let read = stage.x.readback.read().await.unwrap();
+    assert!(
+        read.contains_key("stage-x-readback"),
+        "keys: {:?}",
+        read.keys()
+    );
+    let desc = stage.x.setpoint.describe().await.unwrap();
+    assert!(
+        desc.contains_key("stage-x-setpoint"),
+        "keys: {:?}",
+        desc.keys()
+    );
+
+    // Plain `new` keeps PV-based names (backward compatible).
+    let bare = Motor::new("BL10C:m1");
+    let bare_read = bare.readback.read().await.unwrap();
+    assert!(
+        bare_read.contains_key("BL10C:m1.RBV"),
+        "keys: {:?}",
+        bare_read.keys()
+    );
+
+    stage.connect_all(Duration::from_millis(100)).await.unwrap();
+}

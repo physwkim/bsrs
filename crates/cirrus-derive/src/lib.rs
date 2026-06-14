@@ -57,17 +57,25 @@ pub fn derive_device(input: TokenStream) -> TokenStream {
         }
     };
 
+    // Two parallel constructors share one field walk: `new` names each signal
+    // by its PV source (backward-compatible); `new_named` propagates the
+    // bluesky `{dev_name}-{field}` convention recursively (CP-06).
     let mut field_inits: Vec<TokenStream2> = Vec::new();
+    let mut field_inits_named: Vec<TokenStream2> = Vec::new();
     let mut connect_calls: Vec<TokenStream2> = Vec::new();
     let mut has_name_field = false;
 
     for field in fields {
         let id = field.ident.as_ref().unwrap();
+        let id_str = id.to_string();
 
         if id == "name" {
             has_name_field = true;
             field_inits.push(quote! {
                 name: prefix.to_string(),
+            });
+            field_inits_named.push(quote! {
+                name: dev_name.to_string(),
             });
             continue;
         }
@@ -86,6 +94,18 @@ pub fn derive_device(input: TokenStream) -> TokenStream {
                     },
                 ),
             });
+            field_inits_named.push(quote! {
+                #id: ::cirrus_devices::Signal::new(
+                    ::std::sync::Arc::new(::cirrus_devices::__derive::default_backend(
+                        &::cirrus_devices::__derive::expand(#template, prefix),
+                    )),
+                    ::cirrus_devices::SignalConfig {
+                        source: ::cirrus_devices::__derive::expand(#template, prefix),
+                        kind: #kind_expr,
+                        name: ::std::format!("{}-{}", dev_name, #id_str),
+                    },
+                ),
+            });
             connect_calls.push(quote! {
                 ::cirrus_devices::__derive::connect_signal(&self.#id, timeout)
             });
@@ -97,6 +117,12 @@ pub fn derive_device(input: TokenStream) -> TokenStream {
             field_inits.push(quote! {
                 #id: <#ty>::new(&::cirrus_devices::__derive::expand(#template, prefix)),
             });
+            field_inits_named.push(quote! {
+                #id: <#ty>::new_named(
+                    &::cirrus_devices::__derive::expand(#template, prefix),
+                    &::std::format!("{}-{}", dev_name, #id_str),
+                ),
+            });
             connect_calls.push(quote! {
                 ::std::boxed::Box::pin(async move { self.#id.connect_all(timeout).await })
             });
@@ -105,6 +131,9 @@ pub fn derive_device(input: TokenStream) -> TokenStream {
 
         // Unattributed field — must be Default-constructible.
         field_inits.push(quote! {
+            #id: ::core::default::Default::default(),
+        });
+        field_inits_named.push(quote! {
             #id: ::core::default::Default::default(),
         });
     }
@@ -135,12 +164,27 @@ pub fn derive_device(input: TokenStream) -> TokenStream {
 
     let expanded = quote! {
         impl #impl_g #name #ty_g #where_g {
-            /// Build the device, allocating each signal under `prefix`.
+            /// Build the device, allocating each signal under `prefix`. Each
+            /// signal is named by its PV source.
             pub fn new(prefix: &str) -> ::std::sync::Arc<Self> {
                 ::std::sync::Arc::new(Self { #( #field_inits )* })
             }
 
-            /// Stable device name (the prefix passed to `new`).
+            /// Build the device under `prefix`, naming it `dev_name` and
+            /// propagating bluesky-style `{dev_name}-{field}` names to every
+            /// signal and (recursively) every sub-device (CP-06). This is the
+            /// construction-time equivalent of ophyd-async `set_name` — cirrus
+            /// devices are immutable `Arc<Self>`, so names are fixed at build
+            /// time rather than mutated post-hoc.
+            pub fn new_named(prefix: &str, dev_name: &str) -> ::std::sync::Arc<Self> {
+                ::std::sync::Arc::new(Self { #( #field_inits_named )* })
+            }
+
+            /// Stable device name (`prefix` for [`new`], `dev_name` for
+            /// [`new_named`]).
+            ///
+            /// [`new`]: Self::new
+            /// [`new_named`]: Self::new_named
             pub fn name(&self) -> &str {
                 &self.name
             }
