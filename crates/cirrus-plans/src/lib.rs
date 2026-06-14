@@ -385,10 +385,15 @@ pub mod stubs {
     ) -> Plan {
         let name = name.into();
         plan_box(async_stream::stream! {
-            for t in &triggerables {
-                yield Msg::Trigger { obj: t.clone(), group: Some("trig".into()) };
+            // Skip the trigger/wait pair when nothing is triggerable, mirroring
+            // bluesky's `no_wait` guard (plan_stubs.py:1455-1462): a Wait on a
+            // group that received no Trigger is a spurious message.
+            if !triggerables.is_empty() {
+                for t in &triggerables {
+                    yield Msg::Trigger { obj: t.clone(), group: Some("trig".into()) };
+                }
+                yield Msg::Wait { group: "trig".into(), error_on_timeout: true, timeout: None };
             }
-            yield Msg::Wait { group: "trig".into(), error_on_timeout: true, timeout: None };
             yield Msg::Create { stream_name: name };
             for r in &readables {
                 yield Msg::Read(r.clone());
@@ -513,14 +518,19 @@ pub fn count_with_trigger(
             ..Default::default()
         });
         for _ in 0..num {
-            for t in &triggerables {
-                yield Msg::Trigger { obj: t.clone(), group: Some("trigger".into()) };
+            // Skip the trigger/wait pair when nothing is triggerable, mirroring
+            // bluesky's `no_wait` guard (plan_stubs.py:1455-1462): a Wait on a
+            // group that received no Trigger is a spurious message.
+            if !triggerables.is_empty() {
+                for t in &triggerables {
+                    yield Msg::Trigger { obj: t.clone(), group: Some("trigger".into()) };
+                }
+                yield Msg::Wait {
+                    group: "trigger".into(),
+                    error_on_timeout: true,
+                    timeout: None,
+                };
             }
-            yield Msg::Wait {
-                group: "trigger".into(),
-                error_on_timeout: true,
-                timeout: None,
-            };
             yield Msg::Create { stream_name: "primary".into() };
             for d in &detectors {
                 yield Msg::Read(d.clone());
@@ -1618,6 +1628,92 @@ mod tests {
         {
             Ok(HashMap::new())
         }
+    }
+
+    /// Triggerable carried only inside `Msg::Trigger`; `trigger_dyn` is never
+    /// called by `drain`.
+    struct FakeTriggerable(String);
+
+    impl NamedObj for FakeTriggerable {
+        fn name(&self) -> &str {
+            &self.0
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TriggerableObj for FakeTriggerable {
+        async fn trigger_dyn(&self) -> Status {
+            Status::done()
+        }
+    }
+
+    // Empty triggerables → no Trigger and no Wait (bluesky no_wait guard),
+    // but a Create/Read/Save event is still produced.
+    #[tokio::test]
+    async fn trigger_and_read_skips_wait_when_no_triggerables() {
+        let r = Arc::new(FakeReadable("det".into())) as Arc<dyn ReadableObj>;
+        let msgs = drain(stubs::trigger_and_read(vec![], vec![r], "primary")).await;
+        assert!(!msgs.iter().any(|m| matches!(m, Msg::Trigger { .. })));
+        assert!(!msgs.iter().any(|m| matches!(m, Msg::Wait { .. })));
+        assert!(matches!(msgs.first(), Some(Msg::Create { .. })));
+        assert!(matches!(msgs.last(), Some(Msg::Save)));
+    }
+
+    // A triggerable present → Trigger then Wait{trig} precede Create.
+    #[tokio::test]
+    async fn trigger_and_read_emits_trigger_then_wait_when_triggerable() {
+        let t = Arc::new(FakeTriggerable("det".into())) as Arc<dyn TriggerableObj>;
+        let r = Arc::new(FakeReadable("det".into())) as Arc<dyn ReadableObj>;
+        let msgs = drain(stubs::trigger_and_read(vec![t], vec![r], "primary")).await;
+        assert!(matches!(msgs.first(), Some(Msg::Trigger { .. })));
+        let wait_pos = msgs
+            .iter()
+            .position(|m| matches!(m, Msg::Wait { group, .. } if group == "trig"))
+            .expect("Wait{trig} present");
+        let create_pos = msgs
+            .iter()
+            .position(|m| matches!(m, Msg::Create { .. }))
+            .expect("Create present");
+        assert!(wait_pos < create_pos, "Wait must precede Create");
+    }
+
+    // Empty triggerables across iterations → zero Wait, one Save per iteration.
+    #[tokio::test]
+    async fn count_with_trigger_skips_wait_each_iteration_when_no_triggerables() {
+        let d = Arc::new(FakeReadable("det".into())) as Arc<dyn ReadableObj>;
+        let msgs = drain(count_with_trigger(vec![d], vec![], 2)).await;
+        assert_eq!(
+            msgs.iter()
+                .filter(|m| matches!(m, Msg::Wait { .. }))
+                .count(),
+            0
+        );
+        assert!(!msgs.iter().any(|m| matches!(m, Msg::Trigger { .. })));
+        assert_eq!(
+            msgs.iter().filter(|m| matches!(m, Msg::Save)).count(),
+            2,
+            "one Save per iteration"
+        );
+    }
+
+    // A triggerable present → one Trigger and one Wait{trigger} per iteration.
+    #[tokio::test]
+    async fn count_with_trigger_emits_wait_each_iteration_when_triggerable() {
+        let t = Arc::new(FakeTriggerable("det".into())) as Arc<dyn TriggerableObj>;
+        let d = Arc::new(FakeReadable("det".into())) as Arc<dyn ReadableObj>;
+        let msgs = drain(count_with_trigger(vec![d], vec![t], 2)).await;
+        assert_eq!(
+            msgs.iter()
+                .filter(|m| matches!(m, Msg::Wait { group, .. } if group == "trigger"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            msgs.iter()
+                .filter(|m| matches!(m, Msg::Trigger { .. }))
+                .count(),
+            2
+        );
     }
 
     fn set_values(msgs: &[Msg]) -> Vec<f64> {
