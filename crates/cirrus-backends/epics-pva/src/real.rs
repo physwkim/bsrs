@@ -203,6 +203,27 @@ fn pv_field_to_ts(p: &PvField) -> Option<f64> {
     Some(secs + nanos / 1.0e9)
 }
 
+// EPICS alarm severity from an NTScalar/NTEnum `alarm` substructure
+// `{ severity: int, ... }`, mapped to the cirrus/ophyd-async convention:
+// 0/1/2 pass through (NO_ALARM/MINOR/MAJOR), 3+ (INVALID) -> -1
+// (`_aioca._make_reading`: `-1 if severity > 2 else severity`). None when no
+// `alarm` substructure is present (e.g. a server publishing a bare scalar).
+fn pv_field_to_alarm_severity(p: &PvField) -> Option<i32> {
+    let PvField::Structure(s) = p else {
+        return None;
+    };
+    let alarm = s.fields.iter().find(|(n, _)| n == "alarm")?;
+    let PvField::Structure(a) = &alarm.1 else {
+        return None;
+    };
+    let sev = a
+        .fields
+        .iter()
+        .find(|(n, _)| n == "severity")
+        .and_then(|(_, f)| pv_field_to_i64(f))?;
+    Some(if sev > 2 { -1 } else { sev as i32 })
+}
+
 #[async_trait]
 impl SignalBackend<f64> for EpicsPvaBackend<f64> {
     async fn connect(&self, _timeout: Duration) -> Result<()> {
@@ -241,7 +262,7 @@ impl SignalBackend<f64> for EpicsPvaBackend<f64> {
         Ok(ReadingValue {
             value: serde_json::Value::from(v),
             timestamp: now_ts(),
-            alarm_severity: None,
+            alarm_severity: pv_field_to_alarm_severity(&f),
             message: None,
         })
     }
@@ -345,7 +366,7 @@ impl SignalBackend<String> for EpicsPvaBackend<String> {
         Ok(ReadingValue {
             value: serde_json::Value::from(s),
             timestamp: now_ts(),
-            alarm_severity: None,
+            alarm_severity: pv_field_to_alarm_severity(&f),
             message: None,
         })
     }
@@ -439,7 +460,7 @@ impl SignalBackend<i64> for EpicsPvaBackend<i64> {
         Ok(ReadingValue {
             value: serde_json::Value::from(i),
             timestamp: now_ts(),
-            alarm_severity: None,
+            alarm_severity: pv_field_to_alarm_severity(&f),
             message: None,
         })
     }
@@ -532,7 +553,7 @@ impl SignalBackend<bool> for EpicsPvaBackend<bool> {
         Ok(ReadingValue {
             value: serde_json::Value::from(b),
             timestamp: now_ts(),
-            alarm_severity: None,
+            alarm_severity: pv_field_to_alarm_severity(&f),
             message: None,
         })
     }
@@ -662,6 +683,59 @@ mod tests {
             pv_field_to_string(&PvField::Structure(nt)),
             Some("hi".into())
         );
+    }
+
+    // Build an NTScalar `{ value, alarm: { severity, status } }`.
+    fn ntscalar_with_alarm(value: f64, severity: i32) -> PvField {
+        let mut alarm = PvStructure::new("alarm_t");
+        alarm.fields.push((
+            "severity".into(),
+            PvField::Scalar(ScalarValue::Int(severity)),
+        ));
+        alarm
+            .fields
+            .push(("status".into(), PvField::Scalar(ScalarValue::Int(0))));
+        let mut nt = PvStructure::new("epics:nt/NTScalar:1.0");
+        nt.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(value))));
+        nt.fields.push(("alarm".into(), PvField::Structure(alarm)));
+        PvField::Structure(nt)
+    }
+
+    #[test]
+    fn alarm_severity_decoded_from_ntscalar_alarm() {
+        // MINOR(1) and MAJOR(2) pass through.
+        assert_eq!(
+            pv_field_to_alarm_severity(&ntscalar_with_alarm(1.0, 1)),
+            Some(1)
+        );
+        assert_eq!(
+            pv_field_to_alarm_severity(&ntscalar_with_alarm(1.0, 2)),
+            Some(2)
+        );
+        // NO_ALARM(0) is still Some(0) — ophyd-async always reports it.
+        assert_eq!(
+            pv_field_to_alarm_severity(&ntscalar_with_alarm(1.0, 0)),
+            Some(0)
+        );
+        // INVALID(3) and any higher code collapse to -1
+        // (`_aioca`: `-1 if severity > 2 else severity`).
+        assert_eq!(
+            pv_field_to_alarm_severity(&ntscalar_with_alarm(1.0, 3)),
+            Some(-1)
+        );
+        assert_eq!(
+            pv_field_to_alarm_severity(&ntscalar_with_alarm(1.0, 4)),
+            Some(-1)
+        );
+    }
+
+    #[test]
+    fn alarm_severity_none_when_no_alarm_substructure() {
+        // Bare scalar and an NTScalar lacking `alarm` both yield None.
+        assert!(pv_field_to_alarm_severity(&PvField::Scalar(ScalarValue::Double(1.0))).is_none());
+        let f = ntscalar_with_ts(42.0, 1, 0); // has timeStamp but no alarm
+        assert!(pv_field_to_alarm_severity(&f).is_none());
     }
 
     #[test]

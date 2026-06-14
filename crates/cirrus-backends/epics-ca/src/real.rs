@@ -214,6 +214,18 @@ async fn channel_native_type(ch: &CaChannel) -> Result<DbFieldType> {
         .map_err(|e| CirrusError::Backend(format!("ca info: {e}")))
 }
 
+/// Map a CA wire alarm severity (`DBR_STS_*` `severity`, a `u16`) to the
+/// cirrus/ophyd-async convention: NO_ALARM(0)/MINOR(1)/MAJOR(2) pass through,
+/// INVALID(3) and any higher code collapse to -1
+/// (`_aioca._make_reading`: `-1 if value.severity > 2 else value.severity`).
+fn alarm_severity(raw: u16) -> i32 {
+    if raw > 2 {
+        -1
+    } else {
+        raw as i32
+    }
+}
+
 /// Encode an `f64` payload as the `EpicsValue` variant that matches
 /// the channel's `native_type`. Required because
 /// `CaChannel::put` writes with `native_type` on the wire (see
@@ -356,16 +368,16 @@ impl SignalBackend<f64> for EpicsCaBackend<f64> {
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
-        let (_ty, v) = ch
-            .get()
+        let snap = ch
+            .get_with_metadata(DbrClass::Sts)
             .await
             .map_err(|e| CirrusError::Backend(format!("ca get: {e}")))?;
-        let f = epics_to_f64(&v)
-            .ok_or_else(|| CirrusError::Backend(format!("ca: not numeric: {v:?}")))?;
+        let f = epics_to_f64(&snap.value)
+            .ok_or_else(|| CirrusError::Backend(format!("ca: not numeric: {:?}", snap.value)))?;
         Ok(ReadingValue {
             value: serde_json::Value::from(f),
             timestamp: now_ts(),
-            alarm_severity: None,
+            alarm_severity: Some(alarm_severity(snap.alarm.severity)),
             message: None,
         })
     }
@@ -454,16 +466,16 @@ impl SignalBackend<String> for EpicsCaBackend<String> {
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
-        let (_ty, v) = ch
-            .get()
+        let snap = ch
+            .get_with_metadata(DbrClass::Sts)
             .await
             .map_err(|e| CirrusError::Backend(format!("ca get: {e}")))?;
-        let s = epics_to_string(&v, self.string_kind)
-            .ok_or_else(|| CirrusError::Backend(format!("ca: not stringable: {v:?}")))?;
+        let s = epics_to_string(&snap.value, self.string_kind)
+            .ok_or_else(|| CirrusError::Backend(format!("ca: not stringable: {:?}", snap.value)))?;
         Ok(ReadingValue {
             value: serde_json::Value::from(s),
             timestamp: now_ts(),
-            alarm_severity: None,
+            alarm_severity: Some(alarm_severity(snap.alarm.severity)),
             message: None,
         })
     }
@@ -554,16 +566,16 @@ impl SignalBackend<i64> for EpicsCaBackend<i64> {
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
-        let (_ty, v) = ch
-            .get()
+        let snap = ch
+            .get_with_metadata(DbrClass::Sts)
             .await
             .map_err(|e| CirrusError::Backend(format!("ca get: {e}")))?;
-        let i =
-            epics_to_i64(&v).ok_or_else(|| CirrusError::Backend(format!("ca: not int: {v:?}")))?;
+        let i = epics_to_i64(&snap.value)
+            .ok_or_else(|| CirrusError::Backend(format!("ca: not int: {:?}", snap.value)))?;
         Ok(ReadingValue {
             value: serde_json::Value::from(i),
             timestamp: now_ts(),
-            alarm_severity: None,
+            alarm_severity: Some(alarm_severity(snap.alarm.severity)),
             message: None,
         })
     }
@@ -643,16 +655,16 @@ impl SignalBackend<bool> for EpicsCaBackend<bool> {
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
-        let (_ty, v) = ch
-            .get()
+        let snap = ch
+            .get_with_metadata(DbrClass::Sts)
             .await
             .map_err(|e| CirrusError::Backend(format!("ca get: {e}")))?;
-        let b = epics_to_bool(&v)
-            .ok_or_else(|| CirrusError::Backend(format!("ca: not bool: {v:?}")))?;
+        let b = epics_to_bool(&snap.value)
+            .ok_or_else(|| CirrusError::Backend(format!("ca: not bool: {:?}", snap.value)))?;
         Ok(ReadingValue {
             value: serde_json::Value::from(b),
             timestamp: now_ts(),
-            alarm_severity: None,
+            alarm_severity: Some(alarm_severity(snap.alarm.severity)),
             message: None,
         })
     }
@@ -848,11 +860,22 @@ impl SignalBackend<String> for CaEnumBackend {
         ))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
-        let label = self.read_label().await?;
+        // A Reading carries the alarm severity that `read_label` discards, so
+        // inline a `Sts` metadata read (value + severity) and decode the label
+        // against the cached choices rather than going through `read_label`.
+        let ch = self.ensure_channel(Duration::from_secs(2)).await?;
+        let choices = self.ensure_choices(&ch).await?;
+        let snap = ch
+            .get_with_metadata(DbrClass::Sts)
+            .await
+            .map_err(|e| CirrusError::Backend(format!("ca enum get: {e}")))?;
+        let label = epics_to_enum_label(&snap.value, &choices).ok_or_else(|| {
+            CirrusError::Backend(format!("ca enum: not enum-decodable: {:?}", snap.value))
+        })?;
         Ok(ReadingValue {
             value: serde_json::Value::from(label),
             timestamp: now_ts(),
-            alarm_severity: None,
+            alarm_severity: Some(alarm_severity(snap.alarm.severity)),
             message: None,
         })
     }
@@ -924,6 +947,19 @@ mod tests {
         // Must not panic. Returns an Arc; we don't dereference into
         // any I/O so the IOC need not be present.
         let _ = ca_context();
+    }
+
+    #[test]
+    fn alarm_severity_maps_invalid_and_above_to_negative_one() {
+        // NO_ALARM / MINOR / MAJOR pass through unchanged.
+        assert_eq!(alarm_severity(0), 0);
+        assert_eq!(alarm_severity(1), 1);
+        assert_eq!(alarm_severity(2), 2);
+        // INVALID(3) and any higher code collapse to -1, matching
+        // ophyd-async `_aioca` (`-1 if value.severity > 2 else value.severity`).
+        assert_eq!(alarm_severity(3), -1);
+        assert_eq!(alarm_severity(4), -1);
+        assert_eq!(alarm_severity(u16::MAX), -1);
     }
 
     #[test]
