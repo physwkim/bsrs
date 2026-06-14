@@ -63,6 +63,7 @@ const RECONNECT_BACKOFF: Duration = Duration::from_millis(50);
 pub struct SuspendBoolHigh {
     name: String,
     rx: watch::Receiver<bool>,
+    resume_delay: Option<Duration>,
 }
 
 impl SuspendBoolHigh {
@@ -74,7 +75,16 @@ impl SuspendBoolHigh {
         Self {
             name: name.into(),
             rx,
+            resume_delay: None,
         }
+    }
+
+    /// Set the resume delay (bluesky `sleep=`): after the signal returns
+    /// to GOOD, wait `delay` — and stay GOOD for the whole `delay` — before
+    /// resuming. A flicker back to BAD during the wait restarts it.
+    pub fn with_resume_delay(mut self, delay: Duration) -> Self {
+        self.resume_delay = Some(delay);
+        self
     }
 
     /// Spawn the watcher task. Returns the `JoinHandle` so the caller
@@ -83,8 +93,12 @@ impl SuspendBoolHigh {
     /// handle drops, `tokio` does **not** abort — call `.abort()` or
     /// wrap in `AbortOnDrop` if you want lifecycle tied to scope.
     pub fn install(self, re: Arc<RunEngine>) -> JoinHandle<()> {
-        let SuspendBoolHigh { name, rx } = self;
-        spawn_bool_watcher(re, name, rx, /*pause_when=*/ true)
+        let SuspendBoolHigh {
+            name,
+            rx,
+            resume_delay,
+        } = self;
+        spawn_bool_watcher(re, name, rx, /*pause_when=*/ true, resume_delay)
     }
 }
 
@@ -93,6 +107,7 @@ impl SuspendBoolHigh {
 pub struct SuspendBoolLow {
     name: String,
     rx: watch::Receiver<bool>,
+    resume_delay: Option<Duration>,
 }
 
 impl SuspendBoolLow {
@@ -101,13 +116,24 @@ impl SuspendBoolLow {
         Self {
             name: name.into(),
             rx,
+            resume_delay: None,
         }
+    }
+
+    /// See [`SuspendBoolHigh::with_resume_delay`].
+    pub fn with_resume_delay(mut self, delay: Duration) -> Self {
+        self.resume_delay = Some(delay);
+        self
     }
 
     /// See [`SuspendBoolHigh::install`].
     pub fn install(self, re: Arc<RunEngine>) -> JoinHandle<()> {
-        let SuspendBoolLow { name, rx } = self;
-        spawn_bool_watcher(re, name, rx, /*pause_when=*/ false)
+        let SuspendBoolLow {
+            name,
+            rx,
+            resume_delay,
+        } = self;
+        spawn_bool_watcher(re, name, rx, /*pause_when=*/ false, resume_delay)
     }
 }
 
@@ -119,6 +145,7 @@ pub struct SuspendThreshold {
     threshold: f64,
     /// Direction of the BAD region.
     direction: ThresholdDirection,
+    resume_delay: Option<Duration>,
 }
 
 /// Which side of [`SuspendThreshold::threshold`] is the BAD (pause)
@@ -146,7 +173,14 @@ impl SuspendThreshold {
             rx,
             threshold,
             direction,
+            resume_delay: None,
         }
+    }
+
+    /// See [`SuspendBoolHigh::with_resume_delay`].
+    pub fn with_resume_delay(mut self, delay: Duration) -> Self {
+        self.resume_delay = Some(delay);
+        self
     }
 
     /// Spawn the watcher; see [`SuspendBoolHigh::install`].
@@ -156,6 +190,7 @@ impl SuspendThreshold {
             mut rx,
             threshold,
             direction,
+            resume_delay,
         } = self;
         let bad = move |v: f64| match direction {
             ThresholdDirection::BadIfBelow => v < threshold,
@@ -169,17 +204,14 @@ impl SuspendThreshold {
                         return;
                     }
                 }
-                // BAD: pause + auto-resume when value returns to GOOD.
+                // BAD: pause + auto-resume once value is GOOD-stable for the
+                // resume delay (bluesky `sleep=`).
                 let resume_rx = rx.clone();
-                let bad_for_fut = bad;
-                let fut: futures::future::BoxFuture<'static, ()> = Box::pin(async move {
-                    let mut rx = resume_rx;
-                    while bad_for_fut(*rx.borrow_and_update()) {
-                        if rx.changed().await.is_err() {
-                            return;
-                        }
-                    }
-                });
+                let fut: futures::future::BoxFuture<'static, ()> = Box::pin(await_good_stable(
+                    resume_rx,
+                    move |v: &f64| bad(*v),
+                    resume_delay,
+                ));
                 re.suspend_until_with(
                     fut,
                     Some(format!(
@@ -210,6 +242,7 @@ fn spawn_bool_watcher(
     name: String,
     mut rx: watch::Receiver<bool>,
     pause_when: bool,
+    resume_delay: Option<Duration>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -218,15 +251,14 @@ fn spawn_bool_watcher(
                     return;
                 }
             }
-            // BAD: pause + auto-resume when value flips back.
-            let mut resume_rx = rx.clone();
-            let fut: futures::future::BoxFuture<'static, ()> = Box::pin(async move {
-                while *resume_rx.borrow_and_update() == pause_when {
-                    if resume_rx.changed().await.is_err() {
-                        return;
-                    }
-                }
-            });
+            // BAD: pause + auto-resume once value is GOOD-stable for the
+            // resume delay (bluesky `sleep=`).
+            let resume_rx = rx.clone();
+            let fut: futures::future::BoxFuture<'static, ()> = Box::pin(await_good_stable(
+                resume_rx,
+                move |v: &bool| *v == pause_when,
+                resume_delay,
+            ));
             re.suspend_until_with(
                 fut,
                 Some(format!(
@@ -243,4 +275,130 @@ fn spawn_bool_watcher(
             tokio::time::sleep(RECONNECT_BACKOFF).await;
         }
     })
+}
+
+/// Resolve once `rx` has been continuously GOOD (`!bad`) for `resume_delay`.
+///
+/// Mirrors bluesky's `sleep=` resume delay: when the watched signal returns
+/// to GOOD the resume is deferred by `resume_delay`; a flicker back to BAD
+/// (or any further update) during that window restarts the wait, so the
+/// engine only resumes after the signal has settled. `None` resolves the
+/// instant the signal is GOOD (no delay). A closed channel resolves too —
+/// the source is gone, so staying suspended forever is the wrong default.
+async fn await_good_stable<T>(
+    mut rx: watch::Receiver<T>,
+    bad: impl Fn(&T) -> bool + Send + 'static,
+    resume_delay: Option<Duration>,
+) where
+    T: Send + Sync + 'static,
+{
+    loop {
+        // Wait until the signal is GOOD.
+        while bad(&rx.borrow_and_update()) {
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+        // GOOD. With no delay, resume now.
+        let Some(delay) = resume_delay else {
+            return;
+        };
+        // Stay GOOD for the whole delay; any update cancels and re-checks.
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => return,
+            changed = rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                // Value changed — loop re-evaluates GOOD/BAD and restarts
+                // the delay if still GOOD, or waits for GOOD again if BAD.
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::FutureExt;
+
+    // BAD when the bool is `true` (mirrors `pause_when = true`).
+    fn bad_high(v: &bool) -> bool {
+        *v
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn await_good_stable_no_delay_resolves_on_good() {
+        let (tx, rx) = watch::channel(true); // BAD
+        let mut fut = Box::pin(await_good_stable(rx, bad_high, None));
+        // Still BAD: pending.
+        assert!((&mut fut).now_or_never().is_none());
+        tx.send(false).unwrap(); // GOOD
+                                 // No delay → resolves immediately on GOOD.
+        assert!((&mut fut).now_or_never().is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn await_good_stable_waits_resume_delay() {
+        let (tx, rx) = watch::channel(true); // BAD
+        let mut fut = Box::pin(await_good_stable(
+            rx,
+            bad_high,
+            Some(Duration::from_secs(5)),
+        ));
+        assert!((&mut fut).now_or_never().is_none());
+        tx.send(false).unwrap(); // GOOD — arms the 5s delay
+        assert!(
+            (&mut fut).now_or_never().is_none(),
+            "must not resume before the delay elapses"
+        );
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(
+            (&mut fut).now_or_never().is_some(),
+            "must resume after the delay elapses"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn await_good_stable_restarts_on_flicker_back_to_bad() {
+        let (tx, rx) = watch::channel(true); // BAD
+        let mut fut = Box::pin(await_good_stable(
+            rx,
+            bad_high,
+            Some(Duration::from_secs(5)),
+        ));
+        tx.send(false).unwrap(); // GOOD — arms 5s
+        assert!((&mut fut).now_or_never().is_none());
+        tokio::time::advance(Duration::from_secs(3)).await; // partway through
+        tx.send(true).unwrap(); // flicker BAD — cancels the pending delay
+        assert!((&mut fut).now_or_never().is_none());
+        tokio::time::advance(Duration::from_secs(5)).await; // old timer must NOT fire
+        assert!(
+            (&mut fut).now_or_never().is_none(),
+            "flicker to BAD must cancel the resume"
+        );
+        tx.send(false).unwrap(); // GOOD again — fresh 5s
+        assert!((&mut fut).now_or_never().is_none());
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(
+            (&mut fut).now_or_never().is_some(),
+            "resumes only after a full stable delay"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn await_good_stable_closed_channel_resolves() {
+        let (tx, rx) = watch::channel(true); // BAD
+        let mut fut = Box::pin(await_good_stable(
+            rx,
+            bad_high,
+            Some(Duration::from_secs(5)),
+        ));
+        assert!((&mut fut).now_or_never().is_none());
+        drop(tx); // source gone while BAD
+        assert!(
+            (&mut fut).now_or_never().is_some(),
+            "closed channel must resolve, not hang suspended"
+        );
+    }
 }

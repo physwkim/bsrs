@@ -18,3 +18,8 @@ tracing.workspace = true
 uuid.workspace = true
 cirrus-core.workspace = true
 cirrus-event-model.workspace = true
+
+[dev-dependencies]
+# `test-util` enables `tokio::test(start_paused)` + `tokio::time::advance`
+# for the suspender resume-delay tests (deterministic virtual time).
+tokio = { workspace = true, features = ["test-util"] }
