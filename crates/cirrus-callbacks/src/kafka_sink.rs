@@ -91,10 +91,13 @@ impl KafkaDocumentSink {
 /// Free-function form of `encode_body` so unit tests can exercise the
 /// serialization without spinning up a Kafka producer.
 fn encode_body(serializer: Serializer, doc: &Document) -> Result<Vec<u8>> {
+    // Serialize the raw document dict (inner variant), not the adjacently
+    // tagged `Document` wrapper — matches the bluesky-kafka envelope where the
+    // doc kind travels in the message key, not the body (CBEM-01).
     match serializer {
-        Serializer::Json => serde_json::to_vec(doc)
+        Serializer::Json => crate::doc_encode::encode_inner_json(doc)
             .map_err(|e| CirrusError::Backend(format!("kafka json encode: {e}"))),
-        Serializer::Msgpack => rmp_serde::to_vec_named(doc)
+        Serializer::Msgpack => crate::doc_encode::encode_inner_msgpack(doc)
             .map_err(|e| CirrusError::Backend(format!("kafka msgpack encode: {e}"))),
     }
 }
@@ -142,9 +145,15 @@ mod tests {
     #[test]
     fn encode_body_json_round_trips() {
         let body = encode_body(Serializer::Json, &fake_stop()).expect("encode");
-        let s = std::str::from_utf8(&body).expect("utf8 json");
-        assert!(s.contains("\"exit_status\""));
-        assert!(s.contains("\"success\""));
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("parse json");
+        // CBEM-01: the body is the raw event-model dict (doc kind lives in the
+        // Kafka key), not the adjacently-tagged {"name":..,"doc":..} wrapper.
+        assert_eq!(v["exit_status"], "success");
+        assert_eq!(v["run_start"], "run-1");
+        assert!(
+            v.get("name").is_none() && v.get("doc").is_none(),
+            "kafka body must be the raw doc dict, not the Document wrapper: {v}"
+        );
     }
 
     #[test]

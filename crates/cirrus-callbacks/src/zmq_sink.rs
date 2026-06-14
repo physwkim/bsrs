@@ -98,32 +98,14 @@ impl ZmqDocumentSink {
     fn encode_body(&self, doc: &Document) -> Result<Vec<u8>> {
         // The wire format expects the *body only* (without the discriminator
         // tag), so we serialize the inner variant rather than the tagged
-        // `Document` enum. This matches Python event-model dicts.
-        let mp = |r: std::result::Result<Vec<u8>, rmp_serde::encode::Error>| -> Result<Vec<u8>> {
-            r.map_err(|e| CirrusError::Backend(format!("msgpack: {e}")))
-        };
-        match (self.serializer, doc) {
-            (Serializer::Msgpack, Document::Start(d)) => mp(rmp_serde::to_vec_named(d)),
-            (Serializer::Msgpack, Document::Descriptor(d)) => mp(rmp_serde::to_vec_named(d)),
-            (Serializer::Msgpack, Document::Event(d)) => mp(rmp_serde::to_vec_named(d)),
-            (Serializer::Msgpack, Document::EventPage(d)) => mp(rmp_serde::to_vec_named(d)),
-            (Serializer::Msgpack, Document::Resource(d)) => mp(rmp_serde::to_vec_named(d)),
-            (Serializer::Msgpack, Document::Datum(d)) => mp(rmp_serde::to_vec_named(d)),
-            (Serializer::Msgpack, Document::DatumPage(d)) => mp(rmp_serde::to_vec_named(d)),
-            (Serializer::Msgpack, Document::StreamResource(d)) => mp(rmp_serde::to_vec_named(d)),
-            (Serializer::Msgpack, Document::StreamDatum(d)) => mp(rmp_serde::to_vec_named(d)),
-            (Serializer::Msgpack, Document::Stop(d)) => mp(rmp_serde::to_vec_named(d)),
-
-            (Serializer::Json, Document::Start(d)) => Ok(serde_json::to_vec(d)?),
-            (Serializer::Json, Document::Descriptor(d)) => Ok(serde_json::to_vec(d)?),
-            (Serializer::Json, Document::Event(d)) => Ok(serde_json::to_vec(d)?),
-            (Serializer::Json, Document::EventPage(d)) => Ok(serde_json::to_vec(d)?),
-            (Serializer::Json, Document::Resource(d)) => Ok(serde_json::to_vec(d)?),
-            (Serializer::Json, Document::Datum(d)) => Ok(serde_json::to_vec(d)?),
-            (Serializer::Json, Document::DatumPage(d)) => Ok(serde_json::to_vec(d)?),
-            (Serializer::Json, Document::StreamResource(d)) => Ok(serde_json::to_vec(d)?),
-            (Serializer::Json, Document::StreamDatum(d)) => Ok(serde_json::to_vec(d)?),
-            (Serializer::Json, Document::Stop(d)) => Ok(serde_json::to_vec(d)?),
+        // `Document` enum. This matches Python event-model dicts. The
+        // per-variant match lives in `doc_encode` so every sink shares one
+        // owner (CBEM-01).
+        match self.serializer {
+            Serializer::Msgpack => crate::doc_encode::encode_inner_msgpack(doc)
+                .map_err(|e| CirrusError::Backend(format!("msgpack: {e}"))),
+            Serializer::Json => crate::doc_encode::encode_inner_json(doc)
+                .map_err(|e| CirrusError::Backend(format!("json: {e}"))),
         }
     }
 

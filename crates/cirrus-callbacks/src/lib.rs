@@ -9,6 +9,7 @@
 #![deny(missing_docs)]
 
 mod basic;
+mod doc_encode;
 mod doc_name;
 
 pub use basic::{CapturingSink, JsonlSink, StderrTraceSink};

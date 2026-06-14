@@ -30,10 +30,13 @@ impl JsonlSink {
 #[async_trait]
 impl DocumentSink for JsonlSink {
     async fn dispatch(&self, doc: &Document) -> Result<()> {
-        let mut line = serde_json::to_string(doc)?;
-        line.push('\n');
+        // Serialize the raw document dict (not the tagged `Document` wrapper),
+        // matching Python event-model JSONL — see `doc_encode` (CBEM-01).
+        let mut line = crate::doc_encode::encode_inner_json(doc)
+            .map_err(|e| cirrus_core::error::CirrusError::Backend(format!("jsonl encode: {e}")))?;
+        line.push(b'\n');
         let mut f = self.file.lock().await;
-        f.write_all(line.as_bytes())
+        f.write_all(&line)
             .await
             .map_err(|e| cirrus_core::error::CirrusError::Backend(format!("jsonl write: {e}")))?;
         Ok(())
