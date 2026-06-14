@@ -229,7 +229,7 @@ impl DetectorWriter for Hdf5FrameSink {
         self.tx.lock().unwrap().take();
         Ok(())
     }
-    fn collect_stream_docs(&self, up_to: u64) -> BoxStream<'_, StreamAsset> {
+    fn collect_stream_docs(&self, up_to: u64, descriptor: &str) -> BoxStream<'_, StreamAsset> {
         let mut docs: Vec<StreamAsset> = Vec::new();
         let resource_uid = {
             let mut g = self.resource_uid.lock().unwrap();
@@ -259,7 +259,7 @@ impl DetectorWriter for Hdf5FrameSink {
             docs.push(StreamAsset::Datum(StreamDatum {
                 uid: uuid::Uuid::new_v4().to_string(),
                 stream_resource: resource_uid,
-                descriptor: String::new(),
+                descriptor: descriptor.to_string(),
                 indices: StreamRange {
                     start: prev,
                     stop: up_to,

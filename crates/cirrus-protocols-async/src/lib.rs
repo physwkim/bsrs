@@ -203,8 +203,11 @@ pub trait WritesStreamAssets: Send + Sync {
     fn name(&self) -> &str;
     /// Returns the current write index (frames written so far).
     async fn get_index(&self) -> Result<u64>;
-    /// Yield asset documents up to `up_to`.
-    fn collect_asset_docs(&self, up_to: u64) -> BoxStream<'_, StreamAsset>;
+    /// Yield asset documents up to `up_to`, stamping each `StreamDatum` with
+    /// `descriptor` (the EventDescriptor UID linking the stream data to its
+    /// schema; empty when the caller has no descriptor context, e.g. a raw
+    /// streaming tool with no open run).
+    fn collect_asset_docs(&self, up_to: u64, descriptor: &str) -> BoxStream<'_, StreamAsset>;
 }
 
 /// Sealed: detector control half (`prepare`/`arm`/`wait_for_idle`/`disarm`).
@@ -255,8 +258,10 @@ pub trait DetectorWriter: Send + Sync {
     fn observe_indices_written(&self) -> watch::Receiver<u64>;
     /// Read the current index synchronously (atomic load).
     async fn indices_written(&self) -> u64;
-    /// Yield asset documents for frames up to `up_to`.
-    fn collect_stream_docs(&self, up_to: u64) -> BoxStream<'_, StreamAsset>;
+    /// Yield asset documents for frames up to `up_to`, stamping each
+    /// `StreamDatum` with `descriptor` (the EventDescriptor UID; empty when
+    /// the caller has no descriptor context).
+    fn collect_stream_docs(&self, up_to: u64, descriptor: &str) -> BoxStream<'_, StreamAsset>;
     /// Close the writer.
     async fn close(&self) -> Result<()>;
 }

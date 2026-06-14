@@ -152,14 +152,19 @@ async fn binary_frame_sink_writes_and_emits_stream_docs() {
     assert_eq!(bytes.len(), 8 + 3 * (4 + 4));
     assert_eq!(sink.indices_written().await, 3);
 
-    // collect_stream_docs(3) should produce StreamResource + StreamDatum [0,3).
-    let docs: Vec<_> = sink.collect_stream_docs(3).collect::<Vec<_>>().await;
+    // collect_stream_docs(3) should produce StreamResource + StreamDatum [0,3),
+    // and the StreamDatum must carry the descriptor UID we pass (CBEM-13).
+    let docs: Vec<_> = sink
+        .collect_stream_docs(3, "desc-uid-xyz")
+        .collect::<Vec<_>>()
+        .await;
     assert_eq!(docs.len(), 2);
     use cirrus::ophyd_async::StreamAsset;
     assert!(matches!(&docs[0], StreamAsset::Resource(_)));
     if let StreamAsset::Datum(d) = &docs[1] {
         assert_eq!(d.indices.start, 0);
         assert_eq!(d.indices.stop, 3);
+        assert_eq!(d.descriptor, "desc-uid-xyz");
     } else {
         panic!("expected StreamDatum");
     }
@@ -213,12 +218,39 @@ async fn fly_plan_drives_standard_detector_to_completion() {
     assert_eq!(result.exit_status, "success");
 
     let docs = sink.snapshot().await;
-    // RunStart, Descriptor (from describe_collect), Event (from collect),
-    // RunStop  → 4 documents minimum.
+    // RunStart, Descriptor (from describe_collect), StreamResource +
+    // StreamDatum (from collect), Event (from collect), RunStop.
     assert!(docs.len() >= 4, "got {} docs: {:?}", docs.len(), docs);
     use cirrus_core::Document::*;
     assert!(matches!(&docs[0], Start(_)));
     assert!(matches!(&docs[docs.len() - 1], Stop(_)));
+
+    // CBEM-13: the engine emits the writer's StreamDatum during collect, and
+    // it must carry the EventDescriptor UID the engine composed for the collect
+    // stream — not an empty string. This is the owner-path check: the descriptor
+    // is stamped by the engine (single owner), not invented by the sink.
+    let descriptor_uid = docs
+        .iter()
+        .find_map(|d| match d {
+            Descriptor(desc) => Some(desc.uid.clone()),
+            _ => None,
+        })
+        .expect("expected an EventDescriptor from describe_collect");
+    let datum_descriptor = docs
+        .iter()
+        .find_map(|d| match d {
+            StreamDatum(sd) => Some(sd.descriptor.clone()),
+            _ => None,
+        })
+        .expect("expected a StreamDatum emitted by the engine collect (CBEM-13)");
+    assert!(
+        !datum_descriptor.is_empty(),
+        "StreamDatum.descriptor must not be empty"
+    );
+    assert_eq!(
+        datum_descriptor, descriptor_uid,
+        "StreamDatum.descriptor must equal the collect stream's EventDescriptor uid"
+    );
 }
 
 // -- M4 -----------------------------------------------------------------

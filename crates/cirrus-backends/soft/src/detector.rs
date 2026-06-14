@@ -245,7 +245,7 @@ impl DetectorWriter for SoftDetectorWriter {
     async fn indices_written(&self) -> u64 {
         self.counter.load(Ordering::SeqCst)
     }
-    fn collect_stream_docs(&self, up_to: u64) -> BoxStream<'_, StreamAsset> {
+    fn collect_stream_docs(&self, up_to: u64, descriptor: &str) -> BoxStream<'_, StreamAsset> {
         let mut docs: Vec<StreamAsset> = Vec::new();
         // Resource (only once)
         let resource_uid = {
@@ -273,7 +273,7 @@ impl DetectorWriter for SoftDetectorWriter {
             let datum = cirrus_event_model::StreamDatum {
                 uid: uuid::Uuid::new_v4().to_string(),
                 stream_resource: resource_uid,
-                descriptor: String::new(),
+                descriptor: descriptor.to_string(),
                 indices: cirrus_event_model::StreamRange {
                     start: last,
                     stop: up_to,

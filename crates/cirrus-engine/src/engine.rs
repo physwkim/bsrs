@@ -1197,6 +1197,22 @@ impl RunEngine {
                 for descriptor in new_descriptors {
                     self.broadcast(&Document::Descriptor(descriptor)).await?;
                 }
+                // Emit the writer's StreamResource/StreamDatum, stamped with the
+                // collect stream's just-composed EventDescriptor UID, so stream
+                // data links back to its descriptor (CBEM-13). StandardDetector
+                // collects into a single stream; pass that stream's descriptor.
+                let collect_descriptor = {
+                    let state = self.state.lock().await;
+                    let bundler = state.bundler.as_ref().ok_or_else(|| {
+                        CirrusError::Plan("Collect lost open run before stream docs".into())
+                    })?;
+                    descs.keys().next().and_then(|s| bundler.descriptor_uid(s))
+                };
+                if let Some(descriptor_uid) = collect_descriptor {
+                    for doc in obj.collect_stream_docs_dyn(&descriptor_uid).await? {
+                        self.broadcast(&doc).await?;
+                    }
+                }
                 let events = obj.collect_dyn().await?;
                 for (name, data, timestamps) in events {
                     let stream = stream_name.clone().unwrap_or(name);

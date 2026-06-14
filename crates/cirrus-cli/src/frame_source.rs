@@ -216,7 +216,9 @@ async fn run_wired(args: FrameSourceArgs) -> i32 {
                 continue;
             }
             last = n;
-            let mut stream = writer_clone.collect_stream_docs(n);
+            // Raw PV→file→ZMQ streaming with no open run: there is no
+            // EventDescriptor to reference, so the descriptor is left empty.
+            let mut stream = writer_clone.collect_stream_docs(n, "");
             while let Some(asset) = stream.next().await {
                 let doc = match asset {
                     StreamAsset::Resource(r) => Document::StreamResource(r),

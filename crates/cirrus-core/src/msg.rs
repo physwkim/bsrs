@@ -673,6 +673,19 @@ pub trait CollectableObj: NamedObj {
         Vec<(String, HashMap<String, Value>, HashMap<String, f64>)>,
         crate::error::CirrusError,
     >;
+    /// Drain stream-asset documents (`StreamResource` / `StreamDatum`) buffered
+    /// since the last call, each `StreamDatum` stamped with `descriptor` — the
+    /// EventDescriptor UID the engine just composed for this collect stream.
+    /// The engine broadcasts the returned documents so consumers can link
+    /// stream data back to the descriptor that describes its data keys
+    /// (CBEM-13). Default yields none; asset-writing collectables (e.g.
+    /// `StandardDetector`) override it.
+    async fn collect_stream_docs_dyn(
+        &self,
+        _descriptor: &str,
+    ) -> Result<Vec<cirrus_event_model::Document>, crate::error::CirrusError> {
+        Ok(Vec::new())
+    }
 }
 
 /// Anything that can be subscribed to (monitor stream). A monitorable

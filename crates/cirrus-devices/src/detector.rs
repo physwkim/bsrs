@@ -156,8 +156,8 @@ where
     async fn get_index(&self) -> Result<u64> {
         Ok(self.writer.indices_written().await)
     }
-    fn collect_asset_docs(&self, up_to: u64) -> BoxStream<'_, StreamAsset> {
-        self.writer.collect_stream_docs(up_to)
+    fn collect_asset_docs(&self, up_to: u64, descriptor: &str) -> BoxStream<'_, StreamAsset> {
+        self.writer.collect_stream_docs(up_to, descriptor)
     }
 }
 
@@ -249,17 +249,33 @@ where
     async fn collect_dyn(
         &self,
     ) -> Result<Vec<(String, HashMap<String, Value>, HashMap<String, f64>)>> {
-        // Drain remaining stream assets by walking the stream up to the current index.
+        // Emit one summary event with the current index. The writer's
+        // StreamResource/StreamDatum are drained separately via
+        // `collect_stream_docs_dyn` (driven by the engine, which supplies the
+        // composed descriptor UID) — draining them here too would
+        // double-consume the writer's `last_emitted` and silently drop the
+        // stream docs.
         let up_to = WritesStreamAssets::get_index(self).await?;
-        let _docs: Vec<_> = WritesStreamAssets::collect_asset_docs(self, up_to)
-            .collect::<Vec<_>>()
-            .await;
-        // For now emit one summary event with the index.
         let mut data = HashMap::new();
         data.insert(format!("{}_index", self.name), Value::from(up_to));
         let mut ts = HashMap::new();
         ts.insert(format!("{}_index", self.name), 0.0);
         Ok(vec![(self.name.clone(), data, ts)])
+    }
+
+    async fn collect_stream_docs_dyn(
+        &self,
+        descriptor: &str,
+    ) -> Result<Vec<cirrus_event_model::Document>> {
+        let up_to = WritesStreamAssets::get_index(self).await?;
+        let docs = WritesStreamAssets::collect_asset_docs(self, up_to, descriptor)
+            .map(|asset| match asset {
+                StreamAsset::Resource(r) => cirrus_event_model::Document::StreamResource(r),
+                StreamAsset::Datum(d) => cirrus_event_model::Document::StreamDatum(d),
+            })
+            .collect::<Vec<_>>()
+            .await;
+        Ok(docs)
     }
 }
 
