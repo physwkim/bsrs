@@ -209,6 +209,51 @@ pub mod stubs {
         })
     }
 
+    /// `kickoff_all(flyers, group, wait)` — kickoff every flyer under one
+    /// shared group, then optionally `Msg::Wait` on that group. Mirrors
+    /// bluesky `plan_stubs.kickoff_all`, where `wait` defaults to **true**.
+    ///
+    /// `group` of `None` resolves to the literal `"kickoff_all"` (cirrus-plans
+    /// carries no uuid dependency; bluesky mints a fresh uuid here) — pass an
+    /// explicit group to isolate concurrent kickoffs.
+    pub fn kickoff_all(
+        flyers: Vec<Arc<dyn FlyableObj>>,
+        group: Option<String>,
+        wait: bool,
+    ) -> Plan {
+        let group = group.unwrap_or_else(|| "kickoff_all".into());
+        plan_box(async_stream::stream! {
+            for f in flyers {
+                yield Msg::Kickoff { obj: f, group: Some(group.clone()) };
+            }
+            if wait {
+                yield Msg::Wait { group, error_on_timeout: true, timeout: None };
+            }
+        })
+    }
+
+    /// `complete_all(flyers, group, wait)` — tell every flyer to stop
+    /// collecting under one shared group, then optionally `Msg::Wait` on it.
+    /// Mirrors bluesky `plan_stubs.complete_all`, where `wait` defaults to
+    /// **false** (note: opposite of [`kickoff_all`]).
+    ///
+    /// `group` of `None` resolves to the literal `"complete_all"`.
+    pub fn complete_all(
+        flyers: Vec<Arc<dyn FlyableObj>>,
+        group: Option<String>,
+        wait: bool,
+    ) -> Plan {
+        let group = group.unwrap_or_else(|| "complete_all".into());
+        plan_box(async_stream::stream! {
+            for f in flyers {
+                yield Msg::Complete { obj: f, group: Some(group.clone()) };
+            }
+            if wait {
+                yield Msg::Wait { group, error_on_timeout: true, timeout: None };
+            }
+        })
+    }
+
     /// `collect(obj, stream_name)`.
     pub fn collect(obj: Arc<dyn CollectableObj>, stream_name: Option<String>) -> Plan {
         plan_box(async_stream::stream! {
@@ -1152,4 +1197,109 @@ pub fn rel_adaptive_scan(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cirrus_core::plan::{Plan, PlanItem};
+    use cirrus_core::status::Status;
+    use futures::StreamExt;
+
+    /// Minimal flyer for stub-stream tests. `kickoff_dyn`/`complete_dyn`
+    /// are never called by `drain` (only the engine invokes them), so the
+    /// returned `Status::done()` is just a stand-in.
+    struct FakeFlyer(String);
+
+    impl cirrus_core::msg::NamedObj for FakeFlyer {
+        fn name(&self) -> &str {
+            &self.0
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FlyableObj for FakeFlyer {
+        async fn kickoff_dyn(&self) -> Status {
+            Status::done()
+        }
+        async fn complete_dyn(&self) -> Status {
+            Status::done()
+        }
+    }
+
+    async fn drain(mut plan: Plan) -> Vec<Msg> {
+        let mut out = Vec::new();
+        while let Some(item) = plan.next().await {
+            if let PlanItem::Bare(m) = item {
+                out.push(m);
+            }
+        }
+        out
+    }
+
+    fn flyers(n: usize) -> Vec<Arc<dyn FlyableObj>> {
+        (0..n)
+            .map(|i| Arc::new(FakeFlyer(format!("fly{i}"))) as Arc<dyn FlyableObj>)
+            .collect()
+    }
+
+    fn kickoff_group(m: &Msg) -> Option<&str> {
+        match m {
+            Msg::Kickoff { group, .. } => group.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn complete_group(m: &Msg) -> Option<&str> {
+        match m {
+            Msg::Complete { group, .. } => group.as_deref(),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn kickoff_all_kicks_each_then_waits_shared_group() {
+        let msgs = drain(stubs::kickoff_all(flyers(3), None, true)).await;
+        // 3 Kickoff + 1 Wait, all on the same default group.
+        assert_eq!(msgs.len(), 4);
+        for m in &msgs[..3] {
+            assert_eq!(kickoff_group(m), Some("kickoff_all"));
+        }
+        assert!(matches!(
+            &msgs[3],
+            Msg::Wait { group, error_on_timeout: true, timeout: None } if group == "kickoff_all"
+        ));
+    }
+
+    #[tokio::test]
+    async fn kickoff_all_no_wait_omits_wait_and_honors_group() {
+        let msgs = drain(stubs::kickoff_all(flyers(2), Some("g".into()), false)).await;
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs.iter().all(|m| kickoff_group(m) == Some("g")));
+        assert!(!msgs.iter().any(|m| matches!(m, Msg::Wait { .. })));
+    }
+
+    #[tokio::test]
+    async fn complete_all_completes_each_then_waits_when_requested() {
+        let msgs = drain(stubs::complete_all(flyers(2), None, true)).await;
+        assert_eq!(msgs.len(), 3);
+        for m in &msgs[..2] {
+            assert_eq!(complete_group(m), Some("complete_all"));
+        }
+        assert!(matches!(
+            &msgs[2],
+            Msg::Wait { group, .. } if group == "complete_all"
+        ));
+    }
+
+    #[tokio::test]
+    async fn complete_all_default_no_wait_emits_only_completes() {
+        // bluesky's complete_all defaults wait=false; this exercises that path.
+        let msgs = drain(stubs::complete_all(flyers(2), None, false)).await;
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs
+            .iter()
+            .all(|m| complete_group(m) == Some("complete_all")));
+        assert!(!msgs.iter().any(|m| matches!(m, Msg::Wait { .. })));
+    }
 }
