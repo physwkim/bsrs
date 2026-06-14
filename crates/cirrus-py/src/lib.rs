@@ -12,8 +12,9 @@
 //! - `cirrus_native.RunEngine()` with `.run(plan)` returning a
 //!   `(exit_status, run_uid)` tuple.
 //! - `cirrus_native.count(detectors, num)`,
-//!   `cirrus_native.scan(detectors, motor, motor_reader, start, stop, num)`
-//!   — plan factories.
+//!   `cirrus_native.scan(detectors, motor, motor_reader, start, stop, num)`,
+//!   `cirrus_native.grid_scan(…)`, `cirrus_native.rel_scan(…)`,
+//!   `cirrus_native.mv(motor, value)` — plan factories.
 //! - Plan handles are opaque, single-use (consumed by `run`).
 //! - Soft device protocol methods callable directly: `SoftMotor.read()` /
 //!   `.describe()` / `.set(value)`, `SoftDetector.read()` / `.describe()`
@@ -334,6 +335,96 @@ fn scan(
     })
 }
 
+/// `cirrus_native.grid_scan(detectors, m1, m1_reader, s1, e1, n1, m2, m2_reader, s2, e2, n2)`
+/// — bluesky `bp.grid_scan` mirror. `m1` is the slow (outer) axis, `m2` the
+/// fast (inner) axis; detectors are read once per grid point.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn grid_scan(
+    detectors: &Bound<'_, PyList>,
+    m1: &Bound<'_, PySoftMotor>,
+    m1_reader: &Bound<'_, PySoftMotor>,
+    s1: f64,
+    e1: f64,
+    n1: usize,
+    m2: &Bound<'_, PySoftMotor>,
+    m2_reader: &Bound<'_, PySoftMotor>,
+    s2: f64,
+    e2: f64,
+    n2: usize,
+) -> PyResult<PyPlan> {
+    let mut dets: Vec<Arc<dyn ReadableObj>> = Vec::with_capacity(detectors.len());
+    for d in detectors.iter() {
+        if let Ok(det) = d.downcast::<PySoftDetector>() {
+            dets.push(det.borrow().inner.clone() as Arc<dyn ReadableObj>);
+        } else if let Ok(m) = d.downcast::<PySoftMotor>() {
+            dets.push(m.borrow().inner.clone() as Arc<dyn ReadableObj>);
+        } else {
+            return Err(PyValueError::new_err(
+                "grid_scan: every detector must be a SoftDetector or SoftMotor",
+            ));
+        }
+    }
+    let mv1: Arc<dyn MovableObj> = m1.borrow().inner.clone();
+    let mr1: Arc<dyn ReadableObj> = m1_reader.borrow().inner.clone();
+    let mv2: Arc<dyn MovableObj> = m2.borrow().inner.clone();
+    let mr2: Arc<dyn ReadableObj> = m2_reader.borrow().inner.clone();
+    Ok(PyPlan {
+        inner: Mutex::new(Some(cirrus_plans::grid_scan(
+            dets, mv1, mr1, s1, e1, n1, mv2, mr2, s2, e2, n2,
+        ))),
+        label: format!("grid_scan({n1}x{n2})"),
+    })
+}
+
+/// `cirrus_native.rel_scan(detectors, motor, motor_reader, current, start, stop, num)`
+/// — bluesky `bp.rel_scan` mirror. `start`/`stop` are relative to `current`,
+/// the motor's present position (read it via `motor.read()` first), matching
+/// the `cirrus_plans::rel_scan` contract.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn rel_scan(
+    detectors: &Bound<'_, PyList>,
+    motor: &Bound<'_, PySoftMotor>,
+    motor_reader: &Bound<'_, PySoftMotor>,
+    current: f64,
+    start: f64,
+    stop: f64,
+    num: usize,
+) -> PyResult<PyPlan> {
+    let mut dets: Vec<Arc<dyn ReadableObj>> = Vec::with_capacity(detectors.len());
+    for d in detectors.iter() {
+        if let Ok(det) = d.downcast::<PySoftDetector>() {
+            dets.push(det.borrow().inner.clone() as Arc<dyn ReadableObj>);
+        } else if let Ok(m) = d.downcast::<PySoftMotor>() {
+            dets.push(m.borrow().inner.clone() as Arc<dyn ReadableObj>);
+        } else {
+            return Err(PyValueError::new_err(
+                "rel_scan: every detector must be a SoftDetector or SoftMotor",
+            ));
+        }
+    }
+    let mvbl: Arc<dyn MovableObj> = motor.borrow().inner.clone();
+    let mr: Arc<dyn ReadableObj> = motor_reader.borrow().inner.clone();
+    Ok(PyPlan {
+        inner: Mutex::new(Some(cirrus_plans::rel_scan(
+            dets, mvbl, mr, current, start, stop, num,
+        ))),
+        label: format!("rel_scan({start}..{stop} @ {current}, n={num})"),
+    })
+}
+
+/// `cirrus_native.mv(motor, value)` — bluesky `bps.mv` mirror: set the motor
+/// and wait for the move to complete. Runs without opening a run.
+#[pyfunction]
+fn mv(motor: &Bound<'_, PySoftMotor>, value: f64) -> PyPlan {
+    let mvbl: Arc<dyn MovableObj> = motor.borrow().inner.clone();
+    PyPlan {
+        inner: Mutex::new(Some(cirrus_plans::stubs::mv(mvbl, value))),
+        label: format!("mv({value})"),
+    }
+}
+
 /// `cirrus_native.version()` — package version string.
 #[pyfunction]
 fn version() -> &'static str {
@@ -348,6 +439,9 @@ fn cirrus_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRunEngine>()?;
     m.add_function(wrap_pyfunction!(count, m)?)?;
     m.add_function(wrap_pyfunction!(scan, m)?)?;
+    m.add_function(wrap_pyfunction!(grid_scan, m)?)?;
+    m.add_function(wrap_pyfunction!(rel_scan, m)?)?;
+    m.add_function(wrap_pyfunction!(mv, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
     Ok(())
 }

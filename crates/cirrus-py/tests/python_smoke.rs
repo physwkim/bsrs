@@ -152,6 +152,33 @@ print(v)
 }
 
 #[test]
+fn grid_scan_rel_scan_and_mv_round_trip() {
+    // PY-04: grid_scan / rel_scan / mv plan factories are exposed and run.
+    let (out, err, code) = run_python(
+        "
+import cirrus_native as c
+re = c.RunEngine()
+m1 = c.SoftMotor('m1', 0.0)
+m2 = c.SoftMotor('m2', 0.0)
+det = c.SoftDetector('det1')
+status, _ = re.run(c.grid_scan([det], m1, m1, 0.0, 1.0, 2, m2, m2, 0.0, 2.0, 3))
+print(status == 'success')
+status, _ = re.run(c.rel_scan([det], m1, m1, 0.0, -1.0, 1.0, 3))
+print(status == 'success')
+# mv opens no run; assert the side effect (motor moved) via read().
+re.run(c.mv(m1, 5.0))
+print(m1.read()['m1']['value'] == 5.0)
+",
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    let trues = out.lines().filter(|l| *l == "True").count();
+    assert_eq!(
+        trues, 3,
+        "expected grid_scan + rel_scan success and mv side-effect; out: {out}\nerr: {err}"
+    );
+}
+
+#[test]
 fn device_protocol_methods_callable_from_python() {
     // PY-03: soft devices expose the ophyd/bluesky Readable + Movable protocol
     // methods directly — read()/describe() on both, set(value) on the motor.
