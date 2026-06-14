@@ -152,6 +152,38 @@ print(v)
 }
 
 #[test]
+fn device_protocol_methods_callable_from_python() {
+    // PY-03: soft devices expose the ophyd/bluesky Readable + Movable protocol
+    // methods directly — read()/describe() on both, set(value) on the motor.
+    let (out, err, code) = run_python(
+        "
+import cirrus_native as c
+m = c.SoftMotor('m1', 1.5)
+r = m.read()
+assert isinstance(r, dict), 'read must be a dict: %r' % (r,)
+assert 'm1' in r, r
+print(r['m1']['value'] == 1.5)
+d = m.describe()
+assert isinstance(d, dict), d
+print('m1' in d)
+m.set(3.0)
+print(m.read()['m1']['value'] == 3.0)
+det = c.SoftDetector('det1')
+dr = det.read()
+print('det1_counts' in dr)
+print(dr['det1_counts']['value'] == 0)
+print('det1_counts' in det.describe())
+",
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    let trues = out.lines().filter(|l| *l == "True").count();
+    assert_eq!(
+        trues, 6,
+        "expected motor read/describe/set + detector read/describe to round-trip; out: {out}\nerr: {err}"
+    );
+}
+
+#[test]
 fn subscribe_receives_documents_and_unsubscribe_stops_them() {
     // PY-01: RE.subscribe(cb) must deliver every document to a Python callable
     // as (name, dict); unsubscribe(token) must stop further delivery.

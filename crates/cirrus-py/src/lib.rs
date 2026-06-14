@@ -15,6 +15,9 @@
 //!   `cirrus_native.scan(detectors, motor, motor_reader, start, stop, num)`
 //!   — plan factories.
 //! - Plan handles are opaque, single-use (consumed by `run`).
+//! - Soft device protocol methods callable directly: `SoftMotor.read()` /
+//!   `.describe()` / `.set(value)`, `SoftDetector.read()` / `.describe()`
+//!   (ophyd/bluesky `Readable` + `Movable`).
 //!
 //! Future cuts could add: `RemoteDispatcher` analogue, `bp.*`
 //! mirror, async run signatures, document subscribe callbacks.
@@ -58,6 +61,30 @@ impl PySoftMotor {
         cirrus_core::msg::NamedObj::name(&*self.inner).to_string()
     }
 
+    /// `motor.read()` — read the device's signals as a
+    /// `{name: {value, timestamp, …}}` dict (ophyd/bluesky `Readable.read`).
+    fn read(&self, py: Python<'_>) -> PyResult<PyObject> {
+        read_obj(py, self.inner.clone() as Arc<dyn ReadableObj>)
+    }
+
+    /// `motor.describe()` — the data-key description companion to `read`.
+    fn describe(&self, py: Python<'_>) -> PyResult<PyObject> {
+        describe_obj(py, self.inner.clone() as Arc<dyn ReadableObj>)
+    }
+
+    /// `motor.set(value)` — move and block until the move completes
+    /// (ophyd/bluesky `Movable.set` awaited to completion). Raises on failure.
+    fn set(&self, py: Python<'_>, value: f64) -> PyResult<()> {
+        let m: Arc<dyn MovableObj> = self.inner.clone();
+        py.allow_threads(move || {
+            cirrus_core::runtime::block_on(async move {
+                let status = m.set_dyn(value).await;
+                status.await
+            })
+        })
+        .map_err(|e| PyRuntimeError::new_err(format!("set: {e}")))
+    }
+
     fn __repr__(&self) -> String {
         format!("SoftMotor({:?})", self.name())
     }
@@ -80,6 +107,17 @@ impl PySoftDetector {
 
     fn name(&self) -> String {
         cirrus_core::msg::NamedObj::name(&*self.inner).to_string()
+    }
+
+    /// `detector.read()` — read the detector's signals as a
+    /// `{key: {value, timestamp, …}}` dict (ophyd/bluesky `Readable.read`).
+    fn read(&self, py: Python<'_>) -> PyResult<PyObject> {
+        read_obj(py, self.inner.clone() as Arc<dyn ReadableObj>)
+    }
+
+    /// `detector.describe()` — the data-key description companion to `read`.
+    fn describe(&self, py: Python<'_>) -> PyResult<PyObject> {
+        describe_obj(py, self.inner.clone() as Arc<dyn ReadableObj>)
     }
 
     fn __repr__(&self) -> String {
@@ -218,6 +256,30 @@ fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyObject {
             dict.into_py(py)
         }
     }
+}
+
+/// Run a device's `read_dyn` on the cirrus runtime with the GIL released, then
+/// return its `{key: {value, timestamp, …}}` reading set as a native Python
+/// dict. Shared by `SoftMotor.read` and `SoftDetector.read`.
+fn read_obj(py: Python<'_>, obj: Arc<dyn ReadableObj>) -> PyResult<PyObject> {
+    let reading = py
+        .allow_threads(move || cirrus_core::runtime::block_on(async move { obj.read_dyn().await }))
+        .map_err(|e| PyRuntimeError::new_err(format!("read: {e}")))?;
+    let value = serde_json::to_value(&reading).unwrap_or(serde_json::Value::Null);
+    Ok(json_to_py(py, &value))
+}
+
+/// Run a device's `describe_dyn` (GIL released) and return its `{key: <data
+/// key>}` description as a native Python dict — the read protocol's
+/// `describe()` companion to [`read_obj`]. Shared by both soft devices.
+fn describe_obj(py: Python<'_>, obj: Arc<dyn ReadableObj>) -> PyResult<PyObject> {
+    let desc = py
+        .allow_threads(move || {
+            cirrus_core::runtime::block_on(async move { obj.describe_dyn().await })
+        })
+        .map_err(|e| PyRuntimeError::new_err(format!("describe: {e}")))?;
+    let value = serde_json::to_value(&desc).unwrap_or(serde_json::Value::Null);
+    Ok(json_to_py(py, &value))
 }
 
 /// `cirrus_native.count(detectors, num)` — bluesky `bp.count` mirror.
