@@ -1,7 +1,7 @@
 //! `StandardDetector<C, W>` — composition of `DetectorControl` + `DetectorWriter`.
 
 use async_trait::async_trait;
-use cirrus_core::error::Result;
+use cirrus_core::error::{CirrusError, Result};
 use cirrus_core::msg::{
     CollectableObj, FlyableObj, NamedObj, ReadableObj, StageableObj, TriggerableObj,
 };
@@ -34,6 +34,10 @@ where
     // K1: any background tasks owned by start/arm should be tracked here.
     // For M3 we don't spawn any directly.
     cached_target: AtomicU64,
+    // DataKeys captured when the writer is opened at `stage()`. `describe`
+    // reads from this cache rather than re-opening the writer mid-acquisition
+    // (DB-04); `None` until staged.
+    opened: std::sync::Mutex<Option<HashMap<String, DataKey>>>,
 }
 
 impl<C, W> StandardDetector<C, W>
@@ -48,6 +52,7 @@ where
             control,
             writer,
             cached_target: AtomicU64::new(0),
+            opened: std::sync::Mutex::new(None),
         }
     }
 
@@ -64,6 +69,18 @@ where
     /// Stable name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Read the DataKeys cached when the writer was opened at `stage()`.
+    /// Errors with `CirrusError::State` if the detector has not been staged
+    /// (the writer was never opened), so `describe` never re-opens it (DB-04).
+    fn cached_data_keys(&self) -> Result<HashMap<String, DataKey>> {
+        self.opened.lock().unwrap().clone().ok_or_else(|| {
+            CirrusError::State(format!(
+                "{}: describe before stage (writer not opened)",
+                self.name
+            ))
+        })
     }
 }
 
@@ -83,15 +100,20 @@ where
         // calling `_disarm_and_stop(on_unstage=False)`.
         self.control.disarm().await?;
         // Ready the writer for this scan with multiplier=1 by default; plans
-        // can call configure() to change this. (Relocating this open() into
-        // prepare() so describe no longer relies on a stage side-effect is
-        // tracked under DB-04.)
-        self.writer.open(1).await?;
+        // can call configure() to change this. Cache the DataKeys the writer
+        // reports so describe() is a pure read and never re-opens the writer
+        // mid-acquisition (DB-04). (Relocating this open() into prepare() is
+        // DB-15's scope.)
+        let data_keys = self.writer.open(1).await?;
+        *self.opened.lock().unwrap() = Some(data_keys);
         Ok(())
     }
     async fn unstage(&self) -> Result<()> {
         self.control.disarm().await?;
-        self.writer.close().await
+        self.writer.close().await?;
+        // Drop the cached DataKeys so a subsequent re-stage re-opens the writer.
+        *self.opened.lock().unwrap() = None;
+        Ok(())
     }
 }
 
@@ -246,11 +268,12 @@ where
     W: DetectorWriter + Send + Sync + 'static,
 {
     async fn describe_collect_dyn(&self) -> Result<HashMap<String, HashMap<String, DataKey>>> {
-        let dks = WritesStreamAssets::name(self).to_string();
-        let _ = dks; // unused
-        let dk = self.writer.open(1).await?;
+        // Read the DataKeys cached when the writer was opened at stage(); never
+        // re-open the writer here (DB-04) — that would re-emit a StreamResource
+        // with a new uid and disturb the in-progress frame counter.
+        let data_keys = self.cached_data_keys()?;
         let mut out = HashMap::new();
-        out.insert(self.name.clone(), dk);
+        out.insert(self.name.clone(), data_keys);
         Ok(out)
     }
 
@@ -308,7 +331,8 @@ where
         Ok(out)
     }
     async fn describe_dyn(&self) -> Result<HashMap<String, DataKey>> {
-        self.writer.open(1).await
+        // Read cached DataKeys, never re-open the writer (DB-04).
+        self.cached_data_keys()
     }
     fn hint_fields(&self) -> Option<Vec<String>> {
         Some(vec![format!("{}_index", self.name)])
@@ -421,5 +445,39 @@ mod tests {
             1,
             "stage() still readies the writer"
         );
+    }
+
+    #[tokio::test]
+    async fn describe_reads_cache_without_reopening_writer() {
+        // DB-04: describe must read the DataKeys cached at stage(), never
+        // re-open the writer (which would re-emit a StreamResource with a new
+        // uid and disturb the in-progress frame counter).
+        let (det, _disarms, opens) = detector();
+
+        // Before stage: describe is a device-state error, with no open().
+        assert!(CollectableObj::describe_collect_dyn(&det).await.is_err());
+        assert!(ReadableObj::describe_dyn(&det).await.is_err());
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            0,
+            "describe before stage must not open the writer"
+        );
+
+        Stageable::stage(&det).await.unwrap();
+        assert_eq!(opens.load(Ordering::SeqCst), 1, "stage opens exactly once");
+
+        // Repeated describe calls read the cache; the open count stays at 1.
+        CollectableObj::describe_collect_dyn(&det).await.unwrap();
+        ReadableObj::describe_dyn(&det).await.unwrap();
+        CollectableObj::describe_collect_dyn(&det).await.unwrap();
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            1,
+            "describe must not re-open the writer (DB-04)"
+        );
+
+        // After unstage the cache is cleared, so describe errors again.
+        Stageable::unstage(&det).await.unwrap();
+        assert!(ReadableObj::describe_dyn(&det).await.is_err());
     }
 }
