@@ -16,7 +16,9 @@ pub use documents::{
     EventDescriptor, EventPage, Hints, Limits, LimitsRange, PerObjectHint, Projections, RdsRange,
     Reading, Resource, RunStart, RunStop, SignalMetadata, StreamDatum, StreamRange, StreamResource,
 };
-pub use page::{pack_datum_page, pack_event_page, unpack_datum_page, unpack_event_page};
+pub use page::{
+    merge_event_pages, pack_datum_page, pack_event_page, unpack_datum_page, unpack_event_page,
+};
 
 /// Errors when composing or routing documents.
 #[derive(Debug, thiserror::Error)]

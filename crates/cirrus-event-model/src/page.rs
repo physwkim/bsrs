@@ -2,11 +2,13 @@
 //! `Datum`/`DatumPage`.
 //!
 //! Mirrors `event_model.pack_event_page` / `unpack_event_page` /
-//! `pack_datum_page` / `unpack_datum_page` (`__init__.py:2620-2751`).
+//! `pack_datum_page` / `unpack_datum_page` / `merge_event_pages`
+//! (`__init__.py:2620-2862`).
 //! Packing transposes a list of row documents into one column-store page;
-//! unpacking reverses it. As in the reference, only keys present on a given
-//! row contribute to that row's columns, and the first document's descriptor
-//! / resource UID is used for the whole page.
+//! unpacking reverses it; merging concatenates several pages into one. As in
+//! the reference, only keys present on a given row contribute to that row's
+//! columns, and the first document's descriptor / resource UID is used for the
+//! whole page.
 
 use crate::documents::{Datum, DatumPage, Event, EventPage};
 use serde_json::Value;
@@ -126,6 +128,62 @@ pub fn unpack_datum_page(page: &DatumPage) -> Vec<Datum> {
         .collect()
 }
 
+/// Combine a slice of `EventPage`s into one, concatenating every column.
+///
+/// Mirrors `event_model.merge_event_pages`. The first page's descriptor UID
+/// labels the result. Column keys are unioned across all pages (like
+/// [`pack_event_page`], rather than the reference's first-page-only key set)
+/// and each page's values are appended in order; a page missing a key
+/// contributes no rows to that column. Returns an empty page if `pages` is
+/// empty, and the sole page (cloned) when there is exactly one.
+pub fn merge_event_pages(pages: &[EventPage]) -> EventPage {
+    if pages.len() == 1 {
+        return pages[0].clone();
+    }
+    let descriptor = pages
+        .first()
+        .map(|p| p.descriptor.clone())
+        .unwrap_or_default();
+    let total: usize = pages.iter().map(|p| p.uid.len()).sum();
+    let mut uid = Vec::with_capacity(total);
+    let mut time = Vec::with_capacity(total);
+    let mut seq_num = Vec::with_capacity(total);
+    let mut data: HashMap<String, Vec<Value>> = HashMap::new();
+    let mut timestamps: HashMap<String, Vec<f64>> = HashMap::new();
+    let mut filled: HashMap<String, Vec<Value>> = HashMap::new();
+    for p in pages {
+        uid.extend(p.uid.iter().cloned());
+        time.extend(p.time.iter().copied());
+        seq_num.extend(p.seq_num.iter().copied());
+        for (k, col) in &p.data {
+            data.entry(k.clone())
+                .or_default()
+                .extend(col.iter().cloned());
+        }
+        for (k, col) in &p.timestamps {
+            timestamps
+                .entry(k.clone())
+                .or_default()
+                .extend(col.iter().copied());
+        }
+        for (k, col) in &p.filled {
+            filled
+                .entry(k.clone())
+                .or_default()
+                .extend(col.iter().cloned());
+        }
+    }
+    EventPage {
+        uid,
+        descriptor,
+        time,
+        seq_num,
+        data,
+        timestamps,
+        filled,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +238,51 @@ mod tests {
         let page = pack_event_page(&[]);
         assert!(page.uid.is_empty());
         assert!(unpack_event_page(&page).is_empty());
+    }
+
+    #[test]
+    fn merge_event_pages_concatenates_columns_and_keeps_first_descriptor() {
+        let p1 = pack_event_page(&[event("e-1", 1, 1.5), event("e-2", 2, 2.5)]);
+        let mut p2 = pack_event_page(&[event("e-3", 3, 3.5)]);
+        // A differing descriptor on a later page must not win.
+        p2.descriptor = "d-2".into();
+        let merged = merge_event_pages(&[p1, p2]);
+        assert_eq!(merged.uid, vec!["e-1", "e-2", "e-3"]);
+        assert_eq!(merged.seq_num, vec![1, 2, 3]);
+        assert_eq!(merged.time, vec![101.0, 102.0, 103.0]);
+        assert_eq!(
+            merged.data["x"],
+            vec![json!(1.5), json!(2.5), json!(3.5)],
+            "data column concatenated in page order"
+        );
+        assert_eq!(merged.timestamps["x"], vec![101.0, 102.0, 103.0]);
+        assert_eq!(
+            merged.descriptor, "d-1",
+            "first page's descriptor labels the merge"
+        );
+        // The merged page unpacks back to the three original events.
+        let back = unpack_event_page(&merged);
+        assert_eq!(
+            back,
+            vec![
+                event("e-1", 1, 1.5),
+                event("e-2", 2, 2.5),
+                event("e-3", 3, 3.5)
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_event_pages_single_returns_that_page() {
+        let p1 = pack_event_page(&[event("e-1", 1, 1.5)]);
+        assert_eq!(merge_event_pages(std::slice::from_ref(&p1)), p1);
+    }
+
+    #[test]
+    fn merge_event_pages_empty_is_safe() {
+        let merged = merge_event_pages(&[]);
+        assert!(merged.uid.is_empty());
+        assert_eq!(merged.descriptor, "");
+        assert!(unpack_event_page(&merged).is_empty());
     }
 }
