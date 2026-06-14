@@ -7,7 +7,8 @@ pub mod preprocessors;
 
 use cirrus_core::msg::{
     CollectableObj, ConfigurableObj, ConfigureArgs, FlyableObj, LocatableObj, MonitorableObj,
-    MovableObj, Msg, ReadableObj, RunMetadata, StageableObj, StoppableObj, TriggerableObj,
+    MovableObj, Msg, PreparableObj, ReadableObj, RunMetadata, StageableObj, StoppableObj,
+    TriggerableObj,
 };
 use cirrus_core::plan::{plan_box, Plan};
 use std::sync::Arc;
@@ -218,6 +219,33 @@ pub mod stubs {
     pub fn resume() -> Plan {
         plan_box(async_stream::stream! {
             yield Msg::Resume;
+        })
+    }
+
+    /// `prepare(obj, value, group, wait)` — emit `Msg::Prepare` to set up a
+    /// `Preparable` device (flyer, detector) for a step or fly scan. Mirrors
+    /// bluesky `plan_stubs.prepare`: the resulting `Status` joins `group`, and
+    /// when `wait` is true the plan blocks on that group before continuing.
+    ///
+    /// bluesky mints a fresh uuid for `group` when none is given so the Status
+    /// can always be waited on; cirrus-plans carries no uuid dependency, so a
+    /// requested wait without an explicit group falls back to the literal
+    /// `"prepare"` (as [`kickoff_all`]/[`complete_all`] do). Without a wait the
+    /// caller's `group` passes through untouched (may be `None`).
+    pub fn prepare(
+        obj: Arc<dyn PreparableObj>,
+        value: serde_json::Value,
+        group: Option<String>,
+        wait: bool,
+    ) -> Plan {
+        plan_box(async_stream::stream! {
+            if wait {
+                let group = group.unwrap_or_else(|| "prepare".into());
+                yield Msg::Prepare { obj, value, group: Some(group.clone()) };
+                yield Msg::Wait { group, error_on_timeout: true, timeout: None };
+            } else {
+                yield Msg::Prepare { obj, value, group };
+            }
         })
     }
 
@@ -1424,6 +1452,23 @@ mod tests {
         }
     }
 
+    /// Minimal preparable for `prepare` stub-stream tests. `prepare_dyn` is
+    /// never called by `drain` (only the engine invokes it).
+    struct FakePreparable(String);
+
+    impl cirrus_core::msg::NamedObj for FakePreparable {
+        fn name(&self) -> &str {
+            &self.0
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PreparableObj for FakePreparable {
+        async fn prepare_dyn(&self, _value: serde_json::Value) -> Status {
+            Status::done()
+        }
+    }
+
     async fn drain(mut plan: Plan) -> Vec<Msg> {
         let mut out = Vec::new();
         while let Some(item) = plan.next().await {
@@ -1824,5 +1869,64 @@ mod tests {
             .iter()
             .all(|m| complete_group(m) == Some("complete_all")));
         assert!(!msgs.iter().any(|m| matches!(m, Msg::Wait { .. })));
+    }
+
+    fn preparable(name: &str) -> Arc<dyn PreparableObj> {
+        Arc::new(FakePreparable(name.into())) as Arc<dyn PreparableObj>
+    }
+
+    // wait=true: Prepare carries the value and a wait-group, followed by a Wait
+    // on that same group. group=None mints the literal "prepare" fallback (no
+    // uuid dep), and an explicit group passes through to both messages.
+    #[tokio::test]
+    async fn prepare_with_wait_emits_prepare_then_wait_on_same_group() {
+        // Default group when none is given.
+        let val = serde_json::json!({"trigger": "internal"});
+        let msgs = drain(stubs::prepare(preparable("det"), val.clone(), None, true)).await;
+        assert_eq!(msgs.len(), 2);
+        match &msgs[0] {
+            Msg::Prepare { value, group, .. } => {
+                assert_eq!(value, &val, "value must thread through unchanged");
+                assert_eq!(group.as_deref(), Some("prepare"));
+            }
+            other => panic!("first msg not Prepare: {other:?}"),
+        }
+        assert!(matches!(
+            &msgs[1],
+            Msg::Wait { group, error_on_timeout: true, timeout: None } if group == "prepare"
+        ));
+
+        // Explicit group reaches both the Prepare and its Wait.
+        let msgs = drain(stubs::prepare(
+            preparable("det"),
+            val,
+            Some("g".into()),
+            true,
+        ))
+        .await;
+        assert!(matches!(&msgs[0], Msg::Prepare { group, .. } if group.as_deref() == Some("g")));
+        assert!(matches!(&msgs[1], Msg::Wait { group, .. } if group == "g"));
+    }
+
+    // wait=false: only the Prepare is emitted, no Wait, and the caller's group
+    // passes through verbatim — including None (no fallback minted).
+    #[tokio::test]
+    async fn prepare_no_wait_emits_only_prepare_and_preserves_group() {
+        let val = serde_json::json!(null);
+        let msgs = drain(stubs::prepare(
+            preparable("det"),
+            val.clone(),
+            Some("g".into()),
+            false,
+        ))
+        .await;
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(&msgs[0], Msg::Prepare { group, .. } if group.as_deref() == Some("g")));
+        assert!(!msgs.iter().any(|m| matches!(m, Msg::Wait { .. })));
+
+        // None group is preserved (not defaulted) when not waiting.
+        let msgs = drain(stubs::prepare(preparable("det"), val, None, false)).await;
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(&msgs[0], Msg::Prepare { group: None, .. }));
     }
 }
