@@ -83,6 +83,16 @@ pub struct LimitsRange {
     pub low: Option<f64>,
 }
 
+/// Read-different-than-set tolerance (Tango RDS): the acceptable drift
+/// between a setpoint and its readback before they are considered diverged.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct RdsRange {
+    /// Maximum age (seconds) of a readback before it is considered stale.
+    pub time_difference: f64,
+    /// Maximum |readback − setpoint| considered "in sync".
+    pub value_difference: f64,
+}
+
 /// EPICS limits attached to a data key.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Limits {
@@ -101,6 +111,9 @@ pub struct Limits {
     /// Hysteresis (single number).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub hysteresis: Option<f64>,
+    /// Read-different-than-set tolerance (Tango sources).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub rds: Option<RdsRange>,
 }
 
 /// Per-stream descriptor of a single field.
