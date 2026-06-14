@@ -164,6 +164,34 @@ impl RunBundle {
         }
     }
 
+    /// Compose a legacy `Resource` and a `ResourceComposer` that mints
+    /// `Datum`/`DatumPage` documents addressing rows inside it.
+    ///
+    /// Mirrors `ComposeRunBundle.compose_resource`: `run_start` is back-filled,
+    /// `path_semantics` defaults to `posix` when unspecified, and the returned
+    /// composer issues `datum_id`s of the form `<resource_uid>/<counter>`.
+    pub fn resource(
+        &self,
+        spec: String,
+        root: String,
+        resource_path: String,
+        path_semantics: Option<String>,
+        resource_kwargs: HashMap<String, Value>,
+    ) -> ResourceComposer {
+        ResourceComposer {
+            resource: Resource {
+                uid: new_uid(),
+                spec,
+                root,
+                resource_path,
+                path_semantics: path_semantics.or_else(|| Some("posix".to_string())),
+                resource_kwargs,
+                run_start: Some(self.start_uid.clone()),
+            },
+            counter: AtomicU64::new(0),
+        }
+    }
+
     /// Get the run-start UID.
     pub fn start_uid(&self) -> &str {
         &self.start_uid
@@ -179,5 +207,79 @@ impl RunBundle {
     }
 }
 
+/// Mints `Datum`/`DatumPage` documents for one `Resource`, returned by
+/// [`RunBundle::resource`]. Holds the composed `Resource` and a monotone
+/// datum counter (`<resource_uid>/<n>`), mirroring the Python
+/// `ComposeResourceBundle`.
+#[derive(Debug)]
+pub struct ResourceComposer {
+    resource: Resource,
+    counter: AtomicU64,
+}
+
+impl ResourceComposer {
+    /// The `Resource` document to emit before any datum it owns.
+    pub fn resource(&self) -> &Resource {
+        &self.resource
+    }
+
+    /// Compose the next `Datum` pointing into this resource.
+    pub fn datum(&self, datum_kwargs: HashMap<String, Value>) -> Datum {
+        let i = self.counter.fetch_add(1, Ordering::SeqCst);
+        Datum {
+            datum_id: format!("{}/{}", self.resource.uid, i),
+            resource: self.resource.uid.clone(),
+            datum_kwargs,
+        }
+    }
+
+    /// Compose a `DatumPage` of `n` rows from column-store `datum_kwargs`.
+    pub fn datum_page(&self, datum_kwargs: HashMap<String, Vec<Value>>, n: usize) -> DatumPage {
+        let start = self.counter.fetch_add(n as u64, Ordering::SeqCst);
+        let datum_id = (0..n as u64)
+            .map(|j| format!("{}/{}", self.resource.uid, start + j))
+            .collect();
+        DatumPage {
+            datum_id,
+            resource: self.resource.uid.clone(),
+            datum_kwargs,
+        }
+    }
+}
+
 /// Convenience: a thread-safe `Arc<RunBundle>`.
 pub type SharedBundle = Arc<RunBundle>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resource_composer_mints_sequential_datum_ids() {
+        let start = RunBundle::start(Some(1), None);
+        let bundle = RunBundle::open(&start);
+        let rc = bundle.resource(
+            "AD_HDF5".to_string(),
+            "/data".to_string(),
+            "scan.h5".to_string(),
+            None,
+            HashMap::new(),
+        );
+        assert_eq!(rc.resource().path_semantics.as_deref(), Some("posix"));
+        assert_eq!(rc.resource().run_start.as_deref(), Some(start.uid.as_str()));
+        let res_uid = rc.resource().uid.clone();
+        let d0 = rc.datum(HashMap::new());
+        let d1 = rc.datum(HashMap::new());
+        assert_eq!(d0.datum_id, format!("{res_uid}/0"));
+        assert_eq!(d1.datum_id, format!("{res_uid}/1"));
+        let page = rc.datum_page(HashMap::new(), 3);
+        assert_eq!(
+            page.datum_id,
+            vec![
+                format!("{res_uid}/2"),
+                format!("{res_uid}/3"),
+                format!("{res_uid}/4"),
+            ]
+        );
+    }
+}
