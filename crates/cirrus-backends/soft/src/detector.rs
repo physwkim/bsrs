@@ -1,14 +1,14 @@
 //! Soft detector — fake counts on every trigger; soft writer emits in-memory frames.
 
 use async_trait::async_trait;
-use cirrus_core::error::Result;
+use cirrus_core::error::{CirrusError, Result};
 use cirrus_core::msg::{NamedObj, ReadableObj};
 use cirrus_core::reading::ReadingValue;
 use cirrus_core::status::Status;
 use cirrus_devices::StandardDetector;
 use cirrus_event_model::{DataKey, Dtype};
 use cirrus_protocols_async::{
-    AsyncReadable, DetectorControl, DetectorWriter, StreamAsset, TriggerInfo,
+    AsyncReadable, DetectorControl, DetectorTrigger, DetectorWriter, StreamAsset, TriggerInfo,
 };
 use futures::stream::{self, BoxStream, StreamExt};
 use std::collections::HashMap;
@@ -152,6 +152,15 @@ impl DetectorControl for SoftDetectorControl {
         self.deadtime
     }
     async fn prepare(&self, info: TriggerInfo) -> Result<()> {
+        // The soft detector self-times its exposures on arm — it has no
+        // external input, so only internal triggering is supported (mirrors
+        // ophyd-async logic raising NotImplementedError for unsupported modes).
+        if info.trigger != DetectorTrigger::Internal {
+            return Err(CirrusError::Backend(format!(
+                "soft detector supports only DetectorTrigger::Internal, got {:?}",
+                info.trigger
+            )));
+        }
         self.target.store(info.number as u64, Ordering::SeqCst);
         Ok(())
     }
@@ -301,4 +310,39 @@ pub fn soft_detector(
     let counter = control.arm_count();
     let writer = SoftDetectorWriter::new(name, counter);
     StandardDetector::new(writer.name.clone(), control, writer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trigger_info_defaults_to_internal() {
+        // DB-01: TriggerInfo carries a trigger mode, defaulting to Internal
+        // (matches ophyd-async `DetectorTrigger.INTERNAL`).
+        assert_eq!(TriggerInfo::default().trigger, DetectorTrigger::Internal);
+    }
+
+    #[tokio::test]
+    async fn soft_prepare_accepts_internal_and_sets_target() {
+        let control = SoftDetectorControl::new(Duration::from_micros(0));
+        let info = TriggerInfo {
+            number: 7,
+            ..Default::default()
+        };
+        DetectorControl::prepare(&control, info).await.unwrap();
+        assert_eq!(control.target().load(Ordering::SeqCst), 7);
+    }
+
+    #[tokio::test]
+    async fn soft_prepare_rejects_external_trigger() {
+        // The soft detector is internal-only; external modes are unsupported.
+        let control = SoftDetectorControl::new(Duration::from_micros(0));
+        let info = TriggerInfo {
+            trigger: DetectorTrigger::ExternalEdge,
+            ..Default::default()
+        };
+        let err = DetectorControl::prepare(&control, info).await.unwrap_err();
+        assert!(format!("{err}").contains("Internal"), "err: {err}");
+    }
 }

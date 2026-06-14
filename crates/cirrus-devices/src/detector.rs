@@ -17,8 +17,9 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Re-export so users get `TriggerInfo` straight from cirrus-devices.
-pub use cirrus_protocols_async::TriggerInfo;
+/// Re-export so users get `TriggerInfo` / `DetectorTrigger` straight from
+/// cirrus-devices.
+pub use cirrus_protocols_async::{DetectorTrigger, TriggerInfo};
 
 /// A detector composed of an arming half (`DetectorControl`) and a writing half
 /// (`DetectorWriter`). Implements all eight bluesky protocols by delegation.

@@ -10,7 +10,7 @@ pub mod signal;
 pub mod signal_cache;
 pub mod standard_readable;
 
-pub use detector::{StandardDetector, TriggerInfo};
+pub use detector::{DetectorTrigger, StandardDetector, TriggerInfo};
 pub use device::{walk_signal_sources, Device, DeviceVector};
 pub use observe::{observe_value, wait_for_value};
 pub use signal::{

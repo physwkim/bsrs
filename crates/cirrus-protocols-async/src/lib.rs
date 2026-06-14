@@ -225,9 +225,26 @@ pub trait DetectorControl: Send + Sync {
     async fn disarm(&self) -> Result<()>;
 }
 
+/// Mechanism for triggering a detector to take exposures. Direct port of
+/// `ophyd_async/core/_detector.py:50-62` `DetectorTrigger`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DetectorTrigger {
+    /// On arm, generate internally timed exposures.
+    #[default]
+    Internal,
+    /// On every (normally rising) edge of an external input, generate an
+    /// internally timed exposure.
+    ExternalEdge,
+    /// On a rising edge of an external input start an exposure, ending on the
+    /// falling edge.
+    ExternalLevel,
+}
+
 /// Detector trigger configuration.
 #[derive(Clone, Debug)]
 pub struct TriggerInfo {
+    /// What sort of triggering the detector should be set for.
+    pub trigger: DetectorTrigger,
     /// Number of triggers, 0 for infinite.
     pub number: u32,
     /// Live (exposure) time.
@@ -241,6 +258,7 @@ pub struct TriggerInfo {
 impl Default for TriggerInfo {
     fn default() -> Self {
         Self {
+            trigger: DetectorTrigger::Internal,
             number: 1,
             livetime: None,
             deadtime: None,
