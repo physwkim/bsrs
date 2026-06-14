@@ -2133,7 +2133,13 @@ fn register_msg_namespace(lua: &Lua) -> mlua::Result<()> {
         "subscribe",
         lua.create_function(|_, (cb, name): (mlua::Function, Option<String>)| {
             let cb_arc: SubscribeCallback = make_lua_subscriber_cb(cb, name);
-            Ok(LuaMsg(Msg::Subscribe(cb_arc)))
+            // The Lua callback already filters by document name (all 10
+            // names, finer than `DocFilter`); subscribe with `All` so the
+            // engine passes everything through to that single filter.
+            Ok(LuaMsg(Msg::Subscribe {
+                cb: cb_arc,
+                filter: cirrus_event_model::DocFilter::All,
+            }))
         })?,
     )?;
     // unsubscribe(id)

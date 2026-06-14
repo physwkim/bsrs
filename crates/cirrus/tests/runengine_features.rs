@@ -19,7 +19,7 @@ use cirrus::prelude::*;
 use cirrus_core::msg::Msg;
 use cirrus_core::plan::{plan_box, Plan};
 use cirrus_engine::EngineRunState;
-use cirrus_event_model::Document;
+use cirrus_event_model::{DocFilter, Document};
 use serde_json::Value;
 
 fn one_count_plan() -> Plan {
@@ -235,6 +235,61 @@ async fn subscribe_receives_all_documents() {
     assert!(kinds.iter().any(|s| s == "descriptor"));
     assert!(kinds.iter().any(|s| s == "event"));
     assert_eq!(kinds.last().map(String::as_str), Some("stop"));
+}
+
+#[tokio::test]
+async fn subscribe_filtered_delivers_only_matching_document_types() {
+    // ENG-06: a filtered subscriber receives only its document type;
+    // `All` still receives every type. One subscriber per filter boundary.
+    let re = RunEngine::new(vec![]);
+
+    let start_kinds = Arc::new(StdMutex::new(Vec::<String>::new()));
+    let event_kinds = Arc::new(StdMutex::new(Vec::<String>::new()));
+    let stop_kinds = Arc::new(StdMutex::new(Vec::<String>::new()));
+    let all_kinds = Arc::new(StdMutex::new(Vec::<String>::new()));
+
+    fn kind_of(d: &Document) -> &'static str {
+        match d {
+            Document::Start(_) => "start",
+            Document::Descriptor(_) => "descriptor",
+            Document::Event(_) => "event",
+            Document::Stop(_) => "stop",
+            _ => "other",
+        }
+    }
+    let push_kind = |bucket: Arc<StdMutex<Vec<String>>>| {
+        Arc::new(move |d: &Document| {
+            bucket.lock().unwrap().push(kind_of(d).into());
+        }) as Arc<dyn Fn(&Document) + Send + Sync>
+    };
+
+    re.subscribe_filtered(DocFilter::Start, push_kind(start_kinds.clone()));
+    re.subscribe_filtered(DocFilter::Event, push_kind(event_kinds.clone()));
+    re.subscribe_filtered(DocFilter::Stop, push_kind(stop_kinds.clone()));
+    re.subscribe_filtered(DocFilter::All, push_kind(all_kinds.clone()));
+
+    re.run_async(one_count_plan()).await.unwrap();
+
+    // Each filtered subscriber sees exactly its document type, nothing else.
+    let starts = start_kinds.lock().unwrap().clone();
+    assert_eq!(starts, vec!["start"], "Start filter saw: {starts:?}");
+
+    let events = event_kinds.lock().unwrap().clone();
+    assert!(!events.is_empty(), "Event filter saw nothing");
+    assert!(
+        events.iter().all(|k| k == "event"),
+        "Event filter leaked non-events: {events:?}"
+    );
+
+    let stops = stop_kinds.lock().unwrap().clone();
+    assert_eq!(stops, vec!["stop"], "Stop filter saw: {stops:?}");
+
+    // All subscriber spans the full set.
+    let all = all_kinds.lock().unwrap().clone();
+    assert_eq!(all.first().map(String::as_str), Some("start"));
+    assert!(all.iter().any(|s| s == "descriptor"));
+    assert!(all.iter().any(|s| s == "event"));
+    assert_eq!(all.last().map(String::as_str), Some("stop"));
 }
 
 #[tokio::test]
@@ -1004,7 +1059,7 @@ async fn msg_subscribe_receives_documents_and_auto_unsubscribes() {
     let re = RunEngine::new(vec![]);
 
     let plan = plan_box(async_stream::stream! {
-        yield Msg::Subscribe(cb);
+        yield Msg::Subscribe { cb, filter: DocFilter::All };
         yield Msg::OpenRun(Default::default());
         yield Msg::CloseRun { exit_status: "success".into(), reason: None };
     });
@@ -1041,7 +1096,7 @@ async fn msg_unsubscribe_removes_callback_immediately() {
     // have a stable mid-run hook to read it; instead we issue
     // Subscribe → Unsubscribe via a wrapping handler).
     let plan = plan_box(async_stream::stream! {
-        yield Msg::Subscribe(cb.clone());
+        yield Msg::Subscribe { cb: cb.clone(), filter: DocFilter::All };
         yield Msg::OpenRun(Default::default());
         // No Unsubscribe here; auto-cleanup at run end is enough
         // for this test — we just need the subscriber to fire.

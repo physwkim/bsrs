@@ -220,9 +220,15 @@ pub enum Msg {
 
     /// Add a temporary Document subscriber. Returned id lands in
     /// `MsgResult::SubscriptionId`. Mirrors bluesky's
-    /// `Msg('subscribe', None, callback, name)`. Subscribers added
-    /// this way are auto-removed at run end.
-    Subscribe(SubscribeCallback),
+    /// `Msg('subscribe', None, callback, name)` — `filter` is the `name`
+    /// argument selecting which document types reach `cb`. Subscribers
+    /// added this way are auto-removed at run end.
+    Subscribe {
+        /// Callback invoked for each matching document.
+        cb: SubscribeCallback,
+        /// Document-type selector (`DocFilter::All` for every document).
+        filter: cirrus_event_model::DocFilter,
+    },
     /// Remove a subscriber by id (the value previously returned via
     /// `MsgResult::SubscriptionId`).
     Unsubscribe(u64),
@@ -305,7 +311,7 @@ impl Msg {
                 | Msg::Locate(_)
                 | Msg::Input { .. }
                 | Msg::ReClass
-                | Msg::Subscribe(_)
+                | Msg::Subscribe { .. }
                 | Msg::Unsubscribe(_)
                 | Msg::Fail(_)
                 | Msg::Null
@@ -426,7 +432,10 @@ impl Clone for Msg {
                 prompt: prompt.clone(),
             },
             Msg::ReClass => Msg::ReClass,
-            Msg::Subscribe(cb) => Msg::Subscribe(cb.clone()),
+            Msg::Subscribe { cb, filter } => Msg::Subscribe {
+                cb: cb.clone(),
+                filter: *filter,
+            },
             Msg::Unsubscribe(id) => Msg::Unsubscribe(*id),
             Msg::Fail(reason) => Msg::Fail(reason.clone()),
             Msg::Resume => Msg::Resume,
@@ -481,7 +490,7 @@ impl std::fmt::Debug for Msg {
             Msg::UnregisterPausable(o) => write!(f, "UnregisterPausable({})", o.name()),
             Msg::Input { prompt } => write!(f, "Input({prompt:?})"),
             Msg::ReClass => write!(f, "ReClass"),
-            Msg::Subscribe(_) => write!(f, "Subscribe(<cb>)"),
+            Msg::Subscribe { filter, .. } => write!(f, "Subscribe(<cb>, {filter:?})"),
             Msg::Unsubscribe(id) => write!(f, "Unsubscribe({id})"),
             Msg::Fail(reason) => write!(f, "Fail({reason:?})"),
             Msg::Resume => write!(f, "Resume"),

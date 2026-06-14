@@ -25,7 +25,7 @@ use cirrus_core::msg::{Msg, RunMetadata};
 use cirrus_core::plan::{Plan, PlanItem};
 use cirrus_core::status::{Status, StatusError};
 use cirrus_event_model::compose::RunBundle;
-use cirrus_event_model::Document;
+use cirrus_event_model::{DocFilter, Document};
 use futures::future::BoxFuture;
 use futures::StreamExt;
 use serde_json::Value;
@@ -262,7 +262,7 @@ pub struct RunEngine {
     /// Dynamic Document subscribers. Inserted/removed via
     /// `subscribe` / `unsubscribe`. Wrapped in `Arc` so spawned tasks
     /// (monitor pumps) can re-read the live list on each tick.
-    subscribers: Arc<StdMutex<Vec<(SubscriptionId, DocumentCallback)>>>,
+    subscribers: Arc<StdMutex<Vec<(SubscriptionId, DocFilter, DocumentCallback)>>>,
     /// Custom command handlers — `RunEngine::register_command`.
     commands: StdMutex<HashMap<String, CustomCommandHandler>>,
     /// Optional metadata validator.
@@ -581,17 +581,50 @@ impl RunEngine {
         *self.md.lock().unwrap() = md;
     }
 
-    /// Subscribe a Document callback. Returns a [`SubscriptionId`]; pair
-    /// with `unsubscribe(id)` to remove.
+    /// Subscribe a Document callback for *every* document type. Returns a
+    /// [`SubscriptionId`]; pair with `unsubscribe(id)` to remove.
     pub fn subscribe(&self, cb: DocumentCallback) -> SubscriptionId {
+        self.subscribe_filtered(DocFilter::All, cb)
+    }
+
+    /// Subscribe a Document callback restricted to one document type
+    /// (bluesky `RE.subscribe(func, name)`). Only documents matching
+    /// `filter` reach `cb`; `DocFilter::All` is equivalent to
+    /// [`subscribe`](Self::subscribe).
+    pub fn subscribe_filtered(&self, filter: DocFilter, cb: DocumentCallback) -> SubscriptionId {
         let id = self.sub_counter.fetch_add(1, Ordering::SeqCst) + 1;
-        self.subscribers.lock().unwrap().push((id, cb));
+        self.subscribers.lock().unwrap().push((id, filter, cb));
         id
+    }
+
+    /// Fan a document out to every dynamic subscriber whose filter
+    /// matches. The single owner of subscriber filtering — both
+    /// [`broadcast`](Self::broadcast) and the spawned monitor pump route
+    /// through here so the filter rule lives in exactly one place. The
+    /// callback Arcs are cloned out from under the lock so user code never
+    /// runs while the lock is held.
+    fn dispatch_subscribers(
+        subs: &StdMutex<Vec<(SubscriptionId, DocFilter, DocumentCallback)>>,
+        doc: &Document,
+    ) {
+        let matched: Vec<DocumentCallback> = subs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, filter, _)| filter.matches(doc))
+            .map(|(_, _, cb)| cb.clone())
+            .collect();
+        for cb in matched {
+            cb(doc);
+        }
     }
 
     /// Remove a subscriber by id. No-op if the id is unknown.
     pub fn unsubscribe(&self, id: SubscriptionId) {
-        self.subscribers.lock().unwrap().retain(|(i, _)| *i != id);
+        self.subscribers
+            .lock()
+            .unwrap()
+            .retain(|(i, _, _)| *i != id);
     }
 
     /// Forward an externally-supplied Document through the engine's
@@ -1348,8 +1381,8 @@ impl RunEngine {
                     name: "cirrus.RunEngine",
                 };
             }
-            Msg::Subscribe(cb) => {
-                let id = self.subscribe(cb);
+            Msg::Subscribe { cb, filter } => {
+                let id = self.subscribe_filtered(filter, cb);
                 self.state.lock().await.temp_subscribers.push(id);
                 *self.last_msg_result.lock().unwrap() = MsgResult::SubscriptionId { id };
             }
@@ -1471,15 +1504,7 @@ impl RunEngine {
                 for s in &sinks {
                     let _ = s.dispatch(&doc).await;
                 }
-                let snapshot: Vec<DocumentCallback> = subs_arc
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .map(|(_, cb)| cb.clone())
-                    .collect();
-                for cb in snapshot {
-                    cb(&doc);
-                }
+                RunEngine::dispatch_subscribers(&subs_arc, &doc);
             }
         });
         let abort = handle.abort_handle();
@@ -1701,20 +1726,11 @@ impl RunEngine {
         for s in &self.sinks {
             let _ = s.dispatch(doc).await;
         }
-        // Dynamic subscribers — clone the callback Arcs out of the lock so the
-        // lock isn't held across user code. Each callback is invoked
-        // synchronously; lossless w.r.t. order, but slow callbacks back
-        // the engine up. (Use a buffering callback if you need decoupling.)
-        let subs: Vec<DocumentCallback> = self
-            .subscribers
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(_, cb)| cb.clone())
-            .collect();
-        for cb in subs {
-            cb(doc);
-        }
+        // Dynamic subscribers — filtered + fanned out by the single owner.
+        // Each callback is invoked synchronously; lossless w.r.t. order, but
+        // slow callbacks back the engine up. (Use a buffering callback if you
+        // need decoupling.)
+        Self::dispatch_subscribers(&self.subscribers, doc);
         Ok(())
     }
 

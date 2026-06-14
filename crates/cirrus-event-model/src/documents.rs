@@ -482,6 +482,41 @@ pub enum Document {
     Stop(RunStop),
 }
 
+/// Document-type filter for selective subscriptions, mirroring the
+/// bluesky `name` argument to `RE.subscribe`/`Msg('subscribe', …, name)`.
+///
+/// `All` matches every document; each named variant matches exactly its
+/// corresponding [`Document`] variant. Documents without a named variant
+/// (e.g. `EventPage`, `Resource`, `Datum`) are delivered only to `All`
+/// subscribers — one uniform rule, no per-boundary special-casing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum DocFilter {
+    /// Receive every document.
+    #[default]
+    All,
+    /// Receive only `Start`.
+    Start,
+    /// Receive only `Descriptor`.
+    Descriptor,
+    /// Receive only `Event`.
+    Event,
+    /// Receive only `Stop`.
+    Stop,
+}
+
+impl DocFilter {
+    /// True if a subscriber with this filter should receive `doc`.
+    pub fn matches(&self, doc: &Document) -> bool {
+        match self {
+            DocFilter::All => true,
+            DocFilter::Start => matches!(doc, Document::Start(_)),
+            DocFilter::Descriptor => matches!(doc, Document::Descriptor(_)),
+            DocFilter::Event => matches!(doc, Document::Event(_)),
+            DocFilter::Stop => matches!(doc, Document::Stop(_)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,6 +543,47 @@ mod tests {
         let json = serde_json::to_string(&docs).unwrap();
         let back: Vec<Document> = serde_json::from_str(&json).unwrap();
         assert_eq!(docs, back);
+    }
+
+    #[test]
+    fn doc_filter_matches_by_variant() {
+        let start = Document::Start(RunStart {
+            uid: "r".into(),
+            time: 0.0,
+            ..Default::default()
+        });
+        let stop = Document::Stop(RunStop {
+            uid: "s".into(),
+            run_start: "r".into(),
+            time: 0.0,
+            exit_status: "success".into(),
+            reason: None,
+            num_events: HashMap::new(),
+        });
+        let page = Document::EventPage(EventPage {
+            uid: vec![],
+            descriptor: "d".into(),
+            time: vec![],
+            seq_num: vec![],
+            data: HashMap::new(),
+            timestamps: HashMap::new(),
+            filled: HashMap::new(),
+        });
+
+        // All matches everything, including variants without a named filter.
+        assert!(DocFilter::All.matches(&start));
+        assert!(DocFilter::All.matches(&stop));
+        assert!(DocFilter::All.matches(&page));
+
+        // Named filters match exactly their variant and nothing else.
+        assert!(DocFilter::Start.matches(&start));
+        assert!(!DocFilter::Start.matches(&stop));
+        assert!(DocFilter::Stop.matches(&stop));
+        assert!(!DocFilter::Stop.matches(&start));
+
+        // EventPage has no named filter — only All delivers it.
+        assert!(!DocFilter::Event.matches(&page));
+        assert!(!DocFilter::Start.matches(&page));
     }
 
     #[test]
