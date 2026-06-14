@@ -238,6 +238,11 @@ pub struct EventPage {
     pub data: HashMap<String, Vec<Value>>,
     /// Column-store of timestamps.
     pub timestamps: HashMap<String, Vec<f64>>,
+    /// Column-store of external-reference fill state. Each entry maps a
+    /// data key to one `bool | str` per row: `false` = unfilled external
+    /// slot, a string = the foreign key after a Filler resolves it.
+    #[serde(skip_serializing_if = "HashMap::is_empty", default)]
+    pub filled: HashMap<String, Vec<Value>>,
 }
 
 // -- resource.json + datum.json ----------------------------------------------
