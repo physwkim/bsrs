@@ -4,9 +4,11 @@
 #![deny(missing_docs)]
 
 pub mod detector;
+pub mod observe;
 pub mod signal;
 
 pub use detector::{StandardDetector, TriggerInfo};
+pub use observe::{observe_value, wait_for_value};
 pub use signal::{Signal, SignalConfig, SignalKind};
 
 /// Re-export of the `#[derive(Device)]` proc-macro.
