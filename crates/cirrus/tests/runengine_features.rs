@@ -202,7 +202,7 @@ async fn msg_publish_goes_through_broadcast() {
         spec: "AD_HDF5_SWMR_STREAM".into(),
         root: "/data".into(),
         resource_path: "shot.h5".into(),
-        path_semantics: "posix".into(),
+        path_semantics: Some("posix".into()),
         run_start: Some("external".into()),
         resource_kwargs: Default::default(),
     });

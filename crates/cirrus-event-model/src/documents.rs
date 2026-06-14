@@ -273,8 +273,10 @@ pub struct Resource {
     pub root: String,
     /// Resource path relative to `root`.
     pub resource_path: String,
-    /// Path semantics (`posix` / `windows`).
-    pub path_semantics: String,
+    /// Path semantics (`posix` / `windows`). Optional per schema; absent on
+    /// Resources that do not pin a platform.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub path_semantics: Option<String>,
     /// Format-specific arguments.
     #[serde(default)]
     pub resource_kwargs: HashMap<String, Value>,

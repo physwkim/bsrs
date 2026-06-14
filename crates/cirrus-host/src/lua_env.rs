@@ -1546,9 +1546,9 @@ fn lua_table_to_data_key(t: &mlua::Table) -> mlua::Result<cirrus_event_model::Da
 /// here. Verified against `crates/cirrus-event-model/src/documents.rs`.
 fn publish_required_fields(kind: &str) -> Option<&'static [&'static str]> {
     match kind {
-        // Resource: resource_kwargs has #[serde(default)]; run_start
-        // is Option + default. Required = the five strings.
-        "resource" => Some(&["uid", "spec", "root", "resource_path", "path_semantics"]),
+        // Resource: resource_kwargs has #[serde(default)]; run_start and
+        // path_semantics are Option + default. Required = the four strings.
+        "resource" => Some(&["uid", "spec", "root", "resource_path"]),
         // Datum: datum_kwargs has #[serde(default)].
         "datum" => Some(&["datum_id", "resource"]),
         // StreamResource: parameters has #[serde(default)]; run_start
