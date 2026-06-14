@@ -1,6 +1,11 @@
-//! Mock backend — single-fixed-value backend used in unit tests.
+//! Mock backends for unit tests: the trivial fixed-value [`MockBackend`] and
+//! the ophyd-async-style [`MockSignalBackend`] (records puts, put callback,
+//! `put_proceeds` gate).
 
 #![deny(missing_docs)]
+
+pub mod mock_signal;
+pub use mock_signal::{MockPutCallback, MockSignalBackend, PutsBlockedGuard};
 
 use async_trait::async_trait;
 use cirrus_core::error::Result;

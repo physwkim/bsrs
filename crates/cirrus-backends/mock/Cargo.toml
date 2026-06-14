@@ -10,6 +10,7 @@ cirrus-core.workspace = true
 cirrus-event-model.workspace = true
 cirrus-protocols-async.workspace = true
 cirrus-devices.workspace = true
+cirrus-backend-soft.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
