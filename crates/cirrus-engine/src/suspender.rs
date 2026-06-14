@@ -235,6 +235,179 @@ impl SuspendThreshold {
     }
 }
 
+/// Pause while a watched `f64` is **outside** the open band
+/// `(band_bottom, band_top)`; resume when it returns inside. Mirrors
+/// bluesky's `SuspendWhenOutsideBand` (temperature controllers, beam
+/// position). BAD ⟺ `value <= band_bottom || value >= band_top`.
+pub struct SuspendOutsideBand {
+    name: String,
+    rx: watch::Receiver<f64>,
+    band_bottom: f64,
+    band_top: f64,
+    resume_delay: Option<Duration>,
+}
+
+impl SuspendOutsideBand {
+    /// Build with the inclusive-outside band edges. `band_bottom` must be
+    /// the lower edge; values are GOOD only strictly inside the band.
+    pub fn new(
+        name: impl Into<String>,
+        rx: watch::Receiver<f64>,
+        band_bottom: f64,
+        band_top: f64,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            rx,
+            band_bottom,
+            band_top,
+            resume_delay: None,
+        }
+    }
+
+    /// See [`SuspendBoolHigh::with_resume_delay`].
+    pub fn with_resume_delay(mut self, delay: Duration) -> Self {
+        self.resume_delay = Some(delay);
+        self
+    }
+
+    /// Spawn the watcher; see [`SuspendBoolHigh::install`].
+    pub fn install(self, re: Arc<RunEngine>) -> JoinHandle<()> {
+        let SuspendOutsideBand {
+            name,
+            mut rx,
+            band_bottom,
+            band_top,
+            resume_delay,
+        } = self;
+        let bad = move |v: f64| v <= band_bottom || v >= band_top;
+        tokio::spawn(async move {
+            loop {
+                // Wait until the value leaves the band (BAD).
+                while !bad(*rx.borrow_and_update()) {
+                    if rx.changed().await.is_err() {
+                        return;
+                    }
+                }
+                // BAD: pause + auto-resume once back inside and GOOD-stable.
+                let resume_rx = rx.clone();
+                let fut: futures::future::BoxFuture<'static, ()> = Box::pin(await_good_stable(
+                    resume_rx,
+                    move |v: &f64| bad(*v),
+                    resume_delay,
+                ));
+                re.suspend_until_with(
+                    fut,
+                    Some(format!("{name}: outside ({band_bottom}, {band_top})")),
+                );
+                // Wait for the value to actually return inside before the next
+                // bad-watch iteration (avoid a tight loop on flickers).
+                while bad(*rx.borrow_and_update()) {
+                    if rx.changed().await.is_err() {
+                        return;
+                    }
+                }
+                tokio::time::sleep(RECONNECT_BACKOFF).await;
+            }
+        })
+    }
+}
+
+/// Pause when a watched value deviates from `expected`; resume when it
+/// returns. Mirrors bluesky's `SuspendWhenChanged` (facility-mode enum
+/// PVs). With `allow_resume = false` (bluesky default) the suspender is
+/// one-shot: it pauses on the first deviation and the engine stays paused
+/// until a **manual** [`RunEngine::resume`] — it never auto-resumes.
+pub struct SuspendWhenChanged<T> {
+    name: String,
+    rx: watch::Receiver<T>,
+    expected: T,
+    allow_resume: bool,
+    resume_delay: Option<Duration>,
+}
+
+impl<T> SuspendWhenChanged<T>
+where
+    T: Eq + Clone + Send + Sync + 'static,
+{
+    /// Build with the `expected` value. Defaults to `allow_resume = false`
+    /// (matches bluesky): manual resume required after a deviation.
+    pub fn new(name: impl Into<String>, rx: watch::Receiver<T>, expected: T) -> Self {
+        Self {
+            name: name.into(),
+            rx,
+            expected,
+            allow_resume: false,
+            resume_delay: None,
+        }
+    }
+
+    /// Allow the suspender to auto-resume when the value returns to
+    /// `expected` (bluesky `allow_resume=True`). Without this the
+    /// suspender is one-shot and requires a manual resume.
+    pub fn allow_resume(mut self) -> Self {
+        self.allow_resume = true;
+        self
+    }
+
+    /// See [`SuspendBoolHigh::with_resume_delay`]. Only meaningful with
+    /// [`allow_resume`](Self::allow_resume).
+    pub fn with_resume_delay(mut self, delay: Duration) -> Self {
+        self.resume_delay = Some(delay);
+        self
+    }
+
+    /// Spawn the watcher; see [`SuspendBoolHigh::install`].
+    pub fn install(self, re: Arc<RunEngine>) -> JoinHandle<()> {
+        let SuspendWhenChanged {
+            name,
+            mut rx,
+            expected,
+            allow_resume,
+            resume_delay,
+        } = self;
+        tokio::spawn(async move {
+            loop {
+                // Wait until the value deviates from `expected` (BAD).
+                while *rx.borrow_and_update() == expected {
+                    if rx.changed().await.is_err() {
+                        return;
+                    }
+                }
+                if !allow_resume {
+                    // One-shot: pause and require a manual resume. The resume
+                    // future never resolves, so only `RunEngine::resume` (which
+                    // un-pauses independently) lifts the suspension. The watcher
+                    // is then spent — return rather than re-trip the user.
+                    let fut: futures::future::BoxFuture<'static, ()> =
+                        Box::pin(std::future::pending());
+                    re.suspend_until_with(
+                        fut,
+                        Some(format!("{name}: value changed (manual resume required)")),
+                    );
+                    return;
+                }
+                // BAD: pause + auto-resume once value returns to expected.
+                let resume_rx = rx.clone();
+                let exp = expected.clone();
+                let fut: futures::future::BoxFuture<'static, ()> = Box::pin(await_good_stable(
+                    resume_rx,
+                    move |v: &T| *v != exp,
+                    resume_delay,
+                ));
+                re.suspend_until_with(fut, Some(format!("{name}: value changed from expected")));
+                // Wait for the value to actually return before next iteration.
+                while *rx.borrow_and_update() != expected {
+                    if rx.changed().await.is_err() {
+                        return;
+                    }
+                }
+                tokio::time::sleep(RECONNECT_BACKOFF).await;
+            }
+        })
+    }
+}
+
 /// Shared body for `SuspendBoolHigh` / `SuspendBoolLow`. `pause_when`
 /// is the boolean value that triggers a pause.
 fn spawn_bool_watcher(

@@ -15,5 +15,6 @@ pub use engine::{
 };
 pub use sink::{BroadcastSink, DocumentSink};
 pub use suspender::{
-    SuspendBoolHigh, SuspendBoolLow, SuspendThreshold, Suspender, ThresholdDirection,
+    SuspendBoolHigh, SuspendBoolLow, SuspendOutsideBand, SuspendThreshold, SuspendWhenChanged,
+    Suspender, ThresholdDirection,
 };

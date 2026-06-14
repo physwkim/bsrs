@@ -484,6 +484,123 @@ async fn suspend_threshold_floor_pauses_when_below() {
 }
 
 #[tokio::test]
+async fn suspend_outside_band_pauses_outside_resumes_inside() {
+    // ENG-13: pause when value leaves (band_bottom, band_top), resume inside.
+    use cirrus_engine::SuspendOutsideBand;
+    let (tx, rx) = tokio::sync::watch::channel(25.0_f64); // inside (20, 30)
+    let re = Arc::new(RunEngine::new(vec![]));
+    let _watcher = SuspendOutsideBand::new("temperature", rx, 20.0, 30.0).install(re.clone());
+
+    let re2 = re.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::Sleep(Duration::from_millis(50));
+    });
+    let join = tokio::spawn(async move { re2.run_async(plan).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Leave the band above the top edge → pause.
+    tx.send(35.0).unwrap();
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert_eq!(
+        re.state(),
+        EngineRunState::Paused,
+        "must pause when value leaves the band"
+    );
+
+    // Return inside the band → auto-resume.
+    tx.send(25.0).unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("auto-resume in time")
+        .unwrap()
+        .unwrap();
+    assert_eq!(re.state(), EngineRunState::Idle);
+}
+
+#[tokio::test]
+async fn suspend_when_changed_allow_resume_pauses_then_resumes() {
+    // ENG-13: with allow_resume, deviating from `expected` pauses; returning
+    // to `expected` auto-resumes.
+    use cirrus_engine::SuspendWhenChanged;
+    let (tx, rx) = tokio::sync::watch::channel("operate".to_string());
+    let re = Arc::new(RunEngine::new(vec![]));
+    let _watcher = SuspendWhenChanged::new("facility_mode", rx, "operate".to_string())
+        .allow_resume()
+        .install(re.clone());
+
+    let re2 = re.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::Sleep(Duration::from_millis(50));
+    });
+    let join = tokio::spawn(async move { re2.run_async(plan).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    tx.send("shutdown".to_string()).unwrap();
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert_eq!(
+        re.state(),
+        EngineRunState::Paused,
+        "must pause when value deviates from expected"
+    );
+
+    tx.send("operate".to_string()).unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("auto-resume in time")
+        .unwrap()
+        .unwrap();
+    assert_eq!(re.state(), EngineRunState::Idle);
+}
+
+#[tokio::test]
+async fn suspend_when_changed_no_resume_requires_manual_resume() {
+    // ENG-13: default (allow_resume=false) is one-shot — returning to
+    // `expected` does NOT auto-resume; only a manual RE.resume() lifts it.
+    use cirrus_engine::SuspendWhenChanged;
+    let (tx, rx) = tokio::sync::watch::channel(0_i64);
+    // Keep a receiver alive: the one-shot watcher drops its own on trip, and
+    // we still want `tx.send` to succeed afterwards to prove it does nothing.
+    let _rx_keep = rx.clone();
+    let re = Arc::new(RunEngine::new(vec![]));
+    let _watcher = SuspendWhenChanged::new("interlock", rx, 0_i64).install(re.clone());
+
+    let re2 = re.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::Sleep(Duration::from_millis(50));
+    });
+    let join = tokio::spawn(async move { re2.run_async(plan).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    tx.send(1).unwrap(); // deviate → pause
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert_eq!(re.state(), EngineRunState::Paused);
+
+    // Return to expected: must NOT auto-resume (one-shot).
+    tx.send(0).unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(
+        re.state(),
+        EngineRunState::Paused,
+        "allow_resume=false must not auto-resume on return to expected"
+    );
+
+    // Manual resume lifts the suspension and the plan completes.
+    re.resume();
+    let _ = tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("manual resume completes plan")
+        .unwrap()
+        .unwrap();
+    assert_eq!(re.state(), EngineRunState::Idle);
+}
+
+#[tokio::test]
 async fn msg_fail_marks_run_failed_with_reason() {
     // Regression for R2-1: Msg::Fail aborts the plan cleanly with
     // a Plan-level error and exit_status="fail". Used by plans like
