@@ -10,8 +10,8 @@ pub mod signal;
 pub use detector::{StandardDetector, TriggerInfo};
 pub use observe::{observe_value, wait_for_value};
 pub use signal::{
-    Access, Read, ReadWrite, Readable, Signal, SignalConfig, SignalKind, SignalR, SignalRW,
-    SignalW, Writable, Write,
+    Access, Execute, Read, ReadWrite, Readable, Signal, SignalConfig, SignalKind, SignalR,
+    SignalRW, SignalW, SignalX, Writable, Write,
 };
 
 /// Re-export of the `#[derive(Device)]` proc-macro.

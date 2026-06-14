@@ -15,6 +15,7 @@ use cirrus_core::Kind;
 use cirrus_event_model::DataKey;
 use cirrus_protocols_async::{
     AsyncReadable, AsyncSubscribable, ReadingValueCallback, SignalBackend, Subscription,
+    Triggerable,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -48,20 +49,26 @@ pub mod access {
     pub struct Write;
     /// Read + write access — the default for `Signal<T, B>`.
     pub struct ReadWrite;
+    /// Execute-only access: `trigger` only (no `get`/`read`/`put`). Mirrors
+    /// ophyd-async `SignalX`, whose `trigger` writes the backend default via
+    /// `put(None)` (`core/_signal.py:330`).
+    pub struct Execute;
 
     impl sealed::Sealed for Read {}
     impl sealed::Sealed for Write {}
     impl sealed::Sealed for ReadWrite {}
+    impl sealed::Sealed for Execute {}
     impl Access for Read {}
     impl Access for Write {}
     impl Access for ReadWrite {}
+    impl Access for Execute {}
     impl Readable for Read {}
     impl Readable for ReadWrite {}
     impl Writable for Write {}
     impl Writable for ReadWrite {}
 }
 
-pub use access::{Access, Read, ReadWrite, Readable, Writable, Write};
+pub use access::{Access, Execute, Read, ReadWrite, Readable, Writable, Write};
 
 /// Read-only signal: monitor + `get` / `read` / `describe` / `subscribe`,
 /// no `put`. Mirrors ophyd-async `SignalR`.
@@ -71,6 +78,9 @@ pub type SignalW<T, B> = Signal<T, B, Write>;
 /// Read + write signal: the full surface (the default for `Signal<T, B>`).
 /// Mirrors ophyd-async `SignalRW`.
 pub type SignalRW<T, B> = Signal<T, B, ReadWrite>;
+/// Execute signal: `trigger` only (writes the backend default via
+/// `put(None)`). Mirrors ophyd-async `SignalX`.
+pub type SignalX<T, B> = Signal<T, B, Execute>;
 
 /// Per-signal configuration (PV name + kind + units).
 #[derive(Clone, Debug, Default)]
@@ -201,6 +211,39 @@ where
     /// `SignalRW::locate`).
     pub async fn get_setpoint(&self) -> Result<T> {
         self.backend.get_setpoint().await
+    }
+}
+
+// -- Execute role only ([`Execute`]) -----------------------------------------
+
+impl<T, B> Signal<T, B, Execute>
+where
+    T: Clone + Send + Sync + Serialize + 'static,
+    B: SignalBackend<T>,
+{
+    /// Trigger by writing the backend default (`put(None)`), awaiting
+    /// completion. Returns a resolved `Status`. Mirrors ophyd-async
+    /// `SignalX::trigger` (`core/_signal.py:330`), where `None` is the
+    /// put-default sentinel (CP-11).
+    pub async fn trigger(&self) -> Status {
+        match self.backend.put(None).await {
+            Ok(()) => Status::done(),
+            Err(e) => Status::fail(StatusError::Failed(e.to_string())),
+        }
+    }
+}
+
+#[async_trait]
+impl<T, B> Triggerable for Signal<T, B, Execute>
+where
+    T: Clone + Send + Sync + Serialize + 'static,
+    B: SignalBackend<T>,
+{
+    fn name(&self) -> &str {
+        &self.config.name
+    }
+    async fn trigger(&self) -> Status {
+        self.trigger().await
     }
 }
 
@@ -342,5 +385,38 @@ mod tests {
         assert!(rw.put(2.0).await.await.is_ok());
         assert_eq!(rw.get().await.unwrap(), 2.0);
         assert_eq!(rw.get_setpoint().await.unwrap(), 2.0);
+    }
+
+    // SignalX (Execute role) exposes only `trigger`, which writes the
+    // backend default via `put(None)`. (A `SignalX::get`/`put` call would
+    // not compile.)
+    #[tokio::test]
+    async fn signal_x_trigger_writes_backend_default() {
+        use cirrus_event_model::Dtype;
+
+        // Soft backend's `put(None)` writes the configured initial value
+        // (`_soft_signal_backend.py:164`); seed a non-default initial so the
+        // trigger is observable through a separate read handle.
+        let backend = Arc::new(cirrus_backend_soft::SoftSignalBackend::new(
+            42.0_f64,
+            Dtype::Number,
+        ));
+        let x: SignalX<f64, _> = Signal::new(
+            backend.clone(),
+            SignalConfig {
+                source: "proc".into(),
+                kind: Kind::Normal,
+                name: "proc".into(),
+            },
+        );
+        // Move the cell away from the initial, then trigger to restore it.
+        SignalBackend::put(&*backend, Some(0.0)).await.unwrap();
+        assert_eq!(backend.current_value(), 0.0);
+        assert!(x.trigger().await.await.is_ok());
+        assert_eq!(backend.current_value(), 42.0);
+
+        // Triggerable trait object path resolves to the same behavior.
+        let dynx: &dyn Triggerable = &x;
+        assert_eq!(dynx.name(), "proc");
     }
 }
