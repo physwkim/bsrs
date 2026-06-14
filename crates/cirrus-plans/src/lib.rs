@@ -891,6 +891,28 @@ pub fn log_scan(
     list_scan(detectors, motor, motor_readback, points)
 }
 
+/// `rel_log_scan(detectors, motor, motor_readback, start, stop, num)` —
+/// relative variant of [`log_scan`]: the log-spaced targets are offset by the
+/// motor's current readback, snapshotted once via `LocatableObj::locate_dyn`
+/// (bluesky `plans.rel_log_scan`, `relative_set_decorator`).
+///
+/// Consistent with cirrus's other `rel_*` scans, the motor is *not* returned
+/// to its starting position afterward — bluesky additionally wraps in
+/// `reset_positions_decorator`, which cirrus omits uniformly across the
+/// `rel_*` family.
+pub fn rel_log_scan(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    motor: Arc<dyn LocatableObj>,
+    motor_readback: Arc<dyn ReadableObj>,
+    start: f64,
+    stop: f64,
+    num: usize,
+) -> Plan {
+    let mv: Arc<dyn MovableObj> = motor.clone();
+    let inner = log_scan(detectors, mv, motor_readback, start, stop, num);
+    preprocessors::relative_set_wrapper(inner, vec![motor])
+}
+
 /// `spiral_fermat(detectors, x_motor, x_reader, y_motor, y_reader,
 /// x_start, y_start, x_range, y_range, dr, factor)` —
 /// Fermat (sunflower) spiral via golden-angle increments. See
@@ -1254,6 +1276,109 @@ mod tests {
         match m {
             Msg::Complete { group, .. } => group.as_deref(),
             _ => None,
+        }
+    }
+
+    use cirrus_core::msg::{DynLocation, MovableObj, NamedObj, ReadableObj};
+    use cirrus_core::reading::ReadingValue;
+    use std::collections::HashMap;
+
+    /// Locatable motor whose `locate_dyn` reports a fixed readback (`bias`).
+    /// `set_dyn` is never invoked by `drain`.
+    struct FakeMotor {
+        name: String,
+        bias: f64,
+    }
+
+    impl NamedObj for FakeMotor {
+        fn name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MovableObj for FakeMotor {
+        async fn set_dyn(&self, _value: f64) -> Status {
+            Status::done()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cirrus_core::msg::LocatableObj for FakeMotor {
+        async fn locate_dyn(&self) -> Result<DynLocation, cirrus_core::error::CirrusError> {
+            Ok(DynLocation {
+                setpoint: self.bias,
+                readback: self.bias,
+            })
+        }
+    }
+
+    /// Readable carried only inside `Msg::Read`; `read_dyn`/`describe_dyn`
+    /// are never called by `drain`.
+    struct FakeReadable(String);
+
+    impl NamedObj for FakeReadable {
+        fn name(&self) -> &str {
+            &self.0
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ReadableObj for FakeReadable {
+        async fn read_dyn(
+            &self,
+        ) -> Result<HashMap<String, ReadingValue>, cirrus_core::error::CirrusError> {
+            Ok(HashMap::new())
+        }
+        async fn describe_dyn(
+            &self,
+        ) -> Result<HashMap<String, cirrus_event_model::DataKey>, cirrus_core::error::CirrusError>
+        {
+            Ok(HashMap::new())
+        }
+    }
+
+    fn set_values(msgs: &[Msg]) -> Vec<f64> {
+        msgs.iter()
+            .filter_map(|m| match m {
+                Msg::Set { value, .. } => Some(*value),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn rel_log_scan_offsets_log_spaced_targets_by_current_readback() {
+        // log_scan(1, 100, 3) → log-spaced points [1, 10, 100]; with a current
+        // readback of 10 every target shifts by +10 → [11, 20, 110].
+        let motor = Arc::new(FakeMotor {
+            name: "m".into(),
+            bias: 10.0,
+        }) as Arc<dyn cirrus_core::msg::LocatableObj>;
+        let reader = Arc::new(FakeReadable("m_rbv".into())) as Arc<dyn ReadableObj>;
+        let plan = rel_log_scan(vec![], motor, reader, 1.0, 100.0, 3);
+        let vals = set_values(&drain(plan).await);
+        assert_eq!(vals.len(), 3, "expected 3 Set targets, got {vals:?}");
+        for (got, want) in vals.iter().zip([11.0, 20.0, 110.0]) {
+            assert!(
+                (got - want).abs() < 1e-9,
+                "Set target {got} != expected {want} (bias-offset log point)"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rel_log_scan_zero_bias_matches_absolute_log_scan() {
+        // With a current readback of 0 the relative scan reduces to log_scan.
+        let motor = Arc::new(FakeMotor {
+            name: "m".into(),
+            bias: 0.0,
+        }) as Arc<dyn cirrus_core::msg::LocatableObj>;
+        let reader = Arc::new(FakeReadable("m_rbv".into())) as Arc<dyn ReadableObj>;
+        let plan = rel_log_scan(vec![], motor, reader, 1.0, 100.0, 3);
+        let vals = set_values(&drain(plan).await);
+        for (got, want) in vals.iter().zip([1.0, 10.0, 100.0]) {
+            assert!((got - want).abs() < 1e-9, "Set target {got} != {want}");
         }
     }
 
