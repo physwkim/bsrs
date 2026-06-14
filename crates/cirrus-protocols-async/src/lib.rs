@@ -240,30 +240,55 @@ pub enum DetectorTrigger {
     ExternalLevel,
 }
 
-/// Detector trigger configuration.
+/// Detector trigger configuration. Direct port of
+/// `ophyd_async/core/_detector.py:65-113` `TriggerInfo`.
 #[derive(Clone, Debug)]
 pub struct TriggerInfo {
     /// What sort of triggering the detector should be set for.
     pub trigger: DetectorTrigger,
-    /// Number of triggers, 0 for infinite.
-    pub number: u32,
-    /// Live (exposure) time.
+    /// Number of bluesky events that will be emitted (`0` = infinite).
+    pub number_of_events: u32,
+    /// Live (exposure) time. `None` leaves whatever the detector currently has.
     pub livetime: Option<Duration>,
-    /// Required dead-time.
+    /// Dead-time required between exposures. `None` = the detector minimum.
     pub deadtime: Option<Duration>,
-    /// Triggers per emitted index.
-    pub multiplier: u32,
+    /// Exposures averaged/combined into a single collection. `> 1` drives the
+    /// areaDetector `NumExposures` PV.
+    pub exposures_per_collection: u32,
+    /// Collections published per emitted bluesky event — lets a fast detector
+    /// zip several collections against a slower detector's single collection.
+    pub collections_per_event: u32,
+    /// Maximum time to wait for one exposure (guards `complete()` loops).
+    /// `None` = derive from `livetime + deadtime` plus an implementation
+    /// default.
+    pub exposure_timeout: Option<Duration>,
 }
 
 impl Default for TriggerInfo {
     fn default() -> Self {
         Self {
             trigger: DetectorTrigger::Internal,
-            number: 1,
+            number_of_events: 1,
             livetime: None,
             deadtime: None,
-            multiplier: 1,
+            exposures_per_collection: 1,
+            collections_per_event: 1,
+            exposure_timeout: None,
         }
+    }
+}
+
+impl TriggerInfo {
+    /// Total collections taken: `number_of_events * collections_per_event`.
+    /// Fly-scan kickoff watches the write index up to this count.
+    pub fn number_of_collections(&self) -> u32 {
+        self.number_of_events * self.collections_per_event
+    }
+
+    /// Total detector exposures (triggers sent):
+    /// `number_of_collections * exposures_per_collection`.
+    pub fn number_of_exposures(&self) -> u32 {
+        self.number_of_collections() * self.exposures_per_collection
     }
 }
 
@@ -330,4 +355,32 @@ pub trait FrameAllocator: Send + Sync {
     async fn alloc(&self, min_bytes: usize, zero_copy: bool) -> bytes::BytesMut;
     /// Return a buffer to the pool (optional).
     fn ret(&self, _buf: bytes::BytesMut) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trigger_info_computed_counts() {
+        // ophyd _detector.py:90-93 worked example: number_of_events=10,
+        // collections_per_event=5 → 50 collections; exposures_per_collection=3
+        // → 150 exposures.
+        let info = TriggerInfo {
+            number_of_events: 10,
+            collections_per_event: 5,
+            exposures_per_collection: 3,
+            ..Default::default()
+        };
+        assert_eq!(info.number_of_collections(), 50);
+        assert_eq!(info.number_of_exposures(), 150);
+    }
+
+    #[test]
+    fn trigger_info_default_counts_are_one() {
+        let info = TriggerInfo::default();
+        assert_eq!(info.trigger, DetectorTrigger::Internal);
+        assert_eq!(info.number_of_collections(), 1);
+        assert_eq!(info.number_of_exposures(), 1);
+    }
 }

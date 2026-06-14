@@ -161,7 +161,8 @@ impl DetectorControl for SoftDetectorControl {
                 info.trigger
             )));
         }
-        self.target.store(info.number as u64, Ordering::SeqCst);
+        self.target
+            .store(info.number_of_events as u64, Ordering::SeqCst);
         Ok(())
     }
     async fn arm(&self) -> Status {
@@ -327,7 +328,7 @@ mod tests {
     async fn soft_prepare_accepts_internal_and_sets_target() {
         let control = SoftDetectorControl::new(Duration::from_micros(0));
         let info = TriggerInfo {
-            number: 7,
+            number_of_events: 7,
             ..Default::default()
         };
         DetectorControl::prepare(&control, info).await.unwrap();
