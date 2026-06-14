@@ -150,3 +150,39 @@ print(v)
     assert_eq!(code, 0, "stderr: {err}");
     assert!(!out.trim().is_empty());
 }
+
+#[test]
+fn subscribe_receives_documents_and_unsubscribe_stops_them() {
+    // PY-01: RE.subscribe(cb) must deliver every document to a Python callable
+    // as (name, dict); unsubscribe(token) must stop further delivery.
+    let (out, err, code) = run_python(
+        "
+import cirrus_native as c
+re = c.RunEngine()
+det = c.SoftDetector('det1')
+names = []
+def cb(name, doc):
+    assert isinstance(name, str), 'name must be str'
+    assert isinstance(doc, dict), 'doc must be a dict, got %r' % type(doc)
+    names.append(name)
+token = re.subscribe(cb)
+re.run(c.count([det], 3))
+print('start' in names)
+print('descriptor' in names)
+print('event' in names)
+print('stop' in names)
+# The start document carries a uid (proves the body is a real dict).
+print(any(n == 'start' for n in names))
+re.unsubscribe(token)
+before = len(names)
+re.run(c.count([det], 1))
+print(len(names) == before)
+",
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    let trues = out.lines().filter(|l| *l == "True").count();
+    assert_eq!(
+        trues, 6,
+        "expected start/descriptor/event/stop delivered + unsubscribe stops delivery; out: {out}\nerr: {err}"
+    );
+}

@@ -31,10 +31,11 @@ use std::sync::Arc;
 use cirrus_backend_soft::{SoftDetector, SoftMotor};
 use cirrus_core::msg::{MovableObj, ReadableObj};
 use cirrus_core::plan::Plan;
-use cirrus_engine::{DocumentSink, RunEngine};
+use cirrus_core::Document;
+use cirrus_engine::{DocumentCallback, DocumentSink, RunEngine};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PyTuple};
+use pyo3::types::{PyDict, PyList, PyTuple};
 use std::sync::Mutex;
 
 /// `cirrus_native.SoftMotor` — wrapper around `cirrus-backend-soft::SoftMotor`.
@@ -135,6 +136,87 @@ impl PyRunEngine {
                 Err(e) => Err(PyRuntimeError::new_err(format!("RunEngine: {e}"))),
             }
         })
+    }
+
+    /// Subscribe a Python callable `cb(name, doc)` to every emitted document
+    /// (bluesky `RunEngine.subscribe`). `name` is the document type
+    /// (`"start"`, `"descriptor"`, `"event"`, `"stop"`, …) and `doc` is the
+    /// document body as a `dict`. Returns an integer token; pass it to
+    /// `unsubscribe` to remove the callback. Exceptions raised by the callback
+    /// are printed and swallowed — a misbehaving callback does not abort the
+    /// run (bluesky logs and continues).
+    fn subscribe(&self, callable: Py<PyAny>) -> u64 {
+        let cb: DocumentCallback = Arc::new(move |doc: &Document| {
+            let (name, value) = doc_name_and_value(doc);
+            Python::with_gil(|py| {
+                let py_doc = json_to_py(py, &value);
+                if let Err(e) = callable.call1(py, (name, py_doc)) {
+                    e.print(py);
+                }
+            });
+        });
+        self.inner.subscribe(cb)
+    }
+
+    /// Remove a callback previously added with `subscribe`. Unknown tokens are
+    /// ignored.
+    fn unsubscribe(&self, token: u64) {
+        self.inner.unsubscribe(token);
+    }
+}
+
+/// Map a [`Document`] to its bluesky document name and a JSON value of the
+/// inner document body (no enum tag), matching the `(name, doc)` pair a
+/// bluesky `RunEngine.subscribe` callback receives.
+fn doc_name_and_value(doc: &Document) -> (&'static str, serde_json::Value) {
+    use cirrus_core::Document::*;
+    let v = |r: Result<serde_json::Value, serde_json::Error>| r.unwrap_or(serde_json::Value::Null);
+    match doc {
+        Start(d) => ("start", v(serde_json::to_value(d))),
+        Descriptor(d) => ("descriptor", v(serde_json::to_value(d))),
+        Event(d) => ("event", v(serde_json::to_value(d))),
+        EventPage(d) => ("event_page", v(serde_json::to_value(d))),
+        Resource(d) => ("resource", v(serde_json::to_value(d))),
+        Datum(d) => ("datum", v(serde_json::to_value(d))),
+        DatumPage(d) => ("datum_page", v(serde_json::to_value(d))),
+        StreamResource(d) => ("stream_resource", v(serde_json::to_value(d))),
+        StreamDatum(d) => ("stream_datum", v(serde_json::to_value(d))),
+        Stop(d) => ("stop", v(serde_json::to_value(d))),
+    }
+}
+
+/// Recursively convert a `serde_json::Value` into a Python object so document
+/// bodies reach Python as native dicts / lists / scalars rather than a JSON
+/// string.
+fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyObject {
+    use serde_json::Value::*;
+    match value {
+        Null => py.None(),
+        Bool(b) => b.into_py(py),
+        Number(n) => {
+            if let Some(i) = n.as_i64() {
+                i.into_py(py)
+            } else if let Some(u) = n.as_u64() {
+                u.into_py(py)
+            } else {
+                n.as_f64().unwrap_or(f64::NAN).into_py(py)
+            }
+        }
+        String(s) => s.into_py(py),
+        Array(items) => {
+            let list = PyList::empty_bound(py);
+            for item in items {
+                let _ = list.append(json_to_py(py, item));
+            }
+            list.into_py(py)
+        }
+        Object(map) => {
+            let dict = PyDict::new_bound(py);
+            for (k, val) in map {
+                let _ = dict.set_item(k, json_to_py(py, val));
+            }
+            dict.into_py(py)
+        }
     }
 }
 
