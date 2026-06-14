@@ -156,6 +156,62 @@ async fn before_after_plan_hooks_fire() {
 }
 
 #[tokio::test]
+async fn msg_hook_sees_every_message_before_dispatch() {
+    // ENG-03: RE.msg_hook (bluesky run_engine.py:1645) fires for every Msg
+    // just before it is handled. Capture the Debug-formatted variant names.
+    let seen = Arc::new(StdMutex::new(Vec::<String>::new()));
+    let s = seen.clone();
+    let re = RunEngine::new(vec![]);
+    re.set_msg_hook(Some(Arc::new(move |msg: &Msg| {
+        // First token of the Debug repr is the variant name.
+        let repr = format!("{msg:?}");
+        let head = repr.split([' ', '(', '{']).next().unwrap_or("").to_string();
+        s.lock().unwrap().push(head);
+    })));
+
+    re.run_async(one_count_plan()).await.unwrap();
+
+    let names = seen.lock().unwrap().clone();
+    assert!(!names.is_empty(), "msg_hook never fired");
+    // Every run brackets its messages with OpenRun / CloseRun.
+    assert!(
+        names.iter().any(|n| n == "OpenRun"),
+        "msg_hook missed OpenRun; saw: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "CloseRun"),
+        "msg_hook missed CloseRun; saw: {names:?}"
+    );
+    // A 1-point count reads the detector at least once.
+    assert!(
+        names.iter().any(|n| n == "Read"),
+        "msg_hook missed Read; saw: {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn msg_hook_cleared_stops_firing() {
+    // ENG-03: passing None clears the hook — no further calls.
+    let count = Arc::new(AtomicU64::new(0));
+    let c = count.clone();
+    let re = RunEngine::new(vec![]);
+    re.set_msg_hook(Some(Arc::new(move |_msg: &Msg| {
+        c.fetch_add(1, Ordering::SeqCst);
+    })));
+    re.run_async(one_count_plan()).await.unwrap();
+    let after_first = count.load(Ordering::SeqCst);
+    assert!(after_first > 0, "hook should have fired on first run");
+
+    re.set_msg_hook(None);
+    re.run_async(one_count_plan()).await.unwrap();
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        after_first,
+        "cleared hook must not fire on the second run"
+    );
+}
+
+#[tokio::test]
 async fn subscribe_receives_all_documents() {
     let received = Arc::new(StdMutex::new(Vec::<String>::new()));
     let r = received.clone();

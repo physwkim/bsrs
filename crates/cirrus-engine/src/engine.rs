@@ -97,6 +97,12 @@ pub type Preprocessor = Arc<dyn Fn(Plan) -> Plan + Send + Sync + 'static>;
 /// inside `run_async` *outside* the message loop.
 pub type PlanHook = Arc<dyn Fn() + Send + Sync + 'static>;
 
+/// `msg_hook` signature. Synchronous; called on every `Msg` in the run loop
+/// *before* it is dispatched. Mirrors bluesky's `RE.msg_hook`
+/// (`run_engine.py:1645`) — the primary tool for plan introspection, logging,
+/// and test capture.
+pub type MsgHook = Arc<dyn Fn(&Msg) + Send + Sync + 'static>;
+
 /// Snapshot delivered to a [`CheckpointHook`] on every `Msg::Checkpoint`
 /// and on every `CloseRun` (with [`exit_status`](Self::exit_status) set).
 /// Lets callers persist enough state to know "the engine reached a
@@ -271,6 +277,8 @@ pub struct RunEngine {
     before_plan: StdMutex<Option<PlanHook>>,
     /// Optional post-plan hook.
     after_plan: StdMutex<Option<PlanHook>>,
+    /// Optional per-`Msg` hook, called before each message is dispatched.
+    msg_hook: StdMutex<Option<MsgHook>>,
     /// Optional whole-plan timeout. If set and exceeded, the loop fails
     /// with `CirrusError::Timeout`. Mirrors bluesky's
     /// `loop_until_completion_timeout`.
@@ -374,6 +382,7 @@ impl RunEngine {
             preprocessors: StdMutex::new(Vec::new()),
             before_plan: StdMutex::new(None),
             after_plan: StdMutex::new(None),
+            msg_hook: StdMutex::new(None),
             loop_timeout: StdMutex::new(None),
             input_handler: StdMutex::new(None),
             per_call_md: StdMutex::new(HashMap::new()),
@@ -650,6 +659,12 @@ impl RunEngine {
         *self.after_plan.lock().unwrap() = h;
     }
 
+    /// Install a `msg_hook` called with every `Msg` just before it is
+    /// dispatched (bluesky `RE.msg_hook`). Pass `None` to clear it.
+    pub fn set_msg_hook(&self, h: Option<MsgHook>) {
+        *self.msg_hook.lock().unwrap() = h;
+    }
+
     /// Set an overall plan timeout (bluesky `loop_until_completion_timeout`).
     /// `None` = no timeout (default).
     pub fn set_loop_timeout(&self, t: Option<Duration>) {
@@ -868,6 +883,10 @@ impl RunEngine {
                 break;
             }
             tracing::debug!("RE msg: {:?}", &msg);
+            // msg_hook sees every Msg before dispatch (bluesky run_engine.py:1645).
+            if let Some(h) = self.msg_hook.lock().unwrap().clone() {
+                h(&msg);
+            }
             match self.handle(msg).await {
                 Ok(Some(uid)) => run_uid = Some(uid),
                 Ok(None) => {}
