@@ -953,6 +953,86 @@ pub fn spiral_fermat(
     })
 }
 
+/// `rel_spiral(...)` — relative variant of [`spiral`]: the spiral is drawn
+/// around the motors' current readbacks instead of an absolute centre.
+/// Both axis motors are `LocatableObj` so the offsets can be snapshotted
+/// once via `relative_set_wrapper` (bluesky `plans.rel_spiral`).
+///
+/// Like the other `rel_*` plans, the motors are not returned to their start
+/// positions afterward (cirrus's rel_* family is offset-only; bluesky also
+/// applies `reset_positions_decorator`).
+#[allow(clippy::too_many_arguments)]
+pub fn rel_spiral(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    x_motor: Arc<dyn LocatableObj>,
+    x_reader: Arc<dyn ReadableObj>,
+    y_motor: Arc<dyn LocatableObj>,
+    y_reader: Arc<dyn ReadableObj>,
+    x_start: f64,
+    y_start: f64,
+    x_range: f64,
+    y_range: f64,
+    dr: f64,
+    nth: usize,
+) -> Plan {
+    let xm: Arc<dyn MovableObj> = x_motor.clone();
+    let ym: Arc<dyn MovableObj> = y_motor.clone();
+    let inner = spiral(
+        detectors, xm, x_reader, ym, y_reader, x_start, y_start, x_range, y_range, dr, nth,
+    );
+    preprocessors::relative_set_wrapper(inner, vec![x_motor, y_motor])
+}
+
+/// `rel_spiral_square(...)` — relative variant of [`spiral_square`]; the
+/// square raster spiral is centred on the motors' current readbacks
+/// (bluesky `plans.rel_spiral_square`). Offset-only, see [`rel_spiral`].
+#[allow(clippy::too_many_arguments)]
+pub fn rel_spiral_square(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    x_motor: Arc<dyn LocatableObj>,
+    x_reader: Arc<dyn ReadableObj>,
+    y_motor: Arc<dyn LocatableObj>,
+    y_reader: Arc<dyn ReadableObj>,
+    x_center: f64,
+    y_center: f64,
+    x_range: f64,
+    y_range: f64,
+    x_num: usize,
+    y_num: usize,
+) -> Plan {
+    let xm: Arc<dyn MovableObj> = x_motor.clone();
+    let ym: Arc<dyn MovableObj> = y_motor.clone();
+    let inner = spiral_square(
+        detectors, xm, x_reader, ym, y_reader, x_center, y_center, x_range, y_range, x_num, y_num,
+    );
+    preprocessors::relative_set_wrapper(inner, vec![x_motor, y_motor])
+}
+
+/// `rel_spiral_fermat(...)` — relative variant of [`spiral_fermat`]; the
+/// Fermat (sunflower) spiral is centred on the motors' current readbacks
+/// (bluesky `plans.rel_spiral_fermat`). Offset-only, see [`rel_spiral`].
+#[allow(clippy::too_many_arguments)]
+pub fn rel_spiral_fermat(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    x_motor: Arc<dyn LocatableObj>,
+    x_reader: Arc<dyn ReadableObj>,
+    y_motor: Arc<dyn LocatableObj>,
+    y_reader: Arc<dyn ReadableObj>,
+    x_start: f64,
+    y_start: f64,
+    x_range: f64,
+    y_range: f64,
+    dr: f64,
+    factor: f64,
+) -> Plan {
+    let xm: Arc<dyn MovableObj> = x_motor.clone();
+    let ym: Arc<dyn MovableObj> = y_motor.clone();
+    let inner = spiral_fermat(
+        detectors, xm, x_reader, ym, y_reader, x_start, y_start, x_range, y_range, dr, factor,
+    );
+    preprocessors::relative_set_wrapper(inner, vec![x_motor, y_motor])
+}
+
 /// `fly(flyer, dets)` — kickoff, collect while completing, unstage.
 pub fn fly(
     flyer: Arc<dyn FlyableObj>,
@@ -1380,6 +1460,168 @@ mod tests {
         for (got, want) in vals.iter().zip([1.0, 10.0, 100.0]) {
             assert!((got - want).abs() < 1e-9, "Set target {got} != {want}");
         }
+    }
+
+    fn named_set_values(msgs: &[Msg]) -> Vec<(String, f64)> {
+        msgs.iter()
+            .filter_map(|m| match m {
+                Msg::Set { obj, value, .. } => Some((obj.name().to_string(), *value)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn motor_xy(
+        bx: f64,
+        by: f64,
+    ) -> (
+        Arc<dyn cirrus_core::msg::LocatableObj>,
+        Arc<dyn cirrus_core::msg::LocatableObj>,
+    ) {
+        (
+            Arc::new(FakeMotor {
+                name: "x".into(),
+                bias: bx,
+            }) as Arc<dyn cirrus_core::msg::LocatableObj>,
+            Arc::new(FakeMotor {
+                name: "y".into(),
+                bias: by,
+            }) as Arc<dyn cirrus_core::msg::LocatableObj>,
+        )
+    }
+
+    fn abs_motor_xy() -> (Arc<dyn MovableObj>, Arc<dyn MovableObj>) {
+        (
+            Arc::new(FakeMotor {
+                name: "x".into(),
+                bias: 0.0,
+            }) as Arc<dyn MovableObj>,
+            Arc::new(FakeMotor {
+                name: "y".into(),
+                bias: 0.0,
+            }) as Arc<dyn MovableObj>,
+        )
+    }
+
+    fn rdr(n: &str) -> Arc<dyn ReadableObj> {
+        Arc::new(FakeReadable(n.into())) as Arc<dyn ReadableObj>
+    }
+
+    /// Drain `abs` and `rel` (the same 2-D scan, absolute vs relative with
+    /// readbacks `bx`/`by`) and assert each Set target shifts by the matching
+    /// motor's readback: x-targets by `bx`, y-targets by `by`.
+    async fn assert_xy_relative_offsets(abs: Plan, rel: Plan, bx: f64, by: f64) {
+        let abs_sets = named_set_values(&drain(abs).await);
+        let rel_sets = named_set_values(&drain(rel).await);
+        assert_eq!(abs_sets.len(), rel_sets.len(), "Set count must match");
+        assert!(!abs_sets.is_empty(), "plan produced no Set targets");
+        for ((an, av), (rn, rv)) in abs_sets.iter().zip(&rel_sets) {
+            assert_eq!(an, rn, "motor order must match");
+            let bias = if an == "x" { bx } else { by };
+            assert!(
+                (rv - (av + bias)).abs() < 1e-9,
+                "{rn}: relative {rv} != absolute {av} + bias {bias}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rel_spiral_centres_pattern_on_current_readbacks() {
+        let (axm, aym) = abs_motor_xy();
+        let abs = spiral(
+            vec![],
+            axm,
+            rdr("xr"),
+            aym,
+            rdr("yr"),
+            0.0,
+            0.0,
+            2.0,
+            2.0,
+            0.5,
+            8,
+        );
+        let (xm, ym) = motor_xy(5.0, 7.0);
+        let rel = rel_spiral(
+            vec![],
+            xm,
+            rdr("xr"),
+            ym,
+            rdr("yr"),
+            0.0,
+            0.0,
+            2.0,
+            2.0,
+            0.5,
+            8,
+        );
+        assert_xy_relative_offsets(abs, rel, 5.0, 7.0).await;
+    }
+
+    #[tokio::test]
+    async fn rel_spiral_square_centres_pattern_on_current_readbacks() {
+        let (axm, aym) = abs_motor_xy();
+        let abs = spiral_square(
+            vec![],
+            axm,
+            rdr("xr"),
+            aym,
+            rdr("yr"),
+            0.0,
+            0.0,
+            2.0,
+            2.0,
+            3,
+            3,
+        );
+        let (xm, ym) = motor_xy(5.0, 7.0);
+        let rel = rel_spiral_square(
+            vec![],
+            xm,
+            rdr("xr"),
+            ym,
+            rdr("yr"),
+            0.0,
+            0.0,
+            2.0,
+            2.0,
+            3,
+            3,
+        );
+        assert_xy_relative_offsets(abs, rel, 5.0, 7.0).await;
+    }
+
+    #[tokio::test]
+    async fn rel_spiral_fermat_centres_pattern_on_current_readbacks() {
+        let (axm, aym) = abs_motor_xy();
+        let abs = spiral_fermat(
+            vec![],
+            axm,
+            rdr("xr"),
+            aym,
+            rdr("yr"),
+            0.0,
+            0.0,
+            2.0,
+            2.0,
+            0.5,
+            1.0,
+        );
+        let (xm, ym) = motor_xy(5.0, 7.0);
+        let rel = rel_spiral_fermat(
+            vec![],
+            xm,
+            rdr("xr"),
+            ym,
+            rdr("yr"),
+            0.0,
+            0.0,
+            2.0,
+            2.0,
+            0.5,
+            1.0,
+        );
+        assert_xy_relative_offsets(abs, rel, 5.0, 7.0).await;
     }
 
     #[tokio::test]
