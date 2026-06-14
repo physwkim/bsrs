@@ -8,10 +8,12 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 const PENDING: u8 = 0;
 const SUCCESS: u8 = 1;
 const ERROR: u8 = 2;
+const CANCELLED: u8 = 3;
 
 /// Errors that a `Status` can carry.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -92,6 +94,27 @@ struct Inner {
     watcher: watch::Sender<Option<WatcherUpdate>>,
     callbacks: Mutex<Vec<StatusCallback>>,
     wakers: Mutex<Vec<Waker>>,
+    /// Signalled by [`Status::cancel`] (consumer side) so a producer running
+    /// long work can observe the request and abort. Held here, shared by every
+    /// `Status`/`StatusSetter` clone of the same operation.
+    cancel: CancellationToken,
+}
+
+impl Inner {
+    /// Drain and run completion callbacks + wakers. Shared by the three
+    /// terminal transitions (`success`, `fail`, `cancel`) so each fires exactly
+    /// the same way. Takes `&self` — the single owner is whoever won the state
+    /// CAS, which is enforced at the call sites, not here.
+    fn fire(&self, outcome: StatusOutcome) {
+        let cbs: Vec<_> = std::mem::take(&mut *self.callbacks.lock().unwrap());
+        for cb in cbs {
+            cb(&outcome);
+        }
+        let wakers: Vec<_> = std::mem::take(&mut *self.wakers.lock().unwrap());
+        for w in wakers {
+            w.wake();
+        }
+    }
 }
 
 /// Future + sync handle representing a deferred operation.
@@ -119,6 +142,7 @@ impl Status {
             watcher: wtx,
             callbacks: Mutex::new(Vec::new()),
             wakers: Mutex::new(Vec::new()),
+            cancel: CancellationToken::new(),
         });
         (
             Status {
@@ -154,13 +178,51 @@ impl Status {
         self.inner.state.load(Ordering::Acquire) == SUCCESS
     }
 
-    /// If failed, returns the error.
+    /// If failed or cancelled, returns the error (cancellation surfaces as
+    /// [`StatusError::Cancelled`]).
     pub fn exception(&self) -> Option<StatusError> {
-        if self.inner.state.load(Ordering::Acquire) == ERROR {
-            self.inner.error.lock().unwrap().clone()
-        } else {
-            None
+        match self.inner.state.load(Ordering::Acquire) {
+            ERROR | CANCELLED => self.inner.error.lock().unwrap().clone(),
+            _ => None,
         }
+    }
+
+    /// Did the operation end in cancellation? Mirrors ophyd-async
+    /// `Status.cancelled` (`_status.py:91`); a cancelled status is *not*
+    /// `success()`.
+    pub fn cancelled(&self) -> bool {
+        self.inner.state.load(Ordering::Acquire) == CANCELLED
+    }
+
+    /// Request cancellation (consumer side). Signals the producer via the
+    /// shared cancellation token so an in-flight operation (e.g. a motor move)
+    /// can abort, and transitions a still-pending status to `CANCELLED` — its
+    /// [`Future`] then resolves to `Err(StatusError::Cancelled)`.
+    ///
+    /// Idempotent and safe after completion: if the status already finished,
+    /// the token is (harmlessly) re-signalled and the terminal state is left
+    /// unchanged, so cancelling a status that just succeeded preserves the
+    /// success. This is the cirrus analogue of asyncio task cancellation that
+    /// ophyd-async drives from `async with status:` (`_status.py:113-118`).
+    pub fn cancel(&self) {
+        self.inner.cancel.cancel();
+        if self
+            .inner
+            .state
+            .compare_exchange(PENDING, CANCELLED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            *self.inner.error.lock().unwrap() = Some(StatusError::Cancelled);
+            self.inner
+                .fire(StatusOutcome::Failed(StatusError::Cancelled));
+        }
+    }
+
+    /// Wrap this status in a [`CancelGuard`] that cancels it on scope exit —
+    /// the Rust analogue of ophyd-async's `async with status:` block. The guard
+    /// holds a clone, so the original handle still observes the cancellation.
+    pub fn cancel_on_drop(&self) -> CancelGuard {
+        CancelGuard::new(self.clone())
     }
 
     /// Current progress fraction (0.0–1.0). The `Future` impl does
@@ -183,13 +245,14 @@ impl Status {
         let done = state != PENDING;
         let success = match state {
             SUCCESS => Some(true),
-            ERROR => Some(false),
+            ERROR | CANCELLED => Some(false),
             _ => None,
         };
         let exception = self.exception().map(|e| e.to_string());
         serde_json::json!({
             "done": done,
             "success": success,
+            "cancelled": state == CANCELLED,
             "exception": exception,
             "progress": self.progress(),
         })
@@ -254,7 +317,7 @@ impl StatusSetter {
             .compare_exchange(PENDING, SUCCESS, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            self.fire(StatusOutcome::Success);
+            self.inner.fire(StatusOutcome::Success);
         }
     }
 
@@ -267,8 +330,24 @@ impl StatusSetter {
             .is_ok()
         {
             *self.inner.error.lock().unwrap() = Some(err.clone());
-            self.fire(StatusOutcome::Failed(err));
+            self.inner.fire(StatusOutcome::Failed(err));
         }
+    }
+
+    /// Resolves when the consumer requests cancellation via [`Status::cancel`].
+    /// A producer running long work `select!`s on this to abort promptly and
+    /// avoid leaving the operation dangling — the cirrus equivalent of the
+    /// asyncio task cancellation ophyd-async relies on. After observing it the
+    /// producer should release the setter (dropping it, or recording
+    /// [`StatusError::Cancelled`] via [`fail`](Self::fail), which is a no-op
+    /// once [`Status::cancel`] already set the `CANCELLED` state).
+    pub async fn cancelled(&self) {
+        self.inner.cancel.cancelled().await
+    }
+
+    /// Non-blocking check for a pending cancellation request.
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.cancel.is_cancelled()
     }
 
     /// Update progress (0.0 to 1.0). Best-effort — receivers see latest value.
@@ -285,16 +364,36 @@ impl StatusSetter {
         }
         let _ = self.inner.watcher.send(Some(update));
     }
+}
 
-    fn fire(self, outcome: StatusOutcome) {
-        let cbs: Vec<_> = std::mem::take(&mut *self.inner.callbacks.lock().unwrap());
-        for cb in cbs {
-            cb(&outcome);
-        }
-        let wakers: Vec<_> = std::mem::take(&mut *self.inner.wakers.lock().unwrap());
-        for w in wakers {
-            w.wake();
-        }
+/// RAII guard that cancels its [`Status`] when dropped — the Rust analogue of
+/// ophyd-async's `async with status:` block (`_status.py:110-120`), which
+/// cancels the operation on scope exit so a loop that finishes (or errors)
+/// before the operation completes does not leave it dangling.
+///
+/// The guard holds a clone of the status, so the original handle still observes
+/// the cancellation. Because [`Status::cancel`] is idempotent and a no-op once
+/// the status has completed, dropping the guard after a successful completion
+/// preserves the success.
+pub struct CancelGuard {
+    status: Status,
+}
+
+impl CancelGuard {
+    /// Wrap a status so its [`Status::cancel`] runs when this guard drops.
+    pub fn new(status: Status) -> Self {
+        Self { status }
+    }
+
+    /// Borrow the guarded status (to await it, read progress, etc.).
+    pub fn status(&self) -> &Status {
+        &self.status
+    }
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        self.status.cancel();
     }
 }
 
@@ -303,7 +402,7 @@ impl Future for Status {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.inner.state.load(Ordering::Acquire) {
             SUCCESS => Poll::Ready(Ok(())),
-            ERROR => {
+            ERROR | CANCELLED => {
                 let err = self
                     .inner
                     .error
@@ -429,5 +528,73 @@ mod tests {
         setter.fail(StatusError::Failed("boom".into()));
         // give callback chain a chance to run on this thread (it's sync, already done)
         assert!(*flag.lock().unwrap());
+    }
+
+    // Boundary: status PENDING at cancel time → resolves Cancelled, distinct
+    // from success and from a Failed error.
+    #[tokio::test]
+    async fn cancel_pending_resolves_to_cancelled() {
+        let (s, _setter) = Status::new();
+        let waiter = tokio::spawn(s.clone());
+        s.cancel();
+        let out = waiter.await.unwrap();
+        assert!(matches!(out, Err(StatusError::Cancelled)));
+        assert!(s.cancelled());
+        assert!(!s.success());
+        assert!(matches!(s.exception(), Some(StatusError::Cancelled)));
+        let v = s.inspect();
+        assert_eq!(v["done"], true);
+        assert_eq!(v["success"], false);
+        assert_eq!(v["cancelled"], true);
+        assert_eq!(v["exception"].as_str(), Some("cancelled"));
+    }
+
+    // Boundary: status already SUCCESS at cancel time → cancel is a no-op;
+    // the success outcome is preserved (matches `async with` exit after done).
+    #[tokio::test]
+    async fn cancel_after_success_is_noop() {
+        let (s, setter) = Status::new();
+        setter.success();
+        s.cancel();
+        assert!(s.success());
+        assert!(!s.cancelled());
+        assert!(s.exception().is_none());
+        assert!(s.clone().await.is_ok());
+    }
+
+    // Boundary: the producer observes the cancellation request through the
+    // shared token, so an in-flight operation can abort (the headline use case).
+    #[tokio::test]
+    async fn cancel_signals_producer_token() {
+        let (s, setter) = Status::new();
+        assert!(!setter.is_cancelled());
+        let producer = tokio::spawn(async move {
+            // Aborts as soon as cancellation is requested.
+            setter.cancelled().await;
+            setter.is_cancelled()
+        });
+        s.cancel();
+        assert!(producer.await.unwrap(), "producer saw the cancel request");
+    }
+
+    // Boundary: guard dropped while PENDING → cancels; guard dropped after
+    // SUCCESS → preserves success.
+    #[tokio::test]
+    async fn cancel_guard_cancels_on_drop_only_while_pending() {
+        // Pending → drop cancels.
+        let (s, _setter) = Status::new();
+        {
+            let g = s.cancel_on_drop();
+            assert!(!g.status().done_state());
+        }
+        assert!(s.cancelled());
+        assert!(matches!(s.clone().await, Err(StatusError::Cancelled)));
+
+        // Already succeeded → drop is a no-op.
+        let (s2, setter2) = Status::new();
+        setter2.success();
+        drop(s2.cancel_on_drop());
+        assert!(s2.success());
+        assert!(!s2.cancelled());
     }
 }
