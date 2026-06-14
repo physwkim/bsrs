@@ -144,38 +144,28 @@ impl RunBundle {
         }
     }
 
-    /// Compose a `StreamResource` for a fly-style data path.
+    /// Compose a `StreamResource` for a fly-style data path, returning a
+    /// [`StreamResourceComposer`] that mints `StreamDatum`s into it. Mirrors
+    /// `ComposeStreamResource`/`ComposeStreamResourceBundle`: the composer owns
+    /// the resource doc and a monotone counter, so each `StreamDatum.uid` is
+    /// `<stream_resource_uid>/<n>` by construction.
     pub fn stream_resource(
         &self,
         data_key: String,
         mimetype: String,
         uri: String,
         parameters: HashMap<String, Value>,
-    ) -> StreamResource {
-        StreamResource {
-            uid: new_uid(),
-            data_key,
-            mimetype,
-            uri,
-            parameters,
-            run_start: Some(self.start_uid.clone()),
-        }
-    }
-
-    /// Compose a `StreamDatum` for a previously-emitted `StreamResource`.
-    pub fn stream_datum(
-        &self,
-        stream_resource_uid: String,
-        descriptor_uid: String,
-        indices: StreamRange,
-        seq_nums: StreamRange,
-    ) -> StreamDatum {
-        StreamDatum {
-            uid: new_uid(),
-            stream_resource: stream_resource_uid,
-            descriptor: descriptor_uid,
-            indices,
-            seq_nums,
+    ) -> StreamResourceComposer {
+        StreamResourceComposer {
+            stream_resource: StreamResource {
+                uid: new_uid(),
+                data_key,
+                mimetype,
+                uri,
+                parameters,
+                run_start: Some(self.start_uid.clone()),
+            },
+            counter: AtomicU64::new(0),
         }
     }
 
@@ -258,6 +248,43 @@ impl ResourceComposer {
             datum_id,
             resource: self.resource.uid.clone(),
             datum_kwargs,
+        }
+    }
+}
+
+/// Mints `StreamDatum` documents for one `StreamResource`, returned by
+/// [`RunBundle::stream_resource`]. Holds the composed `StreamResource` and a
+/// monotone counter (`<stream_resource_uid>/<n>`), mirroring the Python
+/// `ComposeStreamResourceBundle` / `ComposeStreamDatum`.
+#[derive(Debug)]
+pub struct StreamResourceComposer {
+    stream_resource: StreamResource,
+    counter: AtomicU64,
+}
+
+impl StreamResourceComposer {
+    /// The `StreamResource` document to emit before any datum it owns.
+    pub fn stream_resource(&self) -> &StreamResource {
+        &self.stream_resource
+    }
+
+    /// Compose the next `StreamDatum` pointing into this stream resource. The
+    /// `uid` is `<stream_resource_uid>/<counter>` (mirrors event_model
+    /// `ComposeStreamDatum`, and the legacy `Datum.datum_id` form) — NOT a fresh
+    /// random uid — so chunks are identifiable and ordered within the resource.
+    pub fn stream_datum(
+        &self,
+        indices: StreamRange,
+        seq_nums: StreamRange,
+        descriptor_uid: String,
+    ) -> StreamDatum {
+        let i = self.counter.fetch_add(1, Ordering::SeqCst);
+        StreamDatum {
+            uid: format!("{}/{}", self.stream_resource.uid, i),
+            stream_resource: self.stream_resource.uid.clone(),
+            descriptor: descriptor_uid,
+            indices,
+            seq_nums,
         }
     }
 }
@@ -401,5 +428,73 @@ mod tests {
                 format!("{res_uid}/4"),
             ]
         );
+    }
+
+    // Parity with event_model ComposeStreamDatum: StreamDatum.uid is
+    // `<stream_resource_uid>/<counter>`, not a fresh random uid, and the
+    // indices/seq_nums/descriptor pass through verbatim.
+    #[test]
+    fn stream_resource_composer_mints_resource_scoped_stream_datum_uids() {
+        let start = RunBundle::start(Some(1), None);
+        let bundle = RunBundle::open(&start);
+        let src = bundle.stream_resource(
+            "img".to_string(),
+            "application/x-hdf5".to_string(),
+            "file:///data/scan.h5".to_string(),
+            HashMap::new(),
+        );
+        assert_eq!(
+            src.stream_resource().run_start.as_deref(),
+            Some(start.uid.as_str())
+        );
+        let sr_uid = src.stream_resource().uid.clone();
+
+        let sd0 = src.stream_datum(
+            StreamRange { start: 0, stop: 5 },
+            StreamRange { start: 1, stop: 6 },
+            "desc-uid".to_string(),
+        );
+        let sd1 = src.stream_datum(
+            StreamRange { start: 5, stop: 9 },
+            StreamRange { start: 6, stop: 10 },
+            "desc-uid".to_string(),
+        );
+        assert_eq!(sd0.uid, format!("{sr_uid}/0"), "counter-based, not random");
+        assert_eq!(sd1.uid, format!("{sr_uid}/1"));
+        assert_eq!(sd0.stream_resource, sr_uid);
+        assert_eq!(sd1.stream_resource, sr_uid);
+        // Args thread through unchanged.
+        assert_eq!(sd0.indices, StreamRange { start: 0, stop: 5 });
+        assert_eq!(sd1.seq_nums, StreamRange { start: 6, stop: 10 });
+        assert_eq!(sd0.descriptor, "desc-uid");
+    }
+
+    #[test]
+    fn distinct_stream_resources_have_independent_datum_counters() {
+        let start = RunBundle::start(Some(1), None);
+        let bundle = RunBundle::open(&start);
+        let a = bundle.stream_resource(
+            "a".into(),
+            "application/octet-stream".into(),
+            "file:///a".into(),
+            HashMap::new(),
+        );
+        let b = bundle.stream_resource(
+            "b".into(),
+            "application/octet-stream".into(),
+            "file:///b".into(),
+            HashMap::new(),
+        );
+        let r = StreamRange { start: 0, stop: 1 };
+        // Each resource's counter starts at 0 independently.
+        assert_eq!(
+            a.stream_datum(r, r, "d".into()).uid,
+            format!("{}/0", a.stream_resource().uid)
+        );
+        assert_eq!(
+            b.stream_datum(r, r, "d".into()).uid,
+            format!("{}/0", b.stream_resource().uid)
+        );
+        assert_ne!(a.stream_resource().uid, b.stream_resource().uid);
     }
 }
