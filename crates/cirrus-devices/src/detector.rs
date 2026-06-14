@@ -77,8 +77,15 @@ where
         &self.name
     }
     async fn stage(&self) -> Result<()> {
-        // Open writer with multiplier=1 by default; plans can call configure()
-        // to change this.
+        // A detector left armed by a previous (possibly aborted) scan must be
+        // returned to idle before a new scan begins, or it can free-run into
+        // the next acquisition. Mirrors ophyd-async `StandardDetector.stage()`
+        // calling `_disarm_and_stop(on_unstage=False)`.
+        self.control.disarm().await?;
+        // Ready the writer for this scan with multiplier=1 by default; plans
+        // can call configure() to change this. (Relocating this open() into
+        // prepare() so describe no longer relies on a stage side-effect is
+        // tracked under DB-04.)
         self.writer.open(1).await?;
         Ok(())
     }
@@ -305,5 +312,114 @@ where
     }
     fn hint_fields(&self) -> Option<Vec<String>> {
         Some(vec![format!("{}_index", self.name)])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::stream;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::watch;
+
+    /// Counts how many times `disarm()` fired so a test can assert that
+    /// `stage()` returns the detector to idle (DB-03).
+    struct RecordingControl {
+        disarms: Arc<AtomicU64>,
+    }
+
+    #[async_trait]
+    impl DetectorControl for RecordingControl {
+        fn deadtime(&self, _exposure: Option<Duration>) -> Duration {
+            Duration::ZERO
+        }
+        async fn prepare(&self, _info: TriggerInfo) -> Result<()> {
+            Ok(())
+        }
+        async fn arm(&self) -> Status {
+            Status::done()
+        }
+        async fn wait_for_idle(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn disarm(&self) -> Result<()> {
+            self.disarms.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// Minimal writer that counts `open()` calls.
+    struct CountingWriter {
+        opens: Arc<AtomicU64>,
+        rx: watch::Receiver<u64>,
+    }
+
+    #[async_trait]
+    impl DetectorWriter for CountingWriter {
+        async fn open(&self, _multiplier: u32) -> Result<HashMap<String, DataKey>> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            Ok(HashMap::new())
+        }
+        fn observe_indices_written(&self) -> watch::Receiver<u64> {
+            self.rx.clone()
+        }
+        async fn indices_written(&self) -> u64 {
+            0
+        }
+        fn collect_stream_docs(
+            &self,
+            _up_to: u64,
+            _descriptor: &str,
+        ) -> BoxStream<'_, StreamAsset> {
+            stream::iter(Vec::new()).boxed()
+        }
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn detector() -> (
+        StandardDetector<RecordingControl, CountingWriter>,
+        Arc<AtomicU64>,
+        Arc<AtomicU64>,
+    ) {
+        let disarms = Arc::new(AtomicU64::new(0));
+        let opens = Arc::new(AtomicU64::new(0));
+        // The receiver keeps serving its last value after the sender drops;
+        // this test never observes index changes, so the tx is discarded.
+        let (_, rx) = watch::channel(0u64);
+        let control = RecordingControl {
+            disarms: disarms.clone(),
+        };
+        let writer = CountingWriter {
+            opens: opens.clone(),
+            rx,
+        };
+        (
+            StandardDetector::new("det", control, writer),
+            disarms,
+            opens,
+        )
+    }
+
+    #[tokio::test]
+    async fn stage_disarms_before_readying_writer() {
+        // DB-03: a detector left armed by a previous scan must be disarmed at
+        // stage time. Before the fix `stage()` never called `disarm()`, so a
+        // detector armed by a prior (aborted) scan free-ran into the next one.
+        let (det, disarms, opens) = detector();
+        Stageable::stage(&det).await.unwrap();
+        assert_eq!(
+            disarms.load(Ordering::SeqCst),
+            1,
+            "stage() must disarm exactly once"
+        );
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            1,
+            "stage() still readies the writer"
+        );
     }
 }
