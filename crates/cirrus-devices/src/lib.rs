@@ -9,7 +9,10 @@ pub mod signal;
 
 pub use detector::{StandardDetector, TriggerInfo};
 pub use observe::{observe_value, wait_for_value};
-pub use signal::{Signal, SignalConfig, SignalKind};
+pub use signal::{
+    Access, Read, ReadWrite, Readable, Signal, SignalConfig, SignalKind, SignalR, SignalRW,
+    SignalW, Writable, Write,
+};
 
 /// Re-export of the `#[derive(Device)]` proc-macro.
 pub use cirrus_derive::Device;
@@ -25,7 +28,7 @@ pub trait BackendFromPv: Sized {
 /// the public API — name and shape may change.
 #[doc(hidden)]
 pub mod __derive {
-    use super::{BackendFromPv, Signal};
+    use super::{Access, BackendFromPv, Signal};
     use cirrus_core::error::Result;
     use cirrus_protocols_async::SignalBackend;
     use std::future::Future;
@@ -44,13 +47,14 @@ pub mod __derive {
 
     /// Connect a Signal — used by generated `connect_all` to homogenize
     /// future types so they can be `try_join`'d.
-    pub fn connect_signal<'a, T, B>(
-        sig: &'a Signal<T, B>,
+    pub fn connect_signal<'a, T, B, A>(
+        sig: &'a Signal<T, B, A>,
         timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>
     where
         T: Clone + Send + Sync + serde::Serialize + 'static,
         B: SignalBackend<T> + 'static,
+        A: Access + 'static,
     {
         Box::pin(sig.connect(timeout))
     }

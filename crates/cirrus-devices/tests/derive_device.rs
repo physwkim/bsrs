@@ -5,17 +5,17 @@ use std::time::Duration;
 
 use cirrus_backend_soft::SoftSignalBackend;
 use cirrus_core::Kind;
-use cirrus_devices::{Device, Signal};
+use cirrus_devices::{Device, SignalR, SignalRW};
 
 #[derive(Device)]
 struct Motor {
     name: String,
     #[signal(rw, "{prefix}.VAL")]
-    setpoint: Signal<f64, SoftSignalBackend<f64>>,
+    setpoint: SignalRW<f64, SoftSignalBackend<f64>>,
     #[signal(ro, "{prefix}.RBV", kind = hinted)]
-    readback: Signal<f64, SoftSignalBackend<f64>>,
+    readback: SignalR<f64, SoftSignalBackend<f64>>,
     #[signal(rw, "{prefix}.VELO", kind = config)]
-    velocity: Signal<f64, SoftSignalBackend<f64>>,
+    velocity: SignalRW<f64, SoftSignalBackend<f64>>,
 }
 
 #[derive(Device)]
@@ -37,6 +37,13 @@ async fn motor_derive_builds_and_connects() {
     assert_eq!(m.setpoint.kind(), Kind::Normal);
     assert_eq!(m.readback.kind(), Kind::Hinted);
     assert_eq!(m.velocity.kind(), Kind::Config);
+
+    // Access roles are enforced at the type level: the RW setpoint can be
+    // put and read back, the RO readback can be read. (`m.readback.put(..)`
+    // or `m.setpoint`-less access would not compile.)
+    m.setpoint.put(1.5).await.await.unwrap();
+    assert_eq!(m.setpoint.get().await.unwrap(), 1.5);
+    let _ = m.readback.get().await.unwrap();
 }
 
 #[tokio::test]
