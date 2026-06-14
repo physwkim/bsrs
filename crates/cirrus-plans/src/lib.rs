@@ -122,6 +122,32 @@ pub mod stubs {
         })
     }
 
+    /// `rel_set(motor, value, group)` — set relative to the motor's current
+    /// readback, WITHOUT waiting (bluesky `plan_stubs.rel_set`, default
+    /// `wait=False`). Reads the readback via `LocatableObj::locate_dyn`, adds
+    /// `value`, and yields a single `Msg::Set` to that absolute target under
+    /// the caller's `group`.
+    ///
+    /// Differs from `mvr` only by omitting the trailing `Msg::Wait`. Like
+    /// `mvr` — and unlike bluesky's `relative_set_wrapper` composition, which
+    /// would silently fall back to a zero offset — a `locate_dyn` failure
+    /// fails the run via `Msg::Fail` rather than degrading a single explicit
+    /// set into an absolute move.
+    pub fn rel_set(motor: Arc<dyn LocatableObj>, value: f64, group: Option<String>) -> Plan {
+        plan_box(async_stream::stream! {
+            let loc = match motor.locate_dyn().await {
+                Ok(l) => l,
+                Err(e) => {
+                    yield Msg::Fail(format!("rel_set({}): locate_dyn failed: {e}", motor.name()));
+                    return;
+                }
+            };
+            let target = loc.readback + value;
+            let movable: Arc<dyn MovableObj> = motor;
+            yield Msg::Set { obj: movable, value: target, group };
+        })
+    }
+
     /// `trigger(obj, group)`.
     pub fn trigger(obj: Arc<dyn TriggerableObj>, group: Option<String>) -> Plan {
         plan_box(async_stream::stream! {
@@ -1673,6 +1699,29 @@ mod tests {
             assert_eq!(gn, en, "motor order");
             assert!((gv - ev).abs() < 1e-9, "{gn}: {gv} != {ev}");
         }
+    }
+
+    #[tokio::test]
+    async fn rel_set_offsets_by_readback_and_does_not_wait() {
+        let motor = Arc::new(FakeMotor {
+            name: "m".into(),
+            bias: 100.0,
+        }) as Arc<dyn cirrus_core::msg::LocatableObj>;
+        let msgs = drain(stubs::rel_set(motor, 5.0, Some("g".into()))).await;
+        // Exactly one Set, offset by the readback (100 + 5), no trailing Wait.
+        assert_eq!(msgs.len(), 1, "expected a single Set, got {msgs:?}");
+        match &msgs[0] {
+            Msg::Set { obj, value, group } => {
+                assert_eq!(obj.name(), "m");
+                assert!((value - 105.0).abs() < 1e-9, "target {value} != 105");
+                assert_eq!(group.as_deref(), Some("g"));
+            }
+            other => panic!("expected Msg::Set, got {other:?}"),
+        }
+        assert!(
+            !msgs.iter().any(|m| matches!(m, Msg::Wait { .. })),
+            "rel_set must not emit Wait (unlike mvr)"
+        );
     }
 
     #[tokio::test]
