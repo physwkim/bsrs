@@ -226,8 +226,8 @@ pub struct Event {
 /// Page-form Event (multiple rows in one document).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct EventPage {
-    /// UID for this page.
-    pub uid: String,
+    /// UID for each row in this page (one per event).
+    pub uid: Vec<String>,
     /// Descriptor UID.
     pub descriptor: String,
     /// Times for each event.
