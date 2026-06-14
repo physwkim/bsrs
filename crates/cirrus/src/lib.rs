@@ -15,9 +15,9 @@ pub mod ophyd {
     pub use cirrus_plans::*;
     pub use cirrus_protocols_async::{
         AsyncConfigurable, AsyncMovable, AsyncReadable, AsyncSubscribable, Collectable,
-        DetectorControl, DetectorWriter, Flyable, Frame, FrameSink, FrameSource, Locatable,
-        Pausable, Preparable, SignalBackend, Stageable, Stoppable, StreamAsset, TriggerInfo,
-        Triggerable, WritesStreamAssets,
+        DetectorControl, DetectorWriter, FlyMotorInfo, Flyable, Frame, FrameSink, FrameSource,
+        Locatable, Pausable, Preparable, SignalBackend, Stageable, Stoppable, StreamAsset,
+        TriggerInfo, Triggerable, WritesStreamAssets,
     };
     pub use cirrus_protocols_sync::{
         Configurable, FlyableSync, Movable, Readable, StageableSync, TriggerableSync,

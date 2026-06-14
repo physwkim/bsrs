@@ -292,6 +292,57 @@ impl TriggerInfo {
     }
 }
 
+/// Minimal set of information required to fly a motor. Direct port of
+/// `ophyd_async/core/_flyer.py` `FlyMotorInfo`.
+///
+/// The constant-velocity phase runs from `start_position` to `end_position` in
+/// `time_for_move` seconds; [`velocity`](Self::velocity) is therefore derived,
+/// not stored. [`ramp_up_start_pos`](Self::ramp_up_start_pos) /
+/// [`ramp_down_end_pos`](Self::ramp_down_end_pos) extend each end by the run-up
+/// / run-down distance so the motor is already at constant velocity when it
+/// crosses `start_position` and only decelerates after `end_position`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FlyMotorInfo {
+    /// Absolute position of the motor once it finishes accelerating to the
+    /// desired velocity, in motor EGUs.
+    pub start_position: f64,
+    /// Absolute position of the motor once it begins decelerating from the
+    /// desired velocity, in motor EGUs.
+    pub end_position: f64,
+    /// Time taken to get from `start_position` to `end_position`, excluding
+    /// run-up and run-down, in seconds. Must be `> 0`.
+    pub time_for_move: f64,
+    /// Maximum time for the complete move, including run up and run down.
+    /// `None` mirrors ophyd-async's `CALCULATE_TIMEOUT` sentinel — the motor
+    /// derives it (`time_for_move` + run-up + run-down + a default) at prepare
+    /// time — matching how [`TriggerInfo::exposure_timeout`] treats `None`.
+    pub timeout: Option<Duration>,
+}
+
+impl FlyMotorInfo {
+    /// Signed velocity of the constant-velocity phase:
+    /// `(end_position - start_position) / time_for_move`. Negative when the move
+    /// runs from a higher to a lower position.
+    pub fn velocity(&self) -> f64 {
+        (self.end_position - self.start_position) / self.time_for_move
+    }
+
+    /// `start_position` with run-up distance added on, so the motor reaches
+    /// `start_position` already at constant velocity:
+    /// `start_position - acceleration_time * velocity / 2`. The `velocity` sign
+    /// places the run-up on the correct side for either move direction.
+    pub fn ramp_up_start_pos(&self, acceleration_time: Duration) -> f64 {
+        self.start_position - acceleration_time.as_secs_f64() * self.velocity() / 2.0
+    }
+
+    /// `end_position` with run-down distance added on, so the motor only begins
+    /// decelerating after `end_position`:
+    /// `end_position + acceleration_time * velocity / 2`.
+    pub fn ramp_down_end_pos(&self, acceleration_time: Duration) -> f64 {
+        self.end_position + acceleration_time.as_secs_f64() * self.velocity() / 2.0
+    }
+}
+
 /// Sealed: detector writer half (open / observe / collect_stream_docs / close).
 #[async_trait]
 pub trait DetectorWriter: Send + Sync {
@@ -382,5 +433,55 @@ mod tests {
         assert_eq!(info.trigger, DetectorTrigger::Internal);
         assert_eq!(info.number_of_collections(), 1);
         assert_eq!(info.number_of_exposures(), 1);
+    }
+
+    // FlyMotorInfo boundaries: velocity is signed by move direction, and the
+    // run-up/run-down extensions land on the correct side for either sign.
+
+    #[test]
+    fn fly_motor_velocity_is_signed_distance_over_time() {
+        // 0 -> 10 in 2s => +5 EGU/s; reverse => -5 EGU/s.
+        let fwd = FlyMotorInfo {
+            start_position: 0.0,
+            end_position: 10.0,
+            time_for_move: 2.0,
+            timeout: None,
+        };
+        let rev = FlyMotorInfo {
+            start_position: 10.0,
+            end_position: 0.0,
+            time_for_move: 2.0,
+            timeout: None,
+        };
+        assert_eq!(fwd.velocity(), 5.0);
+        assert_eq!(rev.velocity(), -5.0);
+    }
+
+    #[test]
+    fn fly_motor_ramp_extends_each_end_forward() {
+        // accel 1s, v = 5 => run-up/run-down distance = 1 * 5 / 2 = 2.5.
+        let info = FlyMotorInfo {
+            start_position: 0.0,
+            end_position: 10.0,
+            time_for_move: 2.0,
+            timeout: None,
+        };
+        let t = Duration::from_secs(1);
+        assert_eq!(info.ramp_up_start_pos(t), -2.5); // before start_position
+        assert_eq!(info.ramp_down_end_pos(t), 12.5); // past end_position
+    }
+
+    #[test]
+    fn fly_motor_ramp_follows_velocity_sign_reverse() {
+        // 10 -> 0, v = -5: run-up sits at the HIGHER position, run-down LOWER.
+        let info = FlyMotorInfo {
+            start_position: 10.0,
+            end_position: 0.0,
+            time_for_move: 2.0,
+            timeout: None,
+        };
+        let t = Duration::from_secs(1);
+        assert_eq!(info.ramp_up_start_pos(t), 12.5); // 10 - 1*(-5)/2
+        assert_eq!(info.ramp_down_end_pos(t), -2.5); // 0 + 1*(-5)/2
     }
 }
