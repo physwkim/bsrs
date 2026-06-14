@@ -3,7 +3,8 @@
 //!
 //! Mirrors `event_model.pack_event_page` / `unpack_event_page` /
 //! `pack_datum_page` / `unpack_datum_page` / `merge_event_pages` /
-//! `rechunk_event_pages` (`__init__.py:2620-2862`).
+//! `rechunk_event_pages` / `merge_datum_pages` / `rechunk_datum_pages`
+//! (`__init__.py:2620-2920`).
 //! Packing transposes a list of row documents into one column-store page;
 //! unpacking reverses it; merging concatenates several pages into one;
 //! rechunking re-batches pages to a uniform size. As in the reference, only
@@ -233,6 +234,70 @@ pub fn rechunk_event_pages(pages: &[EventPage], chunk_size: usize) -> Vec<EventP
     out
 }
 
+/// Combine a slice of `DatumPage`s into one, concatenating every column.
+///
+/// Mirrors `event_model.merge_datum_pages`. The first page's `resource` UID
+/// labels the result. `datum_kwargs` keys are unioned across all pages (like
+/// [`pack_datum_page`], rather than the reference's first-page-only key set)
+/// and each page's values are appended in order; a page missing a key
+/// contributes no rows to that column. Returns an empty page if `pages` is
+/// empty, and the sole page (cloned) when there is exactly one.
+pub fn merge_datum_pages(pages: &[DatumPage]) -> DatumPage {
+    if pages.len() == 1 {
+        return pages[0].clone();
+    }
+    let resource = pages
+        .first()
+        .map(|p| p.resource.clone())
+        .unwrap_or_default();
+    let total: usize = pages.iter().map(|p| p.datum_id.len()).sum();
+    let mut datum_id = Vec::with_capacity(total);
+    let mut datum_kwargs: HashMap<String, Vec<Value>> = HashMap::new();
+    for p in pages {
+        datum_id.extend(p.datum_id.iter().cloned());
+        for (k, col) in &p.datum_kwargs {
+            datum_kwargs
+                .entry(k.clone())
+                .or_default()
+                .extend(col.iter().cloned());
+        }
+    }
+    DatumPage {
+        datum_id,
+        resource,
+        datum_kwargs,
+    }
+}
+
+/// Re-batch a slice of `DatumPage`s into pages of exactly `chunk_size` rows
+/// (the final page holds the remainder).
+///
+/// Mirrors `event_model.rechunk_datum_pages`. For a well-formed page stream
+/// (all pages share a resource) this is "concatenate every datum in order,
+/// then re-split into `chunk_size`-row pages" — equivalent to the reference's
+/// streaming merge, built here on [`merge_datum_pages`]. The merged `resource`
+/// labels every output page. Returns an empty `Vec` for empty input or
+/// `chunk_size == 0` (which cannot define a chunking).
+pub fn rechunk_datum_pages(pages: &[DatumPage], chunk_size: usize) -> Vec<DatumPage> {
+    if chunk_size == 0 {
+        return Vec::new();
+    }
+    let merged = merge_datum_pages(pages);
+    let n = merged.datum_id.len();
+    let mut out = Vec::with_capacity(n.div_ceil(chunk_size));
+    let mut start = 0;
+    while start < n {
+        let stop = (start + chunk_size).min(n);
+        out.push(DatumPage {
+            datum_id: merged.datum_id[start..stop].to_vec(),
+            resource: merged.resource.clone(),
+            datum_kwargs: slice_cols(&merged.datum_kwargs, start, stop),
+        });
+        start = stop;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,6 +455,107 @@ mod tests {
         );
         assert!(
             rechunk_event_pages(&[], 2).is_empty(),
+            "no input → no pages"
+        );
+    }
+
+    fn datum(id: &str, i: i64) -> Datum {
+        Datum {
+            datum_id: id.into(),
+            resource: "r".into(),
+            datum_kwargs: HashMap::from([("i".into(), json!(i))]),
+        }
+    }
+
+    #[test]
+    fn merge_datum_pages_concatenates_columns_and_keeps_first_resource() {
+        let p1 = pack_datum_page(&[datum("r/1", 1), datum("r/2", 2)]);
+        let mut p2 = pack_datum_page(&[datum("r/3", 3)]);
+        // A differing resource on a later page must not win.
+        p2.resource = "r2".into();
+        let merged = merge_datum_pages(&[p1, p2]);
+        assert_eq!(merged.datum_id, vec!["r/1", "r/2", "r/3"]);
+        assert_eq!(
+            merged.datum_kwargs["i"],
+            vec![json!(1), json!(2), json!(3)],
+            "datum_kwargs column concatenated in page order"
+        );
+        assert_eq!(
+            merged.resource, "r",
+            "first page's resource labels the merge"
+        );
+        // The merged page unpacks back to the three original datums.
+        let back = unpack_datum_page(&merged);
+        assert_eq!(
+            back,
+            vec![datum("r/1", 1), datum("r/2", 2), datum("r/3", 3)]
+        );
+    }
+
+    #[test]
+    fn merge_datum_pages_single_returns_that_page() {
+        let p1 = pack_datum_page(&[datum("r/1", 1)]);
+        assert_eq!(merge_datum_pages(std::slice::from_ref(&p1)), p1);
+    }
+
+    #[test]
+    fn merge_datum_pages_empty_is_safe() {
+        let merged = merge_datum_pages(&[]);
+        assert!(merged.datum_id.is_empty());
+        assert_eq!(merged.resource, "");
+        assert!(unpack_datum_page(&merged).is_empty());
+    }
+
+    #[test]
+    fn rechunk_datum_pages_splits_uniformly_across_page_boundaries() {
+        // 3 + 2 = 5 datums, rechunk to 2 → pages of [2, 2, 1]; the middle chunk
+        // straddles the input page boundary (r/3 from page A, r/4 from page B).
+        let a = pack_datum_page(&[datum("r/1", 1), datum("r/2", 2), datum("r/3", 3)]);
+        let b = pack_datum_page(&[datum("r/4", 4), datum("r/5", 5)]);
+        let chunks = rechunk_datum_pages(&[a, b], 2);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].datum_id, vec!["r/1", "r/2"]);
+        assert_eq!(
+            chunks[1].datum_id,
+            vec!["r/3", "r/4"],
+            "chunk straddles the page boundary"
+        );
+        assert_eq!(chunks[1].datum_kwargs["i"], vec![json!(3), json!(4)]);
+        assert_eq!(chunks[2].datum_id, vec!["r/5"]);
+        for c in &chunks {
+            assert_eq!(c.resource, "r");
+        }
+        // Datums survive the round-trip in order.
+        let all: Vec<Datum> = chunks.iter().flat_map(unpack_datum_page).collect();
+        assert_eq!(
+            all,
+            vec![
+                datum("r/1", 1),
+                datum("r/2", 2),
+                datum("r/3", 3),
+                datum("r/4", 4),
+                datum("r/5", 5),
+            ]
+        );
+    }
+
+    #[test]
+    fn rechunk_datum_pages_chunk_larger_than_total_is_one_page() {
+        let p = pack_datum_page(&[datum("r/1", 1), datum("r/2", 2)]);
+        let chunks = rechunk_datum_pages(&[p], 10);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].datum_id, vec!["r/1", "r/2"]);
+    }
+
+    #[test]
+    fn rechunk_datum_pages_zero_chunk_and_empty_input_yield_nothing() {
+        let p = pack_datum_page(&[datum("r/1", 1)]);
+        assert!(
+            rechunk_datum_pages(std::slice::from_ref(&p), 0).is_empty(),
+            "chunk_size 0 cannot define a chunking"
+        );
+        assert!(
+            rechunk_datum_pages(&[], 2).is_empty(),
             "no input → no pages"
         );
     }

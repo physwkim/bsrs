@@ -17,8 +17,8 @@ pub use documents::{
     Reading, Resource, RunStart, RunStop, SignalMetadata, StreamDatum, StreamRange, StreamResource,
 };
 pub use page::{
-    merge_event_pages, pack_datum_page, pack_event_page, rechunk_event_pages, unpack_datum_page,
-    unpack_event_page,
+    merge_datum_pages, merge_event_pages, pack_datum_page, pack_event_page, rechunk_datum_pages,
+    rechunk_event_pages, unpack_datum_page, unpack_event_page,
 };
 
 /// Errors when composing or routing documents.
