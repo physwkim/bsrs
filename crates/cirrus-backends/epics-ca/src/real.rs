@@ -343,6 +343,40 @@ fn epics_to_f64(v: &EpicsValue) -> Option<f64> {
     }
 }
 
+/// Decode a numeric waveform `EpicsValue` array into `Vec<f64>`, widening every
+/// element type the way [`epics_to_f64`] does for scalars. `CharArray` /
+/// `EnumArray` / `StringArray` are intentionally excluded: they carry the
+/// long-string and enum-choice meanings owned by the `String` / enum backends,
+/// not numeric waveform data.
+fn epics_to_vec_f64(v: &EpicsValue) -> Option<Vec<f64>> {
+    match v {
+        EpicsValue::DoubleArray(a) => Some(a.clone()),
+        EpicsValue::FloatArray(a) => Some(a.iter().map(|x| *x as f64).collect()),
+        EpicsValue::LongArray(a) => Some(a.iter().map(|x| *x as f64).collect()),
+        EpicsValue::ShortArray(a) => Some(a.iter().map(|x| *x as f64).collect()),
+        EpicsValue::Int64Array(a) => Some(a.iter().map(|x| *x as f64).collect()),
+        _ => None,
+    }
+}
+
+/// Encode a `Vec<f64>` waveform payload as the array `EpicsValue` variant that
+/// matches the channel's `native_type`, mirroring [`f64_to_wire`] for arrays
+/// (`CaChannel::put` writes with `native_type`, so a width mismatch corrupts
+/// the wire payload). A `String`-native channel has no numeric-array form, so
+/// the closest `DoubleArray` is used — a `Vec<f64>` backend on a DBR_STRING PV
+/// is a misuse the type system can't forbid here.
+fn f64s_to_wire(t: DbFieldType, v: Vec<f64>) -> EpicsValue {
+    match t {
+        DbFieldType::Double | DbFieldType::String => EpicsValue::DoubleArray(v),
+        DbFieldType::Float => EpicsValue::FloatArray(v.iter().map(|x| *x as f32).collect()),
+        DbFieldType::Long => EpicsValue::LongArray(v.iter().map(|x| *x as i32).collect()),
+        DbFieldType::Int64 => EpicsValue::Int64Array(v.iter().map(|x| *x as i64).collect()),
+        DbFieldType::Short => EpicsValue::ShortArray(v.iter().map(|x| *x as i16).collect()),
+        DbFieldType::Char => EpicsValue::CharArray(v.iter().map(|x| *x as u8).collect()),
+        DbFieldType::Enum => EpicsValue::EnumArray(v.iter().map(|x| *x as u16).collect()),
+    }
+}
+
 fn epics_to_i64(v: &EpicsValue) -> Option<i64> {
     match v {
         EpicsValue::Int64(i) => Some(*i),
@@ -487,6 +521,105 @@ impl SignalBackend<f64> for EpicsCaBackend<f64> {
                         .map(|d| d.as_secs_f64())
                         .unwrap_or_default();
                     cb(&f, ts);
+                }
+            }
+        });
+        let abort = handle.abort_handle();
+        SubToken::new(move || abort.abort())
+    }
+    fn source(&self, name: &str) -> String {
+        format!("ca://{name}")
+    }
+}
+
+#[async_trait]
+impl SignalBackend<Vec<f64>> for EpicsCaBackend<Vec<f64>> {
+    async fn connect(&self, timeout: Duration) -> Result<()> {
+        self.ensure_channel(timeout).await.map(|_| ())
+    }
+    async fn put(&self, value: Option<Vec<f64>>) -> Result<()> {
+        let value = value.unwrap_or_default();
+        let ch = self
+            .ensure_channel(Duration::from_secs(2))
+            .await
+            .map_err(|e| CirrusError::Backend(format!("{e}")))?;
+        let native = channel_native_type(&ch)
+            .await
+            .map_err(|e| CirrusError::Backend(format!("{e}")))?;
+        let v = f64s_to_wire(native, value);
+        ch.put(&v)
+            .await
+            .map_err(|e| CirrusError::Backend(format!("ca put: {e}")))
+    }
+    async fn get_datakey(&self, source: &str) -> Result<DataKey> {
+        let ch = self.ensure_channel(Duration::from_secs(2)).await?;
+        let info = ch
+            .info()
+            .await
+            .map_err(|e| CirrusError::Backend(format!("ca info: {e}")))?;
+        // A waveform's `element_count` is its NELM (max capacity) → 1-D shape.
+        // Float-element waveforms carry units/precision/limits like scalars.
+        let meta = ctrl_metadata(&ch, true, true).await?;
+        Ok(make_datakey(
+            format!("ca://{source}"),
+            Dtype::Number,
+            vec![Some(info.element_count as u64)],
+            Some("<f8".into()),
+            meta,
+        ))
+    }
+    async fn get_reading(&self) -> Result<ReadingValue> {
+        let ch = self.ensure_channel(Duration::from_secs(2)).await?;
+        let snap = ch
+            .get_with_metadata(DbrClass::Sts)
+            .await
+            .map_err(|e| CirrusError::Backend(format!("ca get: {e}")))?;
+        let v = epics_to_vec_f64(&snap.value).ok_or_else(|| {
+            CirrusError::Backend(format!("ca: not a numeric array: {:?}", snap.value))
+        })?;
+        Ok(ReadingValue {
+            value: serde_json::Value::from(v),
+            timestamp: now_ts(),
+            alarm_severity: Some(alarm_severity(snap.alarm.severity)),
+            message: None,
+        })
+    }
+    async fn get_value(&self) -> Result<Vec<f64>> {
+        let ch = self.ensure_channel(Duration::from_secs(2)).await?;
+        let (_ty, v) = ch
+            .get()
+            .await
+            .map_err(|e| CirrusError::Backend(format!("ca get: {e}")))?;
+        epics_to_vec_f64(&v)
+            .ok_or_else(|| CirrusError::Backend(format!("ca: not a numeric array: {v:?}")))
+    }
+    async fn get_setpoint(&self) -> Result<Vec<f64>> {
+        SignalBackend::<Vec<f64>>::get_value(self).await
+    }
+    fn set_callback(&self, cb: Option<ReadingValueCallback<Vec<f64>>>) -> SubToken {
+        let cb = match cb {
+            None => return SubToken::noop(),
+            Some(cb) => Arc::new(cb),
+        };
+        let ctx = self.ctx.clone();
+        let pv = self.pv.clone();
+        let handle = tokio::spawn(async move {
+            let ch = match ctx.get_or_open(&pv, Duration::from_secs(2)).await {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let mut sub = match ch.subscribe().await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            while let Some(Ok(snap)) = sub.recv().await {
+                if let Some(v) = epics_to_vec_f64(&snap.value) {
+                    let ts = snap
+                        .timestamp
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs_f64())
+                        .unwrap_or_default();
+                    cb(&v, ts);
                 }
             }
         });
@@ -1127,6 +1260,63 @@ mod tests {
         );
         // Absent display/control blocks → also empty.
         assert_eq!(ctrl_limits(None, None), Limits::default());
+    }
+
+    #[test]
+    fn epics_to_vec_f64_widens_numeric_arrays_and_rejects_non_numeric() {
+        assert_eq!(
+            epics_to_vec_f64(&EpicsValue::DoubleArray(vec![1.0, 2.0])),
+            Some(vec![1.0, 2.0])
+        );
+        assert_eq!(
+            epics_to_vec_f64(&EpicsValue::FloatArray(vec![1.5, 2.5])),
+            Some(vec![1.5, 2.5])
+        );
+        assert_eq!(
+            epics_to_vec_f64(&EpicsValue::LongArray(vec![3, 4])),
+            Some(vec![3.0, 4.0])
+        );
+        assert_eq!(
+            epics_to_vec_f64(&EpicsValue::ShortArray(vec![5, 6])),
+            Some(vec![5.0, 6.0])
+        );
+        assert_eq!(
+            epics_to_vec_f64(&EpicsValue::Int64Array(vec![7, 8])),
+            Some(vec![7.0, 8.0])
+        );
+        // Char/Enum/String arrays carry non-numeric-waveform meanings; excluded.
+        assert_eq!(epics_to_vec_f64(&EpicsValue::CharArray(vec![1, 2])), None);
+        assert_eq!(
+            epics_to_vec_f64(&EpicsValue::StringArray(vec!["a".into()])),
+            None
+        );
+        // A scalar is not a waveform.
+        assert_eq!(epics_to_vec_f64(&EpicsValue::Double(1.0)), None);
+    }
+
+    #[test]
+    fn f64s_to_wire_matches_native_array_type() {
+        match f64s_to_wire(DbFieldType::Double, vec![1.0, 2.0]) {
+            EpicsValue::DoubleArray(a) => assert_eq!(a, vec![1.0, 2.0]),
+            other => panic!("expected DoubleArray, got {other:?}"),
+        }
+        match f64s_to_wire(DbFieldType::Float, vec![1.0, 2.0]) {
+            EpicsValue::FloatArray(a) => assert_eq!(a, vec![1.0f32, 2.0]),
+            other => panic!("expected FloatArray, got {other:?}"),
+        }
+        match f64s_to_wire(DbFieldType::Long, vec![3.9, 4.1]) {
+            // f64 → i32 truncates toward zero.
+            EpicsValue::LongArray(a) => assert_eq!(a, vec![3, 4]),
+            other => panic!("expected LongArray, got {other:?}"),
+        }
+        match f64s_to_wire(DbFieldType::Short, vec![5.0]) {
+            EpicsValue::ShortArray(a) => assert_eq!(a, vec![5i16]),
+            other => panic!("expected ShortArray, got {other:?}"),
+        }
+        match f64s_to_wire(DbFieldType::Char, vec![65.0]) {
+            EpicsValue::CharArray(a) => assert_eq!(a, vec![65u8]),
+            other => panic!("expected CharArray, got {other:?}"),
+        }
     }
 
     #[test]
