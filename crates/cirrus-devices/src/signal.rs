@@ -140,6 +140,15 @@ where
     pub fn name(&self) -> &str {
         &self.config.name
     }
+
+    /// Transport source URI for this signal — the same string `describe`
+    /// reports in [`DataKey.source`](cirrus_core::DataKey). Sync (no backend
+    /// round-trip), so a device tree can be introspected via
+    /// [`walk_signal_sources`](crate::device::walk_signal_sources). Mirrors
+    /// ophyd-async `Signal.source` (`core/_signal.py`).
+    pub fn source(&self) -> String {
+        self.backend.source(&self.config.source)
+    }
 }
 
 // -- Readable roles only ([`Read`], [`ReadWrite`]) ---------------------------

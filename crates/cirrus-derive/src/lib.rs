@@ -63,6 +63,10 @@ pub fn derive_device(input: TokenStream) -> TokenStream {
     let mut field_inits: Vec<TokenStream2> = Vec::new();
     let mut field_inits_named: Vec<TokenStream2> = Vec::new();
     let mut connect_calls: Vec<TokenStream2> = Vec::new();
+    // Per-field `(dotted_path, source)` pushes for `Device::walk_signal_sources`
+    // (CP-20). Same field walk as `connect_calls`: a `#[signal]` field pushes
+    // its prefixed name + transport source; a `#[device]` field recurses.
+    let mut walk_pushes: Vec<TokenStream2> = Vec::new();
     let mut has_name_field = false;
 
     for field in fields {
@@ -109,6 +113,9 @@ pub fn derive_device(input: TokenStream) -> TokenStream {
             connect_calls.push(quote! {
                 ::cirrus_devices::__derive::connect_signal(&self.#id, timeout)
             });
+            walk_pushes.push(quote! {
+                out.push((::std::format!("{}{}", prefix, #id_str), self.#id.source()));
+            });
             continue;
         }
 
@@ -125,6 +132,13 @@ pub fn derive_device(input: TokenStream) -> TokenStream {
             });
             connect_calls.push(quote! {
                 ::std::boxed::Box::pin(async move { self.#id.connect_all(timeout).await })
+            });
+            walk_pushes.push(quote! {
+                ::cirrus_devices::Device::walk_signal_sources(
+                    &self.#id,
+                    &::std::format!("{}{}.", prefix, #id_str),
+                    out,
+                );
             });
             continue;
         }
@@ -211,6 +225,13 @@ pub fn derive_device(input: TokenStream) -> TokenStream {
                     + 'a,
             >> {
                 ::std::boxed::Box::pin(self.connect_all(timeout))
+            }
+            fn walk_signal_sources(
+                &self,
+                prefix: &str,
+                out: &mut ::std::vec::Vec<(::std::string::String, ::std::string::String)>,
+            ) {
+                #( #walk_pushes )*
             }
         }
     };

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use cirrus_backend_soft::SoftSignalBackend;
 use cirrus_core::Kind;
-use cirrus_devices::{Device, DeviceVector, SignalR, SignalRW};
+use cirrus_devices::{walk_signal_sources, Device, DeviceVector, SignalR, SignalRW};
 
 #[derive(Device)]
 struct Motor {
@@ -92,6 +92,43 @@ async fn new_named_propagates_bluesky_names() {
     );
 
     stage.connect_all(Duration::from_millis(100)).await.unwrap();
+}
+
+#[test]
+fn walk_signal_sources_flat_device() {
+    // CP-20: a flat device walks at the empty root prefix, so each key is the
+    // bare field name and each value is the signal's transport source. Order is
+    // field-declaration order (setpoint, readback, velocity).
+    let m = Motor::new("BL10C:m1");
+    let sources = walk_signal_sources(&*m);
+    assert_eq!(
+        sources,
+        vec![
+            ("setpoint".to_string(), "soft://BL10C:m1.VAL".to_string()),
+            ("readback".to_string(), "soft://BL10C:m1.RBV".to_string()),
+            ("velocity".to_string(), "soft://BL10C:m1.VELO".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn walk_signal_sources_nested_device() {
+    // CP-20: a sub-device contributes `{field}.{signal}` keys, recursing
+    // depth-first — every signal of `x` precedes every signal of `y`. The
+    // source still resolves from the expanded PV prefix, not the dotted path.
+    let stage = XYStage::new("BL10C");
+    let sources = walk_signal_sources(&*stage);
+    assert_eq!(
+        sources,
+        vec![
+            ("x.setpoint".to_string(), "soft://BL10C:x.VAL".to_string()),
+            ("x.readback".to_string(), "soft://BL10C:x.RBV".to_string()),
+            ("x.velocity".to_string(), "soft://BL10C:x.VELO".to_string()),
+            ("y.setpoint".to_string(), "soft://BL10C:y.VAL".to_string()),
+            ("y.readback".to_string(), "soft://BL10C:y.RBV".to_string()),
+            ("y.velocity".to_string(), "soft://BL10C:y.VELO".to_string()),
+        ]
+    );
 }
 
 #[tokio::test]

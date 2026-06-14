@@ -11,7 +11,7 @@ pub mod signal_cache;
 pub mod standard_readable;
 
 pub use detector::{StandardDetector, TriggerInfo};
-pub use device::{Device, DeviceVector};
+pub use device::{walk_signal_sources, Device, DeviceVector};
 pub use observe::{observe_value, wait_for_value};
 pub use signal::{
     Access, Execute, Read, ReadWrite, Readable, Signal, SignalConfig, SignalKind, SignalR,

@@ -27,6 +27,17 @@ pub trait Device: Send + Sync {
         &'a self,
         timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+    /// Push `(dotted_path, source)` for every signal in this device's subtree
+    /// into `out`, recursing into sub-devices. `prefix` is the accumulated
+    /// dotted path — empty at the device the walk started from, `"sub."`
+    /// inside a sub-device named `sub`.
+    ///
+    /// `#[derive(Device)]` emits this by walking the struct's `#[signal]` and
+    /// `#[device]` fields at compile time (the same field walk that drives
+    /// `connect_all`). The default is a no-op so hand-written `Device` impls
+    /// with no introspectable signals need not override it. Prefer the
+    /// [`walk_signal_sources`] free function over calling this directly.
+    fn walk_signal_sources(&self, _prefix: &str, _out: &mut Vec<(String, String)>) {}
 }
 
 impl<D: Device + ?Sized> Device for Arc<D> {
@@ -39,6 +50,24 @@ impl<D: Device + ?Sized> Device for Arc<D> {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         (**self).connect_all_boxed(timeout)
     }
+    fn walk_signal_sources(&self, prefix: &str, out: &mut Vec<(String, String)>) {
+        (**self).walk_signal_sources(prefix, out)
+    }
+}
+
+/// Collect `(dotted_path, source)` for every signal in `root`'s device tree,
+/// depth-first in field-declaration order. The paths are relative to `root`
+/// (the root device's own name is not prefixed), so a signal field `setpoint`
+/// yields `"setpoint"` and a signal `vel` on a sub-device `x` yields `"x.vel"`.
+///
+/// Mirrors ophyd-async `walk_signal_sources` (`core/_signal.py`), adapted to
+/// cirrus where signals are not themselves `Device`s: the per-field pushes are
+/// emitted by `#[derive(Device)]` rather than discovered by recursing a uniform
+/// `children()` of `Signal`-typed devices.
+pub fn walk_signal_sources(root: &dyn Device) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    root.walk_signal_sources("", &mut out);
+    out
 }
 
 /// An integer-keyed collection of identical child devices (e.g. eight cameras
