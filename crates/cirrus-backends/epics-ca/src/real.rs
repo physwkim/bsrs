@@ -14,9 +14,9 @@ use async_trait::async_trait;
 use cirrus_core::error::{CirrusError, Result};
 use cirrus_core::reading::ReadingValue;
 use cirrus_core::status::SubToken;
-use cirrus_event_model::{make_datakey, DataKey, Dtype, SignalMetadata};
+use cirrus_event_model::{make_datakey, DataKey, Dtype, Limits, LimitsRange, SignalMetadata};
 use cirrus_protocols_async::{ReadingValueCallback, SignalBackend};
-use epics_base_rs::server::snapshot::DbrClass;
+use epics_base_rs::server::snapshot::{ControlInfo, DbrClass, DisplayInfo};
 use epics_ca_rs::client::{CaChannel, CaClient};
 use epics_ca_rs::{DbFieldType, EpicsValue};
 use std::array;
@@ -226,6 +226,71 @@ fn alarm_severity(raw: u16) -> i32 {
     }
 }
 
+/// One DBR_CTRL limit range with ophyd-async's inclusion rule
+/// (`_aioca._limits_from_augmented_value`): the range is dropped (`None`)
+/// when both bounds are NaN or both are exactly zero; otherwise a NaN bound
+/// collapses to an open (`None`) side.
+fn limits_range(low: f64, high: f64) -> Option<LimitsRange> {
+    if (low.is_nan() && high.is_nan()) || (high == low && low == 0.0) {
+        return None;
+    }
+    Some(LimitsRange {
+        low: if low.is_nan() { None } else { Some(low) },
+        high: if high.is_nan() { None } else { Some(high) },
+    })
+}
+
+/// Assemble the alarm/control/display/warning ranges from DBR_CTRL
+/// display + control info into a `Limits`, each range filtered by
+/// [`limits_range`]. Field mapping mirrors ophyd-async's `"alarm"`/`"ctrl"`/
+/// `"disp"`/`"warning"` → `alarm`/`control`/`display`/`warning`.
+fn ctrl_limits(display: Option<&DisplayInfo>, control: Option<&ControlInfo>) -> Limits {
+    let mut limits = Limits::default();
+    if let Some(d) = display {
+        limits.alarm = limits_range(d.lower_alarm_limit, d.upper_alarm_limit);
+        limits.warning = limits_range(d.lower_warning_limit, d.upper_warning_limit);
+        limits.display = limits_range(d.lower_disp_limit, d.upper_disp_limit);
+    }
+    if let Some(c) = control {
+        limits.control = limits_range(c.lower_ctrl_limit, c.upper_ctrl_limit);
+    }
+    limits
+}
+
+/// Fetch DBR_CTRL metadata (units, precision, and the four limit ranges) for
+/// a numeric channel and shape it into a [`SignalMetadata`], applying
+/// ophyd-async's per-field inclusion rules (`_aioca._metadata_from_augmented_value`):
+///   - `units` only when the datatype is not string/bool (`want_units`),
+///   - `precision` only for floats — ints have no fractional digits
+///     (`want_precision`),
+///   - `limits` for any numeric, each range filtered by [`limits_range`].
+///
+/// A field stays `None` when the server published no display/control block.
+async fn ctrl_metadata(
+    ch: &CaChannel,
+    want_units: bool,
+    want_precision: bool,
+) -> Result<SignalMetadata> {
+    let snap = ch
+        .get_with_metadata(DbrClass::Ctrl)
+        .await
+        .map_err(|e| CirrusError::Backend(format!("ca ctrl get: {e}")))?;
+    let mut meta = SignalMetadata::default();
+    if let Some(d) = snap.display.as_ref() {
+        if want_units && !d.units.is_empty() {
+            meta.units = Some(d.units.clone());
+        }
+        if want_precision {
+            meta.precision = Some(d.precision as i64);
+        }
+    }
+    let limits = ctrl_limits(snap.display.as_ref(), snap.control.as_ref());
+    if limits != Limits::default() {
+        meta.limits = Some(limits);
+    }
+    Ok(meta)
+}
+
 /// Encode an `f64` payload as the `EpicsValue` variant that matches
 /// the channel's `native_type`. Required because
 /// `CaChannel::put` writes with `native_type` on the wire (see
@@ -354,6 +419,9 @@ impl SignalBackend<f64> for EpicsCaBackend<f64> {
             .info()
             .await
             .map_err(|e| CirrusError::Backend(format!("ca info: {e}")))?;
+        // Floats carry units, precision, and limits (mirrors ophyd-async
+        // `_metadata_from_augmented_value`).
+        let meta = ctrl_metadata(&ch, true, true).await?;
         Ok(make_datakey(
             format!("ca://{source}"),
             Dtype::Number,
@@ -363,7 +431,7 @@ impl SignalBackend<f64> for EpicsCaBackend<f64> {
                 vec![]
             },
             Some("<f8".into()),
-            SignalMetadata::default(),
+            meta,
         ))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
@@ -552,6 +620,9 @@ impl SignalBackend<i64> for EpicsCaBackend<i64> {
             .info()
             .await
             .map_err(|e| CirrusError::Backend(format!("ca info: {e}")))?;
+        // Ints carry units and limits, but no precision — there are no
+        // fractional digits (ophyd-async excludes precision for `int`).
+        let meta = ctrl_metadata(&ch, true, false).await?;
         Ok(make_datakey(
             format!("ca://{source}"),
             Dtype::Integer,
@@ -561,7 +632,7 @@ impl SignalBackend<i64> for EpicsCaBackend<i64> {
                 vec![]
             },
             Some("<i8".into()),
-            SignalMetadata::default(),
+            meta,
         ))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
@@ -960,6 +1031,102 @@ mod tests {
         assert_eq!(alarm_severity(3), -1);
         assert_eq!(alarm_severity(4), -1);
         assert_eq!(alarm_severity(u16::MAX), -1);
+    }
+
+    #[test]
+    fn limits_range_inclusion_rules() {
+        // Both NaN → dropped (limit field absent for this record).
+        assert_eq!(limits_range(f64::NAN, f64::NAN), None);
+        // Both exactly zero → dropped (unset DBR_CTRL limit pair).
+        assert_eq!(limits_range(0.0, 0.0), None);
+        // One-sided NaN → open on that side.
+        assert_eq!(
+            limits_range(f64::NAN, 10.0),
+            Some(LimitsRange {
+                low: None,
+                high: Some(10.0)
+            })
+        );
+        assert_eq!(
+            limits_range(-5.0, f64::NAN),
+            Some(LimitsRange {
+                low: Some(-5.0),
+                high: None
+            })
+        );
+        // Ordinary pair retained.
+        assert_eq!(
+            limits_range(-5.0, 5.0),
+            Some(LimitsRange {
+                low: Some(-5.0),
+                high: Some(5.0)
+            })
+        );
+        // Equal nonzero bounds retained (only 0==0 is dropped).
+        assert_eq!(
+            limits_range(2.0, 2.0),
+            Some(LimitsRange {
+                low: Some(2.0),
+                high: Some(2.0)
+            })
+        );
+    }
+
+    #[test]
+    fn ctrl_limits_maps_alarm_warning_display_control() {
+        let display = DisplayInfo {
+            lower_alarm_limit: -10.0,
+            upper_alarm_limit: 10.0,
+            lower_warning_limit: -5.0,
+            upper_warning_limit: 5.0,
+            lower_disp_limit: -100.0,
+            upper_disp_limit: 100.0,
+            ..Default::default()
+        };
+        let control = ControlInfo {
+            lower_ctrl_limit: -50.0,
+            upper_ctrl_limit: 50.0,
+        };
+        let limits = ctrl_limits(Some(&display), Some(&control));
+        assert_eq!(
+            limits.alarm,
+            Some(LimitsRange {
+                low: Some(-10.0),
+                high: Some(10.0)
+            })
+        );
+        assert_eq!(
+            limits.warning,
+            Some(LimitsRange {
+                low: Some(-5.0),
+                high: Some(5.0)
+            })
+        );
+        assert_eq!(
+            limits.display,
+            Some(LimitsRange {
+                low: Some(-100.0),
+                high: Some(100.0)
+            })
+        );
+        assert_eq!(
+            limits.control,
+            Some(LimitsRange {
+                low: Some(-50.0),
+                high: Some(50.0)
+            })
+        );
+    }
+
+    #[test]
+    fn ctrl_limits_default_or_absent_info_yields_no_ranges() {
+        // A record with all-zero limits (DBR_CTRL default) → every range dropped.
+        assert_eq!(
+            ctrl_limits(Some(&DisplayInfo::default()), Some(&ControlInfo::default())),
+            Limits::default()
+        );
+        // Absent display/control blocks → also empty.
+        assert_eq!(ctrl_limits(None, None), Limits::default());
     }
 
     #[test]
