@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use cirrus_core::error::Result;
 use cirrus_core::reading::ReadingValue;
 use cirrus_core::status::SubToken;
-use cirrus_event_model::{DataKey, Dtype};
+use cirrus_event_model::{make_datakey, DataKey, Dtype, SignalMetadata};
 use cirrus_protocols_async::{ReadingValueCallback, SignalBackend};
 use serde::Serialize;
 use std::time::Duration;
@@ -43,19 +43,13 @@ impl<T: Clone + Send + Sync + Serialize + 'static> SignalBackend<T> for MockBack
         Ok(())
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
-        Ok(DataKey {
-            source: format!("mock://{source}"),
-            dtype: Dtype::Number,
-            shape: vec![],
-            dtype_numpy: None,
-            external: None,
-            units: None,
-            precision: None,
-            object_name: None,
-            dims: None,
-            limits: None,
-            choices: None,
-        })
+        Ok(make_datakey(
+            format!("mock://{source}"),
+            Dtype::Number,
+            vec![],
+            None,
+            SignalMetadata::default(),
+        ))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
         Ok(ReadingValue {

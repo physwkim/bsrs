@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use cirrus_core::error::Result;
 use cirrus_core::reading::ReadingValue;
 use cirrus_core::status::SubToken;
-use cirrus_event_model::{DataKey, Dtype};
+use cirrus_event_model::{make_datakey, DataKey, Dtype, SignalMetadata};
 use cirrus_protocols_async::{ReadingValueCallback, SignalBackend};
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -170,19 +170,16 @@ where
         Ok(())
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
-        Ok(DataKey {
-            source: format!("soft://{source}"),
-            dtype: self.inner.dtype,
-            shape: self.inner.shape.clone(),
-            dtype_numpy: self.inner.dtype_numpy.clone(),
-            external: None,
-            units: self.inner.units.clone(),
-            precision: None,
-            object_name: None,
-            dims: None,
-            limits: None,
-            choices: None,
-        })
+        Ok(make_datakey(
+            format!("soft://{source}"),
+            self.inner.dtype,
+            self.inner.shape.clone(),
+            self.inner.dtype_numpy.clone(),
+            SignalMetadata {
+                units: self.inner.units.clone(),
+                ..Default::default()
+            },
+        ))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
         let v = self.inner.value.lock().unwrap().clone();

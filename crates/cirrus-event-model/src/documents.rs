@@ -198,6 +198,56 @@ pub struct DataKey {
     pub choices: Option<Vec<String>>,
 }
 
+/// Optional, consistently-named metadata for a signal's [`DataKey`], mirroring
+/// ophyd-async `SignalMetadata` (`core/_signal_backend.py:114`). Every field is
+/// optional; a backend fills in what its transport knows — `units`/`precision`
+/// for numerics, `choices` for enums, `limits` for records with control fields.
+///
+/// This is the canonical vocabulary so that the same concept lands in the same
+/// `DataKey` field across every backend, rather than each backend deciding ad
+/// hoc which optional fields to populate.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SignalMetadata {
+    /// Control / display / warning / alarm limits for a numeric datatype.
+    pub limits: Option<Limits>,
+    /// Possible values for an enum datatype, ordered by integer index.
+    pub choices: Option<Vec<String>>,
+    /// Digits after the decimal place to display for a float datatype.
+    pub precision: Option<i64>,
+    /// Engineering units of a numeric value.
+    pub units: Option<String>,
+}
+
+/// Build a [`DataKey`] from the transport-known shape (`dtype`, `shape`,
+/// `dtype_numpy`) plus optional [`SignalMetadata`], mirroring ophyd-async
+/// `make_datakey` (`core/_signal_backend.py:180`).
+///
+/// The descriptor fields that are *not* signal-level metadata — `external`,
+/// `object_name`, `dims` — default to `None` in this one place, so backends
+/// stop re-spelling six always-`None` fields at every `get_datakey` call site
+/// (and cannot silently disagree on which optional fields exist).
+pub fn make_datakey(
+    source: impl Into<String>,
+    dtype: Dtype,
+    shape: Vec<Option<u64>>,
+    dtype_numpy: Option<String>,
+    meta: SignalMetadata,
+) -> DataKey {
+    DataKey {
+        source: source.into(),
+        dtype,
+        shape,
+        dtype_numpy,
+        external: None,
+        units: meta.units,
+        precision: meta.precision,
+        object_name: None,
+        dims: None,
+        limits: meta.limits,
+        choices: meta.choices,
+    }
+}
+
 /// Per-object hint hung off the descriptor.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[allow(non_snake_case)]
@@ -458,6 +508,66 @@ mod tests {
         let json = serde_json::to_string(&docs).unwrap();
         let back: Vec<Document> = serde_json::from_str(&json).unwrap();
         assert_eq!(docs, back);
+    }
+
+    #[test]
+    fn make_datakey_fills_metadata_and_defaults_non_metadata_fields() {
+        // Metadata fields land in their canonical DataKey slots; the
+        // non-metadata fields (external/object_name/dims) are None by default.
+        let limits = Limits {
+            display: Some(LimitsRange {
+                low: Some(0.0),
+                high: Some(10.0),
+            }),
+            ..Default::default()
+        };
+        let dk = make_datakey(
+            "soft://m1",
+            Dtype::Number,
+            vec![],
+            Some("<f8".into()),
+            SignalMetadata {
+                limits: Some(limits.clone()),
+                choices: Some(vec!["a".into(), "b".into()]),
+                precision: Some(3),
+                units: Some("mm".into()),
+            },
+        );
+        assert_eq!(dk.source, "soft://m1");
+        assert_eq!(dk.dtype, Dtype::Number);
+        assert_eq!(dk.shape, Vec::<Option<u64>>::new());
+        assert_eq!(dk.dtype_numpy.as_deref(), Some("<f8"));
+        assert_eq!(dk.units.as_deref(), Some("mm"));
+        assert_eq!(dk.precision, Some(3));
+        assert_eq!(dk.limits, Some(limits));
+        assert_eq!(dk.choices, Some(vec!["a".into(), "b".into()]));
+        // Not signal-level metadata: always defaulted here.
+        assert!(dk.external.is_none());
+        assert!(dk.object_name.is_none());
+        assert!(dk.dims.is_none());
+    }
+
+    #[test]
+    fn make_datakey_empty_metadata_leaves_all_optionals_none() {
+        let dk = make_datakey(
+            "mock://x",
+            Dtype::Number,
+            vec![],
+            None,
+            SignalMetadata::default(),
+        );
+        for absent in [
+            dk.dtype_numpy.is_some(),
+            dk.external.is_some(),
+            dk.units.is_some(),
+            dk.precision.is_some(),
+            dk.object_name.is_some(),
+            dk.dims.is_some(),
+            dk.limits.is_some(),
+            dk.choices.is_some(),
+        ] {
+            assert!(!absent, "empty SignalMetadata must leave optionals None");
+        }
     }
 
     #[test]
