@@ -36,12 +36,60 @@ pub enum StatusOutcome {
     Failed(StatusError),
 }
 
+/// Structured progress update for a long-running operation, mirroring
+/// ophyd-async's `WatcherUpdate` (`core/_utils.py:154`). Carries enough
+/// context for a `LiveTable` / progress bar to render an ETA: where the value
+/// started, where it is now, where it is going, plus display metadata.
+///
+/// Generic over the value type; defaults to `f64` — the common case (motor
+/// positions, temperatures) and the type [`Status`] carries.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WatcherUpdate<T = f64> {
+    /// The current value (where it is now).
+    pub current: T,
+    /// The initial value (where it started).
+    pub initial: T,
+    /// The target value (where it will be when finished).
+    pub target: T,
+    /// Optional device name.
+    pub name: Option<String>,
+    /// Units of the value, if applicable.
+    pub unit: Option<String>,
+    /// Decimal places the value should be displayed to.
+    pub precision: Option<i32>,
+    /// Fraction of the way from `initial` to `target` (0.0–1.0).
+    pub fraction: Option<f64>,
+    /// Seconds elapsed since the operation started.
+    pub time_elapsed: Option<f64>,
+    /// Estimated seconds remaining until completion.
+    pub time_remaining: Option<f64>,
+}
+
+impl<T> WatcherUpdate<T> {
+    /// Construct an update from the three positions; metadata fields default
+    /// to `None`. Use struct-update syntax to set `unit` / `precision` / etc.
+    pub fn new(current: T, initial: T, target: T) -> Self {
+        Self {
+            current,
+            initial,
+            target,
+            name: None,
+            unit: None,
+            precision: None,
+            fraction: None,
+            time_elapsed: None,
+            time_remaining: None,
+        }
+    }
+}
+
 type StatusCallback = Box<dyn FnOnce(&StatusOutcome) + Send>;
 
 struct Inner {
     state: AtomicU8,
     error: Mutex<Option<StatusError>>,
     progress: watch::Sender<f64>,
+    watcher: watch::Sender<Option<WatcherUpdate>>,
     callbacks: Mutex<Vec<StatusCallback>>,
     wakers: Mutex<Vec<Waker>>,
 }
@@ -51,6 +99,7 @@ struct Inner {
 pub struct Status {
     inner: Arc<Inner>,
     progress_rx: watch::Receiver<f64>,
+    watcher_rx: watch::Receiver<Option<WatcherUpdate>>,
 }
 
 /// One-time setter side of a `Status`.
@@ -62,10 +111,12 @@ impl Status {
     /// Build a fresh pair of `(Status, setter)`.
     pub fn new() -> (Self, StatusSetter) {
         let (tx, rx) = watch::channel(0.0_f64);
+        let (wtx, wrx) = watch::channel::<Option<WatcherUpdate>>(None);
         let inner = Arc::new(Inner {
             state: AtomicU8::new(PENDING),
             error: Mutex::new(None),
             progress: tx,
+            watcher: wtx,
             callbacks: Mutex::new(Vec::new()),
             wakers: Mutex::new(Vec::new()),
         });
@@ -73,6 +124,7 @@ impl Status {
             Status {
                 inner: inner.clone(),
                 progress_rx: rx,
+                watcher_rx: wrx,
             },
             StatusSetter { inner },
         )
@@ -184,6 +236,13 @@ impl Status {
     pub fn watch(&self) -> watch::Receiver<f64> {
         self.progress_rx.clone()
     }
+
+    /// Subscribe to structured progress updates (the cirrus equivalent of
+    /// ophyd-async's `WatchableAsyncStatus.watch`). Holds `None` until the
+    /// first [`StatusSetter::update_watcher`] call, then the latest update.
+    pub fn watch_updates(&self) -> watch::Receiver<Option<WatcherUpdate>> {
+        self.watcher_rx.clone()
+    }
 }
 
 impl StatusSetter {
@@ -215,6 +274,16 @@ impl StatusSetter {
     /// Update progress (0.0 to 1.0). Best-effort — receivers see latest value.
     pub fn progress(&self, p: f64) {
         let _ = self.inner.progress.send(p);
+    }
+
+    /// Push a structured progress update. Receivers see the latest update via
+    /// [`Status::watch_updates`]; the scalar [`Status::progress`] fraction is
+    /// also updated when the update carries one. Best-effort.
+    pub fn update_watcher(&self, update: WatcherUpdate) {
+        if let Some(f) = update.fraction {
+            let _ = self.inner.progress.send(f);
+        }
+        let _ = self.inner.watcher.send(Some(update));
     }
 
     fn fire(self, outcome: StatusOutcome) {
@@ -324,6 +393,27 @@ mod tests {
         assert_eq!(v["done"], true);
         assert_eq!(v["success"], false);
         assert_eq!(v["exception"].as_str(), Some("boom"));
+    }
+
+    #[tokio::test]
+    async fn watcher_update_propagates_to_receiver_and_fraction() {
+        let (s, setter) = Status::new();
+        let mut rx = s.watch_updates();
+        // No update yet.
+        assert!(rx.borrow_and_update().is_none());
+        assert_eq!(s.progress(), 0.0);
+
+        let update = WatcherUpdate {
+            fraction: Some(0.25),
+            unit: Some("mm".into()),
+            ..WatcherUpdate::new(2.5, 0.0, 10.0)
+        };
+        setter.update_watcher(update.clone());
+
+        // Structured update landed on the watch_updates channel ...
+        assert_eq!(rx.borrow_and_update().clone(), Some(update));
+        // ... and the scalar progress fraction was updated from it.
+        assert_eq!(s.progress(), 0.25);
     }
 
     #[tokio::test]
