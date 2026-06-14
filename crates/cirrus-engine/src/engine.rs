@@ -1584,6 +1584,15 @@ impl RunEngine {
         Ok(())
     }
 
+    /// Uninstall every engine-level suspender. Mirrors bluesky's
+    /// `RunEngine.clear_suspenders`: each suspender installed via
+    /// [`Msg::InstallSuspender`] is removed and its monitor task aborted
+    /// (dropping the [`SuspenderHandle`] aborts the watcher). A no-op when
+    /// none are installed. Per-id removal is [`Msg::RemoveSuspender`].
+    pub async fn clear_suspenders(&self) {
+        self.state.lock().await.suspenders.clear();
+    }
+
     async fn open_run(&self, meta: RunMetadata) -> Result<String> {
         // Merge persistent metadata first; per-run extras override.
         let mut merged: HashMap<String, Value> = {

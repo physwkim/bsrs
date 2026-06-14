@@ -431,6 +431,99 @@ async fn suspender_auto_resumes_engine() {
     assert_eq!(result.exit_status, "success");
 }
 
+// Contrast with `suspender_auto_resumes_engine`: once `clear_suspenders`
+// uninstalls the gate, clearing its condition must NOT auto-resume the engine
+// (the watcher was aborted with the dropped handle), so the run stays paused
+// until aborted. Verifies the bluesky `RunEngine.clear_suspenders` parity API.
+#[tokio::test]
+async fn clear_suspenders_stops_auto_resume() {
+    use cirrus_engine::Suspender;
+    use futures::future::BoxFuture;
+    use std::sync::atomic::{AtomicBool, Ordering as AOrd};
+    use std::sync::Arc as StdArc;
+    use std::time::Duration;
+
+    struct ManualGate {
+        cleared: StdArc<AtomicBool>,
+        notify: StdArc<tokio::sync::Notify>,
+    }
+    #[async_trait::async_trait]
+    impl Suspender for ManualGate {
+        fn name(&self) -> &str {
+            "manual_gate"
+        }
+        fn watch(&self) -> BoxFuture<'static, ()> {
+            let cleared = self.cleared.clone();
+            let notify = self.notify.clone();
+            Box::pin(async move {
+                while !cleared.load(AOrd::SeqCst) {
+                    notify.notified().await;
+                }
+            })
+        }
+    }
+
+    let cleared = StdArc::new(AtomicBool::new(false));
+    let notify = StdArc::new(tokio::sync::Notify::new());
+    let gate = StdArc::new(ManualGate {
+        cleared: cleared.clone(),
+        notify: notify.clone(),
+    });
+
+    let sink = Arc::new(CapturingSink::new());
+    let re = Arc::new(RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]));
+
+    let id = re.next_suspender_id();
+    let gate_dyn: Arc<dyn cirrus_engine::Suspender> = gate;
+    let payload: Arc<dyn std::any::Any + Send + Sync> = Arc::new(gate_dyn);
+
+    let plan = cirrus_core::plan::plan_box(async_stream::stream! {
+        yield cirrus_core::Msg::InstallSuspender { id, suspender: payload };
+        yield cirrus_core::Msg::OpenRun(Default::default());
+        yield cirrus_core::Msg::Pause { defer: false };
+        // Reached only if something resumes the engine — which must NOT happen
+        // after clear_suspenders, so this run is expected to abort while paused.
+        yield cirrus_core::Msg::CloseRun {
+            exit_status: "success".into(),
+            reason: None,
+        };
+    });
+
+    let re_run = re.clone();
+    let join = tokio::spawn(async move { re_run.run_async(plan).await });
+
+    // Wait for the suspender to pause the engine.
+    for _ in 0..50 {
+        if re.is_paused() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(re.is_paused(), "engine should be paused by the suspender");
+
+    // Uninstall the suspender; its watcher is aborted with the dropped handle.
+    re.clear_suspenders().await;
+    // Give the abort time to propagate before satisfying the (now-ignored) gate.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    cleared.store(true, AOrd::SeqCst);
+    notify.notify_waiters();
+
+    // With no installed suspender, clearing the gate cannot resume the engine:
+    // it stays paused. The run only ends when we abort it.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        re.is_paused(),
+        "cleared suspender must not auto-resume the engine"
+    );
+    re.abort("test");
+    let result = tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("engine did not exit after abort")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.exit_status, "abort");
+}
+
 #[tokio::test]
 async fn mvr_reads_position_inside_plan_then_moves_relative() {
     let motor = Arc::new(SoftMotor::new("m1", Some(2.5)));
