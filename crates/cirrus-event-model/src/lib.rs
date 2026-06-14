@@ -13,8 +13,8 @@ pub mod page;
 
 pub use documents::{
     Configuration, DataKey, Datum, DatumPage, Document, Dtype, Event, EventDescriptor, EventPage,
-    Hints, Limits, LimitsRange, PerObjectHint, RdsRange, Reading, Resource, RunStart, RunStop,
-    StreamDatum, StreamRange, StreamResource,
+    Hints, Limits, LimitsRange, PerObjectHint, Projections, RdsRange, Reading, Resource, RunStart,
+    RunStop, StreamDatum, StreamRange, StreamResource,
 };
 pub use page::{pack_datum_page, pack_event_page, unpack_datum_page, unpack_event_page};
 

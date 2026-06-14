@@ -128,8 +128,7 @@ async fn zmq_msgpack_body_decodes_to_runstart() {
         time: 12345.0,
         scan_id: Some(7),
         hints: None,
-        sample: None,
-        extra: Default::default(),
+        ..Default::default()
     };
     sink.dispatch(&Document::Start(start.clone()))
         .await

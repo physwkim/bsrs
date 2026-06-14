@@ -54,8 +54,7 @@ impl RunBundle {
             time: now(),
             scan_id,
             hints,
-            sample: None,
-            extra: HashMap::new(),
+            ..Default::default()
         }
     }
 

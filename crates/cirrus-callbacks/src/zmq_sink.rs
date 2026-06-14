@@ -183,8 +183,7 @@ mod tests {
             time: 1234.5,
             scan_id: Some(1),
             hints: Some(Hints::default()),
-            sample: None,
-            extra: Default::default(),
+            ..Default::default()
         })
     }
 

@@ -14,8 +14,31 @@ pub struct Hints {
     pub dimensions: Option<Vec<Vec<Vec<String>>>>,
 }
 
+/// A projection spec carried in `RunStart.projections`. Describes how to
+/// interpret a run as a named projection.
+///
+/// Mirrors `event_model`'s `Projections`. The individual `projection` entries
+/// (linked / calculated / static, discriminated by `location`+`type`) are kept
+/// as free-form `Value`s: cirrus passes projections through without
+/// interpreting them, so the four-variant union is not modeled here.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct Projections {
+    /// Static information about the projection.
+    #[serde(default)]
+    pub configuration: HashMap<String, Value>,
+    /// Name of the projection.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Per-field projection entries, keyed by the projected field name.
+    #[serde(default)]
+    pub projection: HashMap<String, Value>,
+    /// Version of the projection spec (may reference an external spec).
+    #[serde(default)]
+    pub version: String,
+}
+
 /// Document created at the start of every run.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct RunStart {
     /// Globally unique ID for this run.
     pub uid: String,
@@ -30,6 +53,29 @@ pub struct RunStart {
     /// Information about the sample, may be a UID to another collection.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub sample: Option<Value>,
+    /// Data access groups meaningful to an external system (facility,
+    /// beamline, proposal, safety form, …).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub data_groups: Vec<String>,
+    /// Data-management grouping of runs (e.g. a visit or set of trials).
+    /// Not a scientific grouping.
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub data_session: String,
+    /// Free-form recursive run-level metadata (`data_type` in the schema).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub data_type: Option<Value>,
+    /// Unix group to associate this data with.
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub group: String,
+    /// Unix owner to associate this data with.
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub owner: String,
+    /// Name of the project this run is part of.
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub project: String,
+    /// Projection specs describing how to interpret this run.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub projections: Vec<Projections>,
     /// Free-form additional metadata.
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
@@ -398,8 +444,7 @@ mod tests {
                 time: 1700000000.0,
                 scan_id: Some(1),
                 hints: None,
-                sample: None,
-                extra: HashMap::new(),
+                ..Default::default()
             }),
             Document::Stop(RunStop {
                 uid: "stop-1".into(),
@@ -413,5 +458,55 @@ mod tests {
         let json = serde_json::to_string(&docs).unwrap();
         let back: Vec<Document> = serde_json::from_str(&json).unwrap();
         assert_eq!(docs, back);
+    }
+
+    #[test]
+    fn run_start_data_management_fields_round_trip() {
+        let start = RunStart {
+            uid: "run-1".into(),
+            time: 1.0,
+            data_groups: vec!["beamline-x".into(), "proposal-42".into()],
+            data_session: "visit-7".into(),
+            group: "users".into(),
+            owner: "alice".into(),
+            project: "imaging".into(),
+            projections: vec![Projections {
+                name: "primary".into(),
+                version: "1.0".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&start).unwrap();
+        // Named fields land at the top level, not inside `extra`.
+        assert_eq!(json["data_session"], "visit-7");
+        assert_eq!(json["owner"], "alice");
+        assert_eq!(json["projections"][0]["name"], "primary");
+        let back: RunStart = serde_json::from_value(json).unwrap();
+        assert_eq!(start, back);
+    }
+
+    #[test]
+    fn run_start_empty_data_management_fields_are_skipped() {
+        let start = RunStart {
+            uid: "run-1".into(),
+            time: 1.0,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&start).unwrap();
+        for absent in [
+            "data_groups",
+            "data_session",
+            "data_type",
+            "group",
+            "owner",
+            "project",
+            "projections",
+        ] {
+            assert!(
+                json.get(absent).is_none(),
+                "empty `{absent}` must not serialize"
+            );
+        }
     }
 }

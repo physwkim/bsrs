@@ -98,8 +98,8 @@ fn make_run_start() -> RunStart {
         time: 1.0,
         scan_id: Some(7),
         hints: None,
-        sample: None,
         extra,
+        ..Default::default()
     }
 }
 
