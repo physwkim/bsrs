@@ -605,6 +605,11 @@ pub type ScanAxis = (Arc<dyn MovableObj>, Arc<dyn ReadableObj>, f64, f64);
 /// One axis of a list-grid scan: `(motor, motor_reader, points)`.
 pub type ListGridAxis = (Arc<dyn MovableObj>, Arc<dyn ReadableObj>, Vec<f64>);
 
+/// One axis of a *relative* list-grid scan: `(motor, motor_reader, points)`,
+/// where `points` are offsets from the motor's current readback and the
+/// motor must be `LocatableObj` so that readback can be snapshotted.
+pub type RelListGridAxis = (Arc<dyn LocatableObj>, Arc<dyn ReadableObj>, Vec<f64>);
+
 /// `inner_product_scan(dets, num, [(motor1, s1, e1), ...])` — all motors move
 /// together (linspaced) for `num` points. Mirrors bluesky's
 /// `inner_product_scan` for the typical positional-only argument shape.
@@ -686,6 +691,36 @@ pub fn list_grid_scan(detectors: Vec<Arc<dyn ReadableObj>>, axes: Vec<ListGridAx
     let motors: Vec<(Arc<dyn MovableObj>, Arc<dyn ReadableObj>)> =
         axes.into_iter().map(|(m, r, _)| (m, r)).collect();
     scan_nd(detectors, motors, pts)
+}
+
+/// `rel_list_grid_scan(dets, axes)` — relative variant of [`list_grid_scan`]
+/// (bluesky `plans.rel_list_grid_scan`). Each axis's positions are offset by
+/// that axis motor's current readback, snapshotted once per motor via
+/// `LocatableObj::locate_dyn`.
+///
+/// As with cirrus's other `rel_*` scans, the motors are not returned to their
+/// starting positions afterward (offset-only; bluesky also wraps in
+/// `reset_positions_decorator`). Like [`list_grid_scan`], snaking is not
+/// applied — each axis traces a plain outer-product trajectory.
+pub fn rel_list_grid_scan(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    axes: Vec<RelListGridAxis>,
+) -> Plan {
+    plan_box(async_stream::stream! {
+        let mut abs_axes: Vec<ListGridAxis> = Vec::with_capacity(axes.len());
+        for (motor, reader, points) in axes {
+            let bias = motor.locate_dyn().await.map(|l| l.readback).unwrap_or(0.0);
+            let abs_points: Vec<f64> = points.iter().map(|p| *p + bias).collect();
+            let mv: Arc<dyn MovableObj> = motor;
+            abs_axes.push((mv, reader, abs_points));
+        }
+        let mut inner = list_grid_scan(detectors, abs_axes);
+        while let Some(item) = futures::StreamExt::next(&mut inner).await {
+            if let cirrus_core::plan::PlanItem::Bare(m) = item {
+                yield m;
+            }
+        }
+    })
 }
 
 /// `spiral_square(dets, x_motor, y_motor, x_center, y_center, x_range,
@@ -1622,6 +1657,22 @@ mod tests {
             1.0,
         );
         assert_xy_relative_offsets(abs, rel, 5.0, 7.0).await;
+    }
+
+    #[tokio::test]
+    async fn rel_list_grid_scan_offsets_each_axis_by_its_readback() {
+        // x list [1,2] with readback 10 → [11,12]; y list [5] with readback
+        // 20 → [25]. The outer product visits (11,25) then (12,25).
+        let (xm, ym) = motor_xy(10.0, 20.0);
+        let axes: Vec<RelListGridAxis> =
+            vec![(xm, rdr("xr"), vec![1.0, 2.0]), (ym, rdr("yr"), vec![5.0])];
+        let sets = named_set_values(&drain(rel_list_grid_scan(vec![], axes)).await);
+        let expected = [("x", 11.0), ("y", 25.0), ("x", 12.0), ("y", 25.0)];
+        assert_eq!(sets.len(), expected.len(), "got {sets:?}");
+        for ((gn, gv), (en, ev)) in sets.iter().zip(expected) {
+            assert_eq!(gn, en, "motor order");
+            assert!((gv - ev).abs() < 1e-9, "{gn}: {gv} != {ev}");
+        }
     }
 
     #[tokio::test]
