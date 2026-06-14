@@ -673,6 +673,40 @@ pub fn inner_product_scan(
     })
 }
 
+/// `x2x_scan(dets, motor1, m1_reader, motor2, m2_reader, start, stop, num)` —
+/// coupled 2:1 *relative* inner-product scan (bluesky `plans.x2x_scan`,
+/// a generalised theta-2theta). `motor1` sweeps `start..stop` relative to its
+/// current readback while `motor2` sweeps `start/2..stop/2` relative to its
+/// own; the two move together each step. Built from [`inner_product_scan`]
+/// run through `relative_set_wrapper`.
+///
+/// As with cirrus's other `rel_*` scans, the motors are not returned to their
+/// starting positions afterward (offset-only; bluesky's
+/// `relative_inner_product_scan` also applies `reset_positions_decorator`).
+#[allow(clippy::too_many_arguments)]
+pub fn x2x_scan(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    motor1: Arc<dyn LocatableObj>,
+    motor1_reader: Arc<dyn ReadableObj>,
+    motor2: Arc<dyn LocatableObj>,
+    motor2_reader: Arc<dyn ReadableObj>,
+    start: f64,
+    stop: f64,
+    num: usize,
+) -> Plan {
+    let m1: Arc<dyn MovableObj> = motor1.clone();
+    let m2: Arc<dyn MovableObj> = motor2.clone();
+    let inner = inner_product_scan(
+        detectors,
+        num,
+        vec![
+            (m1, motor1_reader, start, stop),
+            (m2, motor2_reader, start / 2.0, stop / 2.0),
+        ],
+    );
+    preprocessors::relative_set_wrapper(inner, vec![motor1, motor2])
+}
+
 /// `scan_nd(dets, motors, points)` — visit each row of `points` (shape
 /// `[N, len(motors)]`). Stripped-down `scan_nd`; bluesky's full version
 /// accepts `cycler` objects, this one takes the pre-computed list.
@@ -1722,6 +1756,28 @@ mod tests {
             !msgs.iter().any(|m| matches!(m, Msg::Wait { .. })),
             "rel_set must not emit Wait (unlike mvr)"
         );
+    }
+
+    #[tokio::test]
+    async fn x2x_scan_couples_motors_2to1_relative_to_readbacks() {
+        // motor1 sweeps 0→4 (readback 10); motor2 sweeps the half range 0→2
+        // (readback 100). inner_product(3) → m1 [0,2,4], m2 [0,1,2].
+        let (m1, m2) = motor_xy(10.0, 100.0);
+        let plan = x2x_scan(vec![], m1, rdr("xr"), m2, rdr("yr"), 0.0, 4.0, 3);
+        let sets = named_set_values(&drain(plan).await);
+        let expected = [
+            ("x", 10.0),
+            ("y", 100.0),
+            ("x", 12.0),
+            ("y", 101.0),
+            ("x", 14.0),
+            ("y", 102.0),
+        ];
+        assert_eq!(sets.len(), expected.len(), "got {sets:?}");
+        for ((gn, gv), (en, ev)) in sets.iter().zip(expected) {
+            assert_eq!(gn, en, "motor order");
+            assert!((gv - ev).abs() < 1e-9, "{gn}: {gv} != {ev}");
+        }
     }
 
     #[tokio::test]
