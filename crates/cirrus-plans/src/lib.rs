@@ -6,9 +6,9 @@ pub mod patterns;
 pub mod preprocessors;
 
 use cirrus_core::msg::{
-    CollectableObj, ConfigurableObj, ConfigureArgs, FlyableObj, LocatableObj, MonitorableObj,
-    MovableObj, Msg, PreparableObj, ReadableObj, RunMetadata, StageableObj, StoppableObj,
-    TriggerableObj,
+    AwaitableFactory, CollectableObj, ConfigurableObj, ConfigureArgs, FlyableObj, LocatableObj,
+    MonitorableObj, MovableObj, Msg, PreparableObj, ReadableObj, RunMetadata, StageableObj,
+    StoppableObj, TriggerableObj,
 };
 use cirrus_core::plan::{plan_box, Plan};
 use std::sync::Arc;
@@ -183,6 +183,18 @@ pub mod stubs {
         let group = group.into();
         plan_box(async_stream::stream! {
             yield Msg::Wait { group, error_on_timeout: true, timeout };
+        })
+    }
+
+    /// `wait_for(factories, timeout)` — emit `Msg::WaitFor`. The cirrus
+    /// equivalent of bluesky's `wait_for`: each factory produces a fresh future
+    /// that the engine awaits in order. An optional `timeout` bounds the total
+    /// wait, after which the engine returns `CirrusError::Timeout`. Unlike
+    /// [`wait`], which waits on a status group, this waits on arbitrary
+    /// awaitables supplied by the plan.
+    pub fn wait_for(factories: Vec<AwaitableFactory>, timeout: Option<Duration>) -> Plan {
+        plan_box(async_stream::stream! {
+            yield Msg::WaitFor { factories, timeout };
         })
     }
 
@@ -1978,6 +1990,37 @@ mod tests {
         let msgs = drain(stubs::prepare(preparable("det"), val, None, false)).await;
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Msg::Prepare { group: None, .. }));
+    }
+
+    // wait_for emits a single Msg::WaitFor carrying the supplied factories and
+    // timeout verbatim; each factory must remain callable (produces a future).
+    #[tokio::test]
+    async fn wait_for_emits_single_msg_with_factories_and_timeout() {
+        let f0: AwaitableFactory = Arc::new(|| Box::pin(async { Ok(()) }));
+        let f1: AwaitableFactory = Arc::new(|| Box::pin(async { Ok(()) }));
+        let msgs = drain(stubs::wait_for(vec![f0, f1], Some(Duration::from_secs(2)))).await;
+        assert_eq!(msgs.len(), 1);
+        match &msgs[0] {
+            Msg::WaitFor { factories, timeout } => {
+                assert_eq!(factories.len(), 2);
+                assert_eq!(*timeout, Some(Duration::from_secs(2)));
+                // The factory is invocable and yields a completing future.
+                factories[0]().await.unwrap();
+            }
+            other => panic!("expected Msg::WaitFor, got {other:?}"),
+        }
+    }
+
+    // No timeout passes through as None (indefinite wait).
+    #[tokio::test]
+    async fn wait_for_preserves_none_timeout() {
+        let f0: AwaitableFactory = Arc::new(|| Box::pin(async { Ok(()) }));
+        let msgs = drain(stubs::wait_for(vec![f0], None)).await;
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(
+            &msgs[0],
+            Msg::WaitFor { factories, timeout: None } if factories.len() == 1
+        ));
     }
 
     // delay > 0: a Checkpoint precedes each repetition's messages and a

@@ -35,6 +35,12 @@ pub struct ConfigureArgs {
     pub values: HashMap<String, Value>,
 }
 
+/// Factory for an awaitable used by [`Msg::WaitFor`]. Each call produces a
+/// fresh boxed future, so the message can be re-issued during rewind. Mirrors
+/// the no-argument coroutine functions bluesky's `wait_for` accepts.
+pub type AwaitableFactory =
+    Arc<dyn Fn() -> BoxFuture<'static, crate::error::Result<()>> + Send + Sync>;
+
 /// The complete set of commands that plans can issue. Closed enum + `Custom`.
 #[non_exhaustive]
 pub enum Msg {
@@ -190,7 +196,7 @@ pub enum Msg {
     WaitFor {
         /// Awaitable factories. Each factory produces a fresh future
         /// on every call.
-        factories: Vec<Arc<dyn Fn() -> BoxFuture<'static, crate::error::Result<()>> + Send + Sync>>,
+        factories: Vec<AwaitableFactory>,
         /// Optional timeout. If exceeded, the engine returns
         /// `CirrusError::Timeout`.
         timeout: Option<Duration>,
