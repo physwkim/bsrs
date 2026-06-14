@@ -81,6 +81,42 @@ async fn scan_id_auto_increments() {
 }
 
 #[tokio::test]
+async fn scan_id_written_back_to_md_lets_custom_source_continue_sequence() {
+    // ENG-14: a custom scan_id_source that reads md["scan_id"] and adds 1 must
+    // see the previous run's value. That requires the engine to write the
+    // resolved scan_id back into RE.md after each run (bluesky
+    // run_engine.py:1855). Without the write-back every run reads an absent
+    // "scan_id" and produces 1, 1, 1.
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    re.set_scan_id_source(Some(Arc::new(
+        |md: &std::collections::HashMap<String, Value>| {
+            let prev = md.get("scan_id").and_then(|v| v.as_u64()).unwrap_or(0);
+            Ok(prev + 1)
+        },
+    )));
+
+    re.run_async(one_count_plan()).await.unwrap();
+    re.run_async(one_count_plan()).await.unwrap();
+    re.run_async(one_count_plan()).await.unwrap();
+
+    let starts: Vec<u64> = sink
+        .snapshot()
+        .await
+        .iter()
+        .filter_map(|d| match d {
+            Document::Start(s) => s.scan_id,
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        starts,
+        vec![1, 2, 3],
+        "custom scan_id_source must continue the sequence via md write-back"
+    );
+}
+
+#[tokio::test]
 async fn md_validator_rejects_run() {
     let sink = Arc::new(CapturingSink::new());
     let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);

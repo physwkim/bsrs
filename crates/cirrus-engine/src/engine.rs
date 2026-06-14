@@ -1579,6 +1579,15 @@ impl RunEngine {
             merged
                 .entry("scan_id".into())
                 .or_insert(Value::from(scan_id));
+            // Persist the resolved scan_id back into RE.md so a custom
+            // `scan_id_source` reading `md["scan_id"]` sees the last-used value
+            // on the next run, and external persisters of RE.md observe the
+            // current counter (bluesky `run_engine.py:1855`:
+            // `self.md["scan_id"] = scan_id_source(self.md)`).
+            self.md
+                .lock()
+                .unwrap()
+                .insert("scan_id".into(), Value::from(scan_id));
         }
         let mut start_doc = RunBundle::start(scan_id, None);
         // Validator hook.
