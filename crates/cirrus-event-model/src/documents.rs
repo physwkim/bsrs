@@ -218,9 +218,11 @@ pub struct Event {
     pub data: HashMap<String, Value>,
     /// Per-field timestamps.
     pub timestamps: HashMap<String, f64>,
-    /// Filled (true/false) state of external references.
+    /// Fill state of external references: `false` = unfilled external slot,
+    /// a string = the foreign key after a Filler resolves the reference and
+    /// moves the data into `data`. Matches the schema's `bool | str` union.
     #[serde(skip_serializing_if = "HashMap::is_empty", default)]
-    pub filled: HashMap<String, bool>,
+    pub filled: HashMap<String, Value>,
 }
 
 /// Page-form Event (multiple rows in one document).
