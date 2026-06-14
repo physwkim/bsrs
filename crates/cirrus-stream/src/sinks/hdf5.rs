@@ -211,6 +211,7 @@ impl DetectorWriter for Hdf5FrameSink {
                 object_name: Some(self.name.clone()),
                 dims: Some(vec!["byte".into()]),
                 limits: None,
+                choices: None,
             },
         );
         Ok(out)

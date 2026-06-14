@@ -102,6 +102,7 @@ impl ReadableObj for CaMotor {
                 object_name: Some(self.name.clone()),
                 dims: None,
                 limits: None,
+                choices: None,
             },
         );
         Ok(out)
@@ -207,6 +208,7 @@ impl ReadableObj for CaDetector {
                 object_name: Some(self.name.clone()),
                 dims: None,
                 limits: None,
+                choices: None,
             },
         );
         Ok(out)

@@ -146,6 +146,10 @@ pub struct DataKey {
     /// EPICS limits.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub limits: Option<Limits>,
+    /// Enumerated string choices for mbbi/mbbo/enum records, ordered by
+    /// integer index. Used by LiveTable/Tiled to render enum values.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub choices: Option<Vec<String>>,
 }
 
 /// Per-object hint hung off the descriptor.

@@ -95,6 +95,7 @@ impl AsyncReadable for SoftDetector {
                 object_name: Some(self.name.clone()),
                 dims: None,
                 limits: None,
+                choices: None,
             },
         );
         Ok(out)
@@ -233,6 +234,7 @@ impl DetectorWriter for SoftDetectorWriter {
                 object_name: Some(self.name.clone()),
                 dims: Some(vec!["pixel".into()]),
                 limits: None,
+                choices: None,
             },
         );
         Ok(out)

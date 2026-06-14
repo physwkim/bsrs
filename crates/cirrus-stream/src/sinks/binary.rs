@@ -126,6 +126,7 @@ impl DetectorWriter for BinaryFrameSink {
                 object_name: Some(self.name.clone()),
                 dims: Some(vec!["byte".into()]),
                 limits: None,
+                choices: None,
             },
         );
         Ok(out)

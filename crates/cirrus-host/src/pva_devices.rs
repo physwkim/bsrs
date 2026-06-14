@@ -99,6 +99,7 @@ impl ReadableObj for PvaMotor {
                 object_name: Some(self.name.clone()),
                 dims: None,
                 limits: None,
+                choices: None,
             },
         );
         Ok(out)
@@ -200,6 +201,7 @@ impl ReadableObj for PvaDetector {
                 object_name: Some(self.name.clone()),
                 dims: None,
                 limits: None,
+                choices: None,
             },
         );
         Ok(out)

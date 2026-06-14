@@ -1534,6 +1534,7 @@ fn lua_table_to_data_key(t: &mlua::Table) -> mlua::Result<cirrus_event_model::Da
         object_name: t.get::<String>("object_name").ok(),
         dims: None,
         limits: None,
+        choices: None,
     })
 }
 

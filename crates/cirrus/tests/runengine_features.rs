@@ -446,6 +446,7 @@ impl cirrus_core::msg::ReadableObj for TestMonitor {
                 object_name: None,
                 dims: None,
                 limits: None,
+                choices: None,
             },
         );
         Ok(out)

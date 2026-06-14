@@ -1605,6 +1605,7 @@ impl RunEngine {
                         object_name: None,
                         dims: None,
                         limits: None,
+                        choices: None,
                     },
                 );
                 Some(bundler.declare_stream("interruptions".into(), keys)?)

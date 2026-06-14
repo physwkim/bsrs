@@ -49,6 +49,7 @@ impl<T: Clone + Send + Sync + Serialize + 'static> SignalBackend<T> for MockBack
             object_name: None,
             dims: None,
             limits: None,
+            choices: None,
         })
     }
     async fn get_reading(&self) -> Result<ReadingValue> {

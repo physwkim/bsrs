@@ -365,6 +365,7 @@ impl SignalBackend<f64> for EpicsCaBackend<f64> {
             object_name: None,
             dims: None,
             limits: None,
+            choices: None,
         })
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
@@ -476,6 +477,7 @@ impl SignalBackend<String> for EpicsCaBackend<String> {
             object_name: None,
             dims: None,
             limits: None,
+            choices: None,
         })
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
@@ -590,6 +592,7 @@ impl SignalBackend<i64> for EpicsCaBackend<i64> {
             object_name: None,
             dims: None,
             limits: None,
+            choices: None,
         })
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
@@ -693,6 +696,7 @@ impl SignalBackend<bool> for EpicsCaBackend<bool> {
             object_name: None,
             dims: None,
             limits: None,
+            choices: None,
         })
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
