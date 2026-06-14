@@ -2,13 +2,13 @@
 //! `Datum`/`DatumPage`.
 //!
 //! Mirrors `event_model.pack_event_page` / `unpack_event_page` /
-//! `pack_datum_page` / `unpack_datum_page` / `merge_event_pages`
-//! (`__init__.py:2620-2862`).
+//! `pack_datum_page` / `unpack_datum_page` / `merge_event_pages` /
+//! `rechunk_event_pages` (`__init__.py:2620-2862`).
 //! Packing transposes a list of row documents into one column-store page;
-//! unpacking reverses it; merging concatenates several pages into one. As in
-//! the reference, only keys present on a given row contribute to that row's
-//! columns, and the first document's descriptor / resource UID is used for the
-//! whole page.
+//! unpacking reverses it; merging concatenates several pages into one;
+//! rechunking re-batches pages to a uniform size. As in the reference, only
+//! keys present on a given row contribute to that row's columns, and the first
+//! document's descriptor / resource UID is used for the whole page.
 
 use crate::documents::{Datum, DatumPage, Event, EventPage};
 use serde_json::Value;
@@ -184,6 +184,55 @@ pub fn merge_event_pages(pages: &[EventPage]) -> EventPage {
     }
 }
 
+/// Slice every column of a column-store between `[start, stop)`, clamping to
+/// each column's length so a ragged column cannot panic.
+fn slice_cols<T: Clone>(
+    cols: &HashMap<String, Vec<T>>,
+    start: usize,
+    stop: usize,
+) -> HashMap<String, Vec<T>> {
+    cols.iter()
+        .map(|(k, v)| {
+            let lo = start.min(v.len());
+            let hi = stop.min(v.len());
+            (k.clone(), v[lo..hi].to_vec())
+        })
+        .collect()
+}
+
+/// Re-batch a slice of `EventPage`s into pages of exactly `chunk_size` rows
+/// (the final page holds the remainder).
+///
+/// Mirrors `event_model.rechunk_event_pages`. For a well-formed page stream
+/// (all pages share a descriptor) this is "concatenate every row in order,
+/// then re-split into `chunk_size`-row pages" — equivalent to the reference's
+/// streaming merge, built here on [`merge_event_pages`]. The merged
+/// descriptor labels every output page. Returns an empty `Vec` for empty
+/// input or `chunk_size == 0` (which cannot define a chunking).
+pub fn rechunk_event_pages(pages: &[EventPage], chunk_size: usize) -> Vec<EventPage> {
+    if chunk_size == 0 {
+        return Vec::new();
+    }
+    let merged = merge_event_pages(pages);
+    let n = merged.uid.len();
+    let mut out = Vec::with_capacity(n.div_ceil(chunk_size));
+    let mut start = 0;
+    while start < n {
+        let stop = (start + chunk_size).min(n);
+        out.push(EventPage {
+            uid: merged.uid[start..stop].to_vec(),
+            descriptor: merged.descriptor.clone(),
+            time: merged.time[start..stop].to_vec(),
+            seq_num: merged.seq_num[start..stop].to_vec(),
+            data: slice_cols(&merged.data, start, stop),
+            timestamps: slice_cols(&merged.timestamps, start, stop),
+            filled: slice_cols(&merged.filled, start, stop),
+        });
+        start = stop;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,5 +333,64 @@ mod tests {
         assert!(merged.uid.is_empty());
         assert_eq!(merged.descriptor, "");
         assert!(unpack_event_page(&merged).is_empty());
+    }
+
+    #[test]
+    fn rechunk_event_pages_splits_uniformly_across_page_boundaries() {
+        // 3 + 2 = 5 rows, rechunk to 2 → pages of [2, 2, 1]; the middle chunk
+        // straddles the input page boundary (e-3 from page A, e-4 from page B).
+        let a = pack_event_page(&[
+            event("e-1", 1, 1.5),
+            event("e-2", 2, 2.5),
+            event("e-3", 3, 3.5),
+        ]);
+        let b = pack_event_page(&[event("e-4", 4, 4.5), event("e-5", 5, 5.5)]);
+        let chunks = rechunk_event_pages(&[a, b], 2);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].seq_num, vec![1, 2]);
+        assert_eq!(
+            chunks[1].seq_num,
+            vec![3, 4],
+            "chunk straddles the page boundary"
+        );
+        assert_eq!(chunks[2].seq_num, vec![5]);
+        assert_eq!(chunks[1].uid, vec!["e-3", "e-4"]);
+        assert_eq!(chunks[1].data["x"], vec![json!(3.5), json!(4.5)]);
+        for c in &chunks {
+            assert_eq!(c.descriptor, "d-1");
+        }
+        // Rows survive the round-trip in order.
+        let all: Vec<Event> = chunks.iter().flat_map(unpack_event_page).collect();
+        assert_eq!(
+            all,
+            vec![
+                event("e-1", 1, 1.5),
+                event("e-2", 2, 2.5),
+                event("e-3", 3, 3.5),
+                event("e-4", 4, 4.5),
+                event("e-5", 5, 5.5),
+            ]
+        );
+    }
+
+    #[test]
+    fn rechunk_event_pages_chunk_larger_than_total_is_one_page() {
+        let p = pack_event_page(&[event("e-1", 1, 1.5), event("e-2", 2, 2.5)]);
+        let chunks = rechunk_event_pages(&[p], 10);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].seq_num, vec![1, 2]);
+    }
+
+    #[test]
+    fn rechunk_event_pages_zero_chunk_and_empty_input_yield_nothing() {
+        let p = pack_event_page(&[event("e-1", 1, 1.5)]);
+        assert!(
+            rechunk_event_pages(std::slice::from_ref(&p), 0).is_empty(),
+            "chunk_size 0 cannot define a chunking"
+        );
+        assert!(
+            rechunk_event_pages(&[], 2).is_empty(),
+            "no input → no pages"
+        );
     }
 }
