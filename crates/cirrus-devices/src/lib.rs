@@ -6,6 +6,7 @@
 pub mod detector;
 pub mod observe;
 pub mod signal;
+pub mod standard_readable;
 
 pub use detector::{StandardDetector, TriggerInfo};
 pub use observe::{observe_value, wait_for_value};
@@ -13,6 +14,7 @@ pub use signal::{
     Access, Execute, Read, ReadWrite, Readable, Signal, SignalConfig, SignalKind, SignalR,
     SignalRW, SignalW, SignalX, Writable, Write,
 };
+pub use standard_readable::{StandardReadable, StandardReadableFormat};
 
 /// Re-export of the `#[derive(Device)]` proc-macro.
 pub use cirrus_derive::Device;
