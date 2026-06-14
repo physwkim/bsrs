@@ -25,8 +25,12 @@ use tokio::sync::watch;
 
 // -- Sealed trait #1 --------------------------------------------------------
 
-/// Reading callback type for `set_callback`.
-pub type ReadingValueCallback<T> = Box<dyn Fn(&T, f64) + Send + Sync>;
+/// Reading callback type for `set_callback`: `(value, timestamp,
+/// alarm_severity)`. `alarm_severity` follows the cirrus/ophyd-async
+/// convention (NO_ALARM=0 / MINOR=1 / MAJOR=2 / INVALID=-1); `None` when the
+/// transport does not deliver alarm state on a monitor update (soft/mock
+/// signals, or a PVA monitor whose projection omits the `alarm` field).
+pub type ReadingValueCallback<T> = Box<dyn Fn(&T, f64, Option<i32>) + Send + Sync>;
 
 /// Sealed: backend for one signal. Direct port of
 /// `ophyd_async/core/_signal_backend.py:16-59`.

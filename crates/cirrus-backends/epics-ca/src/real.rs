@@ -520,7 +520,7 @@ impl SignalBackend<f64> for EpicsCaBackend<f64> {
                         .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_secs_f64())
                         .unwrap_or_default();
-                    cb(&f, ts);
+                    cb(&f, ts, Some(alarm_severity(snap.alarm.severity)));
                 }
             }
         });
@@ -619,7 +619,7 @@ impl SignalBackend<Vec<f64>> for EpicsCaBackend<Vec<f64>> {
                         .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_secs_f64())
                         .unwrap_or_default();
-                    cb(&v, ts);
+                    cb(&v, ts, Some(alarm_severity(snap.alarm.severity)));
                 }
             }
         });
@@ -716,7 +716,7 @@ impl SignalBackend<String> for EpicsCaBackend<String> {
                         .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_secs_f64())
                         .unwrap_or_default();
-                    cb(&s, ts);
+                    cb(&s, ts, Some(alarm_severity(snap.alarm.severity)));
                 }
             }
         });
@@ -817,7 +817,7 @@ impl SignalBackend<i64> for EpicsCaBackend<i64> {
                         .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_secs_f64())
                         .unwrap_or_default();
-                    cb(&i, ts);
+                    cb(&i, ts, Some(alarm_severity(snap.alarm.severity)));
                 }
             }
         });
@@ -906,7 +906,7 @@ impl SignalBackend<bool> for EpicsCaBackend<bool> {
                         .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_secs_f64())
                         .unwrap_or_default();
-                    cb(&b, ts);
+                    cb(&b, ts, Some(alarm_severity(snap.alarm.severity)));
                 }
             }
         });
@@ -1125,7 +1125,7 @@ impl SignalBackend<String> for CaEnumBackend {
                         .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_secs_f64())
                         .unwrap_or_default();
-                    cb(&label, ts);
+                    cb(&label, ts, Some(alarm_severity(snap.alarm.severity)));
                 }
             }
         });

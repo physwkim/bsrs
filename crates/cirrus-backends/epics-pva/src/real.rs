@@ -313,15 +313,16 @@ impl SignalBackend<f64> for EpicsPvaBackend<f64> {
         };
         let client = self.client.clone();
         let pv = self.pv.clone();
-        // Server timestamps live in NTScalar's `timeStamp` substructure.
-        // Project explicitly so the server is asked to send it and we
-        // also save bandwidth on alarm / display fields we don't use.
+        // Server timestamps live in NTScalar's `timeStamp` substructure and
+        // alarm state in `alarm`. Project both explicitly (skipping the larger
+        // `display`/`control` fields) so monitor readings carry server time +
+        // alarm severity, matching ophyd-async's reading format.
         // Servers publishing bare (non-Normative) scalars simply have no
         // `timeStamp` to send; we detect that on first frame and emit a
         // one-shot WARN per PV so operators can see that local-clock
         // timestamps are being substituted (the fallback is otherwise
         // invisible).
-        let request = PvRequestExpr::parse("field(value,timeStamp)").unwrap_or_default();
+        let request = PvRequestExpr::parse("field(value,alarm,timeStamp)").unwrap_or_default();
         let warned_local_clock = Arc::new(AtomicBool::new(false));
         let pv_for_cb = pv.clone();
         let warned_for_cb = warned_local_clock.clone();
@@ -343,7 +344,7 @@ impl SignalBackend<f64> for EpicsPvaBackend<f64> {
                                 now_ts()
                             }
                         };
-                        cb(&f, ts);
+                        cb(&f, ts, pv_field_to_alarm_severity(field));
                     }
                 })
                 .await;
@@ -431,7 +432,7 @@ impl SignalBackend<Vec<f64>> for EpicsPvaBackend<Vec<f64>> {
         };
         let client = self.client.clone();
         let pv = self.pv.clone();
-        let request = PvRequestExpr::parse("field(value,timeStamp)").unwrap_or_default();
+        let request = PvRequestExpr::parse("field(value,alarm,timeStamp)").unwrap_or_default();
         let warned_local_clock = Arc::new(AtomicBool::new(false));
         let pv_for_cb = pv.clone();
         let warned_for_cb = warned_local_clock.clone();
@@ -453,7 +454,7 @@ impl SignalBackend<Vec<f64>> for EpicsPvaBackend<Vec<f64>> {
                                 now_ts()
                             }
                         };
-                        cb(&v, ts);
+                        cb(&v, ts, pv_field_to_alarm_severity(field));
                     }
                 })
                 .await;
@@ -528,7 +529,7 @@ impl SignalBackend<String> for EpicsPvaBackend<String> {
         };
         let client = self.client.clone();
         let pv = self.pv.clone();
-        let request = PvRequestExpr::parse("field(value,timeStamp)").unwrap_or_default();
+        let request = PvRequestExpr::parse("field(value,alarm,timeStamp)").unwrap_or_default();
         let warned_local_clock = Arc::new(AtomicBool::new(false));
         let pv_for_cb = pv.clone();
         let warned_for_cb = warned_local_clock.clone();
@@ -547,7 +548,7 @@ impl SignalBackend<String> for EpicsPvaBackend<String> {
                             }
                             now_ts()
                         });
-                        cb(&s, ts);
+                        cb(&s, ts, pv_field_to_alarm_severity(field));
                     }
                 })
                 .await;
@@ -621,7 +622,7 @@ impl SignalBackend<i64> for EpicsPvaBackend<i64> {
         };
         let client = self.client.clone();
         let pv = self.pv.clone();
-        let request = PvRequestExpr::parse("field(value,timeStamp)").unwrap_or_default();
+        let request = PvRequestExpr::parse("field(value,alarm,timeStamp)").unwrap_or_default();
         let warned_local_clock = Arc::new(AtomicBool::new(false));
         let pv_for_cb = pv.clone();
         let warned_for_cb = warned_local_clock.clone();
@@ -640,7 +641,7 @@ impl SignalBackend<i64> for EpicsPvaBackend<i64> {
                             }
                             now_ts()
                         });
-                        cb(&i, ts);
+                        cb(&i, ts, pv_field_to_alarm_severity(field));
                     }
                 })
                 .await;
@@ -714,7 +715,7 @@ impl SignalBackend<bool> for EpicsPvaBackend<bool> {
         };
         let client = self.client.clone();
         let pv = self.pv.clone();
-        let request = PvRequestExpr::parse("field(value,timeStamp)").unwrap_or_default();
+        let request = PvRequestExpr::parse("field(value,alarm,timeStamp)").unwrap_or_default();
         let warned_local_clock = Arc::new(AtomicBool::new(false));
         let pv_for_cb = pv.clone();
         let warned_for_cb = warned_local_clock.clone();
@@ -733,7 +734,7 @@ impl SignalBackend<bool> for EpicsPvaBackend<bool> {
                             }
                             now_ts()
                         });
-                        cb(&b, ts);
+                        cb(&b, ts, pv_field_to_alarm_severity(field));
                     }
                 })
                 .await;
@@ -962,10 +963,11 @@ mod tests {
         let last_ts: Arc<std::sync::Mutex<f64>> = Arc::new(std::sync::Mutex::new(0.0));
         let count_cb = count.clone();
         let last_ts_cb = last_ts.clone();
-        let cb: ReadingValueCallback<f64> = Box::new(move |_v: &f64, ts: f64| {
-            count_cb.fetch_add(1, Ordering::SeqCst);
-            *last_ts_cb.lock().unwrap() = ts;
-        });
+        let cb: ReadingValueCallback<f64> =
+            Box::new(move |_v: &f64, ts: f64, _sev: Option<i32>| {
+                count_cb.fetch_add(1, Ordering::SeqCst);
+                *last_ts_cb.lock().unwrap() = ts;
+            });
         let _tok = backend.set_callback(Some(cb));
 
         tokio::time::sleep(Duration::from_secs(3)).await;

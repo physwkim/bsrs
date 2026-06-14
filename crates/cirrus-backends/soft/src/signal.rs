@@ -136,7 +136,7 @@ where
             .map(|(_, cb)| cb.clone())
             .collect();
         for cb in cbs {
-            cb(&v, ts);
+            cb(&v, ts, None);
         }
     }
 }
@@ -165,7 +165,7 @@ where
             .map(|(_, cb)| cb.clone())
             .collect();
         for cb in cbs {
-            cb(&value, ts);
+            cb(&value, ts, None);
         }
         Ok(())
     }

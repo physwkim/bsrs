@@ -83,12 +83,12 @@ where
 
     fn make_callback(&self) -> ReadingValueCallback<T> {
         let fanout = self.fanout.clone();
-        Box::new(move |v: &T, ts: f64| {
+        Box::new(move |v: &T, ts: f64, alarm_severity: Option<i32>| {
             if let Ok(json) = serde_json::to_value(v) {
                 let _ = fanout.tx.send(ReadingValue {
                     value: json,
                     timestamp: ts,
-                    alarm_severity: None,
+                    alarm_severity,
                     message: None,
                 });
                 fanout.has_value.store(true, Ordering::SeqCst);
@@ -246,5 +246,28 @@ mod tests {
             cache.cached_reading().unwrap().value,
             serde_json::json!(4.5)
         );
+    }
+
+    // The backend-facing callback must thread `alarm_severity` through to the
+    // cached reading. CA/PVA monitors now deliver `Some(severity)` on each
+    // update; the cache previously hardcoded `None` and dropped it. The soft
+    // backend used elsewhere always passes `None`, so exercise the boundary by
+    // invoking the callback directly with a known severity.
+    #[tokio::test]
+    async fn callback_threads_alarm_severity_into_cache() {
+        let cache = SignalCache::new(backend(0.0));
+        // Keep a live fan-out receiver so the watch retains sent values, but
+        // skip `add_listener` (it installs the backend monitor, which would
+        // race its own None-severity updates into the channel).
+        let _rx = cache.fanout.tx.subscribe();
+        let cb = cache.make_callback();
+        cb(&7.5_f64, 12.0, Some(2)); // MAJOR
+        let r = cache.cached_reading().expect("value cached after callback");
+        assert_eq!(r.value, serde_json::json!(7.5));
+        assert_eq!(r.timestamp, 12.0);
+        assert_eq!(r.alarm_severity, Some(2), "cache must not drop severity");
+        // `None` (soft/mock, or an alarm-less monitor frame) passes through.
+        cb(&8.0_f64, 13.0, None);
+        assert_eq!(cache.cached_reading().unwrap().alarm_severity, None);
     }
 }

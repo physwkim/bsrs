@@ -42,9 +42,10 @@ pub async fn ca_watch_f64(pv: &str) -> Result<watch::Receiver<f64>> {
     backend.connect(Duration::from_secs(5)).await?;
     let initial: f64 = backend.get_value().await.unwrap_or(0.0);
     let (tx, rx) = watch::channel(initial);
-    let cb: cirrus_protocols_async::ReadingValueCallback<f64> = Box::new(move |v: &f64, _ts| {
-        let _ = tx.send(*v);
-    });
+    let cb: cirrus_protocols_async::ReadingValueCallback<f64> =
+        Box::new(move |v: &f64, _ts, _sev| {
+            let _ = tx.send(*v);
+        });
     let sub_token = backend.set_callback(Some(cb));
     Box::leak(Box::new(sub_token));
     // Pin the backend too — once dropped, the channel goes idle.
