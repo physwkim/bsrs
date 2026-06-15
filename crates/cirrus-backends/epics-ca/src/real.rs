@@ -34,9 +34,12 @@ fn shard_for(pv: &str) -> usize {
     (h.finish() as usize) % SHARDS
 }
 
-fn now_ts() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+/// Convert a CA snapshot's `SystemTime` to epoch seconds. A `DbrClass::Time`
+/// read carries the server's processing time in `snap.timestamp`, which is the
+/// reading timestamp ophyd-async reports (`epics/core/_aioca.py:305-310`,
+/// `FORMAT_TIME`); the monitor path already stamps from the same field.
+fn ts_to_f64(t: SystemTime) -> f64 {
+    t.duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or_default()
 }
@@ -471,14 +474,14 @@ impl SignalBackend<f64> for EpicsCaBackend<f64> {
     async fn get_reading(&self) -> Result<ReadingValue> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
         let snap = ch
-            .get_with_metadata(DbrClass::Sts)
+            .get_with_metadata(DbrClass::Time)
             .await
             .map_err(|e| CirrusError::Backend(format!("ca get: {e}")))?;
         let f = epics_to_f64(&snap.value)
             .ok_or_else(|| CirrusError::Backend(format!("ca: not numeric: {:?}", snap.value)))?;
         Ok(ReadingValue {
             value: serde_json::Value::from(f),
-            timestamp: now_ts(),
+            timestamp: ts_to_f64(snap.timestamp),
             alarm_severity: Some(alarm_severity(snap.alarm.severity)),
             message: None,
         })
@@ -571,7 +574,7 @@ impl SignalBackend<Vec<f64>> for EpicsCaBackend<Vec<f64>> {
     async fn get_reading(&self) -> Result<ReadingValue> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
         let snap = ch
-            .get_with_metadata(DbrClass::Sts)
+            .get_with_metadata(DbrClass::Time)
             .await
             .map_err(|e| CirrusError::Backend(format!("ca get: {e}")))?;
         let v = epics_to_vec_f64(&snap.value).ok_or_else(|| {
@@ -579,7 +582,7 @@ impl SignalBackend<Vec<f64>> for EpicsCaBackend<Vec<f64>> {
         })?;
         Ok(ReadingValue {
             value: serde_json::Value::from(v),
-            timestamp: now_ts(),
+            timestamp: ts_to_f64(snap.timestamp),
             alarm_severity: Some(alarm_severity(snap.alarm.severity)),
             message: None,
         })
@@ -668,14 +671,14 @@ impl SignalBackend<String> for EpicsCaBackend<String> {
     async fn get_reading(&self) -> Result<ReadingValue> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
         let snap = ch
-            .get_with_metadata(DbrClass::Sts)
+            .get_with_metadata(DbrClass::Time)
             .await
             .map_err(|e| CirrusError::Backend(format!("ca get: {e}")))?;
         let s = epics_to_string(&snap.value, self.string_kind)
             .ok_or_else(|| CirrusError::Backend(format!("ca: not stringable: {:?}", snap.value)))?;
         Ok(ReadingValue {
             value: serde_json::Value::from(s),
-            timestamp: now_ts(),
+            timestamp: ts_to_f64(snap.timestamp),
             alarm_severity: Some(alarm_severity(snap.alarm.severity)),
             message: None,
         })
@@ -771,14 +774,14 @@ impl SignalBackend<i64> for EpicsCaBackend<i64> {
     async fn get_reading(&self) -> Result<ReadingValue> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
         let snap = ch
-            .get_with_metadata(DbrClass::Sts)
+            .get_with_metadata(DbrClass::Time)
             .await
             .map_err(|e| CirrusError::Backend(format!("ca get: {e}")))?;
         let i = epics_to_i64(&snap.value)
             .ok_or_else(|| CirrusError::Backend(format!("ca: not int: {:?}", snap.value)))?;
         Ok(ReadingValue {
             value: serde_json::Value::from(i),
-            timestamp: now_ts(),
+            timestamp: ts_to_f64(snap.timestamp),
             alarm_severity: Some(alarm_severity(snap.alarm.severity)),
             message: None,
         })
@@ -860,14 +863,14 @@ impl SignalBackend<bool> for EpicsCaBackend<bool> {
     async fn get_reading(&self) -> Result<ReadingValue> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
         let snap = ch
-            .get_with_metadata(DbrClass::Sts)
+            .get_with_metadata(DbrClass::Time)
             .await
             .map_err(|e| CirrusError::Backend(format!("ca get: {e}")))?;
         let b = epics_to_bool(&snap.value)
             .ok_or_else(|| CirrusError::Backend(format!("ca: not bool: {:?}", snap.value)))?;
         Ok(ReadingValue {
             value: serde_json::Value::from(b),
-            timestamp: now_ts(),
+            timestamp: ts_to_f64(snap.timestamp),
             alarm_severity: Some(alarm_severity(snap.alarm.severity)),
             message: None,
         })
@@ -1064,13 +1067,14 @@ impl SignalBackend<String> for CaEnumBackend {
         ))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
-        // A Reading carries the alarm severity that `read_label` discards, so
-        // inline a `Sts` metadata read (value + severity) and decode the label
-        // against the cached choices rather than going through `read_label`.
+        // A Reading carries the alarm severity and server timestamp that
+        // `read_label` discards, so inline a `Time` metadata read (value +
+        // severity + timestamp) and decode the label against the cached choices
+        // rather than going through `read_label`.
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
         let choices = self.ensure_choices(&ch).await?;
         let snap = ch
-            .get_with_metadata(DbrClass::Sts)
+            .get_with_metadata(DbrClass::Time)
             .await
             .map_err(|e| CirrusError::Backend(format!("ca enum get: {e}")))?;
         let label = epics_to_enum_label(&snap.value, &choices).ok_or_else(|| {
@@ -1078,7 +1082,7 @@ impl SignalBackend<String> for CaEnumBackend {
         })?;
         Ok(ReadingValue {
             value: serde_json::Value::from(label),
-            timestamp: now_ts(),
+            timestamp: ts_to_f64(snap.timestamp),
             alarm_severity: Some(alarm_severity(snap.alarm.severity)),
             message: None,
         })
