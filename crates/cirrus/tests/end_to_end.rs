@@ -389,6 +389,33 @@ async fn rewind_rolls_back_seq_num_so_replayed_save_reemits_same_seq_num() {
 }
 
 #[tokio::test]
+async fn read_outside_run_returns_ok_without_bundling() {
+    // bluesky `_read` reads the object and returns its value even with no open
+    // run, folding it into a bundle only when a run is open
+    // (run_engine.py:1993-1997). A plan that reads a detector outside any run
+    // must complete cleanly — it is valid ad-hoc inspection, not an
+    // IllegalMessageSequence. The run loop turns a handler error into a
+    // RunResult with exit_status="fail" (it never surfaces as Err), so pre-fix
+    // the bare read drove the plan to "fail"; with the fix the plan ends with
+    // no run ever opened → "no-run".
+    let det = SoftDetector::new("rd_det");
+    let re = RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new());
+    let det_clone = det.clone();
+    let plan = cirrus_core::plan::plan_box(async_stream::stream! {
+        // No OpenRun: a bare Read.
+        yield cirrus_core::Msg::Read(det_clone as Arc<dyn cirrus_core::msg::ReadableObj>);
+    });
+    let result = re
+        .run_async(plan)
+        .await
+        .expect("run_async returns a RunResult");
+    assert_eq!(
+        result.exit_status, "no-run",
+        "a bare read outside a run must not fail the plan (pre-fix: \"fail\")"
+    );
+}
+
+#[tokio::test]
 async fn abort_closes_run_with_abort_status() {
     let det = SoftDetector::new("a_det");
     let sink = Arc::new(CapturingSink::new());

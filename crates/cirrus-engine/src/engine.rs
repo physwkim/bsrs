@@ -1237,29 +1237,33 @@ impl RunEngine {
             Msg::Read(obj) => {
                 let readings = obj.read_dyn().await?;
                 let result_snapshot = readings.clone();
-                let data_keys = obj.describe_dyn().await?;
-                let object_name = Some(obj.name().to_string());
-                let hint_fields = obj.hint_fields();
+                // Bundle the reading only when a run is open. bluesky `_read`
+                // reads the object and returns its value unconditionally,
+                // folding it into the event bundle ONLY if the run_key has an
+                // open bundler (run_engine.py:1993-1997). A read with no open
+                // run is valid ad-hoc inspection: read and surface the value,
+                // do not bundle, do not error. (Contrast Create/DeclareStream,
+                // which DO raise without a run: run_engine.py:1942/1968.)
                 let bundler_present = {
                     let state = self.state.lock().await;
                     state.bundler.is_some()
                 };
                 if bundler_present {
+                    // describe() only matters for the bundle's descriptor, so
+                    // compute it (awaiting before re-locking) only when bundling.
+                    let data_keys = obj.describe_dyn().await?;
+                    let object_name = Some(obj.name().to_string());
+                    let hint_fields = obj.hint_fields();
                     let mut state = self.state.lock().await;
-                    state
-                        .bundler
-                        .as_mut()
-                        .ok_or_else(|| CirrusError::Plan("Read with no open run".into()))?
-                        .add_readings(readings, data_keys, object_name, hint_fields)?;
+                    if let Some(bundler) = state.bundler.as_mut() {
+                        bundler.add_readings(readings, data_keys, object_name, hint_fields)?;
+                    }
                 }
                 // Surface the reading even when there's no open run; the
                 // coroutine bridge can use it for ad-hoc inspection.
                 *self.last_msg_result.lock().unwrap() = MsgResult::Reading {
                     data: result_snapshot,
                 };
-                if !bundler_present {
-                    return Err(CirrusError::Plan("Read with no open run".into()));
-                }
             }
             Msg::Locate(obj) => {
                 let loc = obj.locate_dyn().await?;
