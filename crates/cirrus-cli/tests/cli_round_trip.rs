@@ -113,12 +113,15 @@ fn run_client(addr: &str, args: &[&str]) -> (String, String, i32) {
 }
 
 #[test]
-fn ping_returns_pong() {
+fn ping_returns_status_dict() {
     let m = spawn_manager();
     let (out, err, code) = run_client(&m.control, &["ping"]);
     assert_eq!(code, 0, "stderr: {err}");
-    assert!(out.contains("\"msg\""));
-    assert!(out.contains("pong"), "out = {out}");
+    // ping returns the full status dict (same as status, ref manager.py:1888).
+    assert!(
+        out.contains("manager_state"),
+        "ping should return status dict: {out}"
+    );
 }
 
 #[test]
