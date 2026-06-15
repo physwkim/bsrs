@@ -1402,3 +1402,53 @@ async fn double_stage_of_same_device_unstages_once() {
         "a device staged twice must be unstaged exactly once at run end"
     );
 }
+
+#[tokio::test]
+async fn kickoff_without_open_run_is_rejected_before_flyer_starts() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // bluesky `_kickoff` rejects a kickoff issued with no run open
+    // (IllegalMessageSequence, run_engine.py:2143-2147) *before* calling
+    // `obj.kickoff()`. cirrus must do the same: the flyer's data lands in the
+    // current run, so kicking off the hardware with no run to collect into is
+    // illegal — and the rejection must precede the kickoff side effect so no
+    // hardware begins flying.
+    struct CountingFlyer {
+        kickoffs: Arc<AtomicUsize>,
+    }
+    impl cirrus_core::msg::NamedObj for CountingFlyer {
+        fn name(&self) -> &str {
+            "countfly"
+        }
+    }
+    #[async_trait::async_trait]
+    impl cirrus_core::msg::FlyableObj for CountingFlyer {
+        async fn kickoff_dyn(&self) -> cirrus_core::status::Status {
+            self.kickoffs.fetch_add(1, Ordering::SeqCst);
+            cirrus_core::status::Status::done()
+        }
+        async fn complete_dyn(&self) -> cirrus_core::status::Status {
+            cirrus_core::status::Status::done()
+        }
+    }
+
+    let kickoffs = Arc::new(AtomicUsize::new(0));
+    let flyer = Arc::new(CountingFlyer {
+        kickoffs: kickoffs.clone(),
+    }) as Arc<dyn cirrus_core::msg::FlyableObj>;
+    let re = RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new());
+    // Kickoff with no preceding OpenRun.
+    let plan = cirrus_core::plan::plan_box(async_stream::stream! {
+        yield cirrus_core::Msg::Kickoff { obj: flyer, group: None };
+    });
+
+    let result = re.run_async(plan).await.unwrap();
+    assert_eq!(
+        result.exit_status, "fail",
+        "Kickoff with no open run must be rejected"
+    );
+    assert_eq!(
+        kickoffs.load(Ordering::SeqCst),
+        0,
+        "a rejected Kickoff must not start the flyer hardware"
+    );
+}

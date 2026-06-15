@@ -1325,11 +1325,21 @@ impl RunEngine {
                 obj.stop_dyn(success).await?;
             }
             Msg::Kickoff { obj, group } => {
-                self.state
-                    .lock()
-                    .await
-                    .flyable_objs_touched
-                    .insert(obj.name().to_string(), obj.clone());
+                // A kickoff requires an open run: the flyer's data is collected
+                // into the current run, so kicking off the hardware with no run
+                // to land in is an illegal message sequence. bluesky's
+                // `_kickoff` rejects this *before* calling `obj.kickoff()`
+                // (run_engine.py:2143-2147); reject here before the flyer is
+                // registered or started so no hardware begins flying.
+                {
+                    let mut state = self.state.lock().await;
+                    if state.bundler.is_none() {
+                        return Err(CirrusError::Plan("Kickoff sent but no run is open".into()));
+                    }
+                    state
+                        .flyable_objs_touched
+                        .insert(obj.name().to_string(), obj.clone());
+                }
                 let status = obj.kickoff_dyn().await;
                 if let Some(g) = group.clone() {
                     *self.last_msg_result.lock().unwrap() = MsgResult::Status { group: g };
