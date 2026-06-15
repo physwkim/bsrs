@@ -147,7 +147,7 @@ where
     /// [`walk_signal_sources`](crate::device::walk_signal_sources). Mirrors
     /// ophyd-async `Signal.source` (`core/_signal.py`).
     pub fn source(&self) -> String {
-        self.backend.source(&self.config.source)
+        self.backend.source(&self.config.source, true)
     }
 }
 
@@ -222,7 +222,7 @@ where
         let mut dk = self.backend.get_datakey(&self.config.source).await?;
         // Annotate the source if the backend left it blank.
         if dk.source.is_empty() {
-            dk.source = self.backend.source(&self.config.source);
+            dk.source = self.backend.source(&self.config.source, true);
         }
         let mut out = HashMap::new();
         out.insert(self.config.name.clone(), dk);

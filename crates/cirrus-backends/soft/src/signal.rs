@@ -228,7 +228,7 @@ where
             }
         }
     }
-    fn source(&self, name: &str) -> String {
+    fn source(&self, name: &str, _read: bool) -> String {
         format!("soft://{name}")
     }
 }

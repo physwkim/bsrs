@@ -530,7 +530,7 @@ impl SignalBackend<f64> for EpicsCaBackend<f64> {
         let abort = handle.abort_handle();
         SubToken::new(move || abort.abort())
     }
-    fn source(&self, name: &str) -> String {
+    fn source(&self, name: &str, _read: bool) -> String {
         format!("ca://{name}")
     }
 }
@@ -629,7 +629,7 @@ impl SignalBackend<Vec<f64>> for EpicsCaBackend<Vec<f64>> {
         let abort = handle.abort_handle();
         SubToken::new(move || abort.abort())
     }
-    fn source(&self, name: &str) -> String {
+    fn source(&self, name: &str, _read: bool) -> String {
         format!("ca://{name}")
     }
 }
@@ -726,7 +726,7 @@ impl SignalBackend<String> for EpicsCaBackend<String> {
         let abort = handle.abort_handle();
         SubToken::new(move || abort.abort())
     }
-    fn source(&self, name: &str) -> String {
+    fn source(&self, name: &str, _read: bool) -> String {
         format!("ca://{name}")
     }
 }
@@ -827,7 +827,7 @@ impl SignalBackend<i64> for EpicsCaBackend<i64> {
         let abort = handle.abort_handle();
         SubToken::new(move || abort.abort())
     }
-    fn source(&self, name: &str) -> String {
+    fn source(&self, name: &str, _read: bool) -> String {
         format!("ca://{name}")
     }
 }
@@ -916,7 +916,7 @@ impl SignalBackend<bool> for EpicsCaBackend<bool> {
         let abort = handle.abort_handle();
         SubToken::new(move || abort.abort())
     }
-    fn source(&self, name: &str) -> String {
+    fn source(&self, name: &str, _read: bool) -> String {
         format!("ca://{name}")
     }
 }
@@ -1136,7 +1136,7 @@ impl SignalBackend<String> for CaEnumBackend {
         let abort = handle.abort_handle();
         SubToken::new(move || abort.abort())
     }
-    fn source(&self, name: &str) -> String {
+    fn source(&self, name: &str, _read: bool) -> String {
         format!("ca://{name}")
     }
 }

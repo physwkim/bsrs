@@ -55,7 +55,11 @@ pub trait SignalBackend<T: Clone + Send + Sync + 'static>: Send + Sync {
     /// Subscribe to value updates. RAII token cleans up on drop.
     fn set_callback(&self, cb: Option<ReadingValueCallback<T>>) -> SubToken;
     /// Source string for `DataKey.source`.
-    fn source(&self, name: &str) -> String;
+    ///
+    /// `read=true` returns the URI used to GET (read back) the signal;
+    /// `read=false` returns the URI used to PUT (write) the signal.
+    /// Mirrors `ophyd_async/core/_signal_backend.py:70-75` `source(name, read)`.
+    fn source(&self, name: &str, read: bool) -> String;
 }
 
 // -- ophyd-async protocol traits --------------------------------------------

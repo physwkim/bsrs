@@ -451,7 +451,7 @@ impl SignalBackend<f64> for EpicsPvaBackend<f64> {
         let abort = handle.abort_handle();
         SubToken::new(move || abort.abort())
     }
-    fn source(&self, name: &str) -> String {
+    fn source(&self, name: &str, _read: bool) -> String {
         format!("pva://{name}")
     }
 }
@@ -561,7 +561,7 @@ impl SignalBackend<Vec<f64>> for EpicsPvaBackend<Vec<f64>> {
         let abort = handle.abort_handle();
         SubToken::new(move || abort.abort())
     }
-    fn source(&self, name: &str) -> String {
+    fn source(&self, name: &str, _read: bool) -> String {
         format!("pva://{name}")
     }
 }
@@ -655,7 +655,7 @@ impl SignalBackend<String> for EpicsPvaBackend<String> {
         let abort = handle.abort_handle();
         SubToken::new(move || abort.abort())
     }
-    fn source(&self, name: &str) -> String {
+    fn source(&self, name: &str, _read: bool) -> String {
         format!("pva://{name}")
     }
 }
@@ -755,7 +755,7 @@ impl SignalBackend<i64> for EpicsPvaBackend<i64> {
         let abort = handle.abort_handle();
         SubToken::new(move || abort.abort())
     }
-    fn source(&self, name: &str) -> String {
+    fn source(&self, name: &str, _read: bool) -> String {
         format!("pva://{name}")
     }
 }
@@ -848,7 +848,7 @@ impl SignalBackend<bool> for EpicsPvaBackend<bool> {
         let abort = handle.abort_handle();
         SubToken::new(move || abort.abort())
     }
-    fn source(&self, name: &str) -> String {
+    fn source(&self, name: &str, _read: bool) -> String {
         format!("pva://{name}")
     }
 }

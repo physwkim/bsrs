@@ -68,7 +68,7 @@ impl<T: Clone + Send + Sync + Serialize + 'static> SignalBackend<T> for MockBack
     fn set_callback(&self, _cb: Option<ReadingValueCallback<T>>) -> SubToken {
         SubToken::noop()
     }
-    fn source(&self, name: &str) -> String {
+    fn source(&self, name: &str, _read: bool) -> String {
         format!("mock://{name}")
     }
 }
