@@ -82,13 +82,20 @@ impl ZmqDocumentSource {
         self
     }
 
-    /// Replace the subscription filter (default = empty = all).
+    /// Replace the connect-time all-match subscription with `prefix`.
+    ///
+    /// ZMQ SUB subscriptions are *additive*: `connect` subscribes `b""` (match
+    /// all), so merely *adding* `prefix` would leave `b""` in place and every
+    /// message would keep matching — the filter would be a silent no-op.
+    /// Unsubscribe the `b""` default first, then subscribe `prefix`, so only
+    /// prefix-matching messages arrive. Intended to be called once after
+    /// `connect` to replace the default filter.
     pub fn with_subscribe_prefix(self, prefix: &[u8]) -> Self {
         {
             let s = self.socket.lock().unwrap();
-            // Drop the all-match subscription registered in `connect`
-            // and add the new one. ZMQ subscriptions are additive;
-            // both would match the same messages, so this is safe.
+            // Remove the all-match default before adding the narrower filter;
+            // otherwise the additive `b""` subscription defeats `prefix`.
+            let _ = s.set_unsubscribe(b"");
             let _ = s.set_subscribe(prefix);
         }
         self
@@ -280,6 +287,61 @@ mod tests {
             Document::Stop(s) => assert_eq!(s.exit_status, "success"),
             _ => panic!("wrong doc kind"),
         }
+    }
+
+    // The connect-time `b""` (match-all) subscription must be removed when a
+    // prefix filter is set, or it keeps matching every message and the filter
+    // is a silent no-op. Observe the SUB's real subscribe/unsubscribe frames via
+    // an XPUB peer: a subscribe arrives as `\x01<prefix>`, an unsubscribe as
+    // `\x00<prefix>`. First wait for the empty-prefix subscribe to confirm the
+    // connection is up — so the later unsubscribe is genuinely transmitted and
+    // not coalesced away — then assert the empty-prefix UNSUBSCRIBE arrives.
+    // Neutering the fix (dropping `set_unsubscribe`) never emits that frame.
+    #[test]
+    fn subscribe_prefix_drops_the_match_all_default() {
+        let addr = format!(
+            "ipc:///tmp/cirrus-zmq-xpub-test-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64
+        );
+        let ctx = zmq::Context::new();
+        let xpub = ctx.socket(zmq::XPUB).expect("xpub socket");
+        xpub.bind(&addr).expect("xpub bind");
+        xpub.set_rcvtimeo(100).unwrap();
+
+        // connect() subscribes the match-all default b"".
+        let src = ZmqDocumentSource::connect(&addr).expect("connect source");
+
+        // Wait for the match-all subscribe (one 0x01 byte) so the connection is
+        // established before we narrow — otherwise the unsubscribe below could
+        // cancel the not-yet-sent subscribe and never reach the XPUB.
+        let recv_frame = |sock: &zmq::Socket, want: [u8; 1]| -> bool {
+            for _ in 0..50 {
+                match sock.recv_bytes(0) {
+                    Ok(f) if f == want => return true,
+                    Ok(_) => {}
+                    Err(zmq::Error::EAGAIN) => {}
+                    Err(e) => panic!("xpub recv: {e}"),
+                }
+            }
+            false
+        };
+        assert!(
+            recv_frame(&xpub, [0x01]),
+            "XPUB never saw the connect-time match-all subscribe"
+        );
+
+        // Narrow to a prefix; the fix unsubscribes b"" first.
+        let _src = src.with_subscribe_prefix(b"app1.");
+
+        assert!(
+            recv_frame(&xpub, [0x00]),
+            "with_subscribe_prefix must unsubscribe the match-all default \
+             (no empty-prefix unsubscribe frame reached the XPUB)"
+        );
     }
 
     // Regression for the run_into_engine injection path. Pre-fix the
