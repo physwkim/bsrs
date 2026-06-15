@@ -472,7 +472,6 @@ async fn not_implemented_methods_return_defined_error() {
         "script_upload",
         "function_execute",
         "kernel_interrupt",
-        "manager_stop",
         "manager_kill",
     ] {
         let r = rpc(&req, m, json!({}));
@@ -487,6 +486,38 @@ async fn not_implemented_methods_return_defined_error() {
     }
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manager_stop_shuts_down_server() {
+    let port = rand_port();
+    let reg = Registry::new();
+    let _shutdown = spawn_server(reg, port);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(port);
+    let r = rpc(&req, "manager_stop", json!({}));
+    assert_eq!(r["success"], true, "manager_stop must succeed: {r}");
+    // After manager_stop the server exits its rep loop; further requests time out.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let ctx = zmq::Context::new();
+    let probe = ctx.socket(zmq::REQ).unwrap();
+    probe.set_rcvtimeo(300).unwrap();
+    probe.set_sndtimeo(300).unwrap();
+    probe
+        .connect(&format!(
+            "ipc:///tmp/cirrus-qs-test-{}-{}.sock",
+            std::process::id(),
+            port
+        ))
+        .unwrap();
+    probe
+        .send(
+            serde_json::to_vec(&json!({"method": "status", "params": {}})).unwrap(),
+            0,
+        )
+        .unwrap();
+    let gone = probe.recv_bytes(0).is_err();
+    assert!(gone, "server should not respond after manager_stop");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

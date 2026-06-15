@@ -8,6 +8,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
@@ -25,6 +26,8 @@ use crate::state::{EState, EngineState};
 use crate::tasks::TaskTracker;
 
 /// Top-level dispatch entry. Returns a flat bluesky-queueserver response dict.
+/// When `manager_stop` is called, `stop_requested` is set to `true`; the
+/// caller (rep_loop) must check this after sending the response and exit.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch(
     rt: &tokio::runtime::Handle,
@@ -39,6 +42,7 @@ pub(crate) fn dispatch(
     lua_evaluator: Option<Arc<dyn LuaEvaluator>>,
     task_tracker: Arc<TaskTracker>,
     checkpoint_hook: Option<CheckpointHook>,
+    stop_requested: Arc<AtomicBool>,
 ) -> Value {
     let m = req.method.as_str();
 
@@ -343,10 +347,20 @@ pub(crate) fn dispatch(
             Err(e) => err(format!("permissions_reload: {e}")),
         },
 
+        // -- manager stop -------------------------------------------------
+        "manager_stop" => {
+            // Abort any in-flight queue task, then signal the rep loop to exit.
+            if let Some(h) = queue_task.lock().unwrap().take() {
+                h.abort();
+            }
+            stop_requested.store(true, std::sync::atomic::Ordering::SeqCst);
+            json!({"success": true, "msg": ""})
+        }
+
         // -- not-implemented stubs (registered so clients see the method
         //    name but get a defined error). --------------------------------
         "permissions_set" | "script_upload" | "function_execute" | "kernel_interrupt"
-        | "manager_stop" | "manager_kill" => err(format!(
+        | "manager_kill" => err(format!(
             "method '{m}' is registered but not implemented in cirrus-qs \
              (bluesky-queueserver-only feature)"
         )),

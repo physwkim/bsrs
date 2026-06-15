@@ -1,5 +1,6 @@
 //! `Server` — owns the engine, queue, registry, and the REP socket.
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
@@ -303,6 +304,7 @@ fn rep_loop(
     task_tracker: Arc<TaskTracker>,
     checkpoint_hook: Option<CheckpointHook>,
 ) -> Result<()> {
+    let stop_requested = Arc::new(AtomicBool::new(false));
     while !socket.is_shutdown() {
         let req = match socket.try_recv() {
             Ok(Some(r)) => r,
@@ -322,9 +324,14 @@ fn rep_loop(
             lua_evaluator.clone(),
             task_tracker.clone(),
             checkpoint_hook.clone(),
+            stop_requested.clone(),
         );
         if let Err(e) = socket.send(&resp) {
             tracing::warn!(target: "cirrus-qs", "rep_loop: send error: {e}");
+        }
+        if stop_requested.load(std::sync::atomic::Ordering::SeqCst) {
+            socket.shutdown();
+            break;
         }
     }
     // Loop exited (shutdown). Make absolutely sure the queue worker is gone.
