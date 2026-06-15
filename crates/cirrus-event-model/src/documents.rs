@@ -6,12 +6,32 @@ use std::collections::HashMap;
 
 // -- run_start.json -----------------------------------------------------------
 
+/// One element of a `dimensions` hint entry: either a single name (typically
+/// the stream name) or a list of field names.
+///
+/// The event-model `dimensions` hint is `list[list[ str | list[str] ]]`
+/// (run_start.json `Hints.dimensions`): the canonical entry is
+/// `[["x"], "primary"]`, where the field set is a list but the stream name is a
+/// bare string. Modeling the innermost as plain `Vec<String>` (always a list)
+/// cannot represent the bare-string element, so a real RunStart with a
+/// dimensions hint fails to deserialize.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum DimensionItem {
+    /// A single name, e.g. the stream the fields are read from.
+    Name(String),
+    /// A list of field names.
+    Fields(Vec<String>),
+}
+
 /// Visualization hints carried in `RunStart`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Hints {
-    /// Independent axes of the experiment, ordered slow-to-fast.
+    /// Independent axes of the experiment, ordered slow-to-fast. Each entry is
+    /// a list whose elements are either a field-name list or a bare name
+    /// (e.g. `[["x"], "primary"]`); see [`DimensionItem`].
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub dimensions: Option<Vec<Vec<Vec<String>>>>,
+    pub dimensions: Option<Vec<Vec<DimensionItem>>>,
 }
 
 /// A projection spec carried in `RunStart.projections`. Describes how to
@@ -731,5 +751,28 @@ mod tests {
         assert!(!stop.extra.contains_key("data_type"));
         // Re-serializing reproduces the incoming object verbatim.
         assert_eq!(serde_json::to_value(&stop).unwrap(), incoming);
+    }
+
+    #[test]
+    fn hints_dimensions_round_trip_mixed_list_and_bare_name() {
+        // The canonical dimensions hint pairs a field-name *list* with a bare
+        // stream-name *string*: `[[["x"], "primary"]]`. The bare string must
+        // deserialize as `DimensionItem::Name`, the list as
+        // `DimensionItem::Fields`, and the whole thing must round-trip.
+        let incoming = serde_json::json!({
+            "dimensions": [[["x"], "primary"], [["y"], "primary"]]
+        });
+        let hints: Hints = serde_json::from_value(incoming.clone()).unwrap();
+        let dims = hints.dimensions.as_ref().expect("dimensions present");
+        assert_eq!(
+            dims[0],
+            vec![
+                DimensionItem::Fields(vec!["x".into()]),
+                DimensionItem::Name("primary".into()),
+            ],
+            "list element -> Fields, bare-string element -> Name"
+        );
+        // Round-trips back to the same JSON (bare names stay bare strings).
+        assert_eq!(serde_json::to_value(&hints).unwrap(), incoming);
     }
 }
