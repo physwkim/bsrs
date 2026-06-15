@@ -312,6 +312,8 @@ pub(crate) fn dispatch(
             task_tracker.start(&task_uid, "lua_eval");
             let tracker = task_tracker.clone();
             let uid_for_task = task_uid.clone();
+            let state_for_task = state.clone();
+            state.lock().unwrap().worker_background_tasks += 1;
             rt.spawn(async move {
                 // Catch panics from the eval future so a fault
                 // (mlua bug, OOM, etc.) doesn't leave the task
@@ -332,6 +334,8 @@ pub(crate) fn dispatch(
                     }
                 };
                 tracker.complete(&uid_for_task, result);
+                let mut st = state_for_task.lock().unwrap();
+                st.worker_background_tasks = st.worker_background_tasks.saturating_sub(1);
             });
             json!({"success": true, "msg": "", "task_uid": task_uid})
         }
@@ -498,6 +502,7 @@ fn status_response(
         "worker_environment_state": if env_exists { "idle" } else { "closed" },
         "queue_stop_pending": st.queue_stop_pending,
         "pause_pending": st.pause_pending,
+        "worker_background_tasks": st.worker_background_tasks,
         "queue_autostart_enabled": st.queue_autostart_enabled,
         "plan_queue_mode": st.queue_mode,
         "plan_queue_uid": q.queue_uid(),
