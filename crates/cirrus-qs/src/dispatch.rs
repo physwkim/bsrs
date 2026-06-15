@@ -123,7 +123,7 @@ pub(crate) fn dispatch(
             env_open(document_sink, &state, &engine, rt, checkpoint_hook.as_ref())
         }
         "environment_close" => env_close(&state, &engine, rt),
-        "environment_destroy" => env_close(&state, &engine, rt), // forced close
+        "environment_destroy" => env_destroy(&state, &engine, &queue_task, rt),
         "environment_update" => json!({"success": true, "msg": ""}),
 
         // -- queue contents -----------------------------------------------
@@ -554,6 +554,19 @@ fn env_close(
     *e = None;
     state.lock().unwrap().state = Some(EState::EnvironmentClosed);
     json!({"success": true, "msg": ""})
+}
+
+fn env_destroy(
+    state: &Arc<StdMutex<EngineState>>,
+    engine: &Arc<Mutex<Option<Arc<RunEngine>>>>,
+    queue_task: &Arc<StdMutex<Option<AbortHandle>>>,
+    rt: &tokio::runtime::Handle,
+) -> Value {
+    // Force-abort any running queue task before dropping the engine.
+    if let Some(h) = queue_task.lock().unwrap().take() {
+        h.abort();
+    }
+    env_close(state, engine, rt)
 }
 
 fn queue_get(queue: &Arc<StdMutex<PlanQueue>>, state: &Arc<StdMutex<EngineState>>) -> Value {
