@@ -145,6 +145,26 @@ impl PlanQueue {
         self.bump_queue_uid();
         Some(it)
     }
+    /// Move item `uid` to the position immediately before `ref_uid`.
+    /// Returns the moved item if both UIDs exist.
+    pub fn move_before_uid(&mut self, uid: &str, ref_uid: &str) -> Option<QueuedItem> {
+        let pos = self.items.iter().position(|i| i.item_uid == uid)?;
+        let it = self.items.remove(pos)?;
+        let ref_pos = self.items.iter().position(|i| i.item_uid == ref_uid)?;
+        self.items.insert(ref_pos, it.clone());
+        self.bump_queue_uid();
+        Some(it)
+    }
+    /// Move item `uid` to the position immediately after `ref_uid`.
+    /// Returns the moved item if both UIDs exist.
+    pub fn move_after_uid(&mut self, uid: &str, ref_uid: &str) -> Option<QueuedItem> {
+        let pos = self.items.iter().position(|i| i.item_uid == uid)?;
+        let it = self.items.remove(pos)?;
+        let ref_pos = self.items.iter().position(|i| i.item_uid == ref_uid)?;
+        self.items.insert(ref_pos + 1, it.clone());
+        self.bump_queue_uid();
+        Some(it)
+    }
     /// Clear all pending items.
     pub fn clear(&mut self) {
         if !self.items.is_empty() {

@@ -775,16 +775,34 @@ fn queue_item_move(queue: &Arc<StdMutex<PlanQueue>>, params: &Value) -> Value {
         Some(u) => u.to_string(),
         None => return err("uid required"),
     };
-    let dest = resolve_pos(params.get("pos_dest"), queue);
     let mut q = queue.lock().unwrap();
-    match q.move_to(&uid, dest) {
+    let result = if let Some(ref_uid) = params.get("before_uid").and_then(|v| v.as_str()) {
+        q.move_before_uid(&uid, ref_uid)
+    } else if let Some(ref_uid) = params.get("after_uid").and_then(|v| v.as_str()) {
+        q.move_after_uid(&uid, ref_uid)
+    } else {
+        drop(q);
+        let dest = resolve_pos(params.get("pos_dest"), queue);
+        let mut q = queue.lock().unwrap();
+        let r = q.move_to(&uid, dest);
+        return match r {
+            Some(it) => json!({
+                "success": true,
+                "msg": "",
+                "item": serde_json::to_value(&it).unwrap(),
+                "plan_queue_uid": q.queue_uid(),
+            }),
+            None => err(format!("uid not found: {uid}")),
+        };
+    };
+    match result {
         Some(it) => json!({
             "success": true,
             "msg": "",
             "item": serde_json::to_value(&it).unwrap(),
             "plan_queue_uid": q.queue_uid(),
         }),
-        None => err(format!("uid not found: {uid}")),
+        None => err(format!("uid or reference uid not found: {uid}")),
     }
 }
 
