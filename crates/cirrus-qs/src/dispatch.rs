@@ -561,14 +561,14 @@ fn queue_item_add(
         return err(format!("unknown plan: {name}"));
     }
     let queued = QueuedItem::plan(name, item);
-    let item_uid = queued.item_uid.clone();
+    let queued_val = serde_json::to_value(&queued).unwrap();
     let mut q = queue.lock().unwrap();
     q.push_back(queued);
     json!({
         "success": true,
         "msg": "",
         "qsize": q.len(),
-        "item_uid": item_uid,
+        "item": queued_val,
         "plan_queue_uid": q.queue_uid(),
     })
 }

@@ -334,8 +334,8 @@ async fn queue_item_move_and_get_by_uid() {
         "queue_item_add",
         json!({"item": {"name": "count", "args": ["det1", 2]}}),
     );
-    let uid_first = r1["item_uid"].as_str().unwrap().to_string();
-    let uid_second = r2["item_uid"].as_str().unwrap().to_string();
+    let uid_first = r1["item"]["item_uid"].as_str().unwrap().to_string();
+    let uid_second = r2["item"]["item_uid"].as_str().unwrap().to_string();
 
     // Move the second item to the front.
     let mv = rpc(
