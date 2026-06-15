@@ -317,10 +317,17 @@ pub fn fly_during_wrapper(
     flyers: Vec<(Arc<dyn FlyableObj>, Arc<dyn CollectableObj>)>,
 ) -> Plan {
     plan_box(async_stream::stream! {
+        // Mirror bluesky `fly_during_wrapper`: only insert the kickoff/complete
+        // `wait` when there is at least one flyer (`if flyers:`,
+        // preprocessors.py:895). Waiting on a group that received no Kickoff /
+        // Complete is a spurious message.
+        let any_flyers = !flyers.is_empty();
         for (f, _) in &flyers {
             yield Msg::Kickoff { obj: f.clone(), group: Some("fly_kick".into()) };
         }
-        yield Msg::Wait { group: "fly_kick".into(), error_on_timeout: true, timeout: None };
+        if any_flyers {
+            yield Msg::Wait { group: "fly_kick".into(), error_on_timeout: true, timeout: None };
+        }
         let mut inner = inner;
         while let Some(item) = inner.next().await {
             if let PlanItem::Bare(m) = item {
@@ -330,7 +337,9 @@ pub fn fly_during_wrapper(
         for (f, _) in &flyers {
             yield Msg::Complete { obj: f.clone(), group: Some("fly_done".into()) };
         }
-        yield Msg::Wait { group: "fly_done".into(), error_on_timeout: true, timeout: None };
+        if any_flyers {
+            yield Msg::Wait { group: "fly_done".into(), error_on_timeout: true, timeout: None };
+        }
         for (_, c) in flyers {
             yield Msg::Collect { obj: c, stream_name: None };
         }
@@ -663,5 +672,72 @@ mod tests {
         let msgs = drain(stub_wrapper(body)).await;
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Msg::Fail(s) if s.contains("CloseRun")));
+    }
+
+    struct FakeFlyer(String);
+    impl cirrus_core::msg::NamedObj for FakeFlyer {
+        fn name(&self) -> &str {
+            &self.0
+        }
+    }
+    #[async_trait::async_trait]
+    impl FlyableObj for FakeFlyer {
+        async fn kickoff_dyn(&self) -> cirrus_core::status::Status {
+            cirrus_core::status::Status::done()
+        }
+        async fn complete_dyn(&self) -> cirrus_core::status::Status {
+            cirrus_core::status::Status::done()
+        }
+    }
+    #[async_trait::async_trait]
+    impl CollectableObj for FakeFlyer {
+        async fn describe_collect_dyn(
+            &self,
+        ) -> Result<HashMap<String, HashMap<String, cirrus_event_model::DataKey>>, CirrusError>
+        {
+            Ok(HashMap::new())
+        }
+        async fn collect_dyn(
+            &self,
+        ) -> Result<Vec<(String, HashMap<String, Value>, HashMap<String, f64>)>, CirrusError>
+        {
+            Ok(Vec::new())
+        }
+    }
+
+    fn fake_flyer(name: &str) -> (Arc<dyn FlyableObj>, Arc<dyn CollectableObj>) {
+        let f = Arc::new(FakeFlyer(name.into()));
+        (
+            f.clone() as Arc<dyn FlyableObj>,
+            f as Arc<dyn CollectableObj>,
+        )
+    }
+
+    #[tokio::test]
+    async fn fly_during_wrapper_skips_wait_when_no_flyers() {
+        // bluesky guards both kickoff/complete waits with `if flyers:`; with no
+        // flyers nothing is inserted and only the inner plan's messages survive.
+        let body = plan_box(async_stream::stream! { yield Msg::Null; });
+        let msgs = drain(fly_during_wrapper(body, vec![])).await;
+        assert_eq!(msgs.len(), 1, "got {msgs:?}");
+        assert!(matches!(&msgs[0], Msg::Null));
+        assert!(
+            !msgs.iter().any(|m| matches!(m, Msg::Wait { .. })),
+            "no Wait may be emitted when there are no flyers"
+        );
+    }
+
+    #[tokio::test]
+    async fn fly_during_wrapper_brackets_inner_with_kickoff_wait_complete_collect() {
+        let body = plan_box(async_stream::stream! { yield Msg::Null; });
+        let msgs = drain(fly_during_wrapper(body, vec![fake_flyer("f")])).await;
+        // Kickoff, Wait{fly_kick}, Null, Complete, Wait{fly_done}, Collect.
+        assert_eq!(msgs.len(), 6, "got {msgs:?}");
+        assert!(matches!(&msgs[0], Msg::Kickoff { .. }));
+        assert!(matches!(&msgs[1], Msg::Wait { group, .. } if group == "fly_kick"));
+        assert!(matches!(&msgs[2], Msg::Null));
+        assert!(matches!(&msgs[3], Msg::Complete { .. }));
+        assert!(matches!(&msgs[4], Msg::Wait { group, .. } if group == "fly_done"));
+        assert!(matches!(&msgs[5], Msg::Collect { .. }));
     }
 }
