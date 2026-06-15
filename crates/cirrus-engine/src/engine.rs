@@ -1821,10 +1821,21 @@ impl RunEngine {
     async fn close_run_if_open(&self, exit_status: &str, reason: Option<String>) -> Result<()> {
         let stop_doc = {
             let mut state = self.state.lock().await;
-            state
+            let stop = state
                 .bundler
                 .take()
-                .map(|bundler| bundler.compose().stop(exit_status, reason))
+                .map(|bundler| bundler.compose().stop(exit_status, reason));
+            if stop.is_some() {
+                // Tear down any monitors still active when the run closes —
+                // bluesky's close_run clears each remaining `_monitor_params`
+                // subscription (bundlers.py:246-248). A `Msg::Monitor` not
+                // explicitly `Unmonitor`'d is unsubscribed per-run, not leaked
+                // into the next run, where its pump would otherwise keep
+                // composing Events against this now-closed bundle.
+                // `MonitorTask::drop` aborts the pump and drops its Subscription.
+                state.monitor_tasks.clear();
+            }
+            stop
         };
         if let Some(stop) = stop_doc {
             let run_uid = stop.run_start.clone();

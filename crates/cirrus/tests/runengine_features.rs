@@ -820,6 +820,42 @@ async fn unmonitor_stops_pump_for_custom_named_stream() {
 }
 
 #[tokio::test]
+async fn close_run_tears_down_active_monitor_not_explicitly_unmonitored() {
+    // bluesky's close_run clears any monitor still subscribed at run close
+    // (bundlers.py:246-248). A Msg::Monitor the plan never Unmonitor'd must be
+    // torn down when the run closes — not left pumping until plan end, where
+    // run_async's cleanup would mask the leak. Observed via the monitor's watch
+    // receiver count: the pump (subscribed synchronously in start_monitor)
+    // holds the only receiver.
+    let re = Arc::new(RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new()));
+    let mon = TestMonitor::new("mon_close");
+    let mon_for_plan: Arc<dyn cirrus_core::msg::MonitorableObj> = mon.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Monitor { obj: mon_for_plan, name: None };
+        yield Msg::Sleep(Duration::from_millis(50));
+        // Close WITHOUT a preceding Unmonitor.
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+        // Hold the plan open past the close so the test observes the monitor
+        // state before run_async's plan-end cleanup runs.
+        yield Msg::Sleep(Duration::from_millis(500));
+    });
+    let re_run = re.clone();
+    let join = tokio::spawn(async move { re_run.run_async(plan).await });
+
+    // Inside the post-close window (close fires ~50ms in; the trailing sleep
+    // runs to ~550ms; plan-end cleanup is only after that).
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let receivers = mon.tx.receiver_count();
+
+    join.await.unwrap().unwrap();
+    assert_eq!(
+        receivers, 0,
+        "close_run must unsubscribe a monitor never explicitly Unmonitor'd; pre-fix the pump survives (1 receiver)"
+    );
+}
+
+#[tokio::test]
 async fn pause_changes_state_to_paused() {
     let re = Arc::new(RunEngine::new(vec![]));
     assert_eq!(re.state(), EngineRunState::Idle);
