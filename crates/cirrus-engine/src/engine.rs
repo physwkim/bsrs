@@ -1803,22 +1803,33 @@ impl RunEngine {
                 "OpenRun while a previous run is still open".into(),
             ));
         }
-        // Merge persistent metadata first; per-run extras override.
+        // Combine metadata in order of *decreasing* precedence, mirroring
+        // bluesky's ChainMap (run_engine.py:1861-1870):
+        //   per-call (run_async_with) > per-run (OpenRun extra)
+        //     > computed {plan_name} > persistent (RE.md).
+        // Build bottom-up — insert the lowest-precedence source first so the
+        // highest-precedence source (per-call) is written last and wins.
         let mut merged: HashMap<String, Value> = {
-            let mut m = self.md.lock().unwrap().clone();
-            // Per-call metadata is also merged here (set by
-            // `run_async_with`). Per-run `meta.extra` wins over
-            // per-call which wins over persistent.
-            let per_call = self.per_call_md.lock().unwrap().clone();
-            for (k, v) in per_call {
-                m.insert(k, v);
+            let mut m = self.md.lock().unwrap().clone(); // persistent (lowest)
+                                                         // Computed plan_name overrides persistent but is overridden by the
+                                                         // per-run / per-call layers below. bluesky places its computed
+                                                         // {plan_type, plan_name} above self.md and below msg.kwargs and
+                                                         // _metadata_per_call, so this is an `insert` (overwrite persistent),
+                                                         // not the previous `or_insert` (which left it lowest-precedence).
+            if let Some(ref pn) = meta.plan_name {
+                m.insert("plan_name".into(), Value::String(pn.clone()));
             }
+            // Per-run extras (the OpenRun Msg's kwargs) override the computed
+            // level.
             for (k, v) in &meta.extra {
                 m.insert(k.clone(), v.clone());
             }
-            if let Some(ref pn) = meta.plan_name {
-                m.entry("plan_name".into())
-                    .or_insert(Value::String(pn.clone()));
+            // Per-call md (`run_async_with`) is bluesky's `_metadata_per_call`,
+            // the highest-precedence ChainMap layer — the operator's
+            // invocation-time md wins over what the plan baked into OpenRun.
+            let per_call = self.per_call_md.lock().unwrap().clone();
+            for (k, v) in per_call {
+                m.insert(k, v);
             }
             m
         };

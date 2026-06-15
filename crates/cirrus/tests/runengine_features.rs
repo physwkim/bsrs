@@ -1481,6 +1481,40 @@ async fn run_async_with_per_call_md_lands_in_runstart() {
 }
 
 #[tokio::test]
+async fn per_call_md_wins_over_per_run_open_run_extra() {
+    // bluesky ChainMap precedence (run_engine.py:1861-1870): the operator's
+    // invocation-time md (`_metadata_per_call`, set via `run_async_with`)
+    // outranks the per-run md a plan bakes into its `OpenRun` Msg. When both
+    // set the same key, per-call must win.
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    // Plan supplies a conflicting `operator` via the OpenRun extra md.
+    let plan = plan_box(async_stream::stream! {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("operator".to_string(), Value::String("plan".into()));
+        yield Msg::OpenRun(cirrus_core::msg::RunMetadata {
+            extra,
+            ..Default::default()
+        });
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let mut md = std::collections::HashMap::new();
+    md.insert("operator".into(), Value::String("user".into()));
+    let opts = cirrus_engine::RunOptions { md, subs: vec![] };
+    re.run_async_with(plan, opts).await.unwrap();
+    let docs = sink.snapshot().await;
+    let start = match &docs[0] {
+        Document::Start(s) => s,
+        _ => panic!("first doc not Start"),
+    };
+    assert_eq!(
+        start.extra.get("operator"),
+        Some(&Value::String("user".into())),
+        "per-call md (run_async_with) must outrank per-run OpenRun extra"
+    );
+}
+
+#[tokio::test]
 async fn run_async_with_temp_subs_auto_remove_at_run_end() {
     let count = Arc::new(AtomicU64::new(0));
     let c2 = count.clone();
