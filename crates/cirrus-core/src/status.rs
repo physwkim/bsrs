@@ -270,13 +270,21 @@ impl Status {
 
     /// ophyd-style: register a callback fired on completion. If already done,
     /// fires immediately on the calling thread.
+    ///
+    /// A *cancelled* status counts as done — like a cancelled asyncio task in
+    /// ophyd-async (`_status.py:56-60`, `if self.done: callback(self)`), so a
+    /// callback registered after `cancel()` fires immediately with the stored
+    /// `Cancelled` error. `cancel()` already drained the pending callback queue,
+    /// so an enqueued callback here would never fire; only `PENDING` may enqueue.
+    /// This mirrors the `ERROR | CANCELLED` grouping in `exception()`, `inspect()`,
+    /// and the `Future::poll` impl.
     pub fn add_callback<F>(&self, cb: F)
     where
         F: FnOnce(&StatusOutcome) + Send + 'static,
     {
         match self.inner.state.load(Ordering::Acquire) {
             SUCCESS => cb(&StatusOutcome::Success),
-            ERROR => {
+            ERROR | CANCELLED => {
                 let err = self
                     .inner
                     .error
@@ -597,6 +605,26 @@ mod tests {
         assert_eq!(v["success"], false);
         assert_eq!(v["cancelled"], true);
         assert_eq!(v["exception"].as_str(), Some("cancelled"));
+    }
+
+    // Boundary: callback registered AFTER cancel fires immediately (a cancelled
+    // status is done). cancel() already drained the queue, so enqueuing here
+    // would lose the callback forever → consumer hang. Mirrors `_status.py:56-60`.
+    #[tokio::test]
+    async fn add_callback_after_cancel_fires_immediately() {
+        let (s, _setter) = Status::new();
+        s.cancel();
+        let got = Arc::new(Mutex::new(None));
+        let g2 = got.clone();
+        s.add_callback(move |o| {
+            *g2.lock().unwrap() = Some(o.clone());
+        });
+        // Fired synchronously on this thread with the stored Cancelled error,
+        // not silently enqueued.
+        assert!(matches!(
+            *got.lock().unwrap(),
+            Some(StatusOutcome::Failed(StatusError::Cancelled))
+        ));
     }
 
     // Boundary: status already SUCCESS at cancel time → cancel is a no-op;
