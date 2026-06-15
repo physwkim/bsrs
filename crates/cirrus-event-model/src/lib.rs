@@ -13,7 +13,7 @@ pub mod page;
 
 pub use documents::{
     make_datakey, Configuration, DataKey, Datum, DatumPage, DimensionItem, DocFilter, Document,
-    Dtype, Event, EventDescriptor, EventPage, ExitStatus, Hints, Limits, LimitsRange,
+    Dtype, DtypeNumpy, Event, EventDescriptor, EventPage, ExitStatus, Hints, Limits, LimitsRange,
     PerObjectHint, Projections, RdsRange, Reading, Resource, RunStart, RunStop, SignalMetadata,
     StreamDatum, StreamRange, StreamResource,
 };

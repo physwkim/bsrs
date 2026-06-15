@@ -1527,7 +1527,7 @@ fn lua_table_to_data_key(t: &mlua::Table) -> mlua::Result<cirrus_event_model::Da
         source,
         dtype,
         shape,
-        dtype_numpy: t.get::<String>("dtype_numpy").ok(),
+        dtype_numpy: t.get::<String>("dtype_numpy").ok().map(Into::into),
         external: None,
         units: t.get::<String>("units").ok(),
         precision: t.get::<i64>("precision").ok(),

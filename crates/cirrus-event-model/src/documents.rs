@@ -234,6 +234,36 @@ pub struct Limits {
     pub rds: Option<RdsRange>,
 }
 
+/// Numpy dtype annotation for a [`DataKey`], matching the `dtype_numpy` field in
+/// the event_descriptor JSON schema (`anyOf[string, array-of-pairs]`).
+///
+/// `Scalar` holds a plain numpy dtype string (e.g. `"<f8"`, `"|u1"`).
+/// `Structured` holds a list of `(name, dtype)` pairs for compound/structured
+/// numpy dtypes (e.g. `[("x", "<f4"), ("y", "<f4")]`).
+///
+/// The `#[serde(untagged)]` means serde tries `Scalar` first (string), then
+/// `Structured` (array of 2-element arrays) — matching the schema's `anyOf`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum DtypeNumpy {
+    /// A simple numpy dtype string, e.g. `"<f8"`.
+    Scalar(String),
+    /// A structured numpy dtype: ordered list of `(field_name, dtype_string)` pairs.
+    Structured(Vec<(String, String)>),
+}
+
+impl From<String> for DtypeNumpy {
+    fn from(s: String) -> Self {
+        DtypeNumpy::Scalar(s)
+    }
+}
+
+impl From<&str> for DtypeNumpy {
+    fn from(s: &str) -> Self {
+        DtypeNumpy::Scalar(s.to_owned())
+    }
+}
+
 /// Per-stream descriptor of a single field.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct DataKey {
@@ -243,9 +273,10 @@ pub struct DataKey {
     pub dtype: Dtype,
     /// Shape; `[]` for scalar.
     pub shape: Vec<Option<u64>>,
-    /// Optional numpy dtype string (e.g. `<f8`).
+    /// Optional numpy dtype — a plain string (`Scalar`) or a list of
+    /// `(name, dtype)` pairs for structured types (`Structured`).
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub dtype_numpy: Option<String>,
+    pub dtype_numpy: Option<DtypeNumpy>,
     /// `STREAM:` if data is referenced via StreamResource/StreamDatum.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub external: Option<String>,
@@ -302,7 +333,7 @@ pub fn make_datakey(
     source: impl Into<String>,
     dtype: Dtype,
     shape: Vec<Option<u64>>,
-    dtype_numpy: Option<String>,
+    dtype_numpy: Option<DtypeNumpy>,
     meta: SignalMetadata,
 ) -> DataKey {
     DataKey {
@@ -686,7 +717,7 @@ mod tests {
         assert_eq!(dk.source, "soft://m1");
         assert_eq!(dk.dtype, Dtype::Number);
         assert_eq!(dk.shape, Vec::<Option<u64>>::new());
-        assert_eq!(dk.dtype_numpy.as_deref(), Some("<f8"));
+        assert_eq!(dk.dtype_numpy, Some(DtypeNumpy::Scalar("<f8".into())));
         assert_eq!(dk.units.as_deref(), Some("mm"));
         assert_eq!(dk.precision, Some(3));
         assert_eq!(dk.limits, Some(limits));
@@ -820,6 +851,43 @@ mod tests {
         let stop: RunStop = serde_json::from_value(incoming.clone()).unwrap();
         assert_eq!(stop.exit_status, ExitStatus::Abort);
         assert_eq!(serde_json::to_value(&stop).unwrap(), incoming);
+    }
+
+    #[test]
+    fn dtype_numpy_serde_round_trip_scalar_and_structured() {
+        // Scalar: JSON string -> DtypeNumpy::Scalar -> same JSON string.
+        let scalar_json = serde_json::json!("<f8");
+        let scalar: DtypeNumpy = serde_json::from_value(scalar_json.clone()).unwrap();
+        assert_eq!(scalar, DtypeNumpy::Scalar("<f8".into()));
+        assert_eq!(serde_json::to_value(&scalar).unwrap(), scalar_json);
+
+        // Structured: JSON array-of-pairs -> DtypeNumpy::Structured -> same JSON.
+        let structured_json = serde_json::json!([["x", "<f4"], ["y", "<f4"]]);
+        let structured: DtypeNumpy = serde_json::from_value(structured_json.clone()).unwrap();
+        assert_eq!(
+            structured,
+            DtypeNumpy::Structured(vec![("x".into(), "<f4".into()), ("y".into(), "<f4".into()),])
+        );
+        assert_eq!(serde_json::to_value(&structured).unwrap(), structured_json);
+
+        // Option<DtypeNumpy> inside a DataKey field round-trips through JSON.
+        let dk = make_datakey(
+            "det://x",
+            Dtype::Array,
+            vec![],
+            Some(DtypeNumpy::Structured(vec![
+                ("real".into(), "<f4".into()),
+                ("imag".into(), "<f4".into()),
+            ])),
+            SignalMetadata::default(),
+        );
+        let json = serde_json::to_value(&dk).unwrap();
+        assert_eq!(
+            json["dtype_numpy"],
+            serde_json::json!([["real", "<f4"], ["imag", "<f4"]])
+        );
+        let back: DataKey = serde_json::from_value(json).unwrap();
+        assert_eq!(back.dtype_numpy, dk.dtype_numpy);
     }
 
     #[test]
