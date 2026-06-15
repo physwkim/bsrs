@@ -480,6 +480,98 @@ async fn configure_inside_open_bundle_is_rejected() {
     );
 }
 
+struct CollidingReadable {
+    name: String,
+}
+
+impl cirrus_core::msg::NamedObj for CollidingReadable {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[async_trait::async_trait]
+impl cirrus_core::msg::ReadableObj for CollidingReadable {
+    async fn read_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, cirrus_core::reading::ReadingValue>,
+        cirrus_core::error::CirrusError,
+    > {
+        // Every instance reports the SAME field name, so two of them read into
+        // one bundle collide.
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "shared_key".to_string(),
+            cirrus_core::reading::ReadingValue {
+                value: serde_json::Value::from(1.0),
+                timestamp: 0.0,
+                alarm_severity: None,
+                message: None,
+            },
+        );
+        Ok(m)
+    }
+    async fn describe_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, cirrus_event_model::DataKey>,
+        cirrus_core::error::CirrusError,
+    > {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "shared_key".to_string(),
+            cirrus_event_model::DataKey {
+                source: format!("test://{}", self.name),
+                dtype: cirrus_event_model::Dtype::Number,
+                shape: vec![],
+                dtype_numpy: Some("<f8".into()),
+                external: None,
+                units: None,
+                precision: None,
+                object_name: None,
+                dims: None,
+                limits: None,
+                choices: None,
+            },
+        );
+        Ok(m)
+    }
+}
+
+#[tokio::test]
+async fn colliding_data_keys_in_one_event_are_rejected() {
+    // bluesky raises ValueError when two reads in the same create/save bundle
+    // produce the same field name (bundlers.py:422-433): a silent overwrite
+    // would drop one object's reading and desync the descriptor from the event.
+    // cirrus previously did a last-write-wins HashMap insert. The run loop turns
+    // the handler error into RunResult{exit_status:"fail"}.
+    let a: Arc<dyn cirrus_core::msg::ReadableObj> = Arc::new(CollidingReadable {
+        name: "coll_a".into(),
+    });
+    let b: Arc<dyn cirrus_core::msg::ReadableObj> = Arc::new(CollidingReadable {
+        name: "coll_b".into(),
+    });
+    let re = RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new());
+    let plan = cirrus_core::plan::plan_box(async_stream::stream! {
+        yield cirrus_core::Msg::OpenRun(Default::default());
+        yield cirrus_core::Msg::Create { stream_name: "primary".into() };
+        yield cirrus_core::Msg::Read(a);
+        // Second read with the SAME field name → collision.
+        yield cirrus_core::Msg::Read(b);
+        yield cirrus_core::Msg::Save;
+        yield cirrus_core::Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let result = re
+        .run_async(plan)
+        .await
+        .expect("run_async returns a RunResult");
+    assert_eq!(
+        result.exit_status, "fail",
+        "two reads sharing a field name in one event must be rejected (pre-fix: silent overwrite → \"success\")"
+    );
+}
+
 #[tokio::test]
 async fn abort_closes_run_with_abort_status() {
     let det = SoftDetector::new("a_det");

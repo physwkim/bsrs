@@ -108,6 +108,17 @@ impl RunBundler {
             .ok_or_else(|| CirrusError::Plan("read with no open bundle".into()))?;
         bundle.had_read = true;
         let stream_name = bundle.stream_name.clone();
+        // Reject colliding field names within one event bundle. Two reads in the
+        // same create/save that share a data key would silently overwrite each
+        // other (last write wins), dropping one object's reading and leaving the
+        // descriptor inconsistent with the event. bluesky raises ValueError on
+        // this collision (bundlers.py:422-433); mirror that with an explicit
+        // error instead of the silent HashMap overwrite.
+        if let Some(k) = readings.keys().find(|k| bundle.readings.contains_key(*k)) {
+            return Err(CirrusError::Plan(format!(
+                "Data keys (field names) collide in the open event: '{k}'"
+            )));
+        }
         for (k, v) in readings {
             bundle.readings.insert(k, v);
         }
