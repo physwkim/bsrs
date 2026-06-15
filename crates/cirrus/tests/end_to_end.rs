@@ -1453,6 +1453,76 @@ async fn kickoff_without_open_run_is_rejected_before_flyer_starts() {
     );
 }
 
+#[tokio::test]
+async fn collect_without_open_run_does_not_describe_the_flyer() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // bluesky `_collect` rejects a collect issued with no run open
+    // (IllegalMessageSequence, run_engine.py:2201-2206) *before*
+    // current_run.collect() runs describe_collect. cirrus called
+    // describe_collect_dyn at the top of the Collect handler, before its bundler
+    // check, so a collect with no open run did a wasted device describe round-
+    // trip before erroring. The handler now checks the open-run precondition
+    // first. Sibling of kickoff_without_open_run_is_rejected_before_flyer_starts;
+    // same describe-before-precondition family as
+    // monitor_without_open_run_does_not_describe_the_device.
+    struct DescribeCountingCollectable {
+        describes: Arc<AtomicUsize>,
+    }
+    impl cirrus_core::msg::NamedObj for DescribeCountingCollectable {
+        fn name(&self) -> &str {
+            "countcollect"
+        }
+    }
+    #[async_trait::async_trait]
+    impl cirrus_core::msg::CollectableObj for DescribeCountingCollectable {
+        async fn describe_collect_dyn(
+            &self,
+        ) -> Result<
+            std::collections::HashMap<
+                String,
+                std::collections::HashMap<String, cirrus_event_model::DataKey>,
+            >,
+            cirrus_core::error::CirrusError,
+        > {
+            self.describes.fetch_add(1, Ordering::SeqCst);
+            Ok(std::collections::HashMap::new())
+        }
+        async fn collect_dyn(
+            &self,
+        ) -> Result<
+            Vec<(
+                String,
+                std::collections::HashMap<String, serde_json::Value>,
+                std::collections::HashMap<String, f64>,
+            )>,
+            cirrus_core::error::CirrusError,
+        > {
+            Ok(Vec::new())
+        }
+    }
+
+    let describes = Arc::new(AtomicUsize::new(0));
+    let coll = Arc::new(DescribeCountingCollectable {
+        describes: describes.clone(),
+    }) as Arc<dyn cirrus_core::msg::CollectableObj>;
+    let re = RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new());
+    // Collect with no preceding OpenRun.
+    let plan = cirrus_core::plan::plan_box(async_stream::stream! {
+        yield cirrus_core::Msg::Collect { obj: coll, stream_name: None };
+    });
+
+    let result = re.run_async(plan).await.unwrap();
+    assert_eq!(
+        result.exit_status, "fail",
+        "a collect with no open run must be rejected"
+    );
+    assert_eq!(
+        describes.load(Ordering::SeqCst),
+        0,
+        "no device describe may happen when a collect is rejected for no open run"
+    );
+}
+
 /// A readable whose single data key equals its name, so two instances produce
 /// distinct, non-colliding fields.
 struct KeyedReadable {

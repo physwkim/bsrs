@@ -838,6 +838,102 @@ async fn unmonitor_of_unmonitored_object_is_rejected() {
     );
 }
 
+/// MonitorableObj that counts how many times `describe_dyn` is called, used to
+/// prove a monitor rejected for "no open run" never describes the device.
+struct DescribeCountingMonitor {
+    name: String,
+    describes: Arc<AtomicU64>,
+    tx: tokio::sync::watch::Sender<cirrus_core::reading::ReadingValue>,
+}
+
+impl DescribeCountingMonitor {
+    fn new(name: &str) -> (Arc<Self>, Arc<AtomicU64>) {
+        let (tx, _rx) = tokio::sync::watch::channel(cirrus_core::reading::ReadingValue {
+            value: Value::from(0.0),
+            timestamp: 0.0,
+            alarm_severity: None,
+            message: None,
+        });
+        let describes = Arc::new(AtomicU64::new(0));
+        (
+            Arc::new(Self {
+                name: name.into(),
+                describes: describes.clone(),
+                tx,
+            }),
+            describes,
+        )
+    }
+}
+
+impl cirrus_core::msg::NamedObj for DescribeCountingMonitor {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[async_trait::async_trait]
+impl cirrus_core::msg::ReadableObj for DescribeCountingMonitor {
+    async fn read_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, cirrus_core::reading::ReadingValue>,
+        cirrus_core::error::CirrusError,
+    > {
+        Ok(std::collections::HashMap::new())
+    }
+    async fn describe_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, cirrus_event_model::DataKey>,
+        cirrus_core::error::CirrusError,
+    > {
+        self.describes.fetch_add(1, Ordering::SeqCst);
+        Ok(std::collections::HashMap::new())
+    }
+}
+
+#[async_trait::async_trait]
+impl cirrus_core::msg::MonitorableObj for DescribeCountingMonitor {
+    async fn subscribe_dyn(
+        &self,
+    ) -> Result<cirrus_core::subscription::Subscription, cirrus_core::error::CirrusError> {
+        Ok(cirrus_core::subscription::Subscription::new(
+            self.tx.subscribe(),
+            cirrus_core::status::SubToken::noop(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn monitor_without_open_run_does_not_describe_the_device() {
+    // bluesky's _monitor rejects a monitor with no open run at the top
+    // (run_engine.py:2040-2044) BEFORE current_run.monitor() runs describe.
+    // cirrus's start_monitor called describe_dyn before its own bundler check,
+    // so a monitor with no open run did a wasted device describe round-trip
+    // before erroring. The handler now checks the open-run precondition first,
+    // mirroring the Read path (describe only when bundling). The run fails
+    // either way, so the boundary is the describe COUNT, not exit_status:
+    // 0 with the guard, 1 without (start_monitor describes, then fails).
+    let (mon, describes) = DescribeCountingMonitor::new("mon1");
+    let mon_for_plan: Arc<dyn cirrus_core::msg::MonitorableObj> = mon;
+    let re = RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new());
+    let plan = plan_box(async_stream::stream! {
+        // No OpenRun — the monitor must be rejected before any describe.
+        yield Msg::Monitor { obj: mon_for_plan, name: None };
+    });
+    let result = re.run_async(plan).await.unwrap();
+    assert_eq!(
+        result.exit_status, "fail",
+        "a monitor with no open run must be rejected"
+    );
+    assert_eq!(
+        describes.load(Ordering::SeqCst),
+        0,
+        "no device describe may happen when a monitor is rejected for no open run"
+    );
+}
+
 #[tokio::test]
 async fn unmonitor_stops_pump_for_custom_named_stream() {
     // Regression: monitor_tasks is keyed by the monitored object, not the

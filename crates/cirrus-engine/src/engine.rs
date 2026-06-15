@@ -1354,6 +1354,23 @@ impl RunEngine {
                 self.handle_status(status, group).await?;
             }
             Msg::Collect { obj, stream_name } => {
+                // Open-run precondition, checked before the device is described.
+                // bluesky's _collect rejects a collect with no open run at the top
+                // (run_engine.py:2201-2206) *before* current_run.collect() runs
+                // describe_collect. cirrus called describe_collect_dyn before its
+                // bundler check below, so a collect with no open run did a wasted
+                // device describe round-trip before erroring. Gate it here,
+                // mirroring the Read path which describes only when bundling. The
+                // later `ok_or_else` checks stay as defense for the bundler being
+                // cleared mid-await (a pause landing while collect_dyn is awaiting).
+                {
+                    let state = self.state.lock().await;
+                    if state.bundler.is_none() {
+                        return Err(CirrusError::Plan(
+                            "A 'collect' message was sent but no run is open".into(),
+                        ));
+                    }
+                }
                 let descs = obj.describe_collect_dyn().await?;
                 let new_descriptors: Vec<cirrus_event_model::EventDescriptor> = {
                     let mut state = self.state.lock().await;
@@ -1409,21 +1426,39 @@ impl RunEngine {
                 }
             }
             Msg::Monitor { obj, name } => {
-                // Reject a second monitor of an already-monitored object.
-                // bluesky's bundler raises IllegalMessageSequence ("...which is
-                // already monitored", bundlers.py:470-471) *before* subscribing
-                // or emitting a descriptor. Without this guard a double-monitor
-                // silently re-subscribes, emits another Descriptor (when a
-                // different stream name is given), and overwrites monitor_tasks —
-                // aborting the first pump. The guard is on the explicit message
-                // path only; the resume re-install (restore_monitors) calls
-                // start_monitor directly from the kept `monitored` registry and
-                // is unaffected (same split as the lenient CloseRun cleanup).
-                if self.state.lock().await.monitored.contains_key(obj.name()) {
-                    return Err(CirrusError::Plan(format!(
-                        "A 'monitor' message was sent for {} which is already monitored",
-                        obj.name()
-                    )));
+                {
+                    let state = self.state.lock().await;
+                    // Open-run precondition, checked before any device describe.
+                    // bluesky's _monitor rejects a monitor with no open run at the
+                    // top (run_engine.py:2040-2044) *before* current_run.monitor()
+                    // runs describe/subscribe. cirrus's start_monitor calls
+                    // describe_dyn before its own bundler check, so a monitor with
+                    // no open run did a wasted device describe round-trip before
+                    // erroring. Gate it here, mirroring the Read path which
+                    // describes only when a bundler is present. start_monitor keeps
+                    // its internal check as defense for the resume re-install path.
+                    if state.bundler.is_none() {
+                        return Err(CirrusError::Plan(
+                            "A 'monitor' message was sent but no run is open".into(),
+                        ));
+                    }
+                    // Reject a second monitor of an already-monitored object.
+                    // bluesky's bundler raises IllegalMessageSequence ("...which is
+                    // already monitored", bundlers.py:470-471) *before* subscribing
+                    // or emitting a descriptor. Without this guard a double-monitor
+                    // silently re-subscribes, emits another Descriptor (when a
+                    // different stream name is given), and overwrites monitor_tasks
+                    // — aborting the first pump. The guard is on the explicit
+                    // message path only; the resume re-install (restore_monitors)
+                    // calls start_monitor directly from the kept `monitored`
+                    // registry and is unaffected (same split as the lenient
+                    // CloseRun cleanup).
+                    if state.monitored.contains_key(obj.name()) {
+                        return Err(CirrusError::Plan(format!(
+                            "A 'monitor' message was sent for {} which is already monitored",
+                            obj.name()
+                        )));
+                    }
                 }
                 let stream = name.unwrap_or_else(|| obj.name().to_string());
                 self.start_monitor(stream.clone(), obj.clone()).await?;
