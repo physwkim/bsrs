@@ -316,6 +316,79 @@ async fn pause_then_resume_completes_run_with_success() {
 }
 
 #[tokio::test]
+async fn rewind_rolls_back_seq_num_so_replayed_save_reemits_same_seq_num() {
+    // bluesky snapshots each run's per-stream sequence counters at every
+    // checkpoint (RunBundler.reset_checkpoint_state) and rolls them back on
+    // rewind (RunBundler.rewind), so a `save` replayed from the checkpoint after
+    // a pause re-emits the SAME seq_num instead of advancing it
+    // (bundlers.py:520-528, 651-656; run_engine.py:2461-2467). cirrus snapshots
+    // in the reset_checkpoint_state helper and restores in RunBundler::rewind
+    // via RunBundle::{snapshot,restore}_seq_nums.
+    //
+    // Layout: the checkpoint is taken BEFORE create, so the create/read/save
+    // trio is cached and replayed on resume. Pre-fix the counter is not rolled
+    // back, so the replayed Event advances to seq_num=2; with the fix it rolls
+    // back to 0 and the replay re-emits seq_num=1.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    let det = SoftDetector::new("sq_det");
+    let sink = Arc::new(CapturingSink::new());
+    let re = Arc::new(RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]));
+
+    let reached = Arc::new(AtomicUsize::new(0));
+    let reached_clone = reached.clone();
+    let det_clone = det.clone();
+    let plan = cirrus_core::plan::plan_box(async_stream::stream! {
+        yield cirrus_core::Msg::OpenRun(Default::default());
+        // Checkpoint BEFORE the bundle, so create/read/save are cached and
+        // replayed on resume.
+        yield cirrus_core::Msg::Checkpoint;
+        yield cirrus_core::Msg::Create { stream_name: "primary".into() };
+        yield cirrus_core::Msg::Read(det_clone as Arc<dyn cirrus_core::msg::ReadableObj>);
+        yield cirrus_core::Msg::Save;
+        reached_clone.store(1, Ordering::SeqCst);
+        yield cirrus_core::Msg::Pause { defer: false };
+        // The cached create/read/save replay here on resume.
+        yield cirrus_core::Msg::CloseRun {
+            exit_status: "success".into(),
+            reason: None,
+        };
+    });
+
+    let re_run = re.clone();
+    let join = tokio::spawn(async move { re_run.run_async(plan).await });
+
+    for _ in 0..50 {
+        if reached.load(Ordering::SeqCst) == 1 && re.is_paused() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(re.is_paused(), "engine should be paused");
+
+    re.resume();
+    join.await.unwrap().unwrap();
+
+    let seq_nums: Vec<u64> = sink
+        .snapshot()
+        .await
+        .iter()
+        .filter_map(|d| match d {
+            Document::Event(ev) => Some(ev.seq_num),
+            _ => None,
+        })
+        .collect();
+    // Two Events: the committed one and the replayed one. With the rollback they
+    // share seq_num 1; pre-fix the replay advances to 2.
+    assert_eq!(
+        seq_nums,
+        vec![1, 1],
+        "replayed save must reuse seq_num 1 (pre-fix: [1, 2])"
+    );
+}
+
+#[tokio::test]
 async fn abort_closes_run_with_abort_status() {
     let det = SoftDetector::new("a_det");
     let sink = Arc::new(CapturingSink::new());

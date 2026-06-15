@@ -1141,25 +1141,28 @@ impl RunEngine {
 
     // -- handler ------------------------------------------------------------
 
-    /// Engine-level half of bluesky's `_reset_checkpoint_state`
-    /// (run_engine.py:2461-2467): drop the rewind cache so a subsequent resume
-    /// cannot replay messages issued *before* this point. The single owner of
-    /// "the rewindable region restarts here" — invoked both by the explicit
-    /// checkpoint messages (`Checkpoint` / `ClearCheckpoint` / `Rewindable`)
-    /// and by every commit-point message whose side effect must not be
-    /// straddled by a rewind: stage/unstage, monitor/unmonitor,
-    /// subscribe/unsubscribe (bluesky resets at each:
-    /// run_engine.py:2047/2065/2556/2580/2629/2650). Without it, a pause after
-    /// one of those messages would replay the earlier cached messages on
-    /// resume, re-running side effects bluesky treats as already committed.
+    /// Engine-level mirror of bluesky's `_reset_checkpoint_state_meth`
+    /// (run_engine.py:2461-2467). Two effects, in lockstep:
     ///
-    /// bluesky additionally snapshots each open bundler's sequence counters
-    /// here (`RunBundler.reset_checkpoint_state`, bundlers.py:651) as the
-    /// rewind rollback target; cirrus keeps those counters in `RunBundle`
-    /// (cirrus-event-model) and does not yet snapshot them — tracked
-    /// separately alongside `RunBundler::rewind`.
+    /// 1. Drop the rewind cache so a subsequent resume cannot replay messages
+    ///    issued *before* this point.
+    /// 2. Snapshot each open run's per-stream sequence counters as the rewind
+    ///    rollback target (`RunBundler::reset_checkpoint_state`), so a `save`
+    ///    replayed from this checkpoint re-emits the same `seq_num` instead of
+    ///    advancing it.
+    ///
+    /// The single owner of "the rewindable region restarts here" — invoked by
+    /// the `Checkpoint` and `Rewindable` messages and by every commit-point
+    /// message whose side effect must not be straddled by a rewind:
+    /// stage/unstage, monitor/unmonitor, subscribe/unsubscribe (bluesky resets
+    /// at each: run_engine.py:2047/2065/2556/2580/2629/2650). `ClearCheckpoint`
+    /// is the one reset that *clears* the rollback target rather than taking a
+    /// snapshot, so it takes its own path.
     fn reset_checkpoint_state(state: &mut EngineState) {
         state.msg_cache.clear();
+        if let Some(b) = state.bundler.as_mut() {
+            b.reset_checkpoint_state();
+        }
     }
 
     async fn handle(&self, msg: Msg) -> Result<Option<String>> {
@@ -1458,7 +1461,16 @@ impl RunEngine {
             Msg::ClearCheckpoint => {
                 let mut state = self.state.lock().await;
                 state.rewindable = false;
-                Self::reset_checkpoint_state(&mut state);
+                // Drop the rewind cache AND the seq-counter rollback target: the
+                // checkpoint region is gone, so there is nothing to roll back
+                // to. Mirrors bluesky `_clear_checkpoint` (msg_cache=None +
+                // RunBundler.clear_checkpoint, run_engine.py:2472-2483). Unlike
+                // the Checkpoint / lifecycle resets, this CLEARS the snapshot
+                // rather than taking one.
+                state.msg_cache.clear();
+                if let Some(b) = state.bundler.as_mut() {
+                    b.clear_checkpoint();
+                }
             }
             Msg::Pause { defer } => {
                 self.pause(defer);

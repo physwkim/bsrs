@@ -158,6 +158,35 @@ impl RunBundle {
         })
     }
 
+    /// Snapshot every stream's current sequence counter. Paired with
+    /// [`RunBundle::restore_seq_nums`] to implement checkpoint/rewind: the
+    /// engine snapshots at each checkpoint and restores on a rewind so a
+    /// replayed `save` re-emits the same `seq_num` instead of advancing past
+    /// it. Mirrors bluesky's `RunBundler.reset_checkpoint_state` copying
+    /// `_sequence_counters` into `_sequence_counters_copy` (bundlers.py:651-656).
+    pub fn snapshot_seq_nums(&self) -> HashMap<String, u64> {
+        let streams = self.streams.lock().unwrap();
+        streams
+            .iter()
+            .map(|(name, st)| (name.clone(), st.seq_num.load(Ordering::SeqCst)))
+            .collect()
+    }
+
+    /// Restore stream sequence counters from a [`RunBundle::snapshot_seq_nums`]
+    /// snapshot. A stream present in `snapshot` rolls back to its snapshotted
+    /// value; a stream declared *after* the snapshot was taken (absent from it)
+    /// rolls back to 0 — from the checkpoint's vantage its events have not yet
+    /// happened. Mirrors bluesky's `RunBundler.rewind`, which restores
+    /// `_sequence_counters` from the copy and forces freshly-declared streams
+    /// back to their start (bundlers.py:520-528).
+    pub fn restore_seq_nums(&self, snapshot: &HashMap<String, u64>) {
+        let streams = self.streams.lock().unwrap();
+        for (name, st) in streams.iter() {
+            let val = snapshot.get(name).copied().unwrap_or(0);
+            st.seq_num.store(val, Ordering::SeqCst);
+        }
+    }
+
     /// Compose a `RunStop` document. Closes the bundle.
     pub fn stop(&self, exit_status: &str, reason: Option<String>) -> RunStop {
         let streams = self.streams.lock().unwrap();

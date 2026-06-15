@@ -41,6 +41,11 @@ pub struct RunBundler {
     pending_hints: Option<HashMap<String, PerObjectHint>>,
     /// Object → field-list mapping accumulated for descriptors.
     pending_object_keys: HashMap<String, Vec<String>>,
+    /// Snapshot of per-stream sequence counters taken at the last checkpoint,
+    /// used to roll them back on `rewind` so a replayed `save` re-emits the same
+    /// `seq_num`. `None` when no checkpoint region is active. bluesky
+    /// `RunBundler._sequence_counters_copy` (bundlers.py:167).
+    seq_snapshot: Option<HashMap<String, u64>>,
 }
 
 impl RunBundler {
@@ -55,7 +60,23 @@ impl RunBundler {
             pending_config: HashMap::new(),
             pending_hints: None,
             pending_object_keys: HashMap::new(),
+            seq_snapshot: None,
         }
+    }
+
+    /// Snapshot the current per-stream sequence counters as the rewind target.
+    /// Called at every checkpoint reset (the `Checkpoint` message plus the
+    /// stage/unstage/monitor/subscribe lifecycle handlers), mirroring bluesky's
+    /// `RunBundler.reset_checkpoint_state` (bundlers.py:651-656).
+    pub fn reset_checkpoint_state(&mut self) {
+        self.seq_snapshot = Some(self.bundle.snapshot_seq_nums());
+    }
+
+    /// Drop the rewind target — the checkpoint region is being cleared, so there
+    /// is nothing to roll back to. bluesky `clear_checkpoint` clears
+    /// `_sequence_counters_copy` (bundlers.py:669-670).
+    pub fn clear_checkpoint(&mut self) {
+        self.seq_snapshot = None;
     }
 
     /// Begin a new event bundle for `stream_name`.
@@ -190,12 +211,17 @@ impl RunBundler {
     /// against `open == None`) and the cached `Read`s, so the bundle and its
     /// readings are faithfully rebuilt.
     ///
-    /// bluesky additionally rolls back per-stream sequence counters here;
-    /// cirrus keeps those in `RunBundle` (cirrus-event-model) and does not yet
-    /// snapshot them, so a duplicate event replayed after a post-`save` pause
-    /// advances the seq_num rather than reusing it — tracked separately.
+    /// It also rolls the per-stream sequence counters back to the snapshot taken
+    /// at the last checkpoint (via [`RunBundler::reset_checkpoint_state`]), so a
+    /// `save` replayed after a post-`save` pause re-emits the *same* `seq_num`
+    /// instead of advancing past it. Streams declared after the checkpoint roll
+    /// back to 0. Mirrors bluesky restoring `_sequence_counters` from the copy
+    /// (bundlers.py:520-528).
     pub fn rewind(&mut self) {
         self.open = None;
+        if let Some(snap) = self.seq_snapshot.as_ref() {
+            self.bundle.restore_seq_nums(snap);
+        }
     }
 
     /// Pre-declare a stream (fly scans).
