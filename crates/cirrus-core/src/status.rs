@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -108,6 +108,10 @@ struct Inner {
     /// long work can observe the request and abort. Held here, shared by every
     /// `Status`/`StatusSetter` clone of the same operation.
     cancel: CancellationToken,
+    /// When the operation began, used to back-fill `WatcherUpdate.time_elapsed`
+    /// for producers that omit it. Mirrors ophyd-async's
+    /// `WatchableAsyncStatus._start` (`_status.py:200`).
+    start: Instant,
 }
 
 impl Inner {
@@ -153,6 +157,7 @@ impl Status {
             callbacks: Mutex::new(Vec::new()),
             wakers: Mutex::new(Vec::new()),
             cancel: CancellationToken::new(),
+            start: Instant::now(),
         });
         (
             Status {
@@ -416,7 +421,16 @@ impl StatusSetter {
     /// Push a structured progress update. Receivers see the latest update via
     /// [`Status::watch_updates`]; the scalar [`Status::progress`] fraction is
     /// also updated when the update carries one. Best-effort.
-    pub fn update_watcher(&self, update: WatcherUpdate) {
+    ///
+    /// When the producer omits `time_elapsed`, it is back-filled from the
+    /// operation's start instant before the update is stored and broadcast, so
+    /// a progress display always has an elapsed time (and late observers see
+    /// the filled value). Mirrors ophyd-async's `WatchableAsyncStatus`
+    /// (`_status.py:204-210`), which back-fills the cached `_last_update`.
+    pub fn update_watcher(&self, mut update: WatcherUpdate) {
+        if update.time_elapsed.is_none() {
+            update.time_elapsed = Some(self.inner.start.elapsed().as_secs_f64());
+        }
         if let Some(f) = update.fraction {
             let _ = self.inner.progress.send(f);
         }
@@ -563,6 +577,9 @@ mod tests {
         let update = WatcherUpdate {
             fraction: Some(0.25),
             unit: Some("mm".into()),
+            // Explicit time_elapsed so the back-fill is a no-op and this update
+            // round-trips verbatim (back-fill is covered separately below).
+            time_elapsed: Some(7.0),
             ..WatcherUpdate::new(2.5, 0.0, 10.0)
         };
         setter.update_watcher(update.clone());
@@ -571,6 +588,31 @@ mod tests {
         assert_eq!(rx.borrow_and_update().clone(), Some(update));
         // ... and the scalar progress fraction was updated from it.
         assert_eq!(s.progress(), 0.25);
+    }
+
+    #[tokio::test]
+    async fn update_watcher_backfills_time_elapsed_when_omitted() {
+        let (s, setter) = Status::new();
+
+        // Producer omits time_elapsed → back-filled from the start instant.
+        setter.update_watcher(WatcherUpdate::new(2.5, 0.0, 10.0));
+        let got = s.watch_updates().borrow().clone().expect("update posted");
+        let te = got
+            .time_elapsed
+            .expect("time_elapsed back-filled when omitted");
+        assert!(te >= 0.0, "elapsed must be non-negative, got {te}");
+
+        // Producer-supplied time_elapsed is preserved verbatim.
+        setter.update_watcher(WatcherUpdate {
+            time_elapsed: Some(42.0),
+            ..WatcherUpdate::new(5.0, 0.0, 10.0)
+        });
+        let got2 = s.watch_updates().borrow().clone().expect("update posted");
+        assert_eq!(
+            got2.time_elapsed,
+            Some(42.0),
+            "explicit time_elapsed must not be overwritten"
+        );
     }
 
     #[tokio::test]
