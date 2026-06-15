@@ -409,7 +409,20 @@ pub mod stubs {
         triggerables: Vec<Arc<dyn TriggerableObj>>,
         readables: Vec<Arc<dyn ReadableObj>>,
     ) -> Plan {
-        trigger_and_read(triggerables, readables, "primary")
+        plan_box(async_stream::stream! {
+            // Each shot is a rewind boundary: emit a Checkpoint before the
+            // acquisition so a pause/resume mid-count re-does only the current
+            // shot, not the whole run. Mirrors bluesky's `one_shot`
+            // (plan_stubs.py:1622: `yield Msg("checkpoint")` before
+            // `trigger_and_read`).
+            yield Msg::Checkpoint;
+            let mut inner = trigger_and_read(triggerables, readables, "primary");
+            while let Some(item) = futures::StreamExt::next(&mut inner).await {
+                if let cirrus_core::plan::PlanItem::Bare(m) = item {
+                    yield m;
+                }
+            }
+        })
     }
 
     /// `repeater(n, plan)` — run `plan` `n` times. Each call to `plan_fn`
@@ -493,6 +506,10 @@ pub fn count(detectors: Vec<Arc<dyn ReadableObj>>, num: usize) -> Plan {
             ..Default::default()
         });
         for _ in 0..num {
+            // Per-shot rewind boundary (bluesky count == repeat(one_shot),
+            // both of which emit a Checkpoint per shot: plan_stubs.py:1808,
+            // :1622). Without it a pause/resume rewinds the whole run.
+            yield Msg::Checkpoint;
             yield Msg::Create { stream_name: "primary".into() };
             for d in &detectors {
                 yield Msg::Read(d.clone());
@@ -518,6 +535,10 @@ pub fn count_with_trigger(
             ..Default::default()
         });
         for _ in 0..num {
+            // Per-shot rewind boundary (bluesky count == repeat(one_shot):
+            // plan_stubs.py:1808, :1622). Without it a pause/resume rewinds
+            // the whole run instead of re-doing only the current shot.
+            yield Msg::Checkpoint;
             // Skip the trigger/wait pair when nothing is triggerable, mirroring
             // bluesky's `no_wait` guard (plan_stubs.py:1455-1462): a Wait on a
             // group that received no Trigger is a spurious message.
@@ -1742,6 +1763,66 @@ mod tests {
                 .filter(|m| matches!(m, Msg::Trigger { .. }))
                 .count(),
             2
+        );
+    }
+
+    // Each count shot is a rewind boundary: a Checkpoint precedes every
+    // Create (bluesky count == repeat(one_shot), both emit a per-shot
+    // checkpoint; plan_stubs.py:1808, :1622).
+    #[tokio::test]
+    async fn count_checkpoints_before_each_shot() {
+        let d = Arc::new(FakeReadable("det".into())) as Arc<dyn ReadableObj>;
+        let msgs = drain(count(vec![d], 3)).await;
+        assert_eq!(
+            msgs.iter().filter(|m| matches!(m, Msg::Checkpoint)).count(),
+            3,
+            "one Checkpoint per shot"
+        );
+        for (idx, m) in msgs.iter().enumerate() {
+            if matches!(m, Msg::Create { .. }) {
+                assert!(
+                    idx > 0 && matches!(msgs[idx - 1], Msg::Checkpoint),
+                    "Create at {idx} not immediately preceded by Checkpoint"
+                );
+            }
+        }
+    }
+
+    // count_with_trigger opens each shot with a Checkpoint, before the
+    // (optional) trigger and the Create.
+    #[tokio::test]
+    async fn count_with_trigger_checkpoints_each_shot() {
+        let t = Arc::new(FakeTriggerable("det".into())) as Arc<dyn TriggerableObj>;
+        let d = Arc::new(FakeReadable("det".into())) as Arc<dyn ReadableObj>;
+        let msgs = drain(count_with_trigger(vec![d], vec![t], 2)).await;
+        assert_eq!(
+            msgs.iter().filter(|m| matches!(m, Msg::Checkpoint)).count(),
+            2,
+            "one Checkpoint per shot"
+        );
+        // The first per-shot message is the Checkpoint, ahead of the Trigger.
+        let first_cp = msgs.iter().position(|m| matches!(m, Msg::Checkpoint));
+        let first_trig = msgs.iter().position(|m| matches!(m, Msg::Trigger { .. }));
+        assert!(
+            matches!((first_cp, first_trig), (Some(c), Some(t)) if c < t),
+            "Checkpoint must precede the shot's Trigger"
+        );
+    }
+
+    // Standalone one_shot is a single checkpointed acquisition (bluesky
+    // one_shot, plan_stubs.py:1621-1623).
+    #[tokio::test]
+    async fn one_shot_checkpoints_before_acquisition() {
+        let d = Arc::new(FakeReadable("det".into())) as Arc<dyn ReadableObj>;
+        let msgs = drain(stubs::one_shot(vec![], vec![d])).await;
+        assert!(
+            matches!(msgs.first(), Some(Msg::Checkpoint)),
+            "one_shot must open with a Checkpoint, got {:?}",
+            msgs.first()
+        );
+        assert_eq!(
+            msgs.iter().filter(|m| matches!(m, Msg::Checkpoint)).count(),
+            1
         );
     }
 
