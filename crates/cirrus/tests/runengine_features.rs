@@ -771,6 +771,45 @@ async fn monitor_emits_descriptor_then_events() {
 }
 
 #[tokio::test]
+async fn second_monitor_of_same_object_is_rejected() {
+    // bluesky rejects a 'monitor' for an already-monitored object with
+    // IllegalMessageSequence (bundlers.py:470-471) BEFORE subscribing or
+    // emitting a descriptor. Without the guard cirrus silently re-subscribed,
+    // emitted a second Descriptor for the new stream name, and overwrote the
+    // pump registry (aborting the first pump). The run loop turns the handler
+    // error into RunResult{exit_status:"fail"}.
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let mon = TestMonitor::new("mon1");
+    let mon_for_plan: Arc<dyn cirrus_core::msg::MonitorableObj> = mon.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Monitor { obj: mon_for_plan.clone(), name: Some("stream_a".into()) };
+        // Second monitor of the SAME object with a DIFFERENT stream name: the
+        // pre-fix path emitted a second Descriptor here before failing later.
+        yield Msg::Monitor { obj: mon_for_plan.clone(), name: Some("stream_b".into()) };
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let result = re.run_async(plan).await.unwrap();
+    assert_eq!(
+        result.exit_status, "fail",
+        "a second monitor of an already-monitored object must be rejected"
+    );
+
+    // Only the first monitor's Descriptor (stream_a) may have been emitted; the
+    // rejected second monitor must not have emitted a stream_b Descriptor.
+    let docs = sink.snapshot().await;
+    let descriptors = docs
+        .iter()
+        .filter(|d| matches!(d, Document::Descriptor(_)))
+        .count();
+    assert_eq!(
+        descriptors, 1,
+        "the rejected second monitor must not emit a second Descriptor; got {descriptors}"
+    );
+}
+
+#[tokio::test]
 async fn unmonitor_stops_pump_for_custom_named_stream() {
     // Regression: monitor_tasks is keyed by the monitored object, not the
     // stream name, so Unmonitor(obj) removes a custom-named monitor's pump.

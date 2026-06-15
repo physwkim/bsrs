@@ -1409,6 +1409,22 @@ impl RunEngine {
                 }
             }
             Msg::Monitor { obj, name } => {
+                // Reject a second monitor of an already-monitored object.
+                // bluesky's bundler raises IllegalMessageSequence ("...which is
+                // already monitored", bundlers.py:470-471) *before* subscribing
+                // or emitting a descriptor. Without this guard a double-monitor
+                // silently re-subscribes, emits another Descriptor (when a
+                // different stream name is given), and overwrites monitor_tasks —
+                // aborting the first pump. The guard is on the explicit message
+                // path only; the resume re-install (restore_monitors) calls
+                // start_monitor directly from the kept `monitored` registry and
+                // is unaffected (same split as the lenient CloseRun cleanup).
+                if self.state.lock().await.monitored.contains_key(obj.name()) {
+                    return Err(CirrusError::Plan(format!(
+                        "A 'monitor' message was sent for {} which is already monitored",
+                        obj.name()
+                    )));
+                }
                 let stream = name.unwrap_or_else(|| obj.name().to_string());
                 self.start_monitor(stream.clone(), obj.clone()).await?;
                 let mut state = self.state.lock().await;
