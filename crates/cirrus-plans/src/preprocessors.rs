@@ -178,6 +178,11 @@ where
 /// `monitor_during_wrapper` (preprocessors.py:813), which inserts via
 /// `plan_mutator` after `open_run` / before `close_run`. A run-free inner plan
 /// gets no insertion.
+///
+/// Each monitor's event stream is named `{signal}_monitor`, matching bluesky
+/// (`Msg("monitor", sig, name=sig.name + "_monitor")`, preprocessors.py:836).
+/// The engine keys the pump by the object's identity, so `Unmonitor` still
+/// removes it regardless of the stream name.
 pub fn monitor_during_wrapper(inner: Plan, signals: Vec<Arc<dyn MonitorableObj>>) -> Plan {
     let unmon = signals.clone();
     during_run_wrapper(
@@ -187,7 +192,7 @@ pub fn monitor_during_wrapper(inner: Plan, signals: Vec<Arc<dyn MonitorableObj>>
                 .iter()
                 .map(|s| Msg::Monitor {
                     obj: s.clone(),
-                    name: None,
+                    name: Some(format!("{}_monitor", s.name())),
                 })
                 .collect()
         },
@@ -871,10 +876,14 @@ mod tests {
     async fn monitor_during_wrapper_brackets_inside_run() {
         let sig: Arc<dyn MonitorableObj> = Arc::new(FakeMonitorable("s".into()));
         let msgs = drain(monitor_during_wrapper(run_body(), vec![sig])).await;
-        // OpenRun, Monitor, Null, Unmonitor, CloseRun.
+        // OpenRun, Monitor{name="s_monitor"}, Null, Unmonitor, CloseRun.
         assert_eq!(msgs.len(), 5, "got {msgs:?}");
         assert!(matches!(&msgs[0], Msg::OpenRun(_)));
-        assert!(matches!(&msgs[1], Msg::Monitor { .. }));
+        assert!(
+            matches!(&msgs[1], Msg::Monitor { name, .. } if name.as_deref() == Some("s_monitor")),
+            "monitor stream must be named {{signal}}_monitor; got {:?}",
+            &msgs[1]
+        );
         assert!(matches!(&msgs[2], Msg::Null));
         assert!(matches!(&msgs[3], Msg::Unmonitor(_)));
         assert!(matches!(&msgs[4], Msg::CloseRun { .. }));
