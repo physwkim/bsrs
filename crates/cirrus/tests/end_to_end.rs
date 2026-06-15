@@ -1078,3 +1078,24 @@ async fn second_open_run_rejected_without_emitting_a_second_start() {
         "a rejected second OpenRun must not emit a second RunStart; got {docs:#?}"
     );
 }
+
+#[tokio::test]
+async fn close_run_without_open_run_is_rejected() {
+    // A CloseRun with no run open is illegal. bluesky raises
+    // IllegalMessageSequence (run_engine.py:1902-1905); cirrus must fail the
+    // run rather than silently accept it. (The internal run-end cleanup path
+    // stays lenient — only the explicit message is guarded.)
+    let re = RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new());
+    let plan = cirrus_core::plan::plan_box(async_stream::stream! {
+        yield cirrus_core::Msg::CloseRun {
+            exit_status: "success".into(),
+            reason: None,
+        };
+    });
+
+    let result = re.run_async(plan).await.unwrap();
+    assert_eq!(
+        result.exit_status, "fail",
+        "CloseRun with no open run must be rejected"
+    );
+}

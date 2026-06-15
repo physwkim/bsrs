@@ -1140,6 +1140,14 @@ impl RunEngine {
                 exit_status,
                 reason,
             } => {
+                // bluesky's _close_run raises IllegalMessageSequence when no run
+                // is open (run_engine.py:1902-1905). close_run_if_open is
+                // intentionally lenient — it is the internal run-end cleanup path
+                // (run_loop) — so the strict check belongs on the explicit
+                // message path here.
+                if self.state.lock().await.bundler.is_none() {
+                    return Err(CirrusError::Plan("CloseRun without an open run".into()));
+                }
                 self.close_run_if_open(&exit_status, reason).await?;
                 *self.last_msg_result.lock().unwrap() = MsgResult::CloseRun {
                     exit_status: exit_status.clone(),
