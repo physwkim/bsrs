@@ -9,6 +9,9 @@
 #![deny(missing_docs)]
 
 mod basic;
+// Raw-inner-dict encoding is only needed by the out-of-band sinks (ZMQ/Kafka);
+// the JSONL file sink serializes the tagged `Document` directly.
+#[cfg(any(feature = "zmq", feature = "kafka"))]
 mod doc_encode;
 mod doc_name;
 

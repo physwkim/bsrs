@@ -1,11 +1,16 @@
 //! Shared document-body encoding.
 //!
-//! Sinks that emit *raw* bluesky document dicts (ZMQ, Kafka, JSONL) must
-//! serialize the inner variant of [`Document`], not the adjacently-tagged
+//! Sinks that carry the document kind in an *out-of-band* channel (ZMQ's
+//! multipart `<name>` frame, Kafka's message key) must serialize the raw
+//! inner variant of [`Document`], not the adjacently-tagged
 //! `{"name": ..., "doc": ...}` wrapper that `serde`'s default `Document`
 //! serialization produces. Centralising the per-variant match here makes this
-//! the single owner: a new sink cannot re-implement the match and accidentally
-//! ship the envelope (CBEM-01).
+//! the single owner: a new such sink cannot re-implement the match and
+//! accidentally ship the envelope (CBEM-01).
+//!
+//! Sinks with no out-of-band name channel (JSONL files) keep the tagged
+//! wrapper instead — a `.jsonl` line is otherwise unrecoverable, since the
+//! reader cannot tell a start from an event from a stop. See `basic::JsonlSink`.
 
 use cirrus_event_model::Document;
 
