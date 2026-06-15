@@ -328,6 +328,11 @@ struct EngineState {
     /// unsubscribe) and aborts the pump on `Drop`. Inserted by `Msg::Monitor`,
     /// removed by `Msg::Unmonitor`.
     monitor_tasks: HashMap<String, MonitorTask>,
+    /// Active monitor registrations, keyed by `obj.name()` like `monitor_tasks`
+    /// — the persistent record (obj + stream) that outlives the pump. Kept
+    /// across a pause so resume can re-install the pump; cleared by
+    /// `Msg::Unmonitor` and at run close. bluesky's `_monitor_params`.
+    monitored: HashMap<String, MonitorSpec>,
     /// Movables touched by `Msg::Set` during this run, keyed by name
     /// for dedup. Engine walks this on pause / cleanup and calls
     /// `MovableObj::stop_on_pause(success=true)`. Mirrors bluesky's
@@ -361,6 +366,17 @@ impl Drop for MonitorTask {
     fn drop(&mut self) {
         self.abort.abort();
     }
+}
+
+/// The persistent record of one active monitor — the monitored object and its
+/// resolved stream name — kept independently of the live `MonitorTask` pump.
+/// The cirrus equivalent of bluesky's `_monitor_params` (bundlers.py:500): it
+/// survives a pause (which drops the pump but not the registration) so the
+/// monitor can be re-installed on resume (`restore_monitors`, :665).
+#[derive(Clone)]
+struct MonitorSpec {
+    obj: Arc<dyn cirrus_core::msg::MonitorableObj>,
+    stream: String,
 }
 
 impl RunEngine {
@@ -508,6 +524,7 @@ impl RunEngine {
         let _ = std::mem::take(&mut state.pausables);
         let _ = std::mem::take(&mut state.suspenders); // Drop aborts watchers
         let _ = std::mem::take(&mut state.monitor_tasks); // K1: monitor pumps
+        let _ = std::mem::take(&mut state.monitored); // K1: monitor registry — run over, no resume
         drop(state);
         // Bluesky `_temp_callback_ids` parity: subscribers added via
         // `Msg::Subscribe` or run_async_with's `subs` arg are removed
@@ -1038,8 +1055,10 @@ impl RunEngine {
         // can't hold the engine state locked.
         let (movables, flyables, pausables) = {
             let mut state = self.state.lock().await;
-            // Suspend monitors — drop them; resume will replay the
-            // Monitor messages from the rewind cache if applicable.
+            // Suspend monitors — drop the live pumps (releasing the backend
+            // subscriptions) but keep the `monitored` registrations, so
+            // `on_resume` re-installs them. Mirrors bluesky `suspend_monitors`
+            // (clear_sub but keep `_monitor_params`, bundlers.py:661-663).
             state.monitor_tasks.clear();
             let movables: Vec<_> = state.movable_objs_touched.values().cloned().collect();
             let flyables: Vec<_> = state.flyable_objs_touched.values().cloned().collect();
@@ -1101,6 +1120,20 @@ impl RunEngine {
         for p in pausables {
             if let Err(e) = p.resume_dyn().await {
                 tracing::warn!("resume_dyn failed for {}: {e}", p.name());
+            }
+        }
+        // Re-install the monitors suspended on pause. Mirrors bluesky
+        // `restore_monitors` (re-subscribe from the kept `_monitor_params`,
+        // bundlers.py:665-666). `start_monitor` is idempotent on the descriptor
+        // (the stream was already declared), so this re-subscribes the device
+        // and respawns the pump without re-emitting the Descriptor.
+        let specs: Vec<MonitorSpec> = {
+            let state = self.state.lock().await;
+            state.monitored.values().cloned().collect()
+        };
+        for spec in specs {
+            if let Err(e) = self.start_monitor(spec.stream, spec.obj.clone()).await {
+                tracing::warn!("restore monitor failed for {}: {e}", spec.obj.name());
             }
         }
         self.record_interruption("resume").await;
@@ -1347,8 +1380,14 @@ impl RunEngine {
             }
             Msg::Monitor { obj, name } => {
                 let stream = name.unwrap_or_else(|| obj.name().to_string());
-                self.start_monitor(stream, obj).await?;
+                self.start_monitor(stream.clone(), obj.clone()).await?;
                 let mut state = self.state.lock().await;
+                // Record the registration so the monitor survives a pause: the
+                // pump (monitor_tasks) is dropped on pause, this spec is not, and
+                // resume re-installs the pump from it. bluesky `_monitor_params`.
+                state
+                    .monitored
+                    .insert(obj.name().to_string(), MonitorSpec { obj, stream });
                 Self::reset_checkpoint_state(&mut state);
             }
             Msg::Unmonitor(obj) => {
@@ -1359,6 +1398,9 @@ impl RunEngine {
                 state
                     .monitor_tasks
                     .retain(|obj_name, _| obj_name != obj.name());
+                // Drop the registration too, so a later resume does not
+                // re-install a monitor the plan explicitly removed.
+                state.monitored.remove(obj.name());
                 Self::reset_checkpoint_state(&mut state);
             }
             Msg::Wait {
@@ -1834,6 +1876,9 @@ impl RunEngine {
                 // composing Events against this now-closed bundle.
                 // `MonitorTask::drop` aborts the pump and drops its Subscription.
                 state.monitor_tasks.clear();
+                // Drop the registrations too — a closed run must not restore its
+                // monitors on a later resume.
+                state.monitored.clear();
             }
             stop
         };

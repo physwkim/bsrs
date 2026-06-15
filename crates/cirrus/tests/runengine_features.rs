@@ -856,6 +856,79 @@ async fn close_run_tears_down_active_monitor_not_explicitly_unmonitored() {
 }
 
 #[tokio::test]
+async fn monitor_survives_pause_and_resume() {
+    // bluesky `suspend_monitors`/`restore_monitors` keep `_monitor_params`
+    // across a pause so each device is re-subscribed on resume (bundlers.py:
+    // 661-666; run_engine.py:1543/2431). cirrus's on_pause_enter drops the live
+    // pump (monitor_tasks) but the separate `monitored` registry survives, and
+    // on_resume re-installs from it. Pre-fix on_pause cleared the only record of
+    // the monitor, so it was lost forever: post-resume pushes produced no Event
+    // and the watch had 0 receivers even after resume.
+    let sink = Arc::new(CapturingSink::new());
+    let re = Arc::new(RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]));
+    let mon = TestMonitor::new("mon_pr");
+    let mon_for_plan: Arc<dyn cirrus_core::msg::MonitorableObj> = mon.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Monitor { obj: mon_for_plan, name: None };
+        // Keep the run alive across the external pause/resume/push sequence.
+        for _ in 0..14 {
+            yield Msg::Sleep(Duration::from_millis(50));
+        }
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let re_run = re.clone();
+    let join = tokio::spawn(async move { re_run.run_async(plan).await });
+
+    // The pump subscribes synchronously in start_monitor → 1 receiver running.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(re.state(), EngineRunState::Running);
+    assert_eq!(
+        mon.tx.receiver_count(),
+        1,
+        "pump must be subscribed while the run is running"
+    );
+
+    // Pause suspends the monitor: the live pump is dropped, releasing the sub.
+    re.pause(false);
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(re.state(), EngineRunState::Paused);
+    assert_eq!(
+        mon.tx.receiver_count(),
+        0,
+        "pause must drop the live pump (suspend_monitors)"
+    );
+
+    // Resume must re-install the monitor from the kept registry.
+    re.resume();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(re.state(), EngineRunState::Running);
+    assert_eq!(
+        mon.tx.receiver_count(),
+        1,
+        "resume must restore the monitor (pre-fix: 0, lost forever)"
+    );
+
+    // A value pushed AFTER resume must flow through the restored pump as an Event.
+    mon.push(42.0, 42.0);
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    join.await.unwrap().unwrap();
+
+    let docs = sink.snapshot().await;
+    let saw_post_resume = docs.iter().any(|d| {
+        matches!(
+            d,
+            Document::Event(ev) if ev.data.get("mon_pr") == Some(&Value::from(42.0))
+        )
+    });
+    assert!(
+        saw_post_resume,
+        "post-resume push must produce an Event from the restored monitor"
+    );
+}
+
+#[tokio::test]
 async fn pause_changes_state_to_paused() {
     let re = Arc::new(RunEngine::new(vec![]));
     assert_eq!(re.state(), EngineRunState::Idle);
