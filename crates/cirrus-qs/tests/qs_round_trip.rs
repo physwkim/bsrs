@@ -454,8 +454,8 @@ async fn re_metadata_round_trip() {
         json!({"metadata": {"operator": "alice", "beamline": "BL-7"}}),
     );
     let r = rpc(&req, "re_metadata", json!({}));
-    assert_eq!(r["metadata"]["operator"], "alice");
-    assert_eq!(r["metadata"]["beamline"], "BL-7");
+    assert_eq!(r["re_metadata"]["operator"], "alice");
+    assert_eq!(r["re_metadata"]["beamline"], "BL-7");
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
 }

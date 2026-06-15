@@ -910,7 +910,7 @@ fn re_metadata(
     json!({
         "success": true,
         "msg": "",
-        "metadata": re.md(),
+        "re_metadata": re.md(),
     })
 }
 
