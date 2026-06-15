@@ -188,8 +188,8 @@ where
     fn set_callback(&self, cb: Option<ReadingValueCallback<T>>) -> SubToken {
         self.inner.soft.set_callback(cb)
     }
-    fn source(&self, name: &str) -> String {
-        format!("mock+{}", self.inner.soft.source(name))
+    fn source(&self, name: &str, read: bool) -> String {
+        format!("mock+{}", self.inner.soft.source(name, read))
     }
 }
 
@@ -252,6 +252,9 @@ mod tests {
         let b = MockSignalBackend::with_value(1.0_f64, Dtype::Number);
         b.set_value(42.0);
         assert_eq!(b.get_value().await.unwrap(), 42.0);
-        assert_eq!(b.source("dev"), "mock+soft://dev");
+        // read=true (read-back source) and read=false (write source) are
+        // identical for soft/mock backends, which have a single PV.
+        assert_eq!(b.source("dev", true), "mock+soft://dev");
+        assert_eq!(b.source("dev", false), "mock+soft://dev");
     }
 }
