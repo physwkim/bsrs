@@ -1352,7 +1352,15 @@ async fn prepare_invokes_device_and_groups_status() {
 // -- Msg::WaitFor ------------------------------------------------------------
 
 #[tokio::test]
-async fn wait_for_runs_factories_in_order() {
+async fn wait_for_runs_factories_concurrently() {
+    // bluesky's wait_for starts every awaitable up front
+    // (`[ensure_future(f()) for f in futs]`) and waits for them concurrently
+    // via asyncio.wait (run_engine.py:1828-1829), so the futures make progress
+    // in parallel rather than one-after-another. Invariant boundary: f1 sleeps
+    // 20ms before pushing 1 while f2 pushes 2 immediately. Concurrent execution
+    // records [2, 1] (the no-sleep factory completes first); the prior
+    // sequential await — which started f2 only after f1 resolved — recorded
+    // [1, 2]. The ordering uniquely distinguishes concurrent from sequential.
     let log = Arc::new(StdMutex::new(Vec::<u32>::new()));
     let l1 = log.clone();
     let l2 = log.clone();
@@ -1384,7 +1392,11 @@ async fn wait_for_runs_factories_in_order() {
         yield Msg::WaitFor { factories: vec![f1, f2], timeout: None };
     });
     re.run_async(plan).await.unwrap();
-    assert_eq!(log.lock().unwrap().clone(), vec![1, 2]);
+    assert_eq!(
+        log.lock().unwrap().clone(),
+        vec![2, 1],
+        "wait_for must run factories concurrently: f2 (no sleep) completes before f1 (20ms sleep)"
+    );
 }
 
 #[tokio::test]

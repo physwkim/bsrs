@@ -1703,22 +1703,34 @@ impl RunEngine {
             }
             Msg::WaitFor { factories, timeout } => {
                 let token = self.cancel.lock().unwrap().clone();
-                let inner = async {
-                    for f in factories {
-                        f().await?;
-                    }
-                    Ok::<(), CirrusError>(())
-                };
+                // Start every awaitable up front so they make progress
+                // concurrently, mirroring bluesky's
+                // `[asyncio.ensure_future(f()) for f in futs]` followed by
+                // `asyncio.wait(futs, ...)` (run_engine.py:1828-1829). Awaiting
+                // the factories in sequence would defer each future's creation
+                // until the previous one resolved — wrong for independent or
+                // event-like conditions (a later factory could miss an event
+                // that fired before it was started) and turning the `timeout`
+                // into a sum-of-waits instead of a single concurrent bound.
+                // `try_join_all` preserves the prior `f().await?` contract of
+                // returning the first error (cirrus propagates via `Result`
+                // rather than bluesky's exception-ignoring ALL_COMPLETED).
+                let futs: Vec<_> = factories.iter().map(|f| f()).collect();
+                let inner = futures::future::try_join_all(futs);
                 match timeout {
                     Some(d) => tokio::select! {
                         r = tokio::time::timeout(d, inner) => match r {
-                            Ok(r) => r?,
+                            Ok(r) => {
+                                r?;
+                            }
                             Err(_) => return Err(CirrusError::Timeout(d)),
                         },
                         _ = token.cancelled() => return Err(CirrusError::Cancelled),
                     },
                     None => tokio::select! {
-                        r = inner => r?,
+                        r = inner => {
+                            r?;
+                        }
                         _ = token.cancelled() => return Err(CirrusError::Cancelled),
                     },
                 }

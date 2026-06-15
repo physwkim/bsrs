@@ -226,10 +226,11 @@ pub mod stubs {
 
     /// `wait_for(factories, timeout)` — emit `Msg::WaitFor`. The cirrus
     /// equivalent of bluesky's `wait_for`: each factory produces a fresh future
-    /// that the engine awaits in order. An optional `timeout` bounds the total
-    /// wait, after which the engine returns `CirrusError::Timeout`. Unlike
-    /// [`wait`], which waits on a status group, this waits on arbitrary
-    /// awaitables supplied by the plan.
+    /// and the engine starts them all up front, awaiting them *concurrently*
+    /// (bluesky's `[ensure_future(f()) for f in futs]` + `asyncio.wait`). An
+    /// optional `timeout` bounds the single concurrent wait, after which the
+    /// engine returns `CirrusError::Timeout`. Unlike [`wait`], which waits on a
+    /// status group, this waits on arbitrary awaitables supplied by the plan.
     pub fn wait_for(factories: Vec<AwaitableFactory>, timeout: Option<Duration>) -> Plan {
         plan_box(async_stream::stream! {
             yield Msg::WaitFor { factories, timeout };
