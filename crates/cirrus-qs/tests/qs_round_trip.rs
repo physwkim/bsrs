@@ -100,8 +100,13 @@ async fn ping_works() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let req = req_socket(port);
+    // ping returns the full status dict (same as status, ref manager.py:1888).
     let r = rpc(&req, "ping", json!({}));
-    assert_eq!(r["msg"], "pong");
+    assert_eq!(r["success"], true);
+    assert!(
+        r["manager_state"].is_string(),
+        "ping should return status dict: {r}"
+    );
 
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;

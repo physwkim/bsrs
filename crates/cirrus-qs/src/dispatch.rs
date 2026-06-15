@@ -61,7 +61,8 @@ pub(crate) fn dispatch(
 
     match m {
         // -- info ---------------------------------------------------------
-        "ping" => json!({"success": true, "msg": "pong"}),
+        // ping returns the full status dict (ref: manager.py:1888 calls _status_handler).
+        "ping" => status_response(&state, &queue, &engine, rt),
         "status" => status_response(&state, &queue, &engine, rt),
         "config_get" => json!({
             "success": true,
