@@ -906,18 +906,39 @@ pub fn scan_nd(
             plan_name: Some("scan_nd".into()),
             ..Default::default()
         });
+        // Per-motor last-set position — cirrus's port of bluesky's
+        // move_per_step `pos_cache` (plan_stubs.py:1688-1702). A motor whose
+        // target equals its last-set value is NOT re-commanded this point:
+        // in an N-D grid the slow axes stay constant across a row's inner
+        // points, so without this they would receive a spurious "move to where
+        // you already are" Set + settle every point. `None` until a motor is
+        // first set, so every motor moves on the first point (bluesky seeds
+        // pos_cache with a None default, so the first `pos == None` is False).
+        // Exact equality mirrors bluesky's `pos == pos_cache[motor]`: grid
+        // points recur exactly, so an epsilon is unwanted (it would skip a
+        // genuine small move).
+        let mut pos_cache: Vec<Option<f64>> = vec![None; motors.len()];
         for row in points {
             // Per-step rewind boundary before this point's moves (bluesky
             // move_per_step, plan_stubs.py:1695).
             yield Msg::Checkpoint;
             for (i, v) in row.iter().enumerate() {
                 if i >= motors.len() { break; }
+                if pos_cache[i] == Some(*v) {
+                    // This step does not move motor i (bluesky move_per_step
+                    // `if pos == pos_cache[motor]: continue`, plan_stubs.py:1698).
+                    continue;
+                }
                 yield Msg::Set {
                     obj: motors[i].0.clone(),
                     value: *v,
                     group: Some("set".into()),
                 };
+                pos_cache[i] = Some(*v);
             }
+            // Yielded unconditionally, matching bluesky (the wait on an empty
+            // `set` group is a no-op). Real grid points always move the fast
+            // axis, so the group is non-empty in practice.
             yield Msg::Wait { group: "set".into(), error_on_timeout: true, timeout: None };
             yield Msg::Create { stream_name: "primary".into() };
             for (_, mr) in &motors {
@@ -2214,13 +2235,16 @@ mod tests {
     #[tokio::test]
     async fn rel_list_grid_scan_offsets_each_axis_by_its_readback() {
         // x list [1,2] with readback 10 → [11,12]; y list [5] with readback
-        // 20 → [25]. The outer product visits (11,25) then (12,25).
+        // 20 → [25]. The outer product visits (11,25) then (12,25). y is the
+        // slow axis and holds 25 across both points, so it is Set once and
+        // skipped on the second point — bluesky's move_per_step pos_cache
+        // (plan_stubs.py:1698). The unchanged motor is not re-commanded.
         let (xm, ym) = motor_xy(10.0, 20.0);
         let axes: Vec<RelListGridAxis> =
             vec![(xm, rdr("xr"), vec![1.0, 2.0]), (ym, rdr("yr"), vec![5.0])];
         let msgs = drain(rel_list_grid_scan(vec![], axes)).await;
         let sets = named_scan_sets(&msgs);
-        let expected = [("x", 11.0), ("y", 25.0), ("x", 12.0), ("y", 25.0)];
+        let expected = [("x", 11.0), ("y", 25.0), ("x", 12.0)];
         assert_eq!(sets.len(), expected.len(), "got {sets:?}");
         for ((gn, gv), (en, ev)) in sets.iter().zip(expected) {
             assert_eq!(gn, en, "motor order");
@@ -2404,6 +2428,41 @@ mod tests {
             msgs.iter().filter(|m| matches!(m, Msg::Checkpoint)).count(),
             6,
             "grid_scan: one Checkpoint per row (2) + one per point (4)"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_nd_skips_resetting_an_unchanged_motor() {
+        // bluesky's move_per_step pos_cache (plan_stubs.py:1698) skips a motor
+        // whose target equals its last-set position. In an N-D grid the slow
+        // axis stays constant across a row's inner points, so it must be Set
+        // once, not re-commanded every point. Two points: m0 (slow) stays at
+        // 0.0, m1 (fast) moves 0.0 -> 1.0.
+        let m0 = Arc::new(FakeMotor {
+            name: "m0".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let m1 = Arc::new(FakeMotor {
+            name: "m1".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let motors = vec![(m0, rdr("m0r")), (m1, rdr("m1r"))];
+        let points = vec![vec![0.0, 0.0], vec![0.0, 1.0]];
+        let msgs = drain(scan_nd(vec![], motors, points)).await;
+        let sets_for = |name: &str| {
+            msgs.iter()
+                .filter(|m| matches!(m, Msg::Set { obj, .. } if obj.name() == name))
+                .count()
+        };
+        assert_eq!(
+            sets_for("m0"),
+            1,
+            "the unchanged slow motor m0 is Set once, not re-commanded each point"
+        );
+        assert_eq!(
+            sets_for("m1"),
+            2,
+            "the moving fast motor m1 is Set on both points"
         );
     }
 
