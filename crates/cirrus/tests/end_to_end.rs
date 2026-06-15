@@ -1014,3 +1014,33 @@ async fn checkpoint_inside_open_bundle_is_rejected() {
         "a checkpoint between create and save must be rejected"
     );
 }
+
+#[tokio::test]
+async fn empty_create_save_emits_no_descriptor_or_event() {
+    // A `create`/`save` pair with no intervening `read` must emit nothing —
+    // no Descriptor, no Event. bluesky's `save` short-circuits when nothing
+    // was read ("Do not create empty Events.", bundlers.py:570-573).
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let plan = cirrus_core::plan::plan_box(async_stream::stream! {
+        yield cirrus_core::Msg::OpenRun(Default::default());
+        yield cirrus_core::Msg::Create { stream_name: "primary".into() };
+        yield cirrus_core::Msg::Save;
+        yield cirrus_core::Msg::CloseRun {
+            exit_status: "success".into(),
+            reason: None,
+        };
+    });
+
+    let result = re.run_async(plan).await.unwrap();
+    assert_eq!(result.exit_status, "success");
+
+    // Only RunStart + RunStop — pre-fix the empty save emitted a Descriptor
+    // and an empty Event too (4 docs).
+    let docs = sink.snapshot().await;
+    assert_eq!(
+        docs.len(),
+        2,
+        "empty create/save must emit no Descriptor or Event; got {docs:#?}"
+    );
+}

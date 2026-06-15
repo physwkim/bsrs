@@ -12,6 +12,10 @@ use std::sync::Arc;
 struct OpenBundle {
     stream_name: String,
     readings: HashMap<String, ReadingValue>,
+    /// Whether at least one `Read` has been folded into this bundle. The
+    /// cirrus equivalent of bluesky's `_objs_read` non-emptiness: a `save`
+    /// with no preceding `read` emits no Event (bundlers.py:570-573).
+    had_read: bool,
 }
 
 /// Per-stream descriptor cache entry.
@@ -64,6 +68,7 @@ impl RunBundler {
         self.open = Some(OpenBundle {
             stream_name,
             readings: HashMap::new(),
+            had_read: false,
         });
         Ok(())
     }
@@ -80,6 +85,7 @@ impl RunBundler {
             .open
             .as_mut()
             .ok_or_else(|| CirrusError::Plan("read with no open bundle".into()))?;
+        bundle.had_read = true;
         let stream_name = bundle.stream_name.clone();
         for (k, v) in readings {
             bundle.readings.insert(k, v);
@@ -105,6 +111,14 @@ impl RunBundler {
             .open
             .take()
             .ok_or_else(|| CirrusError::Plan("save with no open bundle".into()))?;
+        // Short-circuit an empty bundle: a `create`/`save` pair with no
+        // intervening `read` emits no Event and no Descriptor. Taking `open`
+        // above already closed the bundle (bundling=false), matching bluesky's
+        // `save`, which sets bundling=False and returns early when nothing was
+        // read (bundlers.py:570-573, "Do not create empty Events.").
+        if !bundle.had_read {
+            return Ok(Vec::new());
+        }
         let stream_name = bundle.stream_name.clone();
         let mut out = Vec::new();
 
