@@ -741,6 +741,50 @@ async fn rbac_filters_plan_name_on_queue_add() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
 
+// -- QS-07: manager_state transitional values ------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manager_state_transitional_values_serialise_correctly() {
+    use cirrus_qs::EState;
+    // Verify wire strings match bluesky MState.value for all EState variants.
+    assert_eq!(EState::EnvironmentClosed.as_str(), "environment_closed");
+    assert_eq!(EState::Idle.as_str(), "idle");
+    assert_eq!(EState::ExecutingQueue.as_str(), "executing_queue");
+    assert_eq!(EState::Paused.as_str(), "paused");
+    assert_eq!(EState::Aborting.as_str(), "aborting");
+    assert_eq!(EState::CreatingEnvironment.as_str(), "creating_environment");
+    assert_eq!(EState::ClosingEnvironment.as_str(), "closing_environment");
+    assert_eq!(
+        EState::DestroyingEnvironment.as_str(),
+        "destroying_environment"
+    );
+
+    // Verify environment_open leaves the state as "idle" after completion
+    // (the creating_environment transition is too fast to observe externally).
+    let port = rand_port();
+    let reg = Registry::new();
+    let shutdown = spawn_server(reg, port);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(port);
+
+    rpc(&req, "environment_open", json!({}));
+    let s = rpc(&req, "status", json!({}));
+    assert_eq!(
+        s["manager_state"], "idle",
+        "state after environment_open should be idle: {s}"
+    );
+
+    rpc(&req, "environment_close", json!({}));
+    let s = rpc(&req, "status", json!({}));
+    assert_eq!(
+        s["manager_state"], "environment_closed",
+        "state after environment_close should be environment_closed: {s}"
+    );
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
 // -- QS-11: instruction item_type ------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

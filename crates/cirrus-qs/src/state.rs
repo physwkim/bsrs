@@ -3,8 +3,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Public engine state — values match `bluesky_queueserver.manager.worker.EState`
-/// where they overlap so qserver CLI displays them naturally.
+/// Public engine state — values match `bluesky_queueserver.manager.MState`
+/// so qserver CLI displays them naturally.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EState {
@@ -18,10 +18,16 @@ pub enum EState {
     Paused,
     /// Abort requested, plan winding down.
     Aborting,
+    /// environment_open in progress (transitional).
+    CreatingEnvironment,
+    /// environment_close in progress (transitional).
+    ClosingEnvironment,
+    /// environment_destroy in progress (transitional).
+    DestroyingEnvironment,
 }
 
 impl EState {
-    /// Stringified for status JSON.
+    /// Stringified for status JSON (matches MState.value in manager.py).
     pub fn as_str(&self) -> &'static str {
         match self {
             EState::EnvironmentClosed => "environment_closed",
@@ -29,6 +35,9 @@ impl EState {
             EState::ExecutingQueue => "executing_queue",
             EState::Paused => "paused",
             EState::Aborting => "aborting",
+            EState::CreatingEnvironment => "creating_environment",
+            EState::ClosingEnvironment => "closing_environment",
+            EState::DestroyingEnvironment => "destroying_environment",
         }
     }
 }

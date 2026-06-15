@@ -532,6 +532,8 @@ fn env_open(
     if e.is_some() {
         return err("environment already open");
     }
+    // Set transitional state (ref: manager.py:511 MState.CREATING_ENVIRONMENT).
+    state.lock().unwrap().state = Some(EState::CreatingEnvironment);
     let sinks: Vec<Arc<dyn DocumentSink>> = document_sink.iter().cloned().collect();
     let re = Arc::new(RunEngine::new(sinks));
     if let Some(hook) = checkpoint_hook {
@@ -551,6 +553,8 @@ fn env_close(
     if e.is_none() {
         return err("no environment");
     }
+    // Set transitional state (ref: manager.py:591 MState.CLOSING_ENVIRONMENT).
+    state.lock().unwrap().state = Some(EState::ClosingEnvironment);
     *e = None;
     state.lock().unwrap().state = Some(EState::EnvironmentClosed);
     json!({"success": true, "msg": ""})
@@ -566,7 +570,24 @@ fn env_destroy(
     if let Some(h) = queue_task.lock().unwrap().take() {
         h.abort();
     }
-    env_close(state, engine, rt)
+    // Set transitional state (ref: manager.py:660 MState.DESTROYING_ENVIRONMENT).
+    state.lock().unwrap().state = Some(EState::DestroyingEnvironment);
+    env_close_inner(state, engine, rt)
+}
+
+fn env_close_inner(
+    state: &Arc<StdMutex<EngineState>>,
+    engine: &Arc<Mutex<Option<Arc<RunEngine>>>>,
+    rt: &tokio::runtime::Handle,
+) -> Value {
+    let mut e = rt.block_on(engine.lock());
+    if e.is_none() {
+        state.lock().unwrap().state = Some(EState::EnvironmentClosed);
+        return err("no environment");
+    }
+    *e = None;
+    state.lock().unwrap().state = Some(EState::EnvironmentClosed);
+    json!({"success": true, "msg": ""})
 }
 
 fn queue_get(queue: &Arc<StdMutex<PlanQueue>>, state: &Arc<StdMutex<EngineState>>) -> Value {
