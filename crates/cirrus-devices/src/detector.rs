@@ -9,7 +9,7 @@ use cirrus_core::reading::ReadingValue;
 use cirrus_core::status::Status;
 use cirrus_event_model::DataKey;
 use cirrus_protocols_async::{
-    DetectorControl, DetectorWriter, Flyable, Stageable, StreamAsset, Triggerable,
+    DetectorControl, DetectorWriter, Flyable, Preparable, Stageable, StreamAsset, Triggerable,
     WritesStreamAssets,
 };
 use futures::stream::{BoxStream, StreamExt};
@@ -31,8 +31,13 @@ where
     name: String,
     control: C,
     writer: W,
-    // K1: any background tasks owned by start/arm should be tracked here.
-    // For M3 we don't spawn any directly.
+    // TriggerInfo stored by Preparable::prepare(); kickoff() reads it to
+    // configure the hardware and compute the absolute target index.
+    // Defaults to TriggerInfo::default() so a bare kickoff() without an
+    // explicit prepare() still acquires one frame (internal trigger).
+    cached_trigger_info: std::sync::Mutex<TriggerInfo>,
+    // Absolute writer index that complete() waits for. Set in kickoff()
+    // from the current writer baseline + number_of_collections().
     cached_target: AtomicU64,
     // DataKeys captured when the writer is opened at `stage()`. `describe`
     // reads from this cache rather than re-opening the writer mid-acquisition
@@ -51,6 +56,7 @@ where
             name: name.into(),
             control,
             writer,
+            cached_trigger_info: std::sync::Mutex::new(TriggerInfo::default()),
             cached_target: AtomicU64::new(0),
             opened: std::sync::Mutex::new(None),
         }
@@ -151,6 +157,19 @@ where
         &self.name
     }
     async fn kickoff(&self) -> Status {
+        let info = self.cached_trigger_info.lock().unwrap().clone();
+        if let Err(e) = self.control.prepare(info.clone()).await {
+            return Status::fail(cirrus_core::status::StatusError::Failed(format!(
+                "prepare: {e}"
+            )));
+        }
+        // Capture the write baseline so complete() waits for exactly
+        // number_of_collections NEW frames, not an absolute total.
+        let baseline = self.writer.indices_written().await;
+        self.cached_target.store(
+            baseline + info.number_of_collections() as u64,
+            Ordering::SeqCst,
+        );
         self.control.arm().await
     }
     async fn complete(&self) -> Status {
@@ -171,6 +190,28 @@ where
                 "wait_for_idle: {e}"
             ))),
         }
+    }
+}
+
+/// Store `TriggerInfo` so the next `kickoff()` configures the hardware and
+/// waits for the correct number of frames. Mirrors Python
+/// `StandardDetector.prepare(trigger_info)` which stores `_prepare_ctx`.
+///
+/// Hardware setup (`DetectorControl::prepare`) is deferred to `kickoff()` so
+/// the trigger-info can be updated multiple times before arming without
+/// issuing redundant hardware transactions.
+#[async_trait]
+impl<C, W> Preparable<TriggerInfo> for StandardDetector<C, W>
+where
+    C: DetectorControl,
+    W: DetectorWriter,
+{
+    fn name(&self) -> &str {
+        &self.name
+    }
+    async fn prepare(&self, info: TriggerInfo) -> cirrus_core::status::Status {
+        *self.cached_trigger_info.lock().unwrap() = info;
+        cirrus_core::status::Status::done()
     }
 }
 
@@ -342,6 +383,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cirrus_protocols_async::Preparable;
     use futures::stream;
     use std::sync::Arc;
     use std::time::Duration;
@@ -479,5 +521,83 @@ mod tests {
         // After unstage the cache is cleared, so describe errors again.
         Stageable::unstage(&det).await.unwrap();
         assert!(ReadableObj::describe_dyn(&det).await.is_err());
+    }
+
+    /// A writer whose index is driven externally by a `watch::Sender<u64>`.
+    struct ControlledWriter {
+        rx: watch::Receiver<u64>,
+    }
+
+    #[async_trait]
+    impl DetectorWriter for ControlledWriter {
+        async fn open(&self, _multiplier: u32) -> Result<HashMap<String, DataKey>> {
+            Ok(HashMap::new())
+        }
+        fn observe_indices_written(&self) -> watch::Receiver<u64> {
+            self.rx.clone()
+        }
+        async fn indices_written(&self) -> u64 {
+            *self.rx.borrow()
+        }
+        fn collect_stream_docs(
+            &self,
+            _up_to: u64,
+            _descriptor: &str,
+        ) -> BoxStream<'_, StreamAsset> {
+            stream::iter(Vec::new()).boxed()
+        }
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_blocks_until_indices_written_reaches_target() {
+        // Regression: complete() used to read cached_target == 0 (never set)
+        // and return immediately regardless of how many frames were requested.
+        // After the fix, kickoff() sets cached_target = baseline +
+        // number_of_collections, and complete() genuinely blocks until the
+        // writer reaches that count.
+        let (tx, rx) = watch::channel(0u64);
+        let disarms = Arc::new(AtomicU64::new(0));
+        let det = Arc::new(StandardDetector::new(
+            "d",
+            RecordingControl {
+                disarms: disarms.clone(),
+            },
+            ControlledWriter { rx },
+        ));
+
+        // Prepare for 3 frames, then stage and kickoff.
+        Preparable::<TriggerInfo>::prepare(
+            &*det,
+            TriggerInfo {
+                number_of_events: 3,
+                ..Default::default()
+            },
+        )
+        .await;
+        Stageable::stage(&*det).await.unwrap();
+        let _kickoff = Flyable::kickoff(&*det).await;
+
+        // complete() must block — no frames yet.
+        let det_c = det.clone();
+        let complete =
+            tokio::spawn(async move { Flyable::complete(&*det_c).await.success() });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !complete.is_finished(),
+            "complete() must block when frames have not yet arrived (was target==0 bug)"
+        );
+
+        // Deliver 3 frames; complete() must unblock.
+        tx.send(3).unwrap();
+
+        let succeeded = tokio::time::timeout(Duration::from_secs(1), complete)
+            .await
+            .expect("complete() timed out after frames were delivered")
+            .expect("task panicked");
+        assert!(succeeded, "complete() should succeed after frames arrive");
     }
 }
