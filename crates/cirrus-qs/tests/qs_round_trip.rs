@@ -741,6 +741,117 @@ async fn rbac_filters_plan_name_on_queue_add() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
 
+// -- QS-09: positional insertion -------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_item_add_positional_insertion() {
+    let port = rand_port();
+    let det = SoftDetector::new("det1");
+    let mut reg = Registry::new();
+    reg.register_readable("det1", det as Arc<dyn ReadableObj>);
+    reg.register_plan_count("count");
+    let shutdown = spawn_server(reg, port);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(port);
+
+    // Add A, B, C at "back" (default).
+    let ra = rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": ["det1", 1]}, "meta": {"label": "A"}}),
+    );
+    let rb = rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": ["det1", 2]}, "meta": {"label": "B"}}),
+    );
+    let rc = rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": ["det1", 3]}, "meta": {"label": "C"}}),
+    );
+    let uid_a = ra["item"]["item_uid"].as_str().unwrap().to_string();
+    let uid_b = rb["item"]["item_uid"].as_str().unwrap().to_string();
+    let uid_c = rc["item"]["item_uid"].as_str().unwrap().to_string();
+    assert_eq!(rc["qsize"], 3);
+
+    // Insert D at front (pos="front") → D,A,B,C
+    let rd = rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": ["det1", 4]}, "pos": "front"}),
+    );
+    assert_eq!(rd["success"], true);
+    let uid_d = rd["item"]["item_uid"].as_str().unwrap().to_string();
+
+    // Insert E before B → D,A,E,B,C
+    let re_ = rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": ["det1", 5]}, "before_uid": uid_b}),
+    );
+    assert_eq!(re_["success"], true);
+    let uid_e = re_["item"]["item_uid"].as_str().unwrap().to_string();
+
+    // Insert F after A → D,A,F,E,B,C
+    let rf = rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": ["det1", 6]}, "after_uid": uid_a}),
+    );
+    assert_eq!(rf["success"], true);
+    let uid_f = rf["item"]["item_uid"].as_str().unwrap().to_string();
+
+    // Verify order: D,A,F,E,B,C
+    let q = rpc(&req, "queue_get", json!({}));
+    let items = q["items"].as_array().unwrap();
+    assert_eq!(items.len(), 6);
+    assert_eq!(items[0]["item_uid"], uid_d);
+    assert_eq!(items[1]["item_uid"], uid_a);
+    assert_eq!(items[2]["item_uid"], uid_f);
+    assert_eq!(items[3]["item_uid"], uid_e);
+    assert_eq!(items[4]["item_uid"], uid_b);
+    assert_eq!(items[5]["item_uid"], uid_c);
+
+    // pos integer: insert G at integer pos=1 → G inserts before index 1 (A) → D,G,A,F,E,B,C
+    let rg = rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": ["det1", 7]}, "pos": 1}),
+    );
+    assert_eq!(rg["success"], true, "{rg}");
+    let uid_g = rg["item"]["item_uid"].as_str().unwrap().to_string();
+    let q = rpc(&req, "queue_get", json!({}));
+    let items = q["items"].as_array().unwrap();
+    assert_eq!(items[0]["item_uid"], uid_d);
+    assert_eq!(items[1]["item_uid"], uid_g);
+
+    // Mutual exclusion: pos + before_uid → error
+    let r = rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": ["det1", 1]}, "pos": "front", "before_uid": uid_a}),
+    );
+    assert!(
+        !r["success"].as_bool().unwrap_or(true),
+        "pos+before_uid should fail: {r}"
+    );
+
+    // before_uid + after_uid → error
+    let r = rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": ["det1", 1]}, "before_uid": uid_a, "after_uid": uid_b}),
+    );
+    assert!(
+        !r["success"].as_bool().unwrap_or(true),
+        "before+after should fail: {r}"
+    );
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
 // -- lua_eval async RPC -----------------------------------------------------
 
 /// Mock LuaEvaluator: echoes the source as stdout, parses a leading

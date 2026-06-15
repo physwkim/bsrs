@@ -605,6 +605,19 @@ fn queue_item_add(
     if registry.plan(&name).is_none() {
         return err(format!("unknown plan: {name}"));
     }
+
+    // Positional-insertion params (ref: plan_queue_ops.py:900-968).
+    let pos_val = params.get("pos");
+    let before_uid_str = params.get("before_uid").and_then(|v| v.as_str());
+    let after_uid_str = params.get("after_uid").and_then(|v| v.as_str());
+
+    if pos_val.is_some() && (before_uid_str.is_some() || after_uid_str.is_some()) {
+        return err("ambiguous: cannot specify both 'pos' and 'before_uid'/'after_uid'");
+    }
+    if before_uid_str.is_some() && after_uid_str.is_some() {
+        return err("ambiguous: cannot specify both 'before_uid' and 'after_uid'");
+    }
+
     let mut queued = QueuedItem::plan(name, item);
     queued.user = params
         .get("user")
@@ -615,8 +628,46 @@ fn queue_item_add(
         .and_then(|v| v.as_str())
         .map(String::from);
     let queued_val = serde_json::to_value(&queued).unwrap();
+
     let mut q = queue.lock().unwrap();
-    q.push_back(queued);
+    let qsize = q.len() as i64;
+
+    if let Some(buid) = before_uid_str {
+        if !q.insert_before_uid(buid, queued) {
+            return err(format!("before_uid not found: {buid}"));
+        }
+    } else if let Some(auid) = after_uid_str {
+        if !q.insert_after_uid(auid, queued) {
+            return err(format!("after_uid not found: {auid}"));
+        }
+    } else {
+        match pos_val {
+            None => q.push_back(queued),
+            Some(Value::String(s)) if s == "back" => q.push_back(queued),
+            Some(Value::String(s)) if s == "front" => q.insert_at(0, queued),
+            Some(Value::String(s)) => return err(format!("invalid pos string: {s}")),
+            Some(Value::Number(n)) => {
+                let i = match n.as_i64() {
+                    Some(v) => v,
+                    None => return err("pos must be an integer"),
+                };
+                if i == 0 || i < -qsize {
+                    q.insert_at(0, queued);
+                } else if i == -1 || i >= qsize {
+                    q.push_back(queued);
+                } else {
+                    // pos_reference: positive → direct index; negative → qsize + pos + 1
+                    let ref_idx = if i > 0 {
+                        i as usize
+                    } else {
+                        (qsize + i + 1) as usize
+                    };
+                    q.insert_at(ref_idx, queued);
+                }
+            }
+            Some(other) => return err(format!("invalid pos value: {other}")),
+        }
+    }
     json!({
         "success": true,
         "msg": "",

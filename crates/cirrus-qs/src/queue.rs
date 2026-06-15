@@ -172,6 +172,41 @@ impl PlanQueue {
         self.bump_queue_uid();
         Some(it)
     }
+    /// Prepend an item to the queue (insert at position 0).
+    pub fn push_front(&mut self, item: QueuedItem) {
+        self.items.push_front(item);
+        self.bump_queue_uid();
+    }
+    /// Insert at 0-based index `idx`, clamped to `0..=len`.
+    pub fn insert_at(&mut self, idx: usize, item: QueuedItem) {
+        let idx = idx.min(self.items.len());
+        self.items.insert(idx, item);
+        self.bump_queue_uid();
+    }
+    /// Insert `item` immediately before the item whose `item_uid == ref_uid`.
+    /// Returns `false` (and does not mutate) if `ref_uid` is not found.
+    pub fn insert_before_uid(&mut self, ref_uid: &str, item: QueuedItem) -> bool {
+        match self.items.iter().position(|i| i.item_uid == ref_uid) {
+            Some(pos) => {
+                self.items.insert(pos, item);
+                self.bump_queue_uid();
+                true
+            }
+            None => false,
+        }
+    }
+    /// Insert `item` immediately after the item whose `item_uid == ref_uid`.
+    /// Returns `false` (and does not mutate) if `ref_uid` is not found.
+    pub fn insert_after_uid(&mut self, ref_uid: &str, item: QueuedItem) -> bool {
+        match self.items.iter().position(|i| i.item_uid == ref_uid) {
+            Some(pos) => {
+                self.items.insert(pos + 1, item);
+                self.bump_queue_uid();
+                true
+            }
+            None => false,
+        }
+    }
     /// Clear all pending items.
     pub fn clear(&mut self) {
         if !self.items.is_empty() {
