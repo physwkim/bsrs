@@ -846,3 +846,52 @@ async fn pause_mid_bundle_then_resume_completes_without_create_collision() {
     let docs = sink.snapshot().await;
     assert_eq!(docs.len(), 4, "got {docs:#?}");
 }
+
+#[tokio::test]
+async fn wait_propagates_status_failure_even_when_error_on_timeout_false() {
+    // A movable whose set_dyn returns an already-FAILED status. `Wait` with
+    // error_on_timeout=false must still fail the run: error_on_timeout gates
+    // only the group-level *timeout* (the group not completing in time), never
+    // a genuine device failure. Matches bluesky `_wait`, where a FailedStatus
+    // always raises (run_engine.py:2384) while error_on_timeout suppresses only
+    // WaitForTimeoutError (:2341-2346).
+    struct FailingMotor;
+    impl cirrus_core::msg::NamedObj for FailingMotor {
+        fn name(&self) -> &str {
+            "boom"
+        }
+    }
+    #[async_trait::async_trait]
+    impl cirrus_core::msg::MovableObj for FailingMotor {
+        async fn set_dyn(&self, _value: f64) -> cirrus_core::status::Status {
+            cirrus_core::status::Status::fail(cirrus_core::status::StatusError::Failed(
+                "move failed".into(),
+            ))
+        }
+    }
+
+    let motor = Arc::new(FailingMotor) as Arc<dyn cirrus_core::msg::MovableObj>;
+    let re = RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new());
+    let plan = cirrus_core::plan::plan_box(async_stream::stream! {
+        yield cirrus_core::Msg::OpenRun(Default::default());
+        yield cirrus_core::Msg::Set { obj: motor, value: 1.0, group: Some("g".into()) };
+        yield cirrus_core::Msg::Wait {
+            group: "g".into(),
+            error_on_timeout: false,
+            timeout: None,
+        };
+        yield cirrus_core::Msg::CloseRun {
+            exit_status: "success".into(),
+            reason: None,
+        };
+    });
+
+    let result = re.run_async(plan).await.unwrap();
+    // Pre-fix: the inner loop swallowed the Failed status under
+    // error_on_timeout=false, so the run reached CloseRun and reported
+    // "success" for a move that never happened.
+    assert_eq!(
+        result.exit_status, "fail",
+        "a failed Set status must fail the run even with error_on_timeout=false"
+    );
+}

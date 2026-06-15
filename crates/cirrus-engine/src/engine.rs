@@ -1853,13 +1853,19 @@ impl RunEngine {
         let fut = async {
             for s in members {
                 if let Err(e) = s.await {
-                    if error_on_timeout {
-                        return Err(match e {
-                            StatusError::Cancelled => CirrusError::Cancelled,
-                            StatusError::Timeout => CirrusError::Timeout(Duration::from_secs(0)),
-                            StatusError::Failed(s) => CirrusError::Backend(s),
-                        });
-                    }
+                    // A status that resolves to an error is a genuine failure
+                    // (bluesky's FIRST_EXCEPTION → FailedStatus) and propagates
+                    // regardless of error_on_timeout. Only the group-level wait
+                    // timeout below (the group not completing within `timeout`)
+                    // is gated by error_on_timeout — mirrors bluesky `_wait`,
+                    // where error_on_timeout suppresses only WaitForTimeoutError
+                    // (run_engine.py:2341-2346) while a FailedStatus always
+                    // raises (:2384).
+                    return Err(match e {
+                        StatusError::Cancelled => CirrusError::Cancelled,
+                        StatusError::Timeout => CirrusError::Timeout(Duration::from_secs(0)),
+                        StatusError::Failed(s) => CirrusError::Backend(s),
+                    });
                 }
             }
             Ok(())
