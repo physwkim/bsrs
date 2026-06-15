@@ -371,12 +371,16 @@ pub(crate) fn dispatch(
             json!({"success": true, "msg": ""})
         }
 
+        // -- function_execute (ref: manager.py:2992) ----------------------
+        "function_execute" => {
+            function_execute(rt, &req.params, &lua_evaluator, &task_tracker, &state)
+        }
+
         // -- not-implemented stubs (registered so clients see the method
         //    name but get a defined error). --------------------------------
-        "permissions_set" | "script_upload" | "function_execute" | "kernel_interrupt"
-        | "manager_kill" => err(format!(
+        "permissions_set" | "script_upload" | "kernel_interrupt" | "manager_kill" => err(format!(
             "method '{m}' is registered but not implemented in cirrus-qs \
-             (bluesky-queueserver-only feature)"
+                 (bluesky-queueserver-only feature)"
         )),
 
         // Unknown.
@@ -385,6 +389,132 @@ pub(crate) fn dispatch(
 }
 
 // -- helpers ----------------------------------------------------------------
+
+/// Synthesize a Lua call `name(arg1, arg2, ..., {kwarg1=v1, ...})`.
+/// Positional args from `args` array come first; keyword args from
+/// `kwargs` object are passed as a trailing Lua table.
+fn lua_source_for_function(name: &str, args: &Value, kwargs: &Value) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(arr) = args.as_array() {
+        for v in arr {
+            parts.push(serde_json::to_string(v).unwrap_or_else(|_| "nil".into()));
+        }
+    }
+    if let Some(obj) = kwargs.as_object() {
+        if !obj.is_empty() {
+            let pairs: Vec<String> = obj
+                .iter()
+                .map(|(k, v)| {
+                    format!(
+                        "{}={}",
+                        k,
+                        serde_json::to_string(v).unwrap_or_else(|_| "nil".into())
+                    )
+                })
+                .collect();
+            parts.push(format!("{{{}}}", pairs.join(",")));
+        }
+    }
+    format!("return {}({})", name, parts.join(","))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn function_execute(
+    rt: &tokio::runtime::Handle,
+    params: &Value,
+    lua_evaluator: &Option<Arc<dyn LuaEvaluator>>,
+    task_tracker: &Arc<TaskTracker>,
+    state: &Arc<StdMutex<EngineState>>,
+) -> Value {
+    let item = match params.get("item") {
+        Some(i) => i.clone(),
+        None => return err("function_execute: missing 'item'"),
+    };
+    // item_type must be "function" (ref: manager.py:3021).
+    let item_type = item
+        .get("item_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("function");
+    if item_type != "function" {
+        return err(format!(
+            "function_execute: item_type must be 'function', got {item_type:?}"
+        ));
+    }
+    let name = match item.get("name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => return err("function_execute: item.name required"),
+    };
+    let args = item.get("args").cloned().unwrap_or(Value::Array(vec![]));
+    let kwargs = item
+        .get("kwargs")
+        .cloned()
+        .unwrap_or(Value::Object(Default::default()));
+    let run_in_background = params
+        .get("run_in_background")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let _ = run_in_background; // background vs foreground distinction not yet tracked
+
+    let ev = match lua_evaluator.clone() {
+        Some(e) => e,
+        None => {
+            return err("function_execute: no Lua evaluator wired \
+                 (use `cirrus qs-manager` rather than a custom build)");
+        }
+    };
+
+    // Generate a unique item_uid and stamp it into the returned item dict.
+    let item_uid = uuid::Uuid::new_v4().to_string();
+    let mut returned_item = item.clone();
+    if let Some(obj) = returned_item.as_object_mut() {
+        obj.insert("item_uid".to_string(), Value::String(item_uid.clone()));
+        obj.insert(
+            "item_type".to_string(),
+            Value::String("function".to_string()),
+        );
+    }
+
+    let src = lua_source_for_function(&name, &args, &kwargs);
+    let task_uid = uuid::Uuid::new_v4().to_string();
+    task_tracker.start(&task_uid, "function_execute");
+    let tracker = task_tracker.clone();
+    let uid_for_task = task_uid.clone();
+    let state_for_task = state.clone();
+    state.lock().unwrap().worker_background_tasks += 1;
+    rt.spawn(async move {
+        use futures::FutureExt;
+        let result = match std::panic::AssertUnwindSafe(ev.eval(&src))
+            .catch_unwind()
+            .await
+        {
+            Ok(r) => r,
+            Err(p) => {
+                let msg = if let Some(s) = p.downcast_ref::<&'static str>() {
+                    s.to_string()
+                } else if let Some(s) = p.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "<no message>".to_string()
+                };
+                crate::tasks::EvalResult {
+                    stdout: String::new(),
+                    return_value: None,
+                    error: Some(format!("function_execute panicked: {msg}")),
+                }
+            }
+        };
+        tracker.complete(&uid_for_task, result);
+        let mut st = state_for_task.lock().unwrap();
+        st.worker_background_tasks = st.worker_background_tasks.saturating_sub(1);
+    });
+
+    json!({
+        "success": true,
+        "msg": "",
+        "item": returned_item,
+        "task_uid": task_uid,
+    })
+}
 
 fn build_plan_dict(names: Vec<String>) -> Value {
     let mut map = serde_json::Map::new();

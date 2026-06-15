@@ -476,7 +476,6 @@ async fn not_implemented_methods_return_defined_error() {
     for m in [
         "permissions_set",
         "script_upload",
-        "function_execute",
         "kernel_interrupt",
         "manager_kill",
     ] {
@@ -741,6 +740,101 @@ async fn rbac_filters_plan_name_on_queue_add() {
     assert!(
         r["success"].as_bool().unwrap_or(false) || !msg.contains("RBAC"),
         "count should not be RBAC-denied: {r}"
+    );
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+// -- QS-10: function_execute -----------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn function_execute_returns_task_uid_and_item() {
+    let port = rand_port();
+    let reg = Registry::new();
+    let shutdown = spawn_server_with_eval(reg, port, Arc::new(MockEval));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(port);
+
+    // function_execute with item_type="function".
+    let r = rpc(
+        &req,
+        "function_execute",
+        json!({
+            "item": {"item_type": "function", "name": "my_func", "args": [1, 2], "kwargs": {}},
+            "user": "alice",
+            "user_group": "primary",
+        }),
+    );
+    assert_eq!(r["success"], true, "function_execute failed: {r}");
+    assert!(
+        r["task_uid"].is_string(),
+        "function_execute must return task_uid: {r}"
+    );
+    assert_eq!(
+        r["item"]["item_type"], "function",
+        "item_type must be function: {r}"
+    );
+    assert_eq!(
+        r["item"]["name"], "my_func",
+        "item name must round-trip: {r}"
+    );
+    assert!(
+        r["item"]["item_uid"].is_string(),
+        "item must have item_uid: {r}"
+    );
+
+    let uid = r["task_uid"].as_str().unwrap().to_string();
+    let mut completed = false;
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let s = rpc(&req, "task_status", json!({"task_uid": uid}));
+        if s["status"] == "completed" || s["status"] == "failed" {
+            completed = true;
+            break;
+        }
+    }
+    assert!(completed, "function_execute task never completed");
+
+    // Missing item → error.
+    let r = rpc(&req, "function_execute", json!({}));
+    assert!(
+        !r["success"].as_bool().unwrap_or(true),
+        "missing item should fail: {r}"
+    );
+
+    // Wrong item_type → error.
+    let r = rpc(
+        &req,
+        "function_execute",
+        json!({"item": {"item_type": "plan", "name": "count"}}),
+    );
+    assert!(
+        !r["success"].as_bool().unwrap_or(true),
+        "wrong item_type should fail: {r}"
+    );
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn function_execute_without_evaluator_returns_error() {
+    let port = rand_port();
+    let reg = Registry::new();
+    let shutdown = spawn_server(reg, port);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(port);
+
+    let r = rpc(
+        &req,
+        "function_execute",
+        json!({"item": {"item_type": "function", "name": "my_func"}}),
+    );
+    assert!(!r["success"].as_bool().unwrap_or(true), "{r}");
+    assert!(
+        r["msg"].as_str().unwrap_or("").contains("no Lua evaluator"),
+        "expected 'no Lua evaluator' message: {r}"
     );
 
     shutdown.shutdown();
