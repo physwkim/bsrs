@@ -771,6 +771,55 @@ async fn monitor_emits_descriptor_then_events() {
 }
 
 #[tokio::test]
+async fn unmonitor_stops_pump_for_custom_named_stream() {
+    // Regression: monitor_tasks is keyed by the monitored object, not the
+    // stream name, so Unmonitor(obj) removes a custom-named monitor's pump.
+    // Before the fix the task was keyed by the stream name ("mon1_monitor"),
+    // so Unmonitor(obj="mon1") never matched and the pump kept emitting events
+    // for values pushed after Unmonitor.
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let mon = TestMonitor::new("mon1");
+    let mon_for_plan: Arc<dyn cirrus_core::msg::MonitorableObj> = mon.clone();
+    let mon_for_drive = mon.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Monitor { obj: mon_for_plan.clone(), name: Some("mon1_monitor".into()) };
+        yield Msg::Sleep(Duration::from_millis(50));
+        mon_for_drive.push(1.0, 1.0);
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::Unmonitor(mon_for_plan);
+        yield Msg::Sleep(Duration::from_millis(50));
+        // Pushed AFTER Unmonitor: must not produce an event if the pump stopped.
+        mon_for_drive.push(2.0, 2.0);
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    re.run_async(plan).await.unwrap();
+
+    let docs = sink.snapshot().await;
+    // The custom stream name reached the descriptor.
+    assert!(
+        docs.iter().any(|d| matches!(
+            d,
+            Document::Descriptor(desc) if desc.name.as_deref() == Some("mon1_monitor")
+        )),
+        "descriptor should carry the custom stream name"
+    );
+    // The post-Unmonitor value (2.0) must never appear — the pump was stopped.
+    let saw_post_unmonitor = docs.iter().any(|d| {
+        matches!(
+            d,
+            Document::Event(ev) if ev.data.get("mon1") == Some(&Value::from(2.0))
+        )
+    });
+    assert!(
+        !saw_post_unmonitor,
+        "no Event for the value pushed after Unmonitor; the pump must stop"
+    );
+}
+
+#[tokio::test]
 async fn pause_changes_state_to_paused() {
     let re = Arc::new(RunEngine::new(vec![]));
     assert_eq!(re.state(), EngineRunState::Idle);

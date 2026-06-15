@@ -316,9 +316,11 @@ struct EngineState {
     bundler: Option<RunBundler>,
     groups: HashMap<String, WaitGroup>,
     staged: Vec<Arc<dyn cirrus_core::msg::StageableObj>>,
-    /// Live monitor pumps. `(stream_name, obj_name)` keyed; the `MonitorTask`
-    /// drops the `Subscription` (RAII unsubscribe) and aborts the pump on
-    /// `Drop`. Inserted by `Msg::Monitor`, removed by `Msg::Unmonitor`.
+    /// Live monitor pumps, keyed by the monitored object's name (`obj.name()`)
+    /// — the identity `Msg::Unmonitor(obj)` carries — independent of the
+    /// descriptor stream name. The `MonitorTask` drops the `Subscription` (RAII
+    /// unsubscribe) and aborts the pump on `Drop`. Inserted by `Msg::Monitor`,
+    /// removed by `Msg::Unmonitor`.
     monitor_tasks: HashMap<String, MonitorTask>,
     /// Movables touched by `Msg::Set` during this run, keyed by name
     /// for dedup. Engine walks this on pause / cleanup and calls
@@ -1290,10 +1292,13 @@ impl RunEngine {
                 self.start_monitor(stream, obj).await?;
             }
             Msg::Unmonitor(obj) => {
-                // Remove the monitor task whose key matches obj.name(). The
-                // MonitorTask Drop aborts the pump and the held Subscription.
+                // monitor_tasks is keyed by the monitored object's name (set in
+                // start_monitor), so remove the entry whose key == obj.name().
+                // MonitorTask::drop aborts the pump and drops the Subscription.
                 let mut state = self.state.lock().await;
-                state.monitor_tasks.retain(|stream, _| stream != obj.name());
+                state
+                    .monitor_tasks
+                    .retain(|obj_name, _| obj_name != obj.name());
             }
             Msg::Wait {
                 group,
@@ -1508,11 +1513,15 @@ impl RunEngine {
             }
         });
         let abort = handle.abort_handle();
+        // Key the pump by the monitored object's identity — that is what
+        // Msg::Unmonitor(obj) carries — NOT by the descriptor stream name.
+        // Keying by `stream` leaked the pump whenever a custom monitor name was
+        // used: Unmonitor matched the key against obj.name() and never found it.
         self.state
             .lock()
             .await
             .monitor_tasks
-            .insert(stream, MonitorTask { abort });
+            .insert(obj.name().to_string(), MonitorTask { abort });
         Ok(())
     }
 
