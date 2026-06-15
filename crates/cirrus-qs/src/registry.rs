@@ -168,6 +168,41 @@ impl Registry {
         v
     }
 
+    /// Plans as a rich dict `{name: {name, description, parameters, module}}`
+    /// matching the bluesky `plans_allowed` / `plans_existing` wire shape.
+    pub fn plan_dict(&self) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        for name in self.plan_names() {
+            map.insert(
+                name.clone(),
+                serde_json::json!({
+                    "name": name,
+                    "description": "",
+                    "parameters": [],
+                    "module": "cirrus_qs",
+                }),
+            );
+        }
+        serde_json::Value::Object(map)
+    }
+
+    /// Devices as a rich dict `{name: {name, description, module}}`
+    /// matching the bluesky `devices_allowed` / `devices_existing` wire shape.
+    pub fn device_dict(&self) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        for name in self.device_names() {
+            map.insert(
+                name.clone(),
+                serde_json::json!({
+                    "name": name,
+                    "description": "",
+                    "module": "cirrus_qs",
+                }),
+            );
+        }
+        serde_json::Value::Object(map)
+    }
+
     /// Look up `name` across every role table and return the first
     /// `NamedObj::inspect_dyn` result. The map is sorted-iterated in
     /// the same role order as registration so the result is stable.

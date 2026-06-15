@@ -81,28 +81,31 @@ pub(crate) fn dispatch(
         }),
 
         // -- plans / devices listing -------------------------------------
+        // Return rich dicts matching bluesky's wire shape:
+        //   {plan_name: {name, description, parameters, module}}
+        // (ref: manager.py:_plans_allowed_handler,_plans_existing_handler).
         "plans_allowed" => json!({
             "success": true,
             "msg": "",
-            "plans_allowed": registry.plan_names(),
+            "plans_allowed": registry.plan_dict(),
             "plans_allowed_uid": "static",
         }),
         "plans_existing" => json!({
             "success": true,
             "msg": "",
-            "plans_existing": registry.plan_names(),
+            "plans_existing": registry.plan_dict(),
             "plans_existing_uid": "static",
         }),
         "devices_allowed" => json!({
             "success": true,
             "msg": "",
-            "devices_allowed": registry.device_names(),
+            "devices_allowed": registry.device_dict(),
             "devices_allowed_uid": "static",
         }),
         "devices_existing" => json!({
             "success": true,
             "msg": "",
-            "devices_existing": registry.device_names(),
+            "devices_existing": registry.device_dict(),
             "devices_existing_uid": "static",
         }),
         "device_inspect" => {

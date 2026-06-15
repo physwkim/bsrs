@@ -128,12 +128,18 @@ async fn end_to_end_count_through_qs() {
     assert_eq!(r["success"], true);
 
     let r = rpc(&req, "plans_allowed", json!({}));
-    let plans = r["plans_allowed"].as_array().unwrap();
-    assert!(plans.iter().any(|v| v == "count"));
+    let plans = r["plans_allowed"].as_object().unwrap();
+    assert!(
+        plans.contains_key("count"),
+        "plans_allowed should contain 'count': {r}"
+    );
 
     let r = rpc(&req, "devices_allowed", json!({}));
-    let devs = r["devices_allowed"].as_array().unwrap();
-    assert!(devs.iter().any(|v| v == "det1"));
+    let devs = r["devices_allowed"].as_object().unwrap();
+    assert!(
+        devs.contains_key("det1"),
+        "devices_allowed should contain 'det1': {r}"
+    );
 
     let r = rpc(
         &req,
@@ -735,6 +741,68 @@ async fn rbac_filters_plan_name_on_queue_add() {
     assert!(
         r["success"].as_bool().unwrap_or(false) || !msg.contains("RBAC"),
         "count should not be RBAC-denied: {r}"
+    );
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+// -- QS-03: plans_allowed / devices_allowed rich dict ----------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn plans_allowed_returns_rich_dict() {
+    let port = rand_port();
+    let det = SoftDetector::new("det1");
+    let mut reg = Registry::new();
+    reg.register_readable("det1", det as Arc<dyn ReadableObj>);
+    reg.register_plan_count("count");
+    let shutdown = spawn_server(reg, port);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(port);
+
+    // plans_allowed: dict keyed by plan name.
+    let r = rpc(&req, "plans_allowed", json!({}));
+    assert_eq!(r["success"], true, "{r}");
+    let plans = r["plans_allowed"]
+        .as_object()
+        .expect("plans_allowed must be object");
+    assert!(
+        plans.contains_key("count"),
+        "plans_allowed must contain 'count': {r}"
+    );
+    let entry = &plans["count"];
+    assert_eq!(entry["name"], "count");
+    assert!(
+        entry["description"].is_string(),
+        "description must be string: {entry}"
+    );
+    assert!(
+        entry["parameters"].is_array(),
+        "parameters must be array: {entry}"
+    );
+    assert_eq!(entry["module"], "cirrus_qs");
+
+    // devices_allowed: dict keyed by device name.
+    let r = rpc(&req, "devices_allowed", json!({}));
+    let devs = r["devices_allowed"]
+        .as_object()
+        .expect("devices_allowed must be object");
+    assert!(
+        devs.contains_key("det1"),
+        "devices_allowed must contain 'det1': {r}"
+    );
+    assert_eq!(devs["det1"]["name"], "det1");
+
+    // plans_existing and devices_existing must also be dicts.
+    let r = rpc(&req, "plans_existing", json!({}));
+    assert!(
+        r["plans_existing"].as_object().is_some(),
+        "plans_existing must be object: {r}"
+    );
+    let r = rpc(&req, "devices_existing", json!({}));
+    assert!(
+        r["devices_existing"].as_object().is_some(),
+        "devices_existing must be object: {r}"
     );
 
     shutdown.shutdown();
