@@ -11,8 +11,24 @@ use cirrus_core::msg::{
     StoppableObj, TriggerableObj,
 };
 use cirrus_core::plan::{plan_box, Plan};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Mint a process-unique synchronization-group name carrying a human-readable
+/// `label` prefix — cirrus's port of bluesky's `short_uid(label)`
+/// (`utils/__init__.py`). A stub that lets the caller supply a sync group but
+/// falls back to a default when none is given uses this for the fallback, so
+/// the default can never collide with a user-chosen group of the same name.
+///
+/// bluesky appends a uuid4 fragment for this isolation; cirrus appends a
+/// monotonic process-global counter, which is equally unique within a process
+/// and needs no extra dependency. The `label-N` shape stays readable in
+/// message dumps and tests (match it with `starts_with(label)`).
+fn short_uid(label: &str) -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    format!("{label}-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
+}
 
 // ===========================================================================
 //  plan_stubs (single-Msg / small composites; mirrors bluesky.plan_stubs)
@@ -274,7 +290,7 @@ pub mod stubs {
     ) -> Plan {
         plan_box(async_stream::stream! {
             if wait {
-                let group = group.unwrap_or_else(|| "prepare".into());
+                let group = group.unwrap_or_else(|| short_uid("prepare"));
                 yield Msg::Prepare { obj, value, group: Some(group.clone()) };
                 yield Msg::Wait { group, error_on_timeout: true, timeout: None };
             } else {
@@ -301,15 +317,16 @@ pub mod stubs {
     /// shared group, then optionally `Msg::Wait` on that group. Mirrors
     /// bluesky `plan_stubs.kickoff_all`, where `wait` defaults to **true**.
     ///
-    /// `group` of `None` resolves to the literal `"kickoff_all"` (cirrus-plans
-    /// carries no uuid dependency; bluesky mints a fresh uuid here) — pass an
-    /// explicit group to isolate concurrent kickoffs.
+    /// `group` of `None` mints a process-unique default via [`short_uid`]
+    /// (`"kickoff_all-N"`), mirroring bluesky minting a fresh uuid here so the
+    /// default cannot collide with a user group — pass an explicit group to
+    /// share/await a known one across concurrent kickoffs.
     pub fn kickoff_all(
         flyers: Vec<Arc<dyn FlyableObj>>,
         group: Option<String>,
         wait: bool,
     ) -> Plan {
-        let group = group.unwrap_or_else(|| "kickoff_all".into());
+        let group = group.unwrap_or_else(|| short_uid("kickoff_all"));
         plan_box(async_stream::stream! {
             for f in flyers {
                 yield Msg::Kickoff { obj: f, group: Some(group.clone()) };
@@ -325,13 +342,15 @@ pub mod stubs {
     /// Mirrors bluesky `plan_stubs.complete_all`, where `wait` defaults to
     /// **false** (note: opposite of [`kickoff_all`]).
     ///
-    /// `group` of `None` resolves to the literal `"complete_all"`.
+    /// `group` of `None` mints a process-unique default via [`short_uid`]
+    /// (`"complete_all-N"`); pass an explicit group when a later `wait` must
+    /// name it (the `wait=false` default leaves the group outstanding).
     pub fn complete_all(
         flyers: Vec<Arc<dyn FlyableObj>>,
         group: Option<String>,
         wait: bool,
     ) -> Plan {
-        let group = group.unwrap_or_else(|| "complete_all".into());
+        let group = group.unwrap_or_else(|| short_uid("complete_all"));
         plan_box(async_stream::stream! {
             for f in flyers {
                 yield Msg::Complete { obj: f, group: Some(group.clone()) };
@@ -2583,15 +2602,34 @@ mod tests {
     #[tokio::test]
     async fn kickoff_all_kicks_each_then_waits_shared_group() {
         let msgs = drain(stubs::kickoff_all(flyers(3), None, true)).await;
-        // 3 Kickoff + 1 Wait, all on the same default group.
+        // 3 Kickoff + 1 Wait, all sharing one process-unique default group.
         assert_eq!(msgs.len(), 4);
+        let g = kickoff_group(&msgs[0]).expect("kickoff group").to_string();
+        assert!(
+            g.starts_with("kickoff_all-"),
+            "default group must be short_uid-minted, got {g:?}"
+        );
         for m in &msgs[..3] {
-            assert_eq!(kickoff_group(m), Some("kickoff_all"));
+            assert_eq!(kickoff_group(m), Some(g.as_str()));
         }
         assert!(matches!(
             &msgs[3],
-            Msg::Wait { group, error_on_timeout: true, timeout: None } if group == "kickoff_all"
+            Msg::Wait { group, error_on_timeout: true, timeout: None } if *group == g
         ));
+    }
+
+    // Two None-group calls to the same stub must mint DIFFERENT default sync
+    // groups, so a stub's internal default can never collide with a user group
+    // — or with another invocation's. Mirrors bluesky's per-call short_uid; the
+    // fixed-literal fallback this replaced returned the same name every time.
+    #[tokio::test]
+    async fn default_sync_groups_are_unique_per_invocation() {
+        let a = drain(stubs::kickoff_all(flyers(1), None, true)).await;
+        let b = drain(stubs::kickoff_all(flyers(1), None, true)).await;
+        let ga = kickoff_group(&a[0]).expect("group a").to_string();
+        let gb = kickoff_group(&b[0]).expect("group b").to_string();
+        assert!(ga.starts_with("kickoff_all-") && gb.starts_with("kickoff_all-"));
+        assert_ne!(ga, gb, "each invocation must mint a distinct default group");
     }
 
     #[tokio::test]
@@ -2606,12 +2644,19 @@ mod tests {
     async fn complete_all_completes_each_then_waits_when_requested() {
         let msgs = drain(stubs::complete_all(flyers(2), None, true)).await;
         assert_eq!(msgs.len(), 3);
+        let g = complete_group(&msgs[0])
+            .expect("complete group")
+            .to_string();
+        assert!(
+            g.starts_with("complete_all-"),
+            "default group must be short_uid-minted, got {g:?}"
+        );
         for m in &msgs[..2] {
-            assert_eq!(complete_group(m), Some("complete_all"));
+            assert_eq!(complete_group(m), Some(g.as_str()));
         }
         assert!(matches!(
             &msgs[2],
-            Msg::Wait { group, .. } if group == "complete_all"
+            Msg::Wait { group, .. } if *group == g
         ));
     }
 
@@ -2620,9 +2665,11 @@ mod tests {
         // bluesky's complete_all defaults wait=false; this exercises that path.
         let msgs = drain(stubs::complete_all(flyers(2), None, false)).await;
         assert_eq!(msgs.len(), 2);
-        assert!(msgs
-            .iter()
-            .all(|m| complete_group(m) == Some("complete_all")));
+        let g = complete_group(&msgs[0])
+            .expect("complete group")
+            .to_string();
+        assert!(g.starts_with("complete_all-"), "got {g:?}");
+        assert!(msgs.iter().all(|m| complete_group(m) == Some(g.as_str())));
         assert!(!msgs.iter().any(|m| matches!(m, Msg::Wait { .. })));
     }
 
@@ -2631,24 +2678,29 @@ mod tests {
     }
 
     // wait=true: Prepare carries the value and a wait-group, followed by a Wait
-    // on that same group. group=None mints the literal "prepare" fallback (no
-    // uuid dep), and an explicit group passes through to both messages.
+    // on that same group. group=None mints a process-unique "prepare-N" default
+    // via short_uid, and an explicit group passes through to both messages.
     #[tokio::test]
     async fn prepare_with_wait_emits_prepare_then_wait_on_same_group() {
         // Default group when none is given.
         let val = serde_json::json!({"trigger": "internal"});
         let msgs = drain(stubs::prepare(preparable("det"), val.clone(), None, true)).await;
         assert_eq!(msgs.len(), 2);
-        match &msgs[0] {
+        let g = match &msgs[0] {
             Msg::Prepare { value, group, .. } => {
                 assert_eq!(value, &val, "value must thread through unchanged");
-                assert_eq!(group.as_deref(), Some("prepare"));
+                let g = group.clone().expect("default group minted");
+                assert!(
+                    g.starts_with("prepare-"),
+                    "default group must be short_uid-minted, got {g:?}"
+                );
+                g
             }
             other => panic!("first msg not Prepare: {other:?}"),
-        }
+        };
         assert!(matches!(
             &msgs[1],
-            Msg::Wait { group, error_on_timeout: true, timeout: None } if group == "prepare"
+            Msg::Wait { group, error_on_timeout: true, timeout: None } if *group == g
         ));
 
         // Explicit group reaches both the Prepare and its Wait.
