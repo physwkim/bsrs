@@ -1987,7 +1987,11 @@ impl RunEngine {
         if members.is_empty() {
             return Ok(());
         }
-        let fut = async {
+        // Await *clones* of the members so the originals survive a move-on
+        // timeout and can be restored to the group below. A clone shares the
+        // same status state, so awaiting it observes the same completion.
+        let waited = members.clone();
+        let fut = async move {
             // Await every member *concurrently*, returning as soon as the first
             // one fails — bluesky `_wait` runs the group through asyncio
             // `FIRST_EXCEPTION` (run_engine.py:2311-2324), so a status that fails
@@ -2000,7 +2004,7 @@ impl RunEngine {
             // `error_on_timeout` suppresses only `WaitForTimeoutError`
             // (run_engine.py:2341-2346) while a `FailedStatus` always raises
             // (:2384).
-            futures::future::try_join_all(members)
+            futures::future::try_join_all(waited)
                 .await
                 .map(|_| ())
                 .map_err(|e| match e {
@@ -2016,6 +2020,24 @@ impl RunEngine {
                     if error_on_timeout {
                         Err(CirrusError::Timeout(d))
                     } else {
+                        // Move-on timeout (`error_on_timeout=false`): execution
+                        // continues, so restore the group's members for a later
+                        // `wait` on the same group to re-await the still-pending
+                        // ones. bluesky puts the futures back on
+                        // `WaitForTimeoutError` before returning
+                        // (run_engine.py:2342-2344); a member that already
+                        // completed is harmless to re-await (it resolves at once).
+                        // Reached only on a genuine timeout, never on a member
+                        // failure (that takes the `Ok(r)` arm above and aborts).
+                        {
+                            let mut state = self.state.lock().await;
+                            state
+                                .groups
+                                .entry(group.to_string())
+                                .or_default()
+                                .members
+                                .extend(members);
+                        }
                         Ok(())
                     }
                 }
@@ -2082,5 +2104,44 @@ mod tests {
             Ok(Err(CirrusError::Backend(msg))) => assert_eq!(msg, "boom"),
             other => panic!("expected a prompt Backend(\"boom\") failure, got {other:?}"),
         }
+    }
+
+    /// A move-on wait (`error_on_timeout=false`) that times out must restore
+    /// the group's still-pending members so a later `wait` on the same group
+    /// re-awaits them, mirroring bluesky putting the futures back on
+    /// `WaitForTimeoutError` (run_engine.py:2342-2344). Without restoration the
+    /// later wait finds an empty group and returns immediately, silently
+    /// dropping the unfinished operation.
+    #[tokio::test]
+    async fn wait_move_on_restores_pending_members_to_group() {
+        let re = RunEngine::new(Vec::new());
+        // A single member that never completes — keep its setter alive.
+        let (pending, _keep) = Status::new();
+        {
+            let mut state = re.state.lock().await;
+            state.groups.insert(
+                "g".into(),
+                WaitGroup {
+                    members: vec![pending],
+                },
+            );
+        }
+        // error_on_timeout=false: wait up to 50ms, then move on without failing.
+        let r = re
+            .wait_group("g", false, Some(Duration::from_millis(50)))
+            .await;
+        assert!(
+            r.is_ok(),
+            "error_on_timeout=false must not fail the run on timeout, got {r:?}"
+        );
+        let restored = {
+            let state = re.state.lock().await;
+            state.groups.get("g").map(|g| g.members.len())
+        };
+        assert_eq!(
+            restored,
+            Some(1),
+            "the still-pending member must be restored to the group on move-on"
+        );
     }
 }
