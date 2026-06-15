@@ -7,7 +7,7 @@ right device method, while emitting `Document`s to subscribed sinks. It owns che
 state, suspender registry, and the bundler that turns `read()` outputs into Events.
 
 The reference implementation is bluesky `run_engine.py:1478-2510` (`_run` and the 26
-`_<command>` handlers). cirrus follows that structure verbatim, with five differences
+`_<command>` handlers). bsrs follows that structure verbatim, with five differences
 listed at the bottom of this doc.
 
 ## Two entry points
@@ -18,7 +18,7 @@ impl RunEngine {
     pub async fn run_async(&self, plan: Plan) -> Result<RunResult>;
 
     /// Sync entry point — equivalent for ophyd-style scripts and the REPL.
-    /// Internally calls `cirrus_runtime().block_on(self.run_async(plan))`.
+    /// Internally calls `bsrs_runtime().block_on(self.run_async(plan))`.
     /// Must NOT be called from inside an async task.
     pub fn run_blocking(&self, plan: Plan) -> Result<RunResult>;
 }
@@ -99,7 +99,7 @@ async fn run_loop(&mut self) -> Result<()> {
 
 ## Bundler
 
-`cirrus_engine::bundler::RunBundler` mirrors `bluesky/bundlers.py`. Holds:
+`bsrs_engine::bundler::RunBundler` mirrors `bluesky/bundlers.py`. Holds:
 
 - `run_uid`, `scan_id`
 - `streams: HashMap<StreamName, DescriptorState>` — stream name → cached descriptor UID
@@ -164,7 +164,7 @@ Two reference impls:
 
 ## Differences from `bluesky/run_engine.py`
 
-| bluesky mechanism | cirrus equivalent |
+| bluesky mechanism | bsrs equivalent |
 |---|---|
 | `_run_permit: asyncio.Event` | `tokio::sync::Notify` + `AtomicState` |
 | `stashed_exception` injected via `gen.throw()` | `mpsc::Receiver<PlanInjection>` polled by `select!` inside the plan |

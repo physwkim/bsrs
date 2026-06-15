@@ -1,8 +1,8 @@
-//! `mini-beamline-qs` — example downstream cirrus-qs daemon that
+//! `mini-beamline-qs` — example downstream bsrs-qs daemon that
 //! registers composite `Dcm` + `Table` devices alongside the plain
 //! per-axis CA motors of the epics-rs mini-beamline IOC.
 //!
-//! Demonstrates the `cirrus-host` library API: how a beamline author
+//! Demonstrates the `bsrs-host` library API: how a beamline author
 //! writes their own ophyd-style hierarchical devices in Rust and stands
 //! up a queue server that exposes them through both the JSON-RPC queue
 //! path *and* the daemon-side Lua REPL.
@@ -23,14 +23,14 @@
 //! cargo run -p mini-beamline-qs --release
 //!
 //! # terminal 4 — attach a REPL
-//! cargo run -p cirrus-cli --release -- qs \
+//! cargo run -p bsrs-cli --release -- qs \
 //!     --address tcp://localhost:60615 repl
-//! cirrus> dcm:move_energy_keV(8.0)
-//! cirrus> dcm:locate()
-//! cirrus> RE:run(scan({ph_det}, dcm, 6, 12, 7))
-//! cirrus> table:move_to_xy(1.0, 2.0)
-//! cirrus> table:at_xy()
-//! cirrus> RE:run(count({table, ph_det}, 5))
+//! bsrs> dcm:move_energy_keV(8.0)
+//! bsrs> dcm:locate()
+//! bsrs> RE:run(scan({ph_det}, dcm, 6, 12, 7))
+//! bsrs> table:move_to_xy(1.0, 2.0)
+//! bsrs> table:at_xy()
+//! bsrs> RE:run(count({table, ph_det}, 5))
 //! ```
 
 #![deny(missing_docs)]
@@ -40,14 +40,14 @@ mod table;
 
 use std::sync::Arc;
 
-use cirrus_core::msg::{LocatableObj, MovableObj, ReadableObj};
-use cirrus_host::checkpoint_store::{default_path as default_ckpt_path, JsonlCheckpointStore};
-use cirrus_host::manager_lua::ManagerLuaState;
-use cirrus_qs::{Registry, Server};
+use bsrs_core::msg::{LocatableObj, MovableObj, ReadableObj};
+use bsrs_host::checkpoint_store::{default_path as default_ckpt_path, JsonlCheckpointStore};
+use bsrs_host::manager_lua::ManagerLuaState;
+use bsrs_qs::{Registry, Server};
 use clap::Parser;
 use tokio::sync::Mutex as TMutex;
 
-/// CLI arguments. Mirror `cirrus qs-manager` but with mini-beamline
+/// CLI arguments. Mirror `bsrs qs-manager` but with mini-beamline
 /// devices hardcoded — no `--ca-motor` flag is needed since the PVs
 /// are fixed for this example.
 #[derive(Parser, Debug)]
@@ -62,7 +62,7 @@ struct Args {
     documents: String,
 
     /// Optional checkpoint JSONL file. Defaults to
-    /// `~/.cirrus/checkpoints.jsonl`.
+    /// `~/.bsrs/checkpoints.jsonl`.
     #[arg(long)]
     checkpoints: Option<std::path::PathBuf>,
 }
@@ -70,8 +70,8 @@ struct Args {
 fn main() {
     // CA bootstrap must run BEFORE the tokio runtime is built (rule:
     // `ca_context()` calls `block_on` once and panics from inside an
-    // active runtime). Same pattern as `cirrus qs-manager`.
-    cirrus_host::ca_devices::bootstrap_ca();
+    // active runtime). Same pattern as `bsrs qs-manager`.
+    bsrs_host::ca_devices::bootstrap_ca();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -92,7 +92,7 @@ async fn run(args: Args) -> i32 {
     reg.register_plan_count("count");
 
     // ---- single-axis CA devices (so plain plans still work) ----
-    let ph_mtr = match cirrus_host::ca_devices::CaMotor::connect_async(
+    let ph_mtr = match bsrs_host::ca_devices::CaMotor::connect_async(
         "ph_mtr",
         "mini:ph:mtr.VAL",
         "mini:ph:mtr.RBV",
@@ -111,7 +111,7 @@ async fn run(args: Args) -> i32 {
     tracing::info!(target: "mini-beamline-qs", "registered ph_mtr");
 
     let ph_det =
-        match cirrus_host::ca_devices::CaDetector::connect_async("ph_det", "mini:ph:DetValue_RBV")
+        match bsrs_host::ca_devices::CaDetector::connect_async("ph_det", "mini:ph:DetValue_RBV")
             .await
         {
             Ok(d) => d,
@@ -167,7 +167,7 @@ async fn run(args: Args) -> i32 {
     // ---- daemon-side Lua bridge + checkpoint store ----
     let engine_slot = Arc::new(TMutex::new(None));
     let registry_for_lua = Arc::new(reg.clone());
-    let evaluator: Arc<dyn cirrus_qs::LuaEvaluator> =
+    let evaluator: Arc<dyn bsrs_qs::LuaEvaluator> =
         Arc::new(ManagerLuaState::new(engine_slot.clone(), registry_for_lua));
 
     let ckpt_path = args.checkpoints.clone().unwrap_or_else(default_ckpt_path);

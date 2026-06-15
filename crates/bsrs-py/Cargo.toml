@@ -1,0 +1,27 @@
+[package]
+name = "bsrs-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Python bindings (PyO3) for bsrs — RunEngine + soft devices + plan factories."
+
+[lib]
+name = "bsrs_native"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"] }
+bsrs-core.workspace = true
+bsrs-engine.workspace = true
+bsrs-plans.workspace = true
+bsrs-backend-soft.workspace = true
+serde_json.workspace = true
+
+[features]
+default = []
+# Compile the `python_smoke` integration tests. Requires `python3`
+# in PATH and a Linux/macOS toolchain that resolves Python ABI
+# symbols at extension-load time. Off by default so the standard
+# workspace `cargo test` doesn't link a Python-symbols-needing
+# test binary on platforms that can't supply them.
+python-tests = []

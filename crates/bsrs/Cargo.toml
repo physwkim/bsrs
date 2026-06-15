@@ -1,0 +1,38 @@
+[package]
+name = "bsrs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bsrs facade — re-exports `ophyd_async` and `ophyd` modules."
+
+[dependencies]
+bsrs-core.workspace = true
+bsrs-engine.workspace = true
+bsrs-event-model.workspace = true
+bsrs-plans.workspace = true
+bsrs-devices.workspace = true
+bsrs-protocols-async.workspace = true
+bsrs-protocols-sync.workspace = true
+bsrs-callbacks.workspace = true
+bsrs-stream.workspace = true
+bsrs-backend-soft = { path = "../bsrs-backends/soft" }
+bsrs-backend-mock = { path = "../bsrs-backends/mock" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+bytes.workspace = true
+futures.workspace = true
+async-stream.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+bsrs-engine.workspace = true
+bsrs-backend-epics-ca = { path = "../bsrs-backends/epics-ca", features = ["real"] }
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "plan_loop"
+harness = false
+
+[[bench]]
+name = "document_fanout"
+harness = false

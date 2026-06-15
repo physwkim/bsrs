@@ -453,6 +453,352 @@ dependencies = [
 ]
 
 [[package]]
+name = "bsrs"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "bsrs-backend-epics-ca",
+ "bsrs-backend-mock",
+ "bsrs-backend-soft",
+ "bsrs-callbacks",
+ "bsrs-core",
+ "bsrs-devices",
+ "bsrs-engine",
+ "bsrs-event-model",
+ "bsrs-plans",
+ "bsrs-protocols-async",
+ "bsrs-protocols-sync",
+ "bsrs-stream",
+ "bytes",
+ "criterion",
+ "futures",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "bsrs-backend-epics-ca"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bsrs-core",
+ "bsrs-devices",
+ "bsrs-event-model",
+ "bsrs-protocols-async",
+ "epics-base-rs",
+ "epics-ca-rs",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "bsrs-backend-epics-pva"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bsrs-core",
+ "bsrs-devices",
+ "bsrs-event-model",
+ "bsrs-protocols-async",
+ "bytes",
+ "epics-pva-rs",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "bsrs-backend-mock"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bsrs-backend-soft",
+ "bsrs-core",
+ "bsrs-devices",
+ "bsrs-event-model",
+ "bsrs-protocols-async",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "bsrs-backend-soft"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bsrs-core",
+ "bsrs-devices",
+ "bsrs-event-model",
+ "bsrs-protocols-async",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "bsrs-callbacks"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bsrs-backend-soft",
+ "bsrs-core",
+ "bsrs-engine",
+ "bsrs-event-model",
+ "bsrs-plans",
+ "kafka",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "tiled-client",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "zmq",
+]
+
+[[package]]
+name = "bsrs-cli"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "bsrs-backend-soft",
+ "bsrs-callbacks",
+ "bsrs-core",
+ "bsrs-derive",
+ "bsrs-engine",
+ "bsrs-event-model",
+ "bsrs-host",
+ "bsrs-plans",
+ "bsrs-protocols-async",
+ "bsrs-qs",
+ "bsrs-stream",
+ "bytes",
+ "clap",
+ "epics-pva-rs",
+ "futures",
+ "mlua",
+ "rustyline",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "zmq",
+]
+
+[[package]]
+name = "bsrs-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bsrs-event-model",
+ "futures",
+ "pin-project-lite",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "bsrs-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "bsrs-devices"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bsrs-backend-soft",
+ "bsrs-core",
+ "bsrs-derive",
+ "bsrs-event-model",
+ "bsrs-protocols-async",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "bsrs-engine"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "bsrs-core",
+ "bsrs-event-model",
+ "futures",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "bsrs-event-model"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
+name = "bsrs-host"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "bsrs-backend-epics-ca",
+ "bsrs-backend-epics-pva",
+ "bsrs-backend-soft",
+ "bsrs-core",
+ "bsrs-derive",
+ "bsrs-engine",
+ "bsrs-event-model",
+ "bsrs-plans",
+ "bsrs-protocols-async",
+ "bsrs-qs",
+ "futures",
+ "mlua",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tiled-client",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "bsrs-plans"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "bsrs-core",
+ "bsrs-event-model",
+ "futures",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "bsrs-protocols-async"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bsrs-core",
+ "bsrs-event-model",
+ "bytes",
+ "futures",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "bsrs-protocols-sync"
+version = "0.1.0"
+dependencies = [
+ "bsrs-core",
+ "bsrs-event-model",
+ "bsrs-protocols-async",
+ "serde_json",
+]
+
+[[package]]
+name = "bsrs-py"
+version = "0.1.0"
+dependencies = [
+ "bsrs-backend-soft",
+ "bsrs-core",
+ "bsrs-engine",
+ "bsrs-plans",
+ "pyo3",
+ "serde_json",
+]
+
+[[package]]
+name = "bsrs-qs"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "bsrs-backend-soft",
+ "bsrs-callbacks",
+ "bsrs-core",
+ "bsrs-engine",
+ "bsrs-event-model",
+ "bsrs-plans",
+ "futures",
+ "metrics 0.24.5",
+ "metrics-exporter-prometheus",
+ "regex",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "uuid",
+ "zmq",
+]
+
+[[package]]
+name = "bsrs-stream"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bsrs-core",
+ "bsrs-event-model",
+ "bsrs-protocols-async",
+ "bytes",
+ "epics-pva-rs",
+ "futures",
+ "rust-hdf5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "bstr"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -565,352 +911,6 @@ checksum = "57663b653d948a338bfb3eeba9bb2fd5fcfaecb9e199e87e1eda4d9e8b240fd9"
 dependencies = [
  "ciborium-io",
  "half",
-]
-
-[[package]]
-name = "cirrus"
-version = "0.1.0"
-dependencies = [
- "async-stream",
- "async-trait",
- "bytes",
- "cirrus-backend-epics-ca",
- "cirrus-backend-mock",
- "cirrus-backend-soft",
- "cirrus-callbacks",
- "cirrus-core",
- "cirrus-devices",
- "cirrus-engine",
- "cirrus-event-model",
- "cirrus-plans",
- "cirrus-protocols-async",
- "cirrus-protocols-sync",
- "cirrus-stream",
- "criterion",
- "futures",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "cirrus-backend-epics-ca"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "cirrus-core",
- "cirrus-devices",
- "cirrus-event-model",
- "cirrus-protocols-async",
- "epics-base-rs",
- "epics-ca-rs",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "cirrus-backend-epics-pva"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "cirrus-core",
- "cirrus-devices",
- "cirrus-event-model",
- "cirrus-protocols-async",
- "epics-pva-rs",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "cirrus-backend-mock"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "cirrus-backend-soft",
- "cirrus-core",
- "cirrus-devices",
- "cirrus-event-model",
- "cirrus-protocols-async",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "cirrus-backend-soft"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "cirrus-core",
- "cirrus-devices",
- "cirrus-event-model",
- "cirrus-protocols-async",
- "futures",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "cirrus-callbacks"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "cirrus-backend-soft",
- "cirrus-core",
- "cirrus-engine",
- "cirrus-event-model",
- "cirrus-plans",
- "kafka",
- "rmp-serde",
- "serde",
- "serde_json",
- "tiled-client",
- "tokio",
- "tokio-util",
- "tracing",
- "url",
- "zmq",
-]
-
-[[package]]
-name = "cirrus-cli"
-version = "0.1.0"
-dependencies = [
- "async-stream",
- "async-trait",
- "bytes",
- "cirrus-backend-soft",
- "cirrus-callbacks",
- "cirrus-core",
- "cirrus-derive",
- "cirrus-engine",
- "cirrus-event-model",
- "cirrus-host",
- "cirrus-plans",
- "cirrus-protocols-async",
- "cirrus-qs",
- "cirrus-stream",
- "clap",
- "epics-pva-rs",
- "futures",
- "mlua",
- "rustyline",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "zmq",
-]
-
-[[package]]
-name = "cirrus-core"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "cirrus-event-model",
- "futures",
- "pin-project-lite",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "cirrus-derive"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "cirrus-devices"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "cirrus-backend-soft",
- "cirrus-core",
- "cirrus-derive",
- "cirrus-event-model",
- "cirrus-protocols-async",
- "futures",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "cirrus-engine"
-version = "0.1.0"
-dependencies = [
- "async-stream",
- "async-trait",
- "cirrus-core",
- "cirrus-event-model",
- "futures",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "cirrus-event-model"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "uuid",
-]
-
-[[package]]
-name = "cirrus-host"
-version = "0.1.0"
-dependencies = [
- "async-stream",
- "async-trait",
- "cirrus-backend-epics-ca",
- "cirrus-backend-epics-pva",
- "cirrus-backend-soft",
- "cirrus-core",
- "cirrus-derive",
- "cirrus-engine",
- "cirrus-event-model",
- "cirrus-plans",
- "cirrus-protocols-async",
- "cirrus-qs",
- "futures",
- "mlua",
- "serde",
- "serde_json",
- "tempfile",
- "tiled-client",
- "tokio",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "cirrus-plans"
-version = "0.1.0"
-dependencies = [
- "async-stream",
- "async-trait",
- "cirrus-core",
- "cirrus-event-model",
- "futures",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "cirrus-protocols-async"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "cirrus-core",
- "cirrus-event-model",
- "futures",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "cirrus-protocols-sync"
-version = "0.1.0"
-dependencies = [
- "cirrus-core",
- "cirrus-event-model",
- "cirrus-protocols-async",
- "serde_json",
-]
-
-[[package]]
-name = "cirrus-py"
-version = "0.1.0"
-dependencies = [
- "cirrus-backend-soft",
- "cirrus-core",
- "cirrus-engine",
- "cirrus-plans",
- "pyo3",
- "serde_json",
-]
-
-[[package]]
-name = "cirrus-qs"
-version = "0.1.0"
-dependencies = [
- "async-stream",
- "async-trait",
- "cirrus-backend-soft",
- "cirrus-callbacks",
- "cirrus-core",
- "cirrus-engine",
- "cirrus-event-model",
- "cirrus-plans",
- "futures",
- "metrics 0.24.5",
- "metrics-exporter-prometheus",
- "regex",
- "rmp-serde",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "toml",
- "tracing",
- "uuid",
- "zmq",
-]
-
-[[package]]
-name = "cirrus-stream"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "cirrus-core",
- "cirrus-event-model",
- "cirrus-protocols-async",
- "epics-pva-rs",
- "futures",
- "rust-hdf5",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -2600,12 +2600,12 @@ name = "mini-beamline-qs"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "cirrus-core",
- "cirrus-derive",
- "cirrus-engine",
- "cirrus-event-model",
- "cirrus-host",
- "cirrus-qs",
+ "bsrs-core",
+ "bsrs-derive",
+ "bsrs-engine",
+ "bsrs-event-model",
+ "bsrs-host",
+ "bsrs-qs",
  "clap",
  "serde_json",
  "tokio",

@@ -1,16 +1,16 @@
--- Lua-driven verification of cirrus against the epics-rs
+-- Lua-driven verification of bsrs against the epics-rs
 -- mini-beamline IOC. Run alongside the IOC:
 --
 --   # terminal 1: start the mini-beamline IOC
 --   cd ~/codes/epics-rs
 --   ./target/release/mini_ioc examples/mini-beamline/ioc/st.cmd
 --
---   # terminal 2: drive cirrus from Lua
---   cd ~/codes/cirrus
---   cargo run -p cirrus-cli -- repl --script examples/mini_beamline_scan.lua
+--   # terminal 2: drive bsrs from Lua
+--   cd ~/codes/bsrs
+--   cargo run -p bsrs-cli -- repl --script examples/mini_beamline_scan.lua
 --
--- Equivalent to crates/cirrus/examples/mini_beamline_scan.rs but
--- driven through cirrus's Lua bridge — proves the same end-to-end
+-- Equivalent to crates/bsrs/examples/mini_beamline_scan.rs but
+-- driven through bsrs's Lua bridge — proves the same end-to-end
 -- path (CA backend → device traits → RunEngine → Documents) works
 -- when the user writes Lua instead of Rust.
 
@@ -31,7 +31,7 @@ print("[lua] current VELO:", velo:read().ph_velo.value)
 
 -- Need to write VELO too — use a movable handle for that. We can't
 -- use ca_motor (no .RBV needed); easiest is to write directly via
--- cirrus's `caput` shortcut if available, or skip if VELO already
+-- bsrs's `caput` shortcut if available, or skip if VELO already
 -- set. For this script we assume the operator pre-set VELO=5.0
 -- (or larger). See the Rust example for an inline put.
 

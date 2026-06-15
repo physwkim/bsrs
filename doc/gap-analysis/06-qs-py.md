@@ -1,19 +1,19 @@
-# Gap Analysis: cirrus-qs vs bluesky-queueserver + cirrus-py vs ophyd-async/bluesky
+# Gap Analysis: bsrs-qs vs bluesky-queueserver + bsrs-py vs ophyd-async/bluesky
 
 **Date:** 2026-06-14  
-**cirrus ref:** `crates/cirrus-qs/src/` (dispatch.rs, methods.rs, state.rs, queue.rs, registry.rs, transport.rs)  
+**bsrs ref:** `crates/bsrs-qs/src/` (dispatch.rs, methods.rs, state.rs, queue.rs, registry.rs, transport.rs)  
 **Python ref:** `daq/bluesky-queueserver/bluesky_queueserver/manager/` (manager.py, comms.py, plan_queue_ops.py)  
-**cirrus-py ref:** `crates/cirrus-py/src/lib.rs`  
+**bsrs-py ref:** `crates/bsrs-py/src/lib.rs`  
 **Python-py ref:** `daq/ophyd-async/`, `daq/bluesky/`
 
 ---
 
-## Part A — cirrus-qs vs bluesky-queueserver Wire Protocol
+## Part A — bsrs-qs vs bluesky-queueserver Wire Protocol
 
 ### What matches
 
 All 44 method names from the Python `_zmq_execute` handler dict (manager.py:3699–3748) appear in
-cirrus dispatch: the 37 implemented methods plus 6 NOT_IMPLEMENTED stubs
+bsrs dispatch: the 37 implemented methods plus 6 NOT_IMPLEMENTED stubs
 (`script_upload`, `function_execute`, `kernel_interrupt`, `permissions_set`,
 `manager_stop`, `manager_kill`). No method name is entirely absent. The ZMQ REP
 socket runs on the same default port 60615 (server.rs:56, comms.py:22).
@@ -26,7 +26,7 @@ socket runs on the same default port 60615 (server.rs:56, comms.py:22).
 
 #### QS-01 — ZMQ envelope incompatible: Python uses `{method, params}` not JSON-RPC 2.0
 
-**cirrus:** `crates/cirrus-qs/src/transport.rs:52`, `crates/cirrus-qs/src/methods.rs:8–19`  
+**bsrs:** `crates/bsrs-qs/src/transport.rs:52`, `crates/bsrs-qs/src/methods.rs:8–19`  
 `RpcRequest { jsonrpc: String, method: String, params: Value, id: Option<Value> }`  
 (`jsonrpc` is a non-optional `String`; missing field → serde error → INVALID_REQUEST reply)
 
@@ -37,9 +37,9 @@ raises on extra keys (including `jsonrpc`).
 Responses are flat dicts `{"success": bool, "msg": str, ...field...}` not JSON-RPC `result/error` objects.
 
 **Gap:** The Python queueserver REManagerAPI client sends `{"method":…,"params":…}` and reads
-top-level `success/msg`. cirrus-qs requires `{"jsonrpc":"2.0",…}` and wraps responses as
+top-level `success/msg`. bsrs-qs requires `{"jsonrpc":"2.0",…}` and wraps responses as
 `{"jsonrpc":"2.0","result":{…}}`. Every call from REManagerAPI or `qserver` CLI will fail with
-INVALID_REQUEST (cirrus) or a KeyError on `success` (client parsing cirrus response).
+INVALID_REQUEST (bsrs) or a KeyError on `success` (client parsing bsrs response).
 
 **Fix sketch:** Replace `RpcRequest.jsonrpc: String` with `Option<String>` (serde default None)
 and treat absent/null as tolerated. On the send side, add a compatibility mode that serialises
@@ -54,7 +54,7 @@ path; otherwise translates the plain `{method, params}` envelope and re-wraps th
 
 #### QS-02 — `ping` returns `"pong"` instead of full status
 
-**cirrus:** `dispatch.rs:70`  
+**bsrs:** `dispatch.rs:70`  
 `"ping" => RpcResponse::ok(id, json!({"success": true, "msg": "pong"}))`
 
 **ref:** `manager.py:1888–1892`  
@@ -73,7 +73,7 @@ one-liner, or make `"ping"` call `"status"` internally.
 
 #### QS-03 — `plans_allowed` / `devices_allowed` return list of names, not rich dict
 
-**cirrus:** `dispatch.rs:87–122`  
+**bsrs:** `dispatch.rs:87–122`  
 `"plans_allowed": registry.plan_names()` → `Vec<String>` (JSON array of strings)  
 `"devices_allowed": registry.device_names()` → `Vec<String>`  
 `"plans_existing"` / `"devices_existing"` same.
@@ -86,7 +86,7 @@ docstrings. `user_group` param is **required** (exception raised if absent, line
 **Gap:** Python clients (e.g. bluesky-widgets, QASE) iterate the returned dict and read
 `.parameters`, `.description`, `.module` for each plan/device. An array of strings provides
 none of that; clients silently get an empty parameter schema or crash on dict access.
-Also, `user_group` filtering is completely absent in cirrus — all plans are returned
+Also, `user_group` filtering is completely absent in bsrs — all plans are returned
 regardless of caller group.
 
 **Fix sketch:** Introduce a `PlanMeta` struct with `name`, `description: Option<String>`,
@@ -101,7 +101,7 @@ group may call, filtering the registry snapshot accordingly.
 
 #### QS-04 — `queue_item_add` response returns `item_uid`, not full `item`
 
-**cirrus:** `dispatch.rs:688–699`  
+**bsrs:** `dispatch.rs:688–699`  
 Returns `{"success", "msg", "qsize", "item_uid": …, "plan_queue_uid": …}`.
 
 **ref:** `manager.py:2412–2413`  
@@ -120,7 +120,7 @@ Remove the now-redundant `item_uid` top-level key.
 
 #### QS-05 — `queue_item_add_batch` response key `items_added` should be `items`, missing `results`
 
-**cirrus:** `dispatch.rs:730–739`  
+**bsrs:** `dispatch.rs:730–739`  
 Returns `{"success","msg","qsize","items_added":[uid…],"plan_queue_uid"}`.
 
 **ref:** `manager.py:2530–2531`  
@@ -139,13 +139,13 @@ Add `results: Vec<{success,msg}>` in parallel, one entry per input item.
 
 #### QS-06 — `re_metadata` response key is `metadata`, should be `re_metadata`
 
-**cirrus:** `dispatch.rs:1086–1092`  
+**bsrs:** `dispatch.rs:1086–1092`  
 `json!({"success":true,"msg":"","metadata": re.md()})`
 
 **ref:** `manager.py:3407`  
 `{"success": success, "msg": msg, "re_metadata": re_metadata}`
 
-**Gap:** Clients reading `resp["re_metadata"]` get None; cirrus returns the data under `"metadata"`.
+**Gap:** Clients reading `resp["re_metadata"]` get None; bsrs returns the data under `"metadata"`.
 
 **Fix sketch:** Rename the JSON key from `"metadata"` to `"re_metadata"` in the `re_metadata` arm.
 
@@ -155,19 +155,19 @@ Add `results: Vec<{success,msg}>` in parallel, one entry per input item.
 
 #### QS-07 — `manager_state` missing five transitional states
 
-**cirrus:** `state.rs:10–21` — EState: EnvironmentClosed, Idle, ExecutingQueue, Paused, Aborting  
+**bsrs:** `state.rs:10–21` — EState: EnvironmentClosed, Idle, ExecutingQueue, Paused, Aborting  
 Emitted strings: `"environment_closed"`, `"idle"`, `"executing_queue"`, `"paused"`, `"aborting"`.
 
 **ref:** `manager.py:50–59` — MState: INITIALIZING, IDLE, PAUSED, CREATING_ENVIRONMENT,
 STARTING_QUEUE, EXECUTING_QUEUE, EXECUTING_TASK, CLOSING_ENVIRONMENT, DESTROYING_ENVIRONMENT.
 
 **Gap:** Clients polling `manager_state` to wait for "idle" after `environment_open` must
-observe the "creating_environment" → "idle" transition. In cirrus the environment opens
+observe the "creating_environment" → "idle" transition. In bsrs the environment opens
 synchronously, so the state jumps directly to idle — clients waiting for the specific
 "creating_environment" state get an instant "idle" they may interpret as "already closed".
-More critically: `"aborting"` is cirrus-only (not in Python), and `"executing_task"`,
+More critically: `"aborting"` is bsrs-only (not in Python), and `"executing_task"`,
 `"closing_environment"`, `"destroying_environment"` / `"starting_queue"` are Python-only.
-Any client code branching on exact state strings will misclassify cirrus states.
+Any client code branching on exact state strings will misclassify bsrs states.
 
 **Fix sketch:** Add an optional brief `CreatingEnvironment` / `ClosingEnvironment` transient
 emission within `env_open`/`env_close` before the final state is committed, to satisfy
@@ -186,7 +186,7 @@ goes to "aborting").
 
 #### QS-08 — `pause_pending` missing from status
 
-**cirrus:** `dispatch.rs:549–601` — status JSON has no `pause_pending` key.
+**bsrs:** `dispatch.rs:549–601` — status JSON has no `pause_pending` key.
 
 **ref:** `manager.py:434` — `"pause_pending": self._re_pause_pending` (True when a deferred
 `re_pause` was accepted but not yet acted on by the worker).
@@ -204,7 +204,7 @@ Paused. Emit `"pause_pending": st.pause_pending` in `status_response`.
 
 #### QS-09 — `queue_item_add` / `queue_item_add_batch` missing positional insertion (`pos`, `before_uid`, `after_uid`)
 
-**cirrus:** `dispatch.rs:668–739` — `queue_item_add` always calls `q.push_back(queued)`;
+**bsrs:** `dispatch.rs:668–739` — `queue_item_add` always calls `q.push_back(queued)`;
 `queue_item_add_batch` always appends. No `pos`, `before_uid`, or `after_uid` param read.
 
 **ref:** `manager.py:2378,2394–2400` — supports `pos` (string "front"/"back" or integer index,
@@ -226,13 +226,13 @@ override during a run) always silently falls to back. Before-/after-uid insertio
 
 #### QS-10 — `function_execute` is unimplemented
 
-**cirrus:** `dispatch.rs:419–430` — NOT_IMPLEMENTED stub.
+**bsrs:** `dispatch.rs:419–430` — NOT_IMPLEMENTED stub.
 
 **ref:** `manager.py:2992–3060` — executes a named user function (registered in the worker
 namespace) as a background task, returns `task_uid` for polling via `task_result`.
 
 **Gap:** Beamline scripts that call `function_execute` (common for ad-hoc calibrations,
-alignment routines) get NOT_IMPLEMENTED. In cirrus's model this maps to `lua_eval`,
+alignment routines) get NOT_IMPLEMENTED. In bsrs's model this maps to `lua_eval`,
 but a standard bluesky client uses `function_execute`.
 
 **Fix sketch:** Define a `function_execute` that accepts `{"item": {"name":…,"args":…,"kwargs":…}}`
@@ -245,7 +245,7 @@ Return the same `{"success","msg","task_uid"}` shape.
 
 #### QS-11 — `instruction` item_type not supported in `queue_item_add`
 
-**cirrus:** `dispatch.rs:678–682` — `queue_item_add` reads `item.name` and looks up a plan;
+**bsrs:** `dispatch.rs:678–682` — `queue_item_add` reads `item.name` and looks up a plan;
 no `item_type` dispatch. `queue.rs:12–15` — `QueuedItem.item_type` is always set to `"plan"`.
 
 **ref:** `manager.py:2161–2205` — `_get_item_from_request` reads `item["item_type"]`
@@ -268,14 +268,14 @@ Validate `item_type` in `queue_item_add`.
 
 #### QS-12 — msgpack encoding not supported
 
-**cirrus:** `transport.rs:51–52` — parses received bytes with `serde_json::from_slice`; sends
+**bsrs:** `transport.rs:51–52` — parses received bytes with `serde_json::from_slice`; sends
 `serde_json::to_vec`. No msgpack path.
 
 **ref:** `comms.py:24–51` — `ZMQEncoding.JSON` / `ZMQEncoding.MSGPACK`; client configured via
 `--zmq-encoding` flag. Manager at lines 3791–3795 dispatches on encoding for recv; at 3808–3812
 for send.
 
-**Gap:** Any client built with `ZMQEncoding.MSGPACK` sends binary msgpack frames; cirrus
+**Gap:** Any client built with `ZMQEncoding.MSGPACK` sends binary msgpack frames; bsrs
 `serde_json::from_slice` errors; client gets INVALID_REQUEST. Affects high-frequency
 polling deployments.
 
@@ -289,13 +289,13 @@ encoding the client used (track per-request or negotiate via first message).
 
 #### QS-13 — `manager_stop` returns NOT_IMPLEMENTED (no clean shutdown path)
 
-**cirrus:** `dispatch.rs:419–430` — `manager_stop` returns NOT_IMPLEMENTED.
+**bsrs:** `dispatch.rs:419–430` — `manager_stop` returns NOT_IMPLEMENTED.
 
 **ref:** `manager.py:3746,1839–1842` — `_manager_stop_handler` sends `manager_stopping`
 to watchdog and initiates graceful shutdown of the manager process.
 
 **Gap:** Clients that call `manager_stop` to shut down the daemon get an error. There is
-no RPC-level way to stop cirrus-qs; only OS signals work.
+no RPC-level way to stop bsrs-qs; only OS signals work.
 
 **Fix sketch:** In `server.rs`, expose a shutdown token (tokio CancellationToken). In
 `dispatch`, pass a clone; `"manager_stop"` calls `token.cancel()` and returns success.
@@ -305,20 +305,20 @@ The `run_blocking` loop exits when token fires.
 
 ---
 
-#### QS-14 — `plans_allowed` / `devices_allowed` require `user_group` param; cirrus ignores it
+#### QS-14 — `plans_allowed` / `devices_allowed` require `user_group` param; bsrs ignores it
 
-**cirrus:** `dispatch.rs:87–122` — `user_group` param not read; same list returned to all callers.
+**bsrs:** `dispatch.rs:87–122` — `user_group` param not read; same list returned to all callers.
 
 **ref:** `manager.py:1934–1945` — `user_group` is **required**; error raised if absent.
 Returns only plans/devices that user's group is allowed to execute.
 
 **Gap:** Standard qserver CLI always sends `user_group=primary` (qserver_cli.py:49).
-Clients that omit `user_group` get an error from Python but silently succeed from cirrus.
-More importantly: cirrus never filters by group, so a "read-only" group can see and
+Clients that omit `user_group` get an error from Python but silently succeed from bsrs.
+More importantly: bsrs never filters by group, so a "read-only" group can see and
 presumably submit all plans — permissions are only enforced at submit time via RBAC, not
 at list-discovery time.
 
-**Fix sketch:** Make `user_group` optional in cirrus (tolerate absence). When present and
+**Fix sketch:** Make `user_group` optional in bsrs (tolerate absence). When present and
 the Permissions table contains group → allowed-plans mappings, intersect `registry.plan_names()`
 with that set before returning. Same for devices.
 
@@ -328,12 +328,12 @@ with that set before returning. Same for devices.
 
 #### QS-15 — Queue items missing `user` / `user_group` attribution
 
-**cirrus:** `queue.rs:12–27` — `QueuedItem` has no `user` or `user_group` fields.
+**bsrs:** `queue.rs:12–27` — `QueuedItem` has no `user` or `user_group` fields.
 
 **ref:** `manager.py:1124–1134` — each item carries `user` and `user_group` injected by
 `_prepare_item`; stored in queue and returned in `queue_get` / `history_get` responses.
 
-**Gap:** History entries and queue snapshots returned by cirrus carry no provenance. Clients
+**Gap:** History entries and queue snapshots returned by bsrs carry no provenance. Clients
 that display or audit who submitted a plan (common in multi-user beamline ops) see no user.
 
 **Fix sketch:** Add `pub user: Option<String>` and `pub user_group: Option<String>` to
@@ -350,7 +350,7 @@ store. Serialize into snapshot/history responses.
 
 #### QS-16 — `status_uid` missing from status response
 
-**cirrus:** `dispatch.rs:564–601` — no `status_uid` field.
+**bsrs:** `dispatch.rs:564–601` — no `status_uid` field.
 
 **ref:** `manager.py:436` — `"status_uid": _generate_uid()` — new UUID every status call;
 used by polling clients to detect a changed status without deep equality checks.
@@ -363,7 +363,7 @@ used by polling clients to detect a changed status without deep equality checks.
 
 #### QS-17 — `time` field missing from status response
 
-**cirrus:** `dispatch.rs:564–601` — no `time` field.
+**bsrs:** `dispatch.rs:564–601` — no `time` field.
 
 **ref:** `manager.py:421` — `"time": self._get_timestamp_iso8601()`.
 
@@ -375,7 +375,7 @@ used by polling clients to detect a changed status without deep equality checks.
 
 #### QS-18 — `worker_background_tasks` missing from status
 
-**cirrus:** `dispatch.rs:564–601` — absent.
+**bsrs:** `dispatch.rs:564–601` — absent.
 
 **ref:** `manager.py:430` — `"worker_background_tasks": background_tasks` (count of
 background tasks executing in the worker process).
@@ -389,15 +389,15 @@ background tasks executing in the worker process).
 
 #### QS-19 — `config_get` response shape mismatch
 
-**cirrus:** `dispatch.rs:72–84`  
-`"config": {"implementation": "cirrus-qs", "runtime": "rust", "version": …, "wire_protocol": …}`
+**bsrs:** `dispatch.rs:72–84`  
+`"config": {"implementation": "bsrs-qs", "runtime": "rust", "version": …, "wire_protocol": …}`
 
 **ref:** `manager.py:1919–1924`  
 `"config": {"ip_connect_info": {}}` (always `{}` when no IPython kernel).
 
 **Gap:** Clients reading `resp["config"]["ip_connect_info"]` get KeyError. Different shapes.
 
-**Fix sketch:** Keep cirrus-specific keys but also include `"ip_connect_info": {}` in
+**Fix sketch:** Keep bsrs-specific keys but also include `"ip_connect_info": {}` in
 the config dict for compatibility.
 
 **Effort:** S
@@ -406,7 +406,7 @@ the config dict for compatibility.
 
 #### QS-20 — `queue_item_move` and `queue_item_move_batch` missing `before_uid` / `after_uid` / `reorder`
 
-**cirrus:** `dispatch.rs:869–925` — only `uid` + `pos_dest` (front/back/int).
+**bsrs:** `dispatch.rs:869–925` — only `uid` + `pos_dest` (front/back/int).
 
 **ref:** `manager.py:2679–2733` — supports `before_uid`, `after_uid`, `reorder` for move
 and move_batch.
@@ -420,7 +420,7 @@ and move_batch.
 
 #### QS-21 — `queue_item_update` missing `replace` parameter
 
-**cirrus:** `dispatch.rs:742–774` — always keeps the same UID.
+**bsrs:** `dispatch.rs:742–774` — always keeps the same UID.
 
 **ref:** `manager.py:2552–2564` — `replace: bool` → generate new UID before replacing.
 
@@ -433,7 +433,7 @@ and move_batch.
 
 #### QS-22 — `re_runs` `option` parameter ignored; `is_open` always false
 
-**cirrus:** `dispatch.rs:1055–1065` — ignores `option`; emits `{"uid":…, "is_open": false}`.
+**bsrs:** `dispatch.rs:1055–1065` — ignores `option`; emits `{"uid":…, "is_open": false}`.
 
 **ref:** `manager.py:3344–3358` — filters by `option = "active"|"open"|"closed"`.
 
@@ -446,7 +446,7 @@ and move_batch.
 
 #### QS-23 — ZMQ CURVE encryption not supported
 
-**cirrus:** `transport.rs:18–34` — plain `zmq::REP` socket, no CURVE key configuration.
+**bsrs:** `transport.rs:18–34` — plain `zmq::REP` socket, no CURVE key configuration.
 
 **ref:** `comms.py:893–898` — supports optional server-public-key CURVE authentication.
 
@@ -459,7 +459,7 @@ call `socket.set_curve_server(true)` + `set_curve_publickey` / `set_curve_secret
 
 #### QS-24 — `environment_destroy` is an alias for `environment_close`
 
-**cirrus:** `dispatch.rs:157` — `"environment_destroy" => env_close(…)` (identical call).
+**bsrs:** `dispatch.rs:157` — `"environment_destroy" => env_close(…)` (identical call).
 
 **ref:** `manager.py:644–673` — `_environment_destroy_handler` forcibly kills the worker
 process (SIGKILL path via watchdog), whereas `_environment_close_handler` sends a graceful
@@ -472,11 +472,11 @@ or directly aborts the running queue task before dropping the engine.
 
 ---
 
-## Part B — cirrus-py vs bluesky / ophyd-async Python API
+## Part B — bsrs-py vs bluesky / ophyd-async Python API
 
 ### What exists
 
-`cirrus_native` module (crates/cirrus-py/src/lib.rs) exposes:
+`bsrs_native` module (crates/bsrs-py/src/lib.rs) exposes:
 - `SoftMotor(name, initial=0.0)` — name accessor, `__repr__`
 - `SoftDetector(name)` — name accessor
 - `Plan` — opaque, single-use handle
@@ -493,13 +493,13 @@ or directly aborts the running queue task before dropping the engine.
 
 #### PY-01 — No document subscription callback
 
-**cirrus-py:** `lib.rs:121–138` — `run()` returns `(exit_status, run_uid)`, no subscription.
+**bsrs-py:** `lib.rs:121–138` — `run()` returns `(exit_status, run_uid)`, no subscription.
 
 **ref:** bluesky `RunEngine.subscribe(cb, name='all')` → callback receives every document
 (start, descriptor, event, resource, datum, stop). This is the primary output mechanism.
 
 **Gap:** Any Python code that does `RE.subscribe(db.insert)` (the universal data-collection
-line) is silently dropped — no data is stored. A cirrus RunEngine with a document sink
+line) is silently dropped — no data is stored. A bsrs RunEngine with a document sink
 must expose subscription, not just a run result tuple.
 
 **Fix sketch:** Expose `RunEngine.subscribe(callable)` from PyO3: wrap the Python callable
@@ -516,16 +516,16 @@ in a `Arc<dyn DocumentSink>` bridged via `Python::with_gil`. Call it through the
 
 #### PY-02 — No EPICS-backed device bindings
 
-**cirrus-py:** `lib.rs:41–87` — only `SoftMotor`, `SoftDetector` (in-memory, no EPICS).
+**bsrs-py:** `lib.rs:41–87` — only `SoftMotor`, `SoftDetector` (in-memory, no EPICS).
 
 **ref:** ophyd-async `EpicsMotor`, `EpicsSignalRO`, `EpicsSignal` connect to real hardware via
 CA/PVA. This is the dominant device class for beamline experiments.
 
-**Gap:** Users cannot drive real EPICS hardware from Python using cirrus devices. The only
+**Gap:** Users cannot drive real EPICS hardware from Python using bsrs devices. The only
 path is soft-device simulation.
 
 **Fix sketch:** Expose `CaMotor(pv_prefix, name)` and `CaSignal(pv, name)` backed by
-`cirrus-backend-ca` (if available). Use PyO3 async integration for the `connect()` call;
+`bsrs-backend-ca` (if available). Use PyO3 async integration for the `connect()` call;
 wrap the underlying `Arc<CaMotor>` as a `PyCaMotor`. Start with read-only CA signal for
 MVP.
 
@@ -535,7 +535,7 @@ MVP.
 
 #### PY-03 — Device protocol methods not callable from Python
 
-**cirrus-py:** `PySoftMotor` / `PySoftDetector` — expose only `name()` and `__repr__()`.
+**bsrs-py:** `PySoftMotor` / `PySoftDetector` — expose only `name()` and `__repr__()`.
 
 **ref:** ophyd/ophyd-async devices expose `read()`, `set(value)`, `trigger()`, `stage()`,
 `unstage()` as async or sync callables.
@@ -552,14 +552,14 @@ on `PySoftMotor`/`PySoftDetector`. Bridge through `py.allow_threads(…)` + `blo
 
 #### PY-04 — Minimal plan set (missing `grid_scan`, `rel_scan`, `mv`, `abs_set`, etc.)
 
-**cirrus-py:** `lib.rs:141–190` — only `count` and `scan`.
+**bsrs-py:** `lib.rs:141–190` — only `count` and `scan`.
 
 **ref:** `bluesky/plans/__init__.py` — `bp.*` includes `grid_scan`, `rel_scan`, `list_scan`,
 `spiral`, `fly`, `mv`, `mvr`, `abs_set`, `rel_set`, `trigger_and_read`, `one_nd_step`, etc.
 
-**Gap:** Any beamline that uses `bp.grid_scan` or `bp.rel_scan` has no cirrus-py equivalent.
+**Gap:** Any beamline that uses `bp.grid_scan` or `bp.rel_scan` has no bsrs-py equivalent.
 
-**Fix sketch:** Expose Rust `cirrus_plans` equivalents. `grid_scan`, `rel_scan` are highest
+**Fix sketch:** Expose Rust `bsrs_plans` equivalents. `grid_scan`, `rel_scan` are highest
 priority. Add as `#[pyfunction]` wrappers following the same pattern as `scan`.
 
 **Effort:** M
@@ -568,18 +568,18 @@ priority. Add as `#[pyfunction]` wrappers following the same pattern as `scan`.
 
 #### PY-05 — No user-defined Python plan execution
 
-**cirrus-py:** `lib.rs` — only Rust-registered plan factories can be run. No mechanism for
+**bsrs-py:** `lib.rs` — only Rust-registered plan factories can be run. No mechanism for
 Python generator plans.
 
 **ref:** bluesky plans are Python generators that `yield Msg(...)`. The RunEngine dispatches
 each `Msg` to the appropriate device. This is the core extensibility model.
 
 **Gap:** Users cannot write `def my_plan(): yield from bp.count([det])` and run it via
-cirrus-py. Completely blocks standard bluesky plan authoring.
+bsrs-py. Completely blocks standard bluesky plan authoring.
 
-**Fix sketch:** In cirrus-py, accept a Python callable/generator as `run(plan_gen)`. Wrap it
+**Fix sketch:** In bsrs-py, accept a Python callable/generator as `run(plan_gen)`. Wrap it
 in a Rust `Plan` that iterates the Python generator inside `run_async`, extracting `Msg`
-objects and executing them via the existing cirrus device dispatch. This requires a Msg
+objects and executing them via the existing bsrs device dispatch. This requires a Msg
 → Rust dispatch table. High effort but unlocks the bluesky ecosystem.
 
 **Effort:** L
@@ -592,7 +592,7 @@ objects and executing them via the existing cirrus device dispatch. This require
 
 #### PY-06 — RunEngine metadata not accessible from Python
 
-**cirrus-py:** `lib.rs` — no `RE.md` accessor.
+**bsrs-py:** `lib.rs` — no `RE.md` accessor.
 
 **ref:** bluesky `RE.md` is a `dict`-like that is merged into every start document.
 
@@ -604,7 +604,7 @@ objects and executing them via the existing cirrus device dispatch. This require
 
 #### PY-07 — No `async` RunEngine integration
 
-**cirrus-py:** `lib.rs:120–138` — `run()` is blocking (releases GIL via `allow_threads`).
+**bsrs-py:** `lib.rs:120–138` — `run()` is blocking (releases GIL via `allow_threads`).
 
 **ref:** bluesky `RunEngine` can be integrated into asyncio via `RE.call_returns_result` /
 `awaitable_run`. Needed for notebook-based interactive scanning.
@@ -618,13 +618,13 @@ objects and executing them via the existing cirrus device dispatch. This require
 
 #### PY-08 — No RemoteDispatcher / pub-sub document stream
 
-**cirrus-py:** no pub-sub mechanism.
+**bsrs-py:** no pub-sub mechanism.
 
 **ref:** bluesky `RemoteDispatcher` connects to a ZMQ PUB socket and replays documents to
-subscribed callbacks. cirrus-qs already has a `document_address` PUB socket (`server.rs:57`).
+subscribed callbacks. bsrs-qs already has a `document_address` PUB socket (`server.rs:57`).
 
-**Fix sketch:** Expose `cirrus_native.RemoteDispatcher(address)` that connects to
-the cirrus document PUB socket and calls `subscribe(cb)` callbacks on received documents.
+**Fix sketch:** Expose `bsrs_native.RemoteDispatcher(address)` that connects to
+the bsrs document PUB socket and calls `subscribe(cb)` callbacks on received documents.
 
 **Effort:** M
 

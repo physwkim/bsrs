@@ -2,7 +2,7 @@
 -- read `mini:BraggThetaRdbkAO` (computed Bragg angle), confirm
 -- the inverse Bragg relationship (E ∝ 1/sin(θ)).
 --
--- This proves cirrus drives derived (compound) motor records the
+-- This proves bsrs drives derived (compound) motor records the
 -- same as plain ones — the IOC's kohzuCtl state machine handles
 -- the angle ↔ energy translation.
 

@@ -3,7 +3,7 @@ name = "mini-beamline-qs"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Example downstream cirrus-qs server: registers a composite Dcm (energy + theta) and Table (x + y) device against the epics-rs mini-beamline IOC. Demonstrates the cirrus-host library API."
+description = "Example downstream bsrs-qs server: registers a composite Dcm (energy + theta) and Table (x + y) device against the epics-rs mini-beamline IOC. Demonstrates the bsrs-host library API."
 
 [dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
@@ -12,12 +12,12 @@ tracing-subscriber.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
 clap.workspace = true
-cirrus-core.workspace = true
-cirrus-engine.workspace = true
-cirrus-event-model.workspace = true
-cirrus-qs.workspace = true
-cirrus-host = { workspace = true, features = ["ca"] }
-cirrus-derive.workspace = true
+bsrs-core.workspace = true
+bsrs-engine.workspace = true
+bsrs-event-model.workspace = true
+bsrs-qs.workspace = true
+bsrs-host = { workspace = true, features = ["ca"] }
+bsrs-derive.workspace = true
 
 [[bin]]
 name = "mini-beamline-qs"

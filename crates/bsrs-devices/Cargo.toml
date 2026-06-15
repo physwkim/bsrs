@@ -1,0 +1,22 @@
+[package]
+name = "bsrs-devices"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Signal, StandardDetector, and Device-tree composition."
+
+[dependencies]
+async-trait.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+bsrs-core.workspace = true
+bsrs-event-model.workspace = true
+bsrs-protocols-async.workspace = true
+bsrs-derive.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+bsrs-backend-soft.workspace = true

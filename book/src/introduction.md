@@ -1,6 +1,6 @@
 # Introduction
 
-**cirrus** is a Rust-native re-implementation of the bluesky / ophyd
+**bsrs** is a Rust-native re-implementation of the bluesky / ophyd
 acquisition stack — RunEngine, devices, plans, document sinks — built
 to be the kind of beamline data-acquisition daemon you can deploy
 without dragging a Python interpreter onto the IOC host.
@@ -18,9 +18,9 @@ without dragging a Python interpreter onto the IOC host.
   with sharded process-singleton registry, in-flight de-dup,
   RAII subscription tokens, and zero-copy NTNDArray decode for
   detector frames.
-- A bluesky-queueserver-compatible daemon (`cirrus qs-manager`) that
+- A bluesky-queueserver-compatible daemon (`bsrs qs-manager`) that
   speaks JSON-RPC over 0MQ on the same control / document ports.
-- An interactive Lua REPL (`cirrus repl`) for prototyping plans
+- An interactive Lua REPL (`bsrs repl`) for prototyping plans
   without recompile.
 - Document sinks for the bluesky Python ecosystem: JSONL, ZMQ
   (msgpack/JSON), Tiled (HTTP), Kafka, HDF5 (NeXus-flavored frame
@@ -44,13 +44,13 @@ and tested. Notable opt-in features behind Cargo flags:
 
 | Feature                          | Crate              | Notes                                    |
 | -------------------------------- | ------------------ | ---------------------------------------- |
-| `zmq`                            | `cirrus-callbacks` | bluesky `Publisher` envelope             |
-| `tiled`                          | `cirrus-callbacks` | HTTP register + metadata patch via tiled-client |
-| `kafka`                          | `cirrus-callbacks` | pure-Rust `kafka` crate, no librdkafka   |
-| `hdf5`                           | `cirrus-stream`    | rust-hdf5 frame writer, NeXus layout     |
-| `pva`                            | `cirrus-stream`    | NTNDArray monitor source                 |
-| `real`                           | `cirrus-backend-epics-{ca,pva}` | live EPICS clients         |
-| `metrics`                        | `cirrus-qs`        | Prometheus `/metrics` endpoint           |
-| `tiled` (cirrus-cli)             | `cirrus-cli`       | Lua `tiled.*` read-side namespace        |
+| `zmq`                            | `bsrs-callbacks` | bluesky `Publisher` envelope             |
+| `tiled`                          | `bsrs-callbacks` | HTTP register + metadata patch via tiled-client |
+| `kafka`                          | `bsrs-callbacks` | pure-Rust `kafka` crate, no librdkafka   |
+| `hdf5`                           | `bsrs-stream`    | rust-hdf5 frame writer, NeXus layout     |
+| `pva`                            | `bsrs-stream`    | NTNDArray monitor source                 |
+| `real`                           | `bsrs-backend-epics-{ca,pva}` | live EPICS clients         |
+| `metrics`                        | `bsrs-qs`        | Prometheus `/metrics` endpoint           |
+| `tiled` (bsrs-cli)             | `bsrs-cli`       | Lua `tiled.*` read-side namespace        |
 
 Roadmap items still open are listed in `doc/10-roadmap.md`.

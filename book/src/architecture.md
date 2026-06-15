@@ -1,25 +1,25 @@
 # Architecture
 
-cirrus is a Cargo workspace. Each crate has a single responsibility;
+bsrs is a Cargo workspace. Each crate has a single responsibility;
 boundaries are designed so a downstream user can swap one
 implementation without touching the others.
 
 ## Crate map
 
 ```text
-cirrus                    # umbrella re-exports + binary entry points
-├── cirrus-cli            # binary: qs-manager, qs, repl, doctor, migrate, frame-source
-├── cirrus-engine         # RunEngine, Msg, state machine, suspenders, preprocessors
-├── cirrus-plans          # bp.* / bps.* / bpp.* mirrors (count, scan, grid_scan, ...)
-├── cirrus-protocols      # Movable, Triggerable, Stageable, Readable (sync facade)
-├── cirrus-protocols-async # ophyd-async-style traits over async fns
-├── cirrus-derive         # #[derive(Device)], #[signal(...)], #[lua_methods] proc-macros
-├── cirrus-devices        # SoftMotor, SoftDetector, NDSimDetector, ...
-├── cirrus-backend-epics-ca   # SignalBackend over CA  (feature: real)
-├── cirrus-backend-epics-pva  # SignalBackend over PVA (feature: real)
-├── cirrus-callbacks      # Document sinks: jsonl, zmq, tiled, kafka
-├── cirrus-stream         # FrameSink/FrameSource: hdf5, binary, pva
-└── cirrus-qs             # bluesky-queueserver-compatible daemon
+bsrs                    # umbrella re-exports + binary entry points
+├── bsrs-cli            # binary: qs-manager, qs, repl, doctor, migrate, frame-source
+├── bsrs-engine         # RunEngine, Msg, state machine, suspenders, preprocessors
+├── bsrs-plans          # bp.* / bps.* / bpp.* mirrors (count, scan, grid_scan, ...)
+├── bsrs-protocols      # Movable, Triggerable, Stageable, Readable (sync facade)
+├── bsrs-protocols-async # ophyd-async-style traits over async fns
+├── bsrs-derive         # #[derive(Device)], #[signal(...)], #[lua_methods] proc-macros
+├── bsrs-devices        # SoftMotor, SoftDetector, NDSimDetector, ...
+├── bsrs-backend-epics-ca   # SignalBackend over CA  (feature: real)
+├── bsrs-backend-epics-pva  # SignalBackend over PVA (feature: real)
+├── bsrs-callbacks      # Document sinks: jsonl, zmq, tiled, kafka
+├── bsrs-stream         # FrameSink/FrameSource: hdf5, binary, pva
+└── bsrs-qs             # bluesky-queueserver-compatible daemon
 ```
 
 Each crate's docs lives at `doc/0N-<topic>.md` in the repo. This
@@ -28,7 +28,7 @@ the doc/ tree.
 
 ## The RunEngine
 
-`cirrus_engine::RunEngine` owns the dispatch loop. A plan is an
+`bsrs_engine::RunEngine` owns the dispatch loop. A plan is an
 `async_stream::Stream<Item = Msg>`; the engine drives it forward,
 matches each `Msg`, and dispatches to the right handler.
 
@@ -100,14 +100,14 @@ sees only `StreamResource` (one per channel) + `StreamDatum` (one
 per chunk of frames written), with file paths or shape descriptors
 that downstream readers use to fetch the bytes.
 
-This is what makes cirrus's "RunEngine on the IOC host" deployment
+This is what makes bsrs's "RunEngine on the IOC host" deployment
 shape work: frame bytes stay local to the IOC host, only Documents
 cross the network.
 
 ## Multi-process: D21
 
 For sites where the camera produces faster than a single process
-can write, the `cirrus frame-source` subcommand splits the picture:
+can write, the `bsrs frame-source` subcommand splits the picture:
 
 ```text
 [ frame-source ]  --pva--> camera

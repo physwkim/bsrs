@@ -1,0 +1,28 @@
+[package]
+name = "bsrs-backend-epics-pva"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "EPICS PV Access backend for bsrs, built on epics-pva-rs."
+
+[features]
+default = ["real"]
+# Links `epics-pva-rs`. On by default for the same reason as
+# `bsrs-backend-epics-ca` — disable via `--no-default-features`
+# for the stub.
+real = ["dep:epics-pva-rs"]
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+bsrs-core.workspace = true
+bsrs-event-model.workspace = true
+bsrs-protocols-async.workspace = true
+bsrs-devices.workspace = true
+
+epics-pva-rs = { version = "0.16.2", optional = true }

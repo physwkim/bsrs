@@ -1,5 +1,5 @@
 [book]
-title = "cirrus"
+title = "bsrs"
 description = "Rust-native bluesky-compatible RunEngine + ophyd-async stack"
 authors = ["Sang Woo Kim"]
 language = "en"
@@ -8,8 +8,8 @@ src = "src"
 [output.html]
 default-theme = "light"
 preferred-dark-theme = "navy"
-git-repository-url = "https://github.com/physwkim/cirrus"
-edit-url-template = "https://github.com/physwkim/cirrus/edit/main/book/{path}"
+git-repository-url = "https://github.com/physwkim/bsrs"
+edit-url-template = "https://github.com/physwkim/bsrs/edit/main/book/{path}"
 
 [output.html.fold]
 enable = true

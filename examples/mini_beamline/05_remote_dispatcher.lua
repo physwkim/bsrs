@@ -1,5 +1,5 @@
 -- Drives a small CA scan while every Document fans out to the
--- ZMQ PUB endpoint passed via `cirrus repl --doc-zmq`. Pair with
+-- ZMQ PUB endpoint passed via `bsrs repl --doc-zmq`. Pair with
 -- `05_remote_dispatcher.py` on the Python side; that script
 -- attaches a `bluesky.callbacks.zmq.RemoteDispatcher` and asserts
 -- the Documents arrive in the bluesky shape.
@@ -9,8 +9,8 @@
 --     ~/mamba/envs/bs2026.1/bin/python \
 --         examples/mini_beamline/05_remote_dispatcher.py tcp://localhost:5577
 --
---     # terminal 2: cirrus publishes
---     cargo run -p cirrus-cli -- repl \
+--     # terminal 2: bsrs publishes
+--     cargo run -p bsrs-cli -- repl \
 --         --doc-zmq 'tcp://*:5577' \
 --         --script examples/mini_beamline/05_remote_dispatcher.lua
 

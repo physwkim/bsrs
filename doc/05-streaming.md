@@ -10,7 +10,7 @@
 - The consumer pipeline (filter / chunk / write) wants to be wired declaratively.
 
 This is the rogue Master/Slave/Frame pattern, distilled into a backend-neutral trait
-in cirrus. PVA monitors are the Phase 1 source; rogue DMA is the Phase 2 source. The
+in bsrs. PVA monitors are the Phase 1 source; rogue DMA is the Phase 2 source. The
 trait does not know about either.
 
 ## The trait set
@@ -111,7 +111,7 @@ On `collect_stream_docs(up_to)`: emits a `StreamDatum` covering `[last_emitted, 
 ## How a rogue source plugs in (Phase 2 preview)
 
 ```rust
-// crates/cirrus-stream/sources/rogue_dma/src/lib.rs (Phase 2 only)
+// crates/bsrs-stream/sources/rogue_dma/src/lib.rs (Phase 2 only)
 pub struct RogueDmaSource {
     handle: rogue::AxiStreamDma,             // via cxx FFI
     pool:   RogueFramePool,                  // exposes downstream allocator
@@ -126,7 +126,7 @@ impl FrameSource for RogueDmaSource {
 }
 ```
 
-The trait remains unchanged. cirrus-engine and cirrus-plans never see the rogue type.
+The trait remains unchanged. bsrs-engine and bsrs-plans never see the rogue type.
 
 ## How bluesky meets rogue at four exact points
 

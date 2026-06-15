@@ -3,13 +3,13 @@
 -- via a coroutine timer trick, expect the plan to finish with
 -- exit_status != success.
 --
--- Note: the local `cirrus repl` doesn't have a JSON-RPC dispatch
+-- Note: the local `bsrs repl` doesn't have a JSON-RPC dispatch
 -- path, so we abort by calling `RE:abort()` directly from a
 -- subscriber callback (fires from a worker thread when the first
 -- Sleep msg's response comes back).
 --
 -- Cleaner verification of the abort path is the integration test
--- `re_abort_cancels_in_flight_lua_eval_plan` (cirrus-cli/tests/
+-- `re_abort_cancels_in_flight_lua_eval_plan` (bsrs-cli/tests/
 -- cli_round_trip.rs); this script is the operator-facing
 -- equivalent for a quick smoke.
 

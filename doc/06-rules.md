@@ -2,7 +2,7 @@
 
 These rules are extracted from kodex bug-pattern entries on the surrounding `epics-rs`
 workspace and from the rogue thread-safety hardening sweep (PRs #1188–#1193). Every
-cirrus crate must follow them; reviews check for K-rule violations explicitly.
+bsrs crate must follow them; reviews check for K-rule violations explicitly.
 
 ## K1. `JoinHandle::drop` does not abort
 
@@ -134,7 +134,7 @@ GIL-holding scope deadlocks when the joined task itself wants to acquire the GIL
 Origin: rogue update H4 (memory::TcpClient/Server: GIL-released join).
 
 Fix: every long-running call from PyO3 wraps in `Python::allow_threads(|| ...)`. The
-`cirrus-py` crate enforces this with a macro-generated wrapper.
+`bsrs-py` crate enforces this with a macro-generated wrapper.
 
 ## K11. ZMQ messages are RAII only
 
@@ -143,7 +143,7 @@ between `zmq_msg_init` and `zmq_msg_close`.
 
 Origin: rogue update H4 (`ZmqClient/ZmqServer` lifecycle, ESROGUE-740 zmq_msg leaks).
 
-Fix: cirrus uses the `tmq` or `async-zmq` crate exclusively. Owned `Message` type;
+Fix: bsrs uses the `tmq` or `async-zmq` crate exclusively. Owned `Message` type;
 no raw handles exposed.
 
 ## K12. External I/O is the last builder step
@@ -171,6 +171,6 @@ and commits.
 | K7 | reap on subscribe | Slot-based subscriber lists |
 | K8 | single CancellationToken | All RunEngine-owned tasks |
 | K9 | spawn after commit | Every builder |
-| K10 | `allow_threads` | `cirrus-py` |
-| K11 | RAII zmq_msg | `cirrus-backends/rogue` (Phase 2) |
+| K10 | `allow_threads` | `bsrs-py` |
+| K11 | RAII zmq_msg | `bsrs-backends/rogue` (Phase 2) |
 | K12 | bind/connect last | Every backend constructor |

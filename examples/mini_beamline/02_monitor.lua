@@ -3,7 +3,7 @@
 -- thread) over a few seconds, observe the variation.
 --
 -- Equivalent to bluesky's `RE:subscribe` + `Msg::Monitor` for a
--- single signal. The CaDetector helper in cirrus-cli doesn't yet
+-- single signal. The CaDetector helper in bsrs-cli doesn't yet
 -- expose `MonitorableObj` — for verification we just call read()
 -- in a loop and check that values change.
 

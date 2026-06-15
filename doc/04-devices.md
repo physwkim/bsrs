@@ -20,7 +20,7 @@ A direct port of `bluesky/protocols.py:36-526`. Three are sealed (see
 | `WritesStreamAssets` | `WritesStreamAssets` | `collect_asset_docs() / get_index()` |
 
 The sync trait is implemented as a blanket impl over the async trait, calling
-`cirrus_runtime().block_on()`. No double maintenance.
+`bsrs_runtime().block_on()`. No double maintenance.
 
 ## How the dual API looks to a user
 
@@ -28,7 +28,7 @@ The same `Motor` device, two ways to use it:
 
 ```rust
 // async (default)
-use cirrus::ophyd_async::*;
+use bsrs::ophyd_async::*;
 
 let motor = Motor::new("BL10C:m1", &cfg).await?;
 let pos = motor.read().await?;
@@ -37,7 +37,7 @@ motor.set(1.0).await?;
 
 ```rust
 // sync (ophyd-style)
-use cirrus::ophyd::*;
+use bsrs::ophyd::*;
 
 let motor = Motor::new("BL10C:m1", &cfg)?;          // sync construct
 let pos = motor.read()?;

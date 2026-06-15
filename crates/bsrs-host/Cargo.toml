@@ -1,0 +1,55 @@
+[package]
+name = "bsrs-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "bsrs host runtime — Lua bridge (build_lua), daemon-side mlua state (ManagerLuaState), CA/PVA device factories, checkpoint store. Reusable by bsrs-cli and downstream binaries that embed a RunEngine + queue server."
+
+[dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "rt-multi-thread", "macros", "sync", "time"] }
+tracing.workspace = true
+mlua.workspace = true
+async-stream.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bsrs-core.workspace = true
+bsrs-engine.workspace = true
+bsrs-event-model.workspace = true
+bsrs-plans.workspace = true
+bsrs-qs.workspace = true
+bsrs-backend-soft.workspace = true
+tiled-client = { git = "https://github.com/physwkim/tiled-rs.git", branch = "main", optional = true }
+url = { version = "2", optional = true }
+bsrs-protocols-async = { workspace = true, optional = true }
+bsrs-backend-epics-ca = { path = "../bsrs-backends/epics-ca", optional = true }
+bsrs-backend-epics-pva = { path = "../bsrs-backends/epics-pva", optional = true }
+
+[features]
+default = []
+# Expose `tiled.*` Lua bindings (read-side: from_uri / keys /
+# metadata / get) — daemon-side `lua_tiled` module.
+tiled = ["dep:tiled-client", "dep:url"]
+# `ca_motor(name, val_pv, rbv_pv)` / `ca_detector(name, value_pv)` /
+# CA-PV-backed suspender Lua factories. Pulls in `epics-ca-rs` via
+# bsrs-backend-epics-ca's `real` feature.
+ca = [
+    "dep:bsrs-backend-epics-ca",
+    "bsrs-backend-epics-ca/real",
+    "dep:bsrs-protocols-async",
+]
+# Symmetric for PV Access — `pva_motor` / `pva_detector` Lua
+# factories on top of `bsrs-backend-epics-pva`.
+pva = [
+    "dep:bsrs-backend-epics-pva",
+    "bsrs-backend-epics-pva/real",
+    "dep:bsrs-protocols-async",
+]
+
+[dev-dependencies]
+bsrs-derive.workspace = true
+tempfile = "3"
+
+[lib]
+path = "src/lib.rs"

@@ -1,24 +1,24 @@
 # 09 — References
 
-Paths to upstream source trees that cirrus reads, cites, or depends on.
+Paths to upstream source trees that bsrs reads, cites, or depends on.
 
 ## Direct dependencies (this user's local Rust workspaces)
 
-| Repo | Path | What cirrus uses |
+| Repo | Path | What bsrs uses |
 |---|---|---|
-| `epics-rs` | `/Users/stevek/codes/epics-rs/` | The whole Rust EPICS stack. cirrus uses `epics-ca-rs` and `epics-pva-rs` as `SignalBackend` impls. |
+| `epics-rs` | `/Users/stevek/codes/epics-rs/` | The whole Rust EPICS stack. bsrs uses `epics-ca-rs` and `epics-pva-rs` as `SignalBackend` impls. |
 | `epics-rs/crates/epics-ca-rs` | `epics-rs/crates/epics-ca-rs/` | CA client + server. M2 backend. |
 | `epics-rs/crates/epics-pva-rs` | `epics-rs/crates/epics-pva-rs/` | PVA client + server, NTNDArray decode. M5 backend + FrameSource. |
 | `epics-rs/crates/epics-base-rs` | `epics-rs/crates/epics-base-rs/` | Base record support; useful for soft IOC test harness. |
-| `epics-rs/examples/ophyd-test-ioc` | `epics-rs/examples/ophyd-test-ioc/` | Soft IOC harness for cirrus-backends/epics-ca tests. |
+| `epics-rs/examples/ophyd-test-ioc` | `epics-rs/examples/ophyd-test-ioc/` | Soft IOC harness for bsrs-backends/epics-ca tests. |
 
-## Reference implementations cirrus ports
+## Reference implementations bsrs ports
 
 | Project | Path | Citation pattern |
 |---|---|---|
 | bluesky | `/Users/stevek/codes/daq/bluesky/` | RunEngine: `src/bluesky/run_engine.py:1478-2510`. Plan stubs: `src/bluesky/plan_stubs.py:62-1747`. Bundler: `src/bluesky/bundlers.py`. Protocols: `src/bluesky/protocols.py:36-526`. |
-| ophyd (sync, original) | `/Users/stevek/codes/daq/ophyd/` | Status: `ophyd/status.py`. Device: `ophyd/device.py`. Signal: `ophyd/signal.py`. ophyd-style API in `cirrus::ophyd`. |
-| ophyd-async | `/Volumes/NAS/codes/bluesky_source/ophyd-async/src/ophyd_async/core/` | SignalBackend: `_signal_backend.py:16-59`. StandardDetector / DetectorControl / DetectorWriter: `_detector.py:69-160`. Status: `_status.py`. ophyd-async API in `cirrus::ophyd_async`. |
+| ophyd (sync, original) | `/Users/stevek/codes/daq/ophyd/` | Status: `ophyd/status.py`. Device: `ophyd/device.py`. Signal: `ophyd/signal.py`. ophyd-style API in `bsrs::ophyd`. |
+| ophyd-async | `/Volumes/NAS/codes/bluesky_source/ophyd-async/src/ophyd_async/core/` | SignalBackend: `_signal_backend.py:16-59`. StandardDetector / DetectorControl / DetectorWriter: `_detector.py:69-160`. Status: `_status.py`. ophyd-async API in `bsrs::ophyd_async`. |
 | event-model | `/Users/stevek/codes/daq/event-model/` | Schemas: `src/event_model/schemas/*.json` (authoritative). Compose helpers: `src/event_model/__init__.py:1852-2528`. DocumentRouter: `src/event_model/__init__.py:311`. |
 
 ## Reference for Phase 2 (rogue)
@@ -26,11 +26,11 @@ Paths to upstream source trees that cirrus reads, cites, or depends on.
 | Project | Path | Used at |
 |---|---|---|
 | rogue | `/Users/stevek/codes/daq/rogue/` | Frame/Master/Slave/Pool semantics: `include/rogue/interfaces/stream/{Frame,Master,Slave,Pool}.h`. Memory plane: `include/rogue/interfaces/memory/`. ZMQ: `python/pyrogue/interfaces/_ZmqServer.py`, `_Virtual.py`. |
-| aes-stream-drivers (external) | (separate SLAC repo, Linux kernel module) | Provides `/dev/datadev_N` that rogue's `AxiStreamDma` mmaps. Required at runtime; cirrus does not interact directly. |
+| aes-stream-drivers (external) | (separate SLAC repo, Linux kernel module) | Provides `/dev/datadev_N` that rogue's `AxiStreamDma` mmaps. Required at runtime; bsrs does not interact directly. |
 
 ## kodex knowledge graph references
 
-cirrus rules K1–K12 are derived from kodex bug-pattern entries in the surrounding
+bsrs rules K1–K12 are derived from kodex bug-pattern entries in the surrounding
 `epics-rs` workspace and the rogue update sweep:
 
 | Rule | Origin UUID | Title |

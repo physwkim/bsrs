@@ -1,0 +1,31 @@
+[package]
+name = "bsrs-backend-epics-ca"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "EPICS Channel Access backend for bsrs, built on epics-ca-rs."
+
+[features]
+default = ["real"]
+# Links `epics-ca-rs` and exposes a real `SignalBackend`. On by
+# default — beamline tooling expects live CA. Disable with
+# `--no-default-features` to build the stub (returns
+# `Backend("epics-ca disabled — enable feature `real`")` on every
+# call) so a host without EPICS libs can still compile the
+# workspace.
+real = ["dep:epics-ca-rs", "dep:epics-base-rs"]
+
+[dependencies]
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+bsrs-core.workspace = true
+bsrs-event-model.workspace = true
+bsrs-protocols-async.workspace = true
+bsrs-devices.workspace = true
+
+epics-ca-rs    = { version = "0.16.2", optional = true }
+epics-base-rs  = { version = "0.16.2", optional = true }

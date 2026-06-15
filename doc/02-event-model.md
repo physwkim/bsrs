@@ -7,12 +7,12 @@ The Python `TypedDict`s in `event_model/documents/*.py` are auto-generated from 
 schemas via `datamodel-codegen`. **The schemas are authoritative. The Python types are
 a derived artifact.**
 
-cirrus follows the same pattern: it does not hand-write Document types. It generates
+bsrs follows the same pattern: it does not hand-write Document types. It generates
 Rust `serde::{Serialize, Deserialize}` types from the same JSON schemas via the
 `typify` crate.
 
 ```text
-cirrus-event-model/
+bsrs-event-model/
 ├── build.rs                 # typify::Generator → src/generated.rs
 ├── schemas/                 # copy or git submodule of event-model schemas
 │   ├── run_start.json
@@ -82,7 +82,7 @@ through `StreamResource` / `StreamDatum` instead of `Event.data`.
 ### `StreamResource` (`stream_resource.json`)
 
 Six fields: `uid`, `data_key`, `mimetype`, `uri`, `parameters`, `run_start`. The recent
-schema renamed `spec` → `mimetype` and `resource_path` → `uri`. cirrus uses the new
+schema renamed `spec` → `mimetype` and `resource_path` → `uri`. bsrs uses the new
 names; older bluesky callbacks may need a translation layer.
 
 ### `StreamDatum` (`stream_datum.json`)
@@ -95,9 +95,9 @@ seq_nums.stop` if `multiplier == 1`, otherwise `indices.stop = seq_nums.stop * m
 
 The Python `compose_*` family in `event_model/__init__.py` takes care of UID generation,
 descriptor caching (so identical `data_keys` reuse the same `descriptor.uid`), and
-sequence-number bookkeeping. cirrus mirrors them in `compose.rs`:
+sequence-number bookkeeping. bsrs mirrors them in `compose.rs`:
 
-| Python | Rust (cirrus) |
+| Python | Rust (bsrs) |
 |---|---|
 | `ComposeRunBundle` (`__init__.py:2528`) | `compose::run` returning `RunBundle { start, descriptor, event, resource, datum, stream_resource, stream_datum, stop }` |
 | `compose_event` (`:2393`) | `RunBundle::event(name, data, timestamps)` |
@@ -124,12 +124,12 @@ are exposed via an atomic counter** (rule K6) — never silently lost.
 
 ## Round-trip test (M0 acceptance)
 
-The first acceptance test for `cirrus-event-model`:
+The first acceptance test for `bsrs-event-model`:
 
 1. Run a Python event-model session that emits all 10 document types.
 2. Capture the JSONL output.
-3. cirrus deserializes the same JSONL via `serde_json` into `Vec<Document>`.
+3. bsrs deserializes the same JSONL via `serde_json` into `Vec<Document>`.
 4. Re-serializes back to JSONL.
 5. Diff is empty.
 
-This is the contract: cirrus never invents a field, never reorders, never coerces.
+This is the contract: bsrs never invents a field, never reorders, never coerces.

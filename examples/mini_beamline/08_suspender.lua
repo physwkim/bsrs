@@ -10,7 +10,7 @@
 -- 08b_suspender_trip.lua.
 --
 -- Usage:
---   cargo run -p cirrus-cli --bin cirrus -- repl --script \
+--   cargo run -p bsrs-cli --bin bsrs -- repl --script \
 --       examples/mini_beamline/08_suspender.lua
 
 local ph = ca_detector("ph_det", "mini:ph:DetValue_RBV")

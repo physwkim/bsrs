@@ -3,29 +3,29 @@
 The fastest path: open the Lua REPL, run a count, then a scan.
 
 ```sh
-$ cargo run --bin cirrus -- repl
-cirrus repl (Lua 5.4) — type `:help` for commands, Ctrl-D to exit
-cirrus> det1 = soft_detector("det1")
-cirrus> RE:run(count({det1}, 5))
+$ cargo run --bin bsrs -- repl
+bsrs repl (Lua 5.4) — type `:help` for commands, Ctrl-D to exit
+bsrs> det1 = soft_detector("det1")
+bsrs> RE:run(count({det1}, 5))
 exit_status=success run_uid=8e3f...
-cirrus> m1 = soft_motor("m1", 0.0)
-cirrus> RE:run(scan({det1}, m1, 0, 10, 11))
+bsrs> m1 = soft_motor("m1", 0.0)
+bsrs> RE:run(scan({det1}, m1, 0, 10, 11))
 exit_status=success run_uid=...
 ```
 
 ## Install
 
 ```sh
-git clone https://github.com/physwkim/cirrus
-cd cirrus
+git clone https://github.com/physwkim/bsrs
+cd bsrs
 cargo build --release
-ln -s "$PWD/target/release/cirrus" ~/.local/bin/
+ln -s "$PWD/target/release/bsrs" ~/.local/bin/
 ```
 
 ## Sanity-check the environment
 
 ```sh
-cirrus doctor
+bsrs doctor
 [ ok ]   tokio runtime (multi-thread)
 [ ok ]   EPICS_CA_ADDR_LIST = 192.168.50.255
 [warn]   EPICS_CA_AUTO_ADDR_LIST = NO  (not auto-detecting interfaces)
@@ -94,10 +94,10 @@ document filters: pass an optional second arg, e.g.
 ## Persist runs to disk
 
 ```lua
--- (Inside cirrus-cli the JsonlSink is the easiest writer to wire
+-- (Inside bsrs-cli the JsonlSink is the easiest writer to wire
 -- up from Rust startup; from Lua REPL the engine has no sinks
 -- attached by default. Production setups attach sinks during
--- `cirrus qs-manager` startup or via a small Rust glue binary.)
+-- `bsrs qs-manager` startup or via a small Rust glue binary.)
 ```
 
 For the queueserver-style deployment (Documents fan out over ZMQ to

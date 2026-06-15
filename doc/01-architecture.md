@@ -38,7 +38,7 @@ Key shifts from earlier drafts:
 - L1a backends bind directly to `epics-rs` (`epics-ca-rs` + `epics-pva-rs`). No Python
   shim. No C library FFI.
 - L2 has *two* trait families — async and sync — but only the async one carries logic.
-  The sync family is a blanket `impl` over the async one through a cirrus runtime handle.
+  The sync family is a blanket `impl` over the async one through a bsrs runtime handle.
 
 ## The 3 sealed traits
 
@@ -116,52 +116,52 @@ pub trait DetectorWriter: Send + Sync {
 ## Workspace layout
 
 ```text
-cirrus/
+bsrs/
 ├── Cargo.toml                         # workspace
 ├── crates/
-│   ├── cirrus-event-model/            # typify auto-gen, Document enum
-│   ├── cirrus-core/                   # Reading, Status, Msg, Plan, runtime
-│   ├── cirrus-protocols-async/        # AsyncReadable, AsyncMovable, ...  (primary)
-│   ├── cirrus-protocols-sync/         # Readable, Movable, ...           (sync facade)
-│   ├── cirrus-engine/                 # RunEngine, Bundler, Suspender
-│   ├── cirrus-plans/                  # count, scan, grid_scan, fly, stubs
-│   ├── cirrus-devices/                # #[derive(Device)] + Signal + StandardDetector
-│   ├── cirrus-backends/
+│   ├── bsrs-event-model/            # typify auto-gen, Document enum
+│   ├── bsrs-core/                   # Reading, Status, Msg, Plan, runtime
+│   ├── bsrs-protocols-async/        # AsyncReadable, AsyncMovable, ...  (primary)
+│   ├── bsrs-protocols-sync/         # Readable, Movable, ...           (sync facade)
+│   ├── bsrs-engine/                 # RunEngine, Bundler, Suspender
+│   ├── bsrs-plans/                  # count, scan, grid_scan, fly, stubs
+│   ├── bsrs-devices/                # #[derive(Device)] + Signal + StandardDetector
+│   ├── bsrs-backends/
 │   │   ├── epics-ca/                  # uses ../../../epics-rs/crates/epics-ca-rs
 │   │   ├── epics-pva/                 # uses ../../../epics-rs/crates/epics-pva-rs
 │   │   ├── soft/                      # in-memory (ophyd-async _soft_signal_backend)
 │   │   └── mock/                      # testing
-│   ├── cirrus-stream/                 # FrameSource/Sink + PvaMonitorSource + Hdf5Sink
-│   ├── cirrus-callbacks/              # JsonlSink, TiledSink, BestEffortCallback
-│   ├── cirrus/                        # facade crate, re-exports cirrus::ophyd_async, cirrus::ophyd
-│   ├── cirrus-cli/                    # bsui-equivalent REPL
-│   └── cirrus-py/                     # (optional, M7) PyO3 adapter
+│   ├── bsrs-stream/                 # FrameSource/Sink + PvaMonitorSource + Hdf5Sink
+│   ├── bsrs-callbacks/              # JsonlSink, TiledSink, BestEffortCallback
+│   ├── bsrs/                        # facade crate, re-exports bsrs::ophyd_async, bsrs::ophyd
+│   ├── bsrs-cli/                    # bsui-equivalent REPL
+│   └── bsrs-py/                     # (optional, M7) PyO3 adapter
 └── examples/
     ├── async_count.rs                 # ophyd-async style
     ├── sync_count.rs                  # ophyd style (same plan)
     └── grid_scan.rs
 ```
 
-The `cirrus` facade crate is what users add to `Cargo.toml`. It exposes:
+The `bsrs` facade crate is what users add to `Cargo.toml`. It exposes:
 
 ```rust
-// in cirrus/src/lib.rs
+// in bsrs/src/lib.rs
 pub mod ophyd_async {
-    pub use cirrus_protocols_async::*;
-    pub use cirrus_devices::async_api::*;
-    pub use cirrus_plans::async_plans::*;
+    pub use bsrs_protocols_async::*;
+    pub use bsrs_devices::async_api::*;
+    pub use bsrs_plans::async_plans::*;
 }
 
 pub mod ophyd {
-    pub use cirrus_protocols_sync::*;
-    pub use cirrus_devices::sync_api::*;
-    pub use cirrus_plans::sync_plans::*;
+    pub use bsrs_protocols_sync::*;
+    pub use bsrs_devices::sync_api::*;
+    pub use bsrs_plans::sync_plans::*;
 }
 
 pub mod prelude {
-    pub use cirrus_event_model::Document;
-    pub use cirrus_core::{Reading, Status, Msg, Plan};
-    pub use cirrus_engine::RunEngine;
+    pub use bsrs_event_model::Document;
+    pub use bsrs_core::{Reading, Status, Msg, Plan};
+    pub use bsrs_engine::RunEngine;
     // user picks ophyd_async or ophyd separately
 }
 ```
@@ -171,8 +171,8 @@ pub mod prelude {
 No existing trait or crate changes. New crates only:
 
 ```text
-+ crates/cirrus-backends/rogue/         # ZMQ Variable backend (impl SignalBackend)
-+ crates/cirrus-stream/sources/rogue_dma/   # impl FrameSource
++ crates/bsrs-backends/rogue/         # ZMQ Variable backend (impl SignalBackend)
++ crates/bsrs-stream/sources/rogue_dma/   # impl FrameSource
 ```
 
 ## Concurrency model
@@ -184,7 +184,7 @@ No existing trait or crate changes. New crates only:
 - **Every `tokio::spawn` site is wrapped by `JoinSet` or an `AbortOnDrop` guard** (rule K1).
 - **Cancellation is a single `CancellationToken` tree** (rule K8). The RunEngine holds
   the root token; bundler / suspender / monitor / framepipe all derive child tokens.
-- **The cirrus runtime is a `tokio::Runtime` started lazily** in `cirrus_core::runtime()`.
+- **The bsrs runtime is a `tokio::Runtime` started lazily** in `bsrs_core::runtime()`.
   Sync entry points (`re.run_blocking(plan)`, `Signal::get_blocking()`) drive it via
   `Handle::block_on`.
 

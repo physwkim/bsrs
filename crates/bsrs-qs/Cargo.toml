@@ -1,0 +1,40 @@
+[package]
+name = "bsrs-qs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "queueserver-compatible 0MQ JSON-RPC daemon backed by bsrs-engine."
+
+[dependencies]
+async-trait.workspace = true
+async-stream.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+bsrs-core.workspace = true
+bsrs-engine.workspace = true
+bsrs-event-model.workspace = true
+bsrs-plans.workspace = true
+bsrs-callbacks = { workspace = true, features = ["zmq"] }
+zmq = "0.10"
+regex = "1"
+toml = "0.8"
+
+# Optional Prometheus metrics endpoint.
+metrics = { version = "0.24", optional = true }
+metrics-exporter-prometheus = { version = "0.16", optional = true, default-features = false, features = ["http-listener"] }
+rmp-serde = "1.3.1"
+
+[features]
+default = []
+metrics = ["dep:metrics", "dep:metrics-exporter-prometheus"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+bsrs-backend-soft = { path = "../bsrs-backends/soft" }
+tempfile = "3"

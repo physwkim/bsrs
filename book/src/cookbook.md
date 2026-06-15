@@ -1,12 +1,12 @@
 # Cookbook
 
 Recipes for common beamline workflows. Every snippet is meant to be
-pasted into either `cirrus repl` (local) or `cirrus qs repl`
+pasted into either `bsrs repl` (local) or `bsrs qs repl`
 (attached to a running daemon).
 
 ## Count + scan + grid
 
-The bluesky `bp.*` namespace is mirrored in cirrus. Common shapes
+The bluesky `bp.*` namespace is mirrored in bsrs. Common shapes
 exposed in the Lua REPL:
 
 ```lua
@@ -18,7 +18,7 @@ RE:run(bp.spiral({det1}, m1, m2, 0, 0, 1, 1, 0.1, 8))   -- last arg is integer n
 
 Not all `bp.*` plans are exposed in Lua yet (e.g. `adaptive_scan`,
 `tune_centroid` are Rust-only as of this writing). Run them from
-Rust via `cirrus_plans::adaptive_scan(...)` for now, or build the
+Rust via `bsrs_plans::adaptive_scan(...)` for now, or build the
 plan as a Lua coroutine (see below).
 
 ## mvr with baseline
@@ -48,17 +48,17 @@ locally (no Document plane bytes). The `fly_during_wrapper` is
 exposed from Rust:
 
 ```rust
-use cirrus_plans::preprocessors::fly_during_wrapper;
+use bsrs_plans::preprocessors::fly_during_wrapper;
 
 let fly_with_writer = fly_during_wrapper(
-    cirrus_plans::count(vec![pilatus.clone()], 1),
+    bsrs_plans::count(vec![pilatus.clone()], 1),
     vec![(pilatus.clone(), pilatus.clone())],   // (flyable, collectable) pair
 );
 re.run_async(fly_with_writer).await?;
 ```
 
 For the multi-process layout (frame source on the IOC host,
-RunEngine elsewhere), use `cirrus frame-source` — see
+RunEngine elsewhere), use `bsrs frame-source` — see
 [CLI tour → frame-source](./cli.md#frame-source).
 
 ## Custom subscriber
@@ -82,7 +82,7 @@ Attach a REPL to the running daemon and inspect device state on the
 fly:
 
 ```lua
--- in cirrus qs repl
+-- in bsrs qs repl
 qs> motor:inspect()
 => {readback=0.5, setpoint=0.5, type="SoftMotor", units="mm", ...}
 qs> det1:inspect()
@@ -99,7 +99,7 @@ qs> s:inspect()
 
 ## Lua coroutine plans
 
-For one-off scans you don't want to compile into `cirrus_plans`:
+For one-off scans you don't want to compile into `bsrs_plans`:
 
 ```lua
 local function snake_grid(detectors, mx, my, x_pts, y_pts, exposure)
@@ -140,17 +140,17 @@ same Msg cadence with no Lua bridge cost per iteration.
 Rust devices expose their own methods to Lua via `#[lua_methods]`:
 
 ```rust
-use cirrus_derive::lua_methods;
+use bsrs_derive::lua_methods;
 
 pub struct Diffractometer { /* ... */ }
 
-impl cirrus_core::msg::NamedObj for Diffractometer { /* ... */ }
+impl bsrs_core::msg::NamedObj for Diffractometer { /* ... */ }
 
 #[lua_methods]
 impl Diffractometer {
     #[lua_method]
     pub async fn set_orientation(&self, h: f64, k: f64, l: f64)
-        -> Result<(), CirrusError> { /* ... */ }
+        -> Result<(), BsrsError> { /* ... */ }
 
     #[lua_method]
     pub async fn current_hkl(&self) -> (f64, f64, f64) { /* ... */ }
@@ -172,7 +172,7 @@ qs> dx:name()                          -- inherited from NamedObj
 => "dx"
 ```
 
-The macro generates a JSON-shaped dispatch table so cirrus-cli's
+The macro generates a JSON-shaped dispatch table so bsrs-cli's
 Lua bridge can wire it into the daemon's mlua state at startup.
 
 ## Configure-time exposure
@@ -181,10 +181,10 @@ To set a uniform `count_time` across multiple detectors before a
 plan, use the Rust-side wrapper (Lua exposure pending):
 
 ```rust
-use cirrus_plans::preprocessors::configure_count_time_wrapper;
+use bsrs_plans::preprocessors::configure_count_time_wrapper;
 
 let plan = configure_count_time_wrapper(
-    cirrus_plans::scan(vec![det1, det2, det3], m1.clone(), m1.clone(), 0.0, 1.0, 11),
+    bsrs_plans::scan(vec![det1, det2, det3], m1.clone(), m1.clone(), 0.0, 1.0, 11),
     0.5,                                       // exposure seconds
     vec![det1, det2, det3],                    // ConfigurableObj devices
 );
@@ -219,18 +219,18 @@ The daemon supports a subsystem lock + per-group ACL:
 
 ```sh
 # from one operator's terminal:
-cirrus qs lock apply --queue --note "tuning the mono" alice-key
+bsrs qs lock apply --queue --note "tuning the mono" alice-key
 
 # any other client now sees:
-$ cirrus qs queue start
+$ bsrs qs queue start
 {"error": {"code": -32000, "message": "operation rejected: subsystem is locked..."}}
 
 # release:
-cirrus qs lock release alice-key
+bsrs qs lock release alice-key
 ```
 
 For finer-grained control, supply a `permissions.toml` to
-`cirrus qs-manager --permissions <PATH>`:
+`bsrs qs-manager --permissions <PATH>`:
 
 ```toml
 default_group = "viewer"

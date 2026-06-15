@@ -1,21 +1,21 @@
 # Optional features
 
-cirrus is a Cargo workspace. Most opt-in functionality lives behind
+bsrs is a Cargo workspace. Most opt-in functionality lives behind
 feature flags so the default build stays small and dependency-free.
 
 ## Document sinks
 
 | Crate              | Feature  | Pulls in                              | Use when                              |
 | ------------------ | -------- | ------------------------------------- | ------------------------------------- |
-| `cirrus-callbacks` | `zmq`    | libzmq + rmp-serde                    | bluesky `RemoteDispatcher` consumers  |
-| `cirrus-callbacks` | `tiled`  | tiled-client (HTTP)                   | Tiled catalog ingestion               |
-| `cirrus-callbacks` | `kafka`  | pure-Rust `kafka` crate               | Kafka topics, no librdkafka           |
+| `bsrs-callbacks` | `zmq`    | libzmq + rmp-serde                    | bluesky `RemoteDispatcher` consumers  |
+| `bsrs-callbacks` | `tiled`  | tiled-client (HTTP)                   | Tiled catalog ingestion               |
+| `bsrs-callbacks` | `kafka`  | pure-Rust `kafka` crate               | Kafka topics, no librdkafka           |
 
 ```sh
-cargo build -p cirrus-callbacks --features zmq,tiled,kafka
+cargo build -p bsrs-callbacks --features zmq,tiled,kafka
 ```
 
-## Frame sinks (cirrus-stream)
+## Frame sinks (bsrs-stream)
 
 | Feature  | Pulls in              | Use when                                     |
 | -------- | --------------------- | -------------------------------------------- |
@@ -32,11 +32,11 @@ frames into a `FramePipe` that fans out to one or more sinks.
 
 | Crate                       | Feature | Behavior without feature           |
 | --------------------------- | ------- | ---------------------------------- |
-| `cirrus-backend-epics-ca`   | `real`  | Stub backend that errors on call   |
-| `cirrus-backend-epics-pva`  | `real`  | Stub backend that errors on call   |
+| `bsrs-backend-epics-ca`   | `real`  | Stub backend that errors on call   |
+| `bsrs-backend-epics-pva`  | `real`  | Stub backend that errors on call   |
 
 ```sh
-cargo build -p cirrus-backend-epics-ca --features real
+cargo build -p bsrs-backend-epics-ca --features real
 ```
 
 The stub-by-default lets the rest of the workspace compile cleanly
@@ -47,10 +47,10 @@ on systems without EPICS. CI build-tests both the stub and the
 
 | Crate        | Feature | Adds                                       |
 | ------------ | ------- | ------------------------------------------ |
-| `cirrus-cli` | `tiled` | `tiled.from_uri(url)` Lua global + methods |
+| `bsrs-cli` | `tiled` | `tiled.from_uri(url)` Lua global + methods |
 
 ```sh
-cargo build -p cirrus-cli --features tiled
+cargo build -p bsrs-cli --features tiled
 ```
 
 Inside the REPL:
@@ -62,7 +62,7 @@ local run = cat:get("scan_42")
 print(run:metadata())
 ```
 
-All HTTP calls run on cirrus's tokio runtime; the REPL thread
+All HTTP calls run on bsrs's tokio runtime; the REPL thread
 re-enters mlua's reentrant lock, so calls inside Lua plans are
 safe.
 
@@ -70,26 +70,26 @@ safe.
 
 | Crate       | Feature   | Adds                                  |
 | ----------- | --------- | ------------------------------------- |
-| `cirrus-qs` | `metrics` | Prometheus `/metrics` HTTP listener   |
+| `bsrs-qs` | `metrics` | Prometheus `/metrics` HTTP listener   |
 
 ```sh
-cirrus qs-manager --metrics 127.0.0.1:9090
-# build first with: cargo build -p cirrus-qs --features metrics
+bsrs qs-manager --metrics 127.0.0.1:9090
+# build first with: cargo build -p bsrs-qs --features metrics
 ```
 
 Currently exported:
 
-- `cirrus_qs_rpc_calls_total{method=...}`
-- `cirrus_qs_rpc_errors_total{method=...}` (when wired)
-- `cirrus_qs_queue_depth` (gauge)
-- `cirrus_qs_runs_total{exit_status=...}`
-- `cirrus_qs_documents_total{name=...}`
+- `bsrs_qs_rpc_calls_total{method=...}`
+- `bsrs_qs_rpc_errors_total{method=...}` (when wired)
+- `bsrs_qs_queue_depth` (gauge)
+- `bsrs_qs_runs_total{exit_status=...}`
+- `bsrs_qs_documents_total{name=...}`
 
 Scrape with the standard Prometheus config:
 
 ```yaml
 scrape_configs:
-  - job_name: 'cirrus-qs'
+  - job_name: 'bsrs-qs'
     static_configs:
       - targets: ['localhost:9090']
 ```

@@ -1,6 +1,6 @@
 # 10 — Roadmap (post-2026-05-10)
 
-This file tracks the items from the comprehensive audit ("cirrus 기능을
+This file tracks the items from the comprehensive audit ("bsrs 기능을
 완벽하게 하려고 할 때 부족한 점") that **remain unaddressed** after the
 spring 2026 milestone push. Items already shipped are listed at the
 bottom for reference.
@@ -8,30 +8,30 @@ bottom for reference.
 ## Tier 1 — production-blocking residue
 
 ### 1.1 Live IOC integration test
-- **Status**: manual end-to-end verified — `crates/cirrus/examples/mini_beamline_scan.rs`
-  drives `epics-rs/examples/mini-beamline` IOC via cirrus's CA backend,
+- **Status**: manual end-to-end verified — `crates/bsrs/examples/mini_beamline_scan.rs`
+  drives `epics-rs/examples/mini-beamline` IOC via bsrs's CA backend,
   runs a 17-point scan, and asserts a Gaussian profile from the
   PinHole point detector. Captured docs land in
-  `/tmp/cirrus_mini_beamline_*.jsonl`. Run with:
+  `/tmp/bsrs_mini_beamline_*.jsonl`. Run with:
   ```
   cd ~/codes/epics-rs && ./target/release/mini_ioc \
       examples/mini-beamline/ioc/st.cmd &
-  cd ~/codes/cirrus && cargo run --example mini_beamline_scan
+  cd ~/codes/bsrs && cargo run --example mini_beamline_scan
   ```
 - **Remaining**: wrap as a CI-automated test (spawn `mini_ioc`
   inside the test fixture). Blocked on either packaging the IOC
-  binary alongside cirrus or vendoring `epics-rs::IocBuilder`.
+  binary alongside bsrs or vendoring `epics-rs::IocBuilder`.
 - **Side fix**: SHIPPED. `ca_context()` now checks
   `Handle::try_current()` and bridges through a dedicated
   `std::thread::scope` worker when invoked from inside an existing
   tokio runtime, eliminating the panic. Regression covered by
-  `cirrus_backend_epics_ca::real::tests::ca_context_initializes_from_inside_runtime`.
+  `bsrs_backend_epics_ca::real::tests::ca_context_initializes_from_inside_runtime`.
 
 ## Tier 2 — ecosystem residue
 
 ### 2.1 PyO3 layer (M7)
 - **Status**: deferred per doc 07 milestone table.
-- **Plan**: a thin `cirrus-py` crate that exposes `cirrus.RunEngine`,
+- **Plan**: a thin `bsrs-py` crate that exposes `bsrs.RunEngine`,
   device factories, and a yield-to-Rust plan adapter. Multi-day
   effort; depends on which subset of ophyd-async API to mirror.
 
@@ -56,9 +56,9 @@ bottom for reference.
   `bpp.set_run_key_wrapper`, `bpp.stub_wrapper` in the Lua surface.
 
 ### 2.4 Real frame-source backends behind D21
-- **Status**: `cirrus frame-source` subcommand + Document-plane wire
+- **Status**: `bsrs frame-source` subcommand + Document-plane wire
   format (`ZmqDocumentSource`/`Sink`) shipped (D21 scaffold).
-- **Plan**: wire `cirrus-stream::PvaMonitorSource` and
+- **Plan**: wire `bsrs-stream::PvaMonitorSource` and
   `Hdf5FrameSink` into the frame-source binary; same for rogue
   (Phase 2 / P2-A/B). Each ~1 day.
 
@@ -69,7 +69,7 @@ bottom for reference.
   now distinguishes mid-run `Msg::Checkpoint` records from
   post-`CloseRun` records; `JsonlCheckpointStore::unfinished_run`
   walks the JSONL audit log and surfaces any run that hit a
-  checkpoint but never closed. `cirrus qs-manager` emits a structured
+  checkpoint but never closed. `bsrs qs-manager` emits a structured
   WARN at startup if such a record is present, so an operator knows
   to re-issue the abandoned plan. Pause/resume itself is still
   in-process only.
@@ -78,9 +78,9 @@ bottom for reference.
   msg_cache replay; multi-day.
 
 ### 3.2 Prometheus metrics + health probes
-- **Status**: SHIPPED (`54e0bc8`). `cirrus-qs/metrics` feature exposes
+- **Status**: SHIPPED (`54e0bc8`). `bsrs-qs/metrics` feature exposes
   `/metrics` HTTP endpoint via `metrics-exporter-prometheus`.
-  `cirrus_qs_rpc_calls_total{method=...}` instrumented in dispatch.
+  `bsrs_qs_rpc_calls_total{method=...}` instrumented in dispatch.
 - **Remaining**: wire queue_depth gauge, run_finished counter, and
   per-document counters at their natural call sites.
 
@@ -102,32 +102,32 @@ bottom for reference.
 
 ### 4.2 Live plot / BestEffortCallback equivalent
 - **Status**: none.
-- **Plan**: a `cirrus-plot` callback that subscribes to Document
+- **Plan**: a `bsrs-plot` callback that subscribes to Document
   stream and drives a `plotters` (or `egui`) window for live scan
   visualization. Multi-day GUI work.
 
-### 4.3 Web UI for cirrus-qs
-- **Status**: cirrus-qs exposes JSON-RPC over ZMQ; no HTTP/web
+### 4.3 Web UI for bsrs-qs
+- **Status**: bsrs-qs exposes JSON-RPC over ZMQ; no HTTP/web
   front-end.
-- **Plan**: a separate `cirrus-qs-web` axum binary that proxies
+- **Plan**: a separate `bsrs-qs-web` axum binary that proxies
   ZMQ → REST + serves a small SPA dashboard. Separate project
   scope.
 
-### 4.4 cirrus-cli REPL UX (autocompletion etc.)
-- **Status**: SHIPPED (`a6ed9b9`). `CirrusReplHelper` registers a
+### 4.4 bsrs-cli REPL UX (autocompletion etc.)
+- **Status**: SHIPPED (`a6ed9b9`). `BsrsReplHelper` registers a
   custom rustyline completer with curated keyword list (RE:*, msg.*,
   bp.*, bps.*, bpt.*, bpp.*, tiled.*); persistent history at
-  `~/.cirrus_repl_history`.
+  `~/.bsrs_repl_history`.
 - **Remaining**: completion of device names introspected from the
   live Lua state (vs. the static keyword list).
 
 ## Tier 5 — security residue
 
 ### 5.1 RBAC / TLS / audit log
-- **Status**: TILED_API_KEY env only; cirrus-qs has no per-method
+- **Status**: TILED_API_KEY env only; bsrs-qs has no per-method
   ACL; no structured audit log; no TLS termination examples.
 - **Plan**: integrate `axum-rustls` for the HTTP probes; add a
-  cirrus-qs ACL middleware that consults a `permissions.toml`
+  bsrs-qs ACL middleware that consults a `permissions.toml`
   (the `permissions_get` RPC stub already returns a permissive
   default — wire that through the actual dispatcher gates). Each
   multi-day, policy-heavy.
@@ -139,7 +139,7 @@ bottom for reference.
   Rust-emitted `Msg::Custom` if a Lua plan needs to trigger a
   custom command).
 - **`RE:add_preprocessor`**: Plan→Plan callback would require Lua
-  to manipulate the cirrus Plan stream type. Not feasible without
+  to manipulate the bsrs Plan stream type. Not feasible without
   a richer bridge layer; out of scope.
 
 ## Shipped in 2026-05 push (reference)
@@ -155,12 +155,12 @@ bottom for reference.
 - M5: `rel_adaptive_scan` + `configure_count_time_wrapper`
   (`0b79946`)
 - KafkaSink (`b9547cf`)
-- `cirrus doctor` + `cirrus migrate` CLI tools (`f67b79c`)
-- M8: cirrus-qs bluesky-queueserver wire compat — task_status,
+- `bsrs doctor` + `bsrs migrate` CLI tools (`f67b79c`)
+- M8: bsrs-qs bluesky-queueserver wire compat — task_status,
   task_result, manager_test, permissions_get, manager_version
   (`819bf6e`)
 - D21 scaffolding: `ZmqDocumentSource` (SUB side) +
-  `cirrus frame-source` subcommand (`dac7c56`)
+  `bsrs frame-source` subcommand (`dac7c56`)
 - REPL Tab completion + persistent history (`a6ed9b9`)
 - criterion benches: `plan_loop` + `document_fanout` (`92bc602`)
 - Prometheus `/metrics` endpoint behind `metrics` feature

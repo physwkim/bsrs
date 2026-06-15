@@ -1,29 +1,29 @@
 # Gap Analysis 01 — RunEngine Core, Suspenders, Msg Verbs, Bundlers
 
 **Date:** 2026-06-14  
-**cirrus ref:** `crates/cirrus-engine/src/` (engine.rs, bundler.rs, suspender.rs, sink.rs)  
+**bsrs ref:** `crates/bsrs-engine/src/` (engine.rs, bundler.rs, suspender.rs, sink.rs)  
 **bluesky ref:** `daq/bluesky/src/bluesky/run_engine.py`, `bundlers.py`, `suspenders.py`, `utils/__init__.py`
 
 ---
 
 ## Scope & Method
 
-Read cirrus `engine.rs` (1 772 lines), `bundler.rs`, `suspender.rs` in full; read bluesky
+Read bsrs `engine.rs` (1 772 lines), `bundler.rs`, `suspender.rs` in full; read bluesky
 `run_engine.py` (all `_command_registry` handlers, state machine, `_run` loop, `request_suspend`,
 `_start_suspender`), `bundlers.py` (`RunBundler`, `_StreamCache`, `_pack_external_assets`,
 `_collect_events`), `suspenders.py` (all classes).
 
-cirrus is NOT a line-for-line port; it is an async-first redesign. Style divergences (Python
+bsrs is NOT a line-for-line port; it is an async-first redesign. Style divergences (Python
 thread/asyncio split → Tokio task; generator stack → Rust Stream; `ChainMap` → manual merge) are
 intentional and not flagged. Only semantic / protocol / completeness gaps are listed.
 
 ---
 
-## Verb coverage (bluesky `_command_registry` → cirrus `Msg` variants)
+## Verb coverage (bluesky `_command_registry` → bsrs `Msg` variants)
 
-All 30 public bluesky verbs map to a handled cirrus `Msg` arm.
+All 30 public bluesky verbs map to a handled bsrs `Msg` arm.
 
-| bluesky verb | cirrus `Msg` | notes |
+| bluesky verb | bsrs `Msg` | notes |
 |---|---|---|
 | `create` | `Msg::Create` | ✓ |
 | `save` | `Msg::Save` | ✓ |
@@ -55,7 +55,7 @@ All 30 public bluesky verbs map to a handled cirrus `Msg` arm.
 | `null` | `Msg::Null` | ✓ |
 | `RE_class` | `Msg::ReClass` | ✓ |
 
-Cirrus-only verbs (no bluesky analogue): `Msg::RegisterPausable`, `Msg::UnregisterPausable`,
+Bsrs-only verbs (no bluesky analogue): `Msg::RegisterPausable`, `Msg::UnregisterPausable`,
 `Msg::Publish`, `Msg::Fail`, `Msg::Custom` (maps to `register_command` pattern).
 
 ---
@@ -66,7 +66,7 @@ Cirrus-only verbs (no bluesky analogue): `Msg::RegisterPausable`, `Msg::Unregist
 
 ### ENG-01 `Msg::Configure` does not invalidate/re-emit EventDescriptor (P0)
 
-**cirrus:** `engine.rs:1329` calls `obj.configure_dyn(args)` and returns. `RunBundler` is never
+**bsrs:** `engine.rs:1329` calls `obj.configure_dyn(args)` and returns. `RunBundler` is never
 notified.
 
 **ref:** `bundlers.py:1197-1217` (`async def configure`):
@@ -82,7 +82,7 @@ for name in list(self._descriptors):
 **Gap:** After `Msg::Configure`, bluesky invalidates every EventDescriptor that includes the
 configured object and immediately re-emits a new descriptor with the updated
 `read_configuration()` values. Downstream consumers (tiled, analysis pipelines) rely on this to
-associate parameter changes with subsequent events. Cirrus silently skips this: configuration
+associate parameter changes with subsequent events. Bsrs silently skips this: configuration
 changes during a scan are invisible to the event stream.
 
 **Fix sketch:** Add a `RunBundler::on_configure(&mut self, obj_name: &str)` method that (a) calls
@@ -97,7 +97,7 @@ after `configure_dyn`.
 
 ### ENG-02 External-asset documents (Resource / Datum / StreamResource / StreamDatum) absent (P0)
 
-**cirrus:** `bundler.rs` and `engine.rs:1181-1218` (`Msg::Collect`) call
+**bsrs:** `bundler.rs` and `engine.rs:1181-1218` (`Msg::Collect`) call
 `obj.collect_dyn()` which returns `Vec<(name, data, timestamps)>` (inline events only).
 No path exists to emit Resource, Datum, StreamResource, or StreamDatum documents.
 `Msg::Read` similarly calls `obj.read_dyn()` → inline values only.
@@ -107,11 +107,11 @@ StreamDatum with `run_start` back-filled, `seq_nums` managed for StreamDatum, an
 `uid` stitched in. Called from both `save()` and `collect()`.
 
 **Gap:** Most real detectors (Pilatus, Eiger, Lambda, any HDF5 writer) produce data on disk and
-reference it through Resource+Datum (or StreamResource+StreamDatum). Without this path, cirrus
+reference it through Resource+Datum (or StreamResource+StreamDatum). Without this path, bsrs
 cannot record detector data for these devices — the data simply disappears.
 
 **Fix sketch:** (1) Add an `ExternalAssetDoc` enum (`Resource`, `Datum`, `StreamResource`,
-`StreamDatum`) to `cirrus_event_model`. (2) Add `collect_asset_docs_dyn()` to the `ReadableObj`
+`StreamDatum`) to `bsrs_event_model`. (2) Add `collect_asset_docs_dyn()` to the `ReadableObj`
 and `FlyableObj` protocols, returning an async iterator of `ExternalAssetDoc`. (3) In
 `RunBundler::save()` and the collect handler, drain that iterator, backfill `run_start`, emit via
 `broadcast`. This is a multi-crate change; the exact shape of the protocol traits needs design
@@ -123,7 +123,7 @@ sign-off.
 
 ### ENG-03 `msg_hook` not exposed (P1)
 
-**cirrus:** `engine.rs:870` logs `tracing::debug!("RE msg: {:?}", &msg)` but does not call any
+**bsrs:** `engine.rs:870` logs `tracing::debug!("RE msg: {:?}", &msg)` but does not call any
 user-supplied callback. No `msg_hook` field or setter.
 
 **ref:** `run_engine.py:490` `self.msg_hook = None`; `run_engine.py:1645-1646`:
@@ -147,7 +147,7 @@ Without it, plan debugging requires re-implementing instrumentation outside the 
 
 ### ENG-04 Multi-run per call not supported (Msg.run key) (P1)
 
-**cirrus:** `EngineState` has `bundler: Option<RunBundler>` — exactly one open run at a time.
+**bsrs:** `EngineState` has `bundler: Option<RunBundler>` — exactly one open run at a time.
 `open_run()` (`engine.rs:1584`) errors if `state.bundler.is_some()`.
 
 **ref:** `run_engine.py:504` `self._run_bundlers: dict[Any, RunBundler] = {}`.
@@ -155,8 +155,8 @@ Without it, plan debugging requires re-implementing instrumentation outside the 
 `_close_run` (`run_engine.py:1890`) deletes one key, leaving others open.
 
 **Gap:** Plans that open interleaved runs (e.g., a fly scan that opens a "primary" run and a
-"diagnostics" run simultaneously) cannot be expressed in cirrus. The bluesky `Msg.run` field
-is the key discriminator; cirrus's `Msg::OpenRun` / `Msg::CloseRun` have no run-key field at all.
+"diagnostics" run simultaneously) cannot be expressed in bsrs. The bluesky `Msg.run` field
+is the key discriminator; bsrs's `Msg::OpenRun` / `Msg::CloseRun` have no run-key field at all.
 All routing to the right bundler is impossible.
 
 **Fix sketch:** (1) Add `run_key: Option<String>` to `Msg::OpenRun` and `Msg::CloseRun` (and to
@@ -171,7 +171,7 @@ by key. `None` key = the single-run default (fully backward-compatible).
 
 ### ENG-05 `RunResult` missing plan_result, interrupted, reason, exception; one uid only (P1)
 
-**cirrus:** `engine.rs:203-207`:
+**bsrs:** `engine.rs:203-207`:
 ```rust
 pub struct RunResult {
     pub run_uid: Option<String>,   // ← single UID, not a list
@@ -198,7 +198,7 @@ from an abort without re-parsing `exit_status`.
 
 **Fix sketch:** Rename `run_uid` → `run_uids: Vec<String>`. Add `plan_result: Option<Box<dyn Any
 + Send>>` (or a simpler typed `plan_value: serde_json::Value`). Add `interrupted: bool`,
-`reason: String`, `exception: Option<CirrusError>`. Accumulate all UIDs in `run_loop`
+`reason: String`, `exception: Option<BsrsError>`. Accumulate all UIDs in `run_loop`
 (currently only captures the last one assigned to `run_uid`).
 
 **Effort:** M
@@ -207,7 +207,7 @@ from an abort without re-parsing `exit_status`.
 
 ### ENG-06 `Msg::Subscribe` has no document-type filter (P1)
 
-**cirrus:** `engine.rs:59` `DocumentCallback = Arc<dyn Fn(&Document) + Send + Sync>`. All
+**bsrs:** `engine.rs:59` `DocumentCallback = Arc<dyn Fn(&Document) + Send + Sync>`. All
 subscribers receive every document type.
 
 **ref:** `run_engine.py:640-671` `RE.subscribe(func, name='all')`: `name` is one of
@@ -231,13 +231,13 @@ calling.
 
 ### ENG-07 `RunBundler::configure` not called; `read_configuration`/`describe_configuration` absent from descriptors (P1)
 
-**cirrus:** `bundler.rs:103-150` (`save()`): calls `bundle.descriptor(stream, data_keys,
+**bsrs:** `bundler.rs:103-150` (`save()`): calls `bundle.descriptor(stream, data_keys,
 pending_config, pending_hints, pending_object_keys)`. `pending_config` is of type
 `HashMap<String, Configuration>` and is accumulated. But `Msg::Configure` at `engine.rs:1329`
 never touches the bundler — `pending_config` is only populated if the user explicitly calls
 something (there is no code path that does).
 
-Neither `ReadableObj` nor any trait in `cirrus_core` has `read_configuration()` or
+Neither `ReadableObj` nor any trait in `bsrs_core` has `read_configuration()` or
 `describe_configuration()` methods.
 
 **ref:** `bundlers.py:82-131` `_StreamCache.ensure_cached` always calls
@@ -245,7 +245,7 @@ Neither `ReadableObj` nor any trait in `cirrus_core` has `read_configuration()` 
 object. These populate `config_values_cache`/`config_ts_cache`/`config_desc_cache`, which
 are then embedded into the EventDescriptor's `configuration` field (`bundlers.py:286-295`).
 
-**Gap:** Every EventDescriptor in cirrus has an empty `configuration: {}`. Downstream analysis
+**Gap:** Every EventDescriptor in bsrs has an empty `configuration: {}`. Downstream analysis
 tools that rely on knowing, e.g., detector exposure time, ROI configuration, or motor backlash
 settings at the time of each scan cannot find this information. This breaks scientific
 reproducibility metadata.
@@ -262,8 +262,8 @@ and store results in a per-stream `config_desc_cache`/`config_values_cache`. (3)
 
 ### ENG-08 `seq_num` not reset on rewind (P1)
 
-**cirrus:** `engine.rs:1010-1027` (`on_resume`): moves `msg_cache` → `replay_queue`. Does not
-touch `cirrus_event_model::compose::RunBundle`'s internal sequence counter. After a rewind, the
+**bsrs:** `engine.rs:1010-1027` (`on_resume`): moves `msg_cache` → `replay_queue`. Does not
+touch `bsrs_event_model::compose::RunBundle`'s internal sequence counter. After a rewind, the
 replayed Msgs re-emit events whose `seq_num` picks up from where the interrupted count left off,
 not from the checkpoint-time count.
 
@@ -282,7 +282,7 @@ re-emitted with continued seq_nums instead of restarted ones). Consumers that va
 monotonicity will reject the second attempt; tiled will produce duplicate sequence numbers in the
 same event stream.
 
-**Fix sketch:** Add `snapshot_sequence_counter(stream_name)` / `restore_sequence_counter(stream_name, snapshot)` to `cirrus_event_model::compose::RunBundle`. In `RunBundler`, on `Checkpoint` save a snapshot; on resume (`on_resume` before replay begins), restore the snapshot for each affected stream.
+**Fix sketch:** Add `snapshot_sequence_counter(stream_name)` / `restore_sequence_counter(stream_name, snapshot)` to `bsrs_event_model::compose::RunBundle`. In `RunBundler`, on `Checkpoint` save a snapshot; on resume (`on_resume` before replay begins), restore the snapshot for each affected stream.
 
 **Effort:** M
 
@@ -290,7 +290,7 @@ same event stream.
 
 ### ENG-09 `backstop_collect` not called on cleanup (P1)
 
-**cirrus:** `engine.rs:485-510` (cleanup block in `run_async`): stops movables/flyables, unstages
+**bsrs:** `engine.rs:485-510` (cleanup block in `run_async`): stops movables/flyables, unstages
 staged devices. It does **not** call `complete()`+`collect()` on flyables still in the
 `flyable_objs_touched` map.
 
@@ -307,7 +307,7 @@ Called during `_run` cleanup for any flyer that had `kickoff` but not `collect`.
 `_uncollected` set tracks flyers added in `kickoff()` and removed in `collect()`.
 
 **Gap:** If a plan aborts after `Msg::Kickoff` but before `Msg::Collect`, the flyer's buffered
-data is permanently lost. Bluesky makes a best-effort data rescue. cirrus silently drops it.
+data is permanently lost. Bluesky makes a best-effort data rescue. bsrs silently drops it.
 
 **Fix sketch:** Add an `uncollected: HashSet<String>` to `EngineState`. In `handle(Msg::Kickoff)`,
 insert the flyer's name; in `handle(Msg::Collect)`, remove it. In the `run_async` cleanup block,
@@ -320,7 +320,7 @@ each (best-effort, log errors).
 
 ### ENG-10 Suspender `sleep` (resume-delay) missing (P1)
 
-**cirrus:** `suspender.rs:86` (`SuspendBoolHigh::install`) → `spawn_bool_watcher`. The resume
+**bsrs:** `suspender.rs:86` (`SuspendBoolHigh::install`) → `spawn_bool_watcher`. The resume
 future resolves as soon as the signal flips to GOOD. No delay.
 
 **ref:** `suspenders.py:34-37` `SuspenderBase.__init__`: `sleep=0` param. `__set_event`
@@ -344,7 +344,7 @@ beam flickers back and immediately fail because the beam is still unstable.
 
 ### ENG-11 Suspender `pre_plan` / `post_plan` injection missing (P1)
 
-**cirrus:** `suspend_until_with` (`engine.rs:699-718`) immediately pauses + spawns a task that
+**bsrs:** `suspend_until_with` (`engine.rs:699-718`) immediately pauses + spawns a task that
 calls `resume()` when `fut` resolves. No way to inject a plan before the suspend or after it.
 
 **ref:** `run_engine.py:1199-1311` `request_suspend(fut, pre_plan=None, post_plan=None)` and
@@ -373,7 +373,7 @@ closures that return `BoxFuture<'static, ()>` and await them in the suspend task
 
 ### ENG-12 Suspenders not checked for tripped state before plan start (P1)
 
-**cirrus:** `run_async()` / `run_async_with()` starts the plan immediately. No check of
+**bsrs:** `run_async()` / `run_async_with()` starts the plan immediately. No check of
 installed suspenders.
 
 **ref:** `run_engine.py:933-967` (`__call__`):
@@ -389,7 +389,7 @@ if tripped_justifications:
 ```
 
 **Gap:** If beam is already off when `run_async` is called, bluesky waits for all suspenders to
-clear before starting. cirrus starts immediately, the plan runs one tick, and the suspender trips
+clear before starting. bsrs starts immediately, the plan runs one tick, and the suspender trips
 mid-plan — the scan starts and the first scan point is corrupt.
 
 **Fix sketch:** In `run_async`, after resetting state and before entering `run_loop`, iterate
@@ -404,7 +404,7 @@ to the plan.
 
 ### ENG-13 `SuspendWhenOutsideBand` and `SuspendWhenChanged` missing (P1)
 
-**cirrus:** `suspender.rs` exports only `SuspendBoolHigh`, `SuspendBoolLow`, `SuspendThreshold`.
+**bsrs:** `suspender.rs` exports only `SuspendBoolHigh`, `SuspendBoolLow`, `SuspendThreshold`.
 
 **ref:** `suspenders.py`:
 - `SuspendWhenOutsideBand` (`line 453`): suspend when scalar leaves `(band_bottom, band_top)`;
@@ -426,7 +426,7 @@ JoinHandle<()>` method following the existing pattern in `spawn_bool_watcher`.
 
 ### ENG-14 `scan_id` not written back to `RE.md` after each run (P1)
 
-**cirrus:** `engine.rs:1562-1566` stores scan_id into `merged` (the per-run metadata) and
+**bsrs:** `engine.rs:1562-1566` stores scan_id into `merged` (the per-run metadata) and
 inserts it into the RunStart. The internal `AtomicU64 scan_id` counter is incremented. But
 `self.md` (the persistent dict) is never updated with the new `scan_id`.
 
@@ -454,7 +454,7 @@ Place this immediately after the counter update, before the validator/normalizer
 
 ### ENG-15 Suspender hysteresis: single threshold for suspend and resume (P2)
 
-**cirrus:** `SuspendThreshold` (`suspender.rs:116`) has one `threshold: f64`. The same value is
+**bsrs:** `SuspendThreshold` (`suspender.rs:116`) has one `threshold: f64`. The same value is
 compared on both the "enter bad" and "exit bad" checks.
 
 **ref:** `suspenders.py:302-314` `_Threshold.__init__`:
@@ -479,7 +479,7 @@ to `self.threshold` for both. In `spawn_threshold_watcher`, use `resume_threshol
 
 ### ENG-16 `waiting_hook` missing (P2)
 
-**cirrus:** No equivalent.
+**bsrs:** No equivalent.
 
 **ref:** `run_engine.py:333-341` `waiting_hook`: callable with signature
 `f(status_objects)` called whenever the engine is blocking on a long-running `wait` (trigger,
@@ -497,7 +497,7 @@ Call it in `wait_group()` with the live `Status` slice when waiting begins, and 
 
 ### ENG-17 `state_hook` missing (P2)
 
-**cirrus:** State is exposed via `RunEngine::state()` which reads atomics at call time.
+**bsrs:** State is exposed via `RunEngine::state()` which reads atomics at call time.
 State transitions are not observable.
 
 **ref:** `run_engine.py:328-332` `state_hook`: callable `f(new_state, old_state)` called on every
@@ -513,7 +513,7 @@ computing old and new `EngineRunState` before/after the store.
 
 ### ENG-18 `panicked` terminal state missing (P2)
 
-**cirrus:** Three-tap SIGINT in `install_signal_handler` halts on the 3rd tap. No irrecoverable
+**bsrs:** Three-tap SIGINT in `install_signal_handler` halts on the 3rd tap. No irrecoverable
 terminal state.
 
 **ref:** `run_engine.py:148` `States.PANICKED`: entered if a `KeyboardInterrupt` fires inside the
@@ -521,12 +521,12 @@ event-loop thread (not on the main thread). Once panicked, `__call__` raises imm
 without letting the plan touch state. The only recovery is to restart the Python session.
 
 **Gap:** The panic path defends against partial writes to shared state that would leave the engine
-in an indeterminate condition. Without it, a sufficiently bad signal race can leave cirrus in a
+in an indeterminate condition. Without it, a sufficiently bad signal race can leave bsrs in a
 state where it accepts another plan but has stale internal state.
 
 **Fix sketch:** Add `is_panicked: AtomicBool`. In `run_async`, check at entry and return
-`Err(CirrusError::Panicked)`. Add `EngineRunState::Panicked`. Set on unrecoverable internal
-errors (e.g., Tokio runtime failure). Since cirrus is fully async (no cross-thread signal
+`Err(BsrsError::Panicked)`. Add `EngineRunState::Panicked`. Set on unrecoverable internal
+errors (e.g., Tokio runtime failure). Since bsrs is fully async (no cross-thread signal
 injection), the risk is lower than in bluesky, so P2 is appropriate.
 
 **Effort:** S
@@ -535,7 +535,7 @@ injection), the risk is lower than in bluesky, so P2 is appropriate.
 
 ### ENG-19 `clear_suspenders()` convenience method missing (P2)
 
-**cirrus:** `Msg::RemoveSuspender` removes by id; no bulk clear. No external method equivalent.
+**bsrs:** `Msg::RemoveSuspender` removes by id; no bulk clear. No external method equivalent.
 
 **ref:** `run_engine.py:1187-1197` `RE.clear_suspenders()`.
 
@@ -547,7 +547,7 @@ injection), the risk is lower than in bluesky, so P2 is appropriate.
 
 ### ENG-20 `deferred_pause_requested` property not exposed (P2)
 
-**cirrus:** `deferred_pause: AtomicBool` (`engine.rs:241`) is private.
+**bsrs:** `deferred_pause: AtomicBool` (`engine.rs:241`) is private.
 
 **ref:** `run_engine.py:390-404` `RE.deferred_pause_requested` property — public read-only.
 
@@ -559,7 +559,7 @@ injection), the risk is lower than in bluesky, so P2 is appropriate.
 
 ### ENG-21 `strict_pre_declare` / `_require_stream_declaration` mode absent (P2)
 
-**cirrus:** `Msg::Create` does not check whether the stream was pre-declared.
+**bsrs:** `Msg::Create` does not check whether the stream was pre-declared.
 
 **ref:** `run_engine.py:533-534` `self._require_stream_declaration = False`; `bundlers.py:399-401`:
 ```python
@@ -578,7 +578,7 @@ pre-declared.
 
 ### ENG-22 `plan_type` absent from `open_run` metadata (P2)
 
-**cirrus:** `open_run()` (`engine.rs:1527`) inserts `plan_name` but not `plan_type`.
+**bsrs:** `open_run()` (`engine.rs:1527`) inserts `plan_name` but not `plan_type`.
 
 **ref:** `run_engine.py:1857-1866`:
 ```python
@@ -588,7 +588,7 @@ md = ChainMap({...,"plan_type": plan_type, "plan_name": plan_name}, ...)
 ```
 
 **Fix sketch:** Add `plan_type: Option<String>` to `RunMetadata`. Plans that know their type fill
-it; cirrus inserts into merged md alongside `plan_name`.
+it; bsrs inserts into merged md alongside `plan_name`.
 
 **Effort:** S
 
@@ -596,7 +596,7 @@ it; cirrus inserts into merged md alongside `plan_name`.
 
 ### ENG-23 `ignore_callback_exceptions` not supported (P2)
 
-**cirrus:** `broadcast()` (`engine.rs:1655-1673`) calls each `DocumentCallback` synchronously.
+**bsrs:** `broadcast()` (`engine.rs:1655-1673`) calls each `DocumentCallback` synchronously.
 Any panic unwinds the engine. There is no try/catch around callbacks.
 
 **ref:** `run_engine.py:490` `self.ignore_callback_exceptions = False`; `Dispatcher.process`
@@ -641,7 +641,7 @@ collects exceptions and either swallows them (if `ignore_exceptions=True`) or wa
 
 ---
 
-## What cirrus already matches (summary)
+## What bsrs already matches (summary)
 
 - All 30 bluesky `_command_registry` verbs have a handled `Msg` arm.
 - State machine (Idle/Running/Paused/Aborting/Halting) covers all common transitions.
@@ -661,5 +661,5 @@ collects exceptions and either swallows them (if `ignore_exceptions=True`) or wa
 - `register_command` / `unregister_command` — present as `register_command()`.
 - `SuspendBoolHigh` / `SuspendBoolLow` / `SuspendThreshold` core logic — present.
 - `suspend_until_with(fut, justification)` — present; justification recorded in interruptions stream.
-- `inject_document()` for external document bridging — cirrus addition, no bluesky analogue.
-- `CheckpointHook` / crash-recovery audit trail — cirrus addition.
+- `inject_document()` for external document bridging — bsrs addition, no bluesky analogue.
+- `CheckpointHook` / crash-recovery audit trail — bsrs addition.

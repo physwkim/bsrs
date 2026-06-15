@@ -1,5 +1,5 @@
-"""Subscribe to cirrus Documents over ZMQ via bluesky's
-RemoteDispatcher. Verifies wire-format compatibility — cirrus emits
+"""Subscribe to bsrs Documents over ZMQ via bluesky's
+RemoteDispatcher. Verifies wire-format compatibility — bsrs emits
 the bluesky `Publisher` envelope (msgpack body), Python consumes it
 unchanged.
 
