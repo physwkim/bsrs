@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use cirrus_core::error::{CirrusError, Result};
 use cirrus_core::reading::ReadingValue;
 use cirrus_core::status::SubToken;
-use cirrus_event_model::{make_datakey, DataKey, Dtype, SignalMetadata};
+use cirrus_event_model::{make_datakey, DataKey, Dtype, Limits, LimitsRange, SignalMetadata};
 use cirrus_protocols_async::{ReadingValueCallback, SignalBackend};
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::pv_request::PvRequestExpr;
@@ -253,6 +253,95 @@ fn pv_field_to_alarm_severity(p: &PvField) -> Option<i32> {
     Some(if sev > 2 { -1 } else { sev as i32 })
 }
 
+// Borrow a structure's named field, if present.
+fn field<'a>(fields: &'a [(String, PvField)], name: &str) -> Option<&'a PvField> {
+    fields.iter().find(|(n, _)| n == name).map(|(_, f)| f)
+}
+
+// Borrow a named substructure's field list.
+fn sub_fields<'a>(fields: &'a [(String, PvField)], name: &str) -> Option<&'a [(String, PvField)]> {
+    match field(fields, name) {
+        Some(PvField::Structure(s)) => Some(&s.fields),
+        _ => None,
+    }
+}
+
+// A numeric leaf field as f64, treating NaN (PVA's "unset" fill) as absent.
+fn leaf_f64(fields: &[(String, PvField)], name: &str) -> Option<f64> {
+    field(fields, name)
+        .and_then(pv_field_to_f64)
+        .filter(|v| !v.is_nan())
+}
+
+// Build a LimitsRange from a low/high pair, dropping it when both bounds are
+// absent (NaN) or both exactly zero (an unset PVA limit pair) — ophyd-async
+// `_limits_from_value.get_limits` (epics/core/_p4p.py:49-53).
+fn limits_range(low: Option<f64>, high: Option<f64>) -> Option<LimitsRange> {
+    if low.is_none() && high.is_none() {
+        return None;
+    }
+    if low.unwrap_or(f64::NAN) == 0.0 && high.unwrap_or(f64::NAN) == 0.0 {
+        return None;
+    }
+    Some(LimitsRange { low, high })
+}
+
+// Extract the four limit ranges from an NTScalar's top-level substructures,
+// mirroring ophyd-async `_limits_from_value` (epics/core/_p4p.py:42-65): alarm
+// and warning from `valueAlarm`, control and display from their own
+// `limitLow`/`limitHigh`.
+fn pv_limits(top: &[(String, PvField)]) -> Limits {
+    let mut limits = Limits::default();
+    if let Some(va) = sub_fields(top, "valueAlarm") {
+        limits.alarm = limits_range(
+            leaf_f64(va, "lowAlarmLimit"),
+            leaf_f64(va, "highAlarmLimit"),
+        );
+        limits.warning = limits_range(
+            leaf_f64(va, "lowWarningLimit"),
+            leaf_f64(va, "highWarningLimit"),
+        );
+    }
+    if let Some(c) = sub_fields(top, "control") {
+        limits.control = limits_range(leaf_f64(c, "limitLow"), leaf_f64(c, "limitHigh"));
+    }
+    if let Some(d) = sub_fields(top, "display") {
+        limits.display = limits_range(leaf_f64(d, "limitLow"), leaf_f64(d, "limitHigh"));
+    }
+    limits
+}
+
+// Build SignalMetadata (units / precision / limits) from a full NTScalar GET,
+// mirroring ophyd-async `_metadata_from_value` (epics/core/_p4p.py:68-94):
+// `display.units` when numeric and not str (`want_units`), `display.precision`
+// only for floats (`want_precision`), and the limit ranges for any numeric.
+fn pv_field_to_metadata(p: &PvField, want_units: bool, want_precision: bool) -> SignalMetadata {
+    let mut meta = SignalMetadata::default();
+    let PvField::Structure(s) = p else {
+        return meta;
+    };
+    let top = &s.fields;
+    if let Some(display) = sub_fields(top, "display") {
+        if want_units {
+            if let Some(PvField::Scalar(ScalarValue::String(u))) = field(display, "units") {
+                if !u.is_empty() {
+                    meta.units = Some(u.clone());
+                }
+            }
+        }
+        if want_precision {
+            if let Some(prec) = field(display, "precision").and_then(pv_field_to_i64) {
+                meta.precision = Some(prec);
+            }
+        }
+    }
+    let limits = pv_limits(top);
+    if limits != Limits::default() {
+        meta.limits = Some(limits);
+    }
+    meta
+}
+
 #[async_trait]
 impl SignalBackend<f64> for EpicsPvaBackend<f64> {
     async fn connect(&self, _timeout: Duration) -> Result<()> {
@@ -272,12 +361,19 @@ impl SignalBackend<f64> for EpicsPvaBackend<f64> {
             .map_err(|e| CirrusError::Backend(format!("pva put: {e}")))
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
+        // pvget the full NTScalar (display/control/valueAlarm carry units,
+        // precision, and limits) — describe is rare; mirrors CA ctrl_metadata.
+        let f = self
+            .client
+            .pvget(&self.pv)
+            .await
+            .map_err(|e| CirrusError::Backend(format!("pva get: {e}")))?;
         Ok(make_datakey(
             format!("pva://{source}"),
             Dtype::Number,
             vec![],
             Some("<f8".into()),
-            SignalMetadata::default(),
+            pv_field_to_metadata(&f, true, true),
         ))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
@@ -395,7 +491,7 @@ impl SignalBackend<Vec<f64>> for EpicsPvaBackend<Vec<f64>> {
             Dtype::Number,
             vec![Some(len as u64)],
             Some("<f8".into()),
-            SignalMetadata::default(),
+            pv_field_to_metadata(&f, true, true),
         ))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
@@ -581,12 +677,19 @@ impl SignalBackend<i64> for EpicsPvaBackend<i64> {
             .map_err(|e| CirrusError::Backend(format!("pva put: {e}")))
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
+        // pvget the full NTScalar for units + limits. Integers carry no
+        // precision (ophyd-async restricts precision to floats), so want_precision=false.
+        let f = self
+            .client
+            .pvget(&self.pv)
+            .await
+            .map_err(|e| CirrusError::Backend(format!("pva get: {e}")))?;
         Ok(make_datakey(
             format!("pva://{source}"),
             Dtype::Integer,
             vec![],
             Some("<i8".into()),
-            SignalMetadata::default(),
+            pv_field_to_metadata(&f, true, false),
         ))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
@@ -1001,5 +1104,113 @@ mod tests {
         nt.fields.push(("timeStamp".into(), PvField::Structure(ts)));
         let f = PvField::Structure(nt);
         assert!(pv_field_to_ts(&f).is_none());
+    }
+
+    // Build an NTScalar carrying display/control/valueAlarm metadata.
+    fn ntscalar_with_meta() -> PvField {
+        fn dbl(v: f64) -> PvField {
+            PvField::Scalar(ScalarValue::Double(v))
+        }
+        let mut display = PvStructure::new("display_t");
+        display.fields.push((
+            "units".into(),
+            PvField::Scalar(ScalarValue::String("mm".into())),
+        ));
+        display
+            .fields
+            .push(("precision".into(), PvField::Scalar(ScalarValue::Int(3))));
+        display.fields.push(("limitLow".into(), dbl(-100.0)));
+        display.fields.push(("limitHigh".into(), dbl(100.0)));
+
+        let mut control = PvStructure::new("control_t");
+        control.fields.push(("limitLow".into(), dbl(-50.0)));
+        control.fields.push(("limitHigh".into(), dbl(50.0)));
+
+        let mut va = PvStructure::new("valueAlarm_t");
+        va.fields.push(("lowAlarmLimit".into(), dbl(-10.0)));
+        va.fields.push(("highAlarmLimit".into(), dbl(10.0)));
+        va.fields.push(("lowWarningLimit".into(), dbl(-5.0)));
+        va.fields.push(("highWarningLimit".into(), dbl(5.0)));
+
+        let mut nt = PvStructure::new("epics:nt/NTScalar:1.0");
+        nt.fields.push(("value".into(), dbl(1.0)));
+        nt.fields
+            .push(("display".into(), PvField::Structure(display)));
+        nt.fields
+            .push(("control".into(), PvField::Structure(control)));
+        nt.fields
+            .push(("valueAlarm".into(), PvField::Structure(va)));
+        PvField::Structure(nt)
+    }
+
+    #[test]
+    fn metadata_extracts_units_precision_and_four_limit_ranges() {
+        let meta = pv_field_to_metadata(&ntscalar_with_meta(), true, true);
+        assert_eq!(meta.units.as_deref(), Some("mm"));
+        assert_eq!(meta.precision, Some(3));
+        let limits = meta.limits.expect("limits present");
+        assert_eq!(
+            limits.alarm,
+            Some(LimitsRange {
+                low: Some(-10.0),
+                high: Some(10.0)
+            })
+        );
+        assert_eq!(
+            limits.warning,
+            Some(LimitsRange {
+                low: Some(-5.0),
+                high: Some(5.0)
+            })
+        );
+        assert_eq!(
+            limits.control,
+            Some(LimitsRange {
+                low: Some(-50.0),
+                high: Some(50.0)
+            })
+        );
+        assert_eq!(
+            limits.display,
+            Some(LimitsRange {
+                low: Some(-100.0),
+                high: Some(100.0)
+            })
+        );
+    }
+
+    #[test]
+    fn metadata_for_int_omits_precision_keeps_units() {
+        // ophyd-async restricts precision to floats; integer datakeys keep units.
+        let meta = pv_field_to_metadata(&ntscalar_with_meta(), true, false);
+        assert_eq!(meta.units.as_deref(), Some("mm"));
+        assert_eq!(meta.precision, None);
+    }
+
+    #[test]
+    fn metadata_drops_zero_pair_and_handles_bare_scalar() {
+        // A display limit pair of exactly (0, 0) is PVA's "unset" → dropped.
+        let mut display = PvStructure::new("display_t");
+        display
+            .fields
+            .push(("limitLow".into(), PvField::Scalar(ScalarValue::Double(0.0))));
+        display.fields.push((
+            "limitHigh".into(),
+            PvField::Scalar(ScalarValue::Double(0.0)),
+        ));
+        let mut nt = PvStructure::new("epics:nt/NTScalar:1.0");
+        nt.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(1.0))));
+        nt.fields
+            .push(("display".into(), PvField::Structure(display)));
+        let meta = pv_field_to_metadata(&PvField::Structure(nt), true, true);
+        assert_eq!(meta.limits, None);
+
+        // A bare (non-Normative) scalar has no metadata substructures.
+        let bare = PvField::Scalar(ScalarValue::Double(2.5));
+        assert_eq!(
+            pv_field_to_metadata(&bare, true, true),
+            SignalMetadata::default()
+        );
     }
 }
