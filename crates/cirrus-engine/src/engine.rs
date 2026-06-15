@@ -1988,24 +1988,26 @@ impl RunEngine {
             return Ok(());
         }
         let fut = async {
-            for s in members {
-                if let Err(e) = s.await {
-                    // A status that resolves to an error is a genuine failure
-                    // (bluesky's FIRST_EXCEPTION → FailedStatus) and propagates
-                    // regardless of error_on_timeout. Only the group-level wait
-                    // timeout below (the group not completing within `timeout`)
-                    // is gated by error_on_timeout — mirrors bluesky `_wait`,
-                    // where error_on_timeout suppresses only WaitForTimeoutError
-                    // (run_engine.py:2341-2346) while a FailedStatus always
-                    // raises (:2384).
-                    return Err(match e {
-                        StatusError::Cancelled => CirrusError::Cancelled,
-                        StatusError::Timeout => CirrusError::Timeout(Duration::from_secs(0)),
-                        StatusError::Failed(s) => CirrusError::Backend(s),
-                    });
-                }
-            }
-            Ok(())
+            // Await every member *concurrently*, returning as soon as the first
+            // one fails — bluesky `_wait` runs the group through asyncio
+            // `FIRST_EXCEPTION` (run_engine.py:2311-2324), so a status that fails
+            // fast short-circuits the wait even while an earlier-issued status in
+            // the same group is still pending. A sequential await would block on
+            // the earlier status and not observe the failure until it resolved
+            // (and would hang indefinitely if it never did). The error still
+            // propagates regardless of `error_on_timeout`; only the group-level
+            // wait timeout below is gated by it, matching bluesky where
+            // `error_on_timeout` suppresses only `WaitForTimeoutError`
+            // (run_engine.py:2341-2346) while a `FailedStatus` always raises
+            // (:2384).
+            futures::future::try_join_all(members)
+                .await
+                .map(|_| ())
+                .map_err(|e| match e {
+                    StatusError::Cancelled => CirrusError::Cancelled,
+                    StatusError::Timeout => CirrusError::Timeout(Duration::from_secs(0)),
+                    StatusError::Failed(s) => CirrusError::Backend(s),
+                })
         };
         match timeout {
             Some(d) => match tokio::time::timeout(d, fut).await {
@@ -2048,5 +2050,37 @@ mod tests {
             before, after,
             "signal handler must not increment Arc<RunEngine> strong count"
         );
+    }
+
+    /// A `wait` on a group must surface a member's failure as soon as it
+    /// happens (bluesky FIRST_EXCEPTION), not after an earlier-issued member
+    /// resolves. The group here holds a never-completing status *first* and a
+    /// failed status *second*: concurrent waiting returns the failure promptly,
+    /// while a sequential await would block on the pending status forever.
+    #[tokio::test]
+    async fn wait_group_short_circuits_on_first_failing_member() {
+        let re = RunEngine::new(Vec::new());
+        // member[0]: pending forever — keep its setter alive, never resolve it.
+        let (pending, _keep) = Status::new();
+        // member[1]: already failed.
+        let failed = Status::fail(StatusError::Failed("boom".into()));
+        {
+            let mut state = re.state.lock().await;
+            state.groups.insert(
+                "g".into(),
+                WaitGroup {
+                    members: vec![pending, failed],
+                },
+            );
+        }
+        // 500ms is a generous upper bound: concurrently the failure resolves
+        // immediately; a sequential await would block on the pending member
+        // until this timeout elapses and never observe the failure.
+        let result =
+            tokio::time::timeout(Duration::from_millis(500), re.wait_group("g", true, None)).await;
+        match result {
+            Ok(Err(CirrusError::Backend(msg))) => assert_eq!(msg, "boom"),
+            other => panic!("expected a prompt Backend(\"boom\") failure, got {other:?}"),
+        }
     }
 }
