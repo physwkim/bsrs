@@ -1371,6 +1371,15 @@ impl RunEngine {
             }
             Msg::Checkpoint => {
                 let mut state = self.state.lock().await;
+                // A checkpoint between `create` and `save` is illegal: rewinding
+                // to a point inside an open event bundle cannot be done cleanly.
+                // bluesky rejects it with IllegalMessageSequence
+                // (run_engine.py:2444-2446); mirror that here.
+                if state.bundler.as_ref().is_some_and(|b| b.is_bundling()) {
+                    return Err(CirrusError::Plan(
+                        "Cannot 'checkpoint' after 'create' and before 'save'".into(),
+                    ));
+                }
                 // Clear cache up to this point — the rewindable region restarts.
                 Self::reset_checkpoint_state(&mut state);
                 state.rewindable = true;

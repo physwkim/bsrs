@@ -988,3 +988,29 @@ async fn stage_resets_rewind_cache_so_pre_stage_set_not_replayed_on_resume() {
         "Stage must reset the rewind cache so the pre-stage Set is not replayed on resume"
     );
 }
+
+#[tokio::test]
+async fn checkpoint_inside_open_bundle_is_rejected() {
+    // A checkpoint issued between `create` and `save` is illegal — rewinding
+    // to a point inside an open event bundle cannot be done cleanly. bluesky
+    // raises IllegalMessageSequence (run_engine.py:2444-2446); cirrus must
+    // reject it, failing the run rather than silently checkpointing mid-bundle.
+    let re = RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new());
+    let plan = cirrus_core::plan::plan_box(async_stream::stream! {
+        yield cirrus_core::Msg::OpenRun(Default::default());
+        yield cirrus_core::Msg::Create { stream_name: "primary".into() };
+        // Bundle is open here — this checkpoint is illegal.
+        yield cirrus_core::Msg::Checkpoint;
+        yield cirrus_core::Msg::Save;
+        yield cirrus_core::Msg::CloseRun {
+            exit_status: "success".into(),
+            reason: None,
+        };
+    });
+
+    let result = re.run_async(plan).await.unwrap();
+    assert_eq!(
+        result.exit_status, "fail",
+        "a checkpoint between create and save must be rejected"
+    );
+}

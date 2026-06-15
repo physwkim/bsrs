@@ -149,6 +149,15 @@ impl RunBundler {
         Ok(out)
     }
 
+    /// Whether an event bundle is currently open — after `create`, before the
+    /// paired `save`/`drop`/`rewind`. The cirrus equivalent of bluesky's
+    /// `RunBundler.bundling` flag (bundlers.py:147, set on `create`:386,
+    /// cleared on `save`/`drop`/`rewind`:533/573/584). Used to reject an
+    /// illegal `checkpoint` issued inside an open bundle.
+    pub fn is_bundling(&self) -> bool {
+        self.open.is_some()
+    }
+
     /// Discard the open bundle.
     pub fn drop_bundle(&mut self) -> Result<()> {
         if self.open.take().is_none() {
