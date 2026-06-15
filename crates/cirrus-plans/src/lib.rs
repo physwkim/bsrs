@@ -630,6 +630,11 @@ pub fn list_scan(
 /// `rel_scan(detectors, motor, start, stop, num)` — like `scan` but
 /// `start`/`stop` are relative to the motor's current position. Caller
 /// supplies `current` (read off the motor before invoking).
+///
+/// After the scan's run closes, the motor is returned to `current`,
+/// mirroring bluesky's `reset_positions_decorator` on `rel_scan`
+/// (`plans.py:1591`). Like cirrus's other plan-level brackets, the reset
+/// runs on normal completion, not after an engine-side abort.
 pub fn rel_scan(
     detectors: Vec<Arc<dyn ReadableObj>>,
     motor: Arc<dyn MovableObj>,
@@ -639,14 +644,27 @@ pub fn rel_scan(
     stop: f64,
     num: usize,
 ) -> Plan {
-    scan(
+    let reset_motor = motor.clone();
+    let inner = scan(
         detectors,
         motor,
         motor_reader,
         current + start,
         current + stop,
         num,
-    )
+    );
+    plan_box(async_stream::stream! {
+        let mut inner = inner;
+        while let Some(item) = futures::StreamExt::next(&mut inner).await {
+            if let cirrus_core::plan::PlanItem::Bare(m) = item {
+                yield m;
+            }
+        }
+        // `current` is the readback the caller snapshotted before the scan;
+        // return the motor there so a relative scan leaves no net motion.
+        yield Msg::Set { obj: reset_motor, value: current, group: Some("reset".into()) };
+        yield Msg::Wait { group: "reset".into(), error_on_timeout: true, timeout: None };
+    })
 }
 
 /// `grid_scan(dets, m1, s1, e1, n1, m2, s2, e2, n2)` — 2-D rectilinear scan.
@@ -858,15 +876,15 @@ pub fn list_grid_scan(detectors: Vec<Arc<dyn ReadableObj>>, axes: Vec<ListGridAx
 /// that axis motor's current readback, snapshotted once per motor via
 /// `LocatableObj::locate_dyn`.
 ///
-/// As with cirrus's other `rel_*` scans, the motors are not returned to their
-/// starting positions afterward (offset-only; bluesky also wraps in
-/// `reset_positions_decorator`). Like [`list_grid_scan`], snaking is not
-/// applied — each axis traces a plain outer-product trajectory.
+/// As in bluesky, each axis motor is returned to its starting position after
+/// the scan (`reset_positions_decorator`). Like [`list_grid_scan`], snaking is
+/// not applied — each axis traces a plain outer-product trajectory.
 pub fn rel_list_grid_scan(
     detectors: Vec<Arc<dyn ReadableObj>>,
     axes: Vec<RelListGridAxis>,
 ) -> Plan {
-    plan_box(async_stream::stream! {
+    let reset_motors: Vec<Arc<dyn LocatableObj>> = axes.iter().map(|(m, _, _)| m.clone()).collect();
+    let inner = plan_box(async_stream::stream! {
         let mut abs_axes: Vec<ListGridAxis> = Vec::with_capacity(axes.len());
         for (motor, reader, points) in axes {
             let bias = motor.locate_dyn().await.map(|l| l.readback).unwrap_or(0.0);
@@ -880,7 +898,8 @@ pub fn rel_list_grid_scan(
                 yield m;
             }
         }
-    })
+    });
+    preprocessors::reset_positions_wrapper(inner, reset_motors)
 }
 
 /// `spiral_square(dets, x_motor, y_motor, x_center, y_center, x_range,
@@ -1005,7 +1024,8 @@ pub fn rel_list_scan(
     motor_reader: Arc<dyn ReadableObj>,
     points: Vec<f64>,
 ) -> Plan {
-    plan_box(async_stream::stream! {
+    let reset_motor = motor.clone();
+    let inner = plan_box(async_stream::stream! {
         let bias = motor.locate_dyn().await
             .map(|l| l.readback)
             .unwrap_or(0.0);
@@ -1017,11 +1037,14 @@ pub fn rel_list_scan(
                 yield m;
             }
         }
-    })
+    });
+    preprocessors::reset_positions_wrapper(inner, vec![reset_motor])
 }
 
 /// `rel_grid_scan` — relative variant of `grid_scan`. Both motors are
-/// `LocatableObj` so we can snapshot starting positions.
+/// `LocatableObj` so we can snapshot starting positions. As in bluesky, both
+/// motors are returned to those positions after the scan
+/// (`reset_positions_decorator`).
 #[allow(clippy::too_many_arguments)]
 pub fn rel_grid_scan(
     detectors: Vec<Arc<dyn ReadableObj>>,
@@ -1036,7 +1059,8 @@ pub fn rel_grid_scan(
     e2: f64,
     n2: usize,
 ) -> Plan {
-    plan_box(async_stream::stream! {
+    let reset_motors: Vec<Arc<dyn LocatableObj>> = vec![motor1.clone(), motor2.clone()];
+    let inner = plan_box(async_stream::stream! {
         let b1 = motor1.locate_dyn().await.map(|l| l.readback).unwrap_or(0.0);
         let b2 = motor2.locate_dyn().await.map(|l| l.readback).unwrap_or(0.0);
         let m1mv: Arc<dyn MovableObj> = motor1;
@@ -1053,7 +1077,8 @@ pub fn rel_grid_scan(
                 yield m;
             }
         }
-    })
+    });
+    preprocessors::reset_positions_wrapper(inner, reset_motors)
 }
 
 /// `log_scan(detectors, motor, motor_readback, start, stop, num)` —
@@ -1091,10 +1116,8 @@ pub fn log_scan(
 /// motor's current readback, snapshotted once via `LocatableObj::locate_dyn`
 /// (bluesky `plans.rel_log_scan`, `relative_set_decorator`).
 ///
-/// Consistent with cirrus's other `rel_*` scans, the motor is *not* returned
-/// to its starting position afterward — bluesky additionally wraps in
-/// `reset_positions_decorator`, which cirrus omits uniformly across the
-/// `rel_*` family.
+/// As in bluesky, the motor is returned to its starting position after the
+/// scan (`reset_positions_decorator` over `relative_set_decorator`).
 pub fn rel_log_scan(
     detectors: Vec<Arc<dyn ReadableObj>>,
     motor: Arc<dyn LocatableObj>,
@@ -1105,7 +1128,8 @@ pub fn rel_log_scan(
 ) -> Plan {
     let mv: Arc<dyn MovableObj> = motor.clone();
     let inner = log_scan(detectors, mv, motor_readback, start, stop, num);
-    preprocessors::relative_set_wrapper(inner, vec![motor])
+    let rel = preprocessors::relative_set_wrapper(inner, vec![motor.clone()]);
+    preprocessors::reset_positions_wrapper(rel, vec![motor])
 }
 
 /// `spiral_fermat(detectors, x_motor, x_reader, y_motor, y_reader,
@@ -1153,9 +1177,8 @@ pub fn spiral_fermat(
 /// Both axis motors are `LocatableObj` so the offsets can be snapshotted
 /// once via `relative_set_wrapper` (bluesky `plans.rel_spiral`).
 ///
-/// Like the other `rel_*` plans, the motors are not returned to their start
-/// positions afterward (cirrus's rel_* family is offset-only; bluesky also
-/// applies `reset_positions_decorator`).
+/// As in bluesky, both motors are returned to their start positions after the
+/// scan (`reset_positions_decorator` over `relative_set_decorator`).
 #[allow(clippy::too_many_arguments)]
 pub fn rel_spiral(
     detectors: Vec<Arc<dyn ReadableObj>>,
@@ -1175,12 +1198,14 @@ pub fn rel_spiral(
     let inner = spiral(
         detectors, xm, x_reader, ym, y_reader, x_start, y_start, x_range, y_range, dr, nth,
     );
-    preprocessors::relative_set_wrapper(inner, vec![x_motor, y_motor])
+    let rel = preprocessors::relative_set_wrapper(inner, vec![x_motor.clone(), y_motor.clone()]);
+    preprocessors::reset_positions_wrapper(rel, vec![x_motor, y_motor])
 }
 
 /// `rel_spiral_square(...)` — relative variant of [`spiral_square`]; the
 /// square raster spiral is centred on the motors' current readbacks
-/// (bluesky `plans.rel_spiral_square`). Offset-only, see [`rel_spiral`].
+/// (bluesky `plans.rel_spiral_square`). Returns the motors to start, see
+/// [`rel_spiral`].
 #[allow(clippy::too_many_arguments)]
 pub fn rel_spiral_square(
     detectors: Vec<Arc<dyn ReadableObj>>,
@@ -1200,12 +1225,14 @@ pub fn rel_spiral_square(
     let inner = spiral_square(
         detectors, xm, x_reader, ym, y_reader, x_center, y_center, x_range, y_range, x_num, y_num,
     );
-    preprocessors::relative_set_wrapper(inner, vec![x_motor, y_motor])
+    let rel = preprocessors::relative_set_wrapper(inner, vec![x_motor.clone(), y_motor.clone()]);
+    preprocessors::reset_positions_wrapper(rel, vec![x_motor, y_motor])
 }
 
 /// `rel_spiral_fermat(...)` — relative variant of [`spiral_fermat`]; the
 /// Fermat (sunflower) spiral is centred on the motors' current readbacks
-/// (bluesky `plans.rel_spiral_fermat`). Offset-only, see [`rel_spiral`].
+/// (bluesky `plans.rel_spiral_fermat`). Returns the motors to start, see
+/// [`rel_spiral`].
 #[allow(clippy::too_many_arguments)]
 pub fn rel_spiral_fermat(
     detectors: Vec<Arc<dyn ReadableObj>>,
@@ -1225,7 +1252,8 @@ pub fn rel_spiral_fermat(
     let inner = spiral_fermat(
         detectors, xm, x_reader, ym, y_reader, x_start, y_start, x_range, y_range, dr, factor,
     );
-    preprocessors::relative_set_wrapper(inner, vec![x_motor, y_motor])
+    let rel = preprocessors::relative_set_wrapper(inner, vec![x_motor.clone(), y_motor.clone()]);
+    preprocessors::reset_positions_wrapper(rel, vec![x_motor, y_motor])
 }
 
 /// `fly(flyer, dets)` — kickoff, collect while completing, unstage.
@@ -1444,9 +1472,8 @@ pub fn tune_centroid(
 /// `rel_adaptive_scan(...)` — relative variant of [`adaptive_scan`].
 /// Reads the motor's current readback once at start, adds the
 /// supplied `start`/`stop` offsets, and runs `adaptive_scan` over
-/// that absolute range. After the scan, the motor remains at its
-/// last position; pair with `reset_positions_wrapper` if you want
-/// to restore the original.
+/// that absolute range. As in bluesky, the motor is returned to its
+/// starting position after the scan (`reset_positions_decorator`).
 #[allow(clippy::too_many_arguments)]
 pub fn rel_adaptive_scan(
     detectors: Vec<Arc<dyn ReadableObj>>,
@@ -1461,7 +1488,8 @@ pub fn rel_adaptive_scan(
     backstep: bool,
 ) -> Plan {
     let signal_field = signal_field.into();
-    plan_box(async_stream::stream! {
+    let reset_motor = motor.clone();
+    let inner = plan_box(async_stream::stream! {
         let center = match motor.locate_dyn().await {
             Ok(loc) => loc.readback,
             Err(e) => {
@@ -1493,7 +1521,8 @@ pub fn rel_adaptive_scan(
                 yield m;
             }
         }
-    })
+    });
+    preprocessors::reset_positions_wrapper(inner, vec![reset_motor])
 }
 
 #[cfg(test)]
@@ -1735,14 +1764,21 @@ mod tests {
         }) as Arc<dyn cirrus_core::msg::LocatableObj>;
         let reader = Arc::new(FakeReadable("m_rbv".into())) as Arc<dyn ReadableObj>;
         let plan = rel_log_scan(vec![], motor, reader, 1.0, 100.0, 3);
-        let vals = set_values(&drain(plan).await);
-        assert_eq!(vals.len(), 3, "expected 3 Set targets, got {vals:?}");
+        let msgs = drain(plan).await;
+        let vals = scan_set_values(&msgs);
+        assert_eq!(vals.len(), 3, "expected 3 scan Set targets, got {vals:?}");
         for (got, want) in vals.iter().zip([11.0, 20.0, 110.0]) {
             assert!(
                 (got - want).abs() < 1e-9,
                 "Set target {got} != expected {want} (bias-offset log point)"
             );
         }
+        // After the scan the motor returns to its starting readback (10).
+        assert_eq!(
+            named_reset_sets(&msgs),
+            vec![("m".to_string(), 10.0)],
+            "rel_log_scan must reset the motor to start"
+        );
     }
 
     #[tokio::test]
@@ -1764,6 +1800,42 @@ mod tests {
         msgs.iter()
             .filter_map(|m| match m {
                 Msg::Set { obj, value, .. } => Some((obj.name().to_string(), *value)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Set targets from the scan body only (excludes the `reset` epilogue that
+    /// returns relative-scan motors to their starting positions).
+    fn scan_set_values(msgs: &[Msg]) -> Vec<f64> {
+        msgs.iter()
+            .filter_map(|m| match m {
+                Msg::Set { value, group, .. } if group.as_deref() != Some("reset") => Some(*value),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Named Set targets from the scan body only (excludes the `reset` epilogue).
+    fn named_scan_sets(msgs: &[Msg]) -> Vec<(String, f64)> {
+        msgs.iter()
+            .filter_map(|m| match m {
+                Msg::Set { obj, value, group } if group.as_deref() != Some("reset") => {
+                    Some((obj.name().to_string(), *value))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Named Set targets from the `reset` epilogue only — the moves that return
+    /// each motor to its starting readback after a relative scan.
+    fn named_reset_sets(msgs: &[Msg]) -> Vec<(String, f64)> {
+        msgs.iter()
+            .filter_map(|m| match m {
+                Msg::Set { obj, value, group } if group.as_deref() == Some("reset") => {
+                    Some((obj.name().to_string(), *value))
+                }
                 _ => None,
             })
             .collect()
@@ -1809,8 +1881,9 @@ mod tests {
     /// readbacks `bx`/`by`) and assert each Set target shifts by the matching
     /// motor's readback: x-targets by `bx`, y-targets by `by`.
     async fn assert_xy_relative_offsets(abs: Plan, rel: Plan, bx: f64, by: f64) {
-        let abs_sets = named_set_values(&drain(abs).await);
-        let rel_sets = named_set_values(&drain(rel).await);
+        let abs_sets = named_scan_sets(&drain(abs).await);
+        let rel_msgs = drain(rel).await;
+        let rel_sets = named_scan_sets(&rel_msgs);
         assert_eq!(abs_sets.len(), rel_sets.len(), "Set count must match");
         assert!(!abs_sets.is_empty(), "plan produced no Set targets");
         for ((an, av), (rn, rv)) in abs_sets.iter().zip(&rel_sets) {
@@ -1821,6 +1894,12 @@ mod tests {
                 "{rn}: relative {rv} != absolute {av} + bias {bias}"
             );
         }
+        // After the scan both motors return to their starting readbacks.
+        assert_eq!(
+            named_reset_sets(&rel_msgs),
+            vec![("x".to_string(), bx), ("y".to_string(), by)],
+            "rel scan must reset both motors to start"
+        );
     }
 
     #[tokio::test]
@@ -1929,13 +2008,42 @@ mod tests {
         let (xm, ym) = motor_xy(10.0, 20.0);
         let axes: Vec<RelListGridAxis> =
             vec![(xm, rdr("xr"), vec![1.0, 2.0]), (ym, rdr("yr"), vec![5.0])];
-        let sets = named_set_values(&drain(rel_list_grid_scan(vec![], axes)).await);
+        let msgs = drain(rel_list_grid_scan(vec![], axes)).await;
+        let sets = named_scan_sets(&msgs);
         let expected = [("x", 11.0), ("y", 25.0), ("x", 12.0), ("y", 25.0)];
         assert_eq!(sets.len(), expected.len(), "got {sets:?}");
         for ((gn, gv), (en, ev)) in sets.iter().zip(expected) {
             assert_eq!(gn, en, "motor order");
             assert!((gv - ev).abs() < 1e-9, "{gn}: {gv} != {ev}");
         }
+        // Each axis returns to its starting readback after the scan.
+        assert_eq!(
+            named_reset_sets(&msgs),
+            vec![("x".to_string(), 10.0), ("y".to_string(), 20.0)],
+            "rel_list_grid_scan must reset every axis to start"
+        );
+    }
+
+    #[tokio::test]
+    async fn rel_scan_returns_motor_to_supplied_current() {
+        // current 10, offsets -2..2 over 3 points → absolute targets [8, 10, 12];
+        // the reset epilogue then returns the motor to `current` (10) so the
+        // relative scan leaves no net motion.
+        let motor = Arc::new(FakeMotor {
+            name: "m".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let msgs = drain(rel_scan(vec![], motor, rdr("m_rbv"), 10.0, -2.0, 2.0, 3)).await;
+        let vals = scan_set_values(&msgs);
+        assert_eq!(vals.len(), 3, "expected 3 scan Set targets, got {vals:?}");
+        for (got, want) in vals.iter().zip([8.0, 10.0, 12.0]) {
+            assert!((got - want).abs() < 1e-9, "Set target {got} != {want}");
+        }
+        assert_eq!(
+            named_reset_sets(&msgs),
+            vec![("m".to_string(), 10.0)],
+            "rel_scan must return the motor to the supplied current"
+        );
     }
 
     #[tokio::test]
