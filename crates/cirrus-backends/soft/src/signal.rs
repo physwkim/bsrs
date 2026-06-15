@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use cirrus_core::error::Result;
 use cirrus_core::reading::ReadingValue;
 use cirrus_core::status::SubToken;
-use cirrus_event_model::{make_datakey, DataKey, Dtype, SignalMetadata};
+use cirrus_event_model::{make_datakey, DataKey, Dtype, DtypeNumpy, SignalMetadata};
 use cirrus_protocols_async::{ReadingValueCallback, SignalBackend};
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,7 +34,7 @@ struct Inner<T: Clone + Send + Sync + 'static> {
     next_id: AtomicU64,
     units: Option<String>,
     dtype: Dtype,
-    dtype_numpy: Option<String>,
+    dtype_numpy: Option<DtypeNumpy>,
     shape: Vec<Option<u64>>,
 }
 
@@ -100,7 +100,7 @@ where
     }
 
     /// Set the dtype_numpy metadata.
-    pub fn with_dtype_numpy(self, np: impl Into<String>) -> Self {
+    pub fn with_dtype_numpy(self, np: impl Into<DtypeNumpy>) -> Self {
         let inner = Arc::new(Inner {
             value: Mutex::new(self.inner.value.lock().unwrap().clone()),
             setpoint: Mutex::new(self.inner.setpoint.lock().unwrap().clone()),

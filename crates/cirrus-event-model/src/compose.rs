@@ -198,7 +198,9 @@ impl RunBundle {
             uid: new_uid(),
             run_start: self.start_uid.clone(),
             time: now(),
-            exit_status: exit_status.to_string(),
+            exit_status: exit_status
+                .parse::<ExitStatus>()
+                .expect("close_run_if_open normalizes exit_status to a schema-valid value"),
             reason,
             num_events,
             ..Default::default()

@@ -239,14 +239,14 @@ mod tests {
     use super::*;
     use crate::ZmqDocumentSink;
     use cirrus_engine::DocumentSink;
-    use cirrus_event_model::RunStop;
+    use cirrus_event_model::{ExitStatus, RunStop};
 
     fn fake_stop() -> Document {
         Document::Stop(RunStop {
             uid: "stop-1".into(),
             run_start: "run-1".into(),
             time: 1.0,
-            exit_status: "success".into(),
+            exit_status: ExitStatus::Success,
             reason: None,
             num_events: std::collections::HashMap::new(),
             ..Default::default()
@@ -285,7 +285,7 @@ mod tests {
         }
         let got = got.expect("never received via SUB");
         match got {
-            Document::Stop(s) => assert_eq!(s.exit_status, "success"),
+            Document::Stop(s) => assert_eq!(s.exit_status, ExitStatus::Success),
             _ => panic!("wrong doc kind"),
         }
     }

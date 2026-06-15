@@ -778,7 +778,7 @@ async fn msg_fail_marks_run_failed_with_reason() {
             _ => None,
         })
         .expect("RunStop should be emitted");
-    assert_eq!(stop.exit_status, "fail");
+    assert_eq!(stop.exit_status, ExitStatus::Fail);
     assert!(
         stop.reason
             .as_ref()

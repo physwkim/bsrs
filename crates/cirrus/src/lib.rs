@@ -39,7 +39,8 @@ pub mod prelude {
     };
     pub use cirrus_engine::{BroadcastSink, DocumentSink, RunEngine, RunResult};
     pub use cirrus_event_model::{
-        DataKey, EventDescriptor, RunStart, RunStop, StreamDatum, StreamRange, StreamResource,
+        DataKey, EventDescriptor, ExitStatus, RunStart, RunStop, StreamDatum, StreamRange,
+        StreamResource,
     };
 }
 

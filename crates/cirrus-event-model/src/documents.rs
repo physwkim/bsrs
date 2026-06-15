@@ -103,6 +103,50 @@ pub struct RunStart {
 
 // -- run_stop.json ------------------------------------------------------------
 
+/// Valid values of [`RunStop::exit_status`], matching the `exit_status` enum in
+/// the run_stop JSON schema (`success` | `abort` | `fail`).
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExitStatus {
+    /// Run completed normally.
+    #[default]
+    Success,
+    /// Run was aborted by the user (or normalised from `halt`).
+    Abort,
+    /// Run ended due to an error.
+    Fail,
+}
+
+impl ExitStatus {
+    /// Return the lowercase string representation (`"success"` / `"abort"` /
+    /// `"fail"`), identical to what serde serialises.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExitStatus::Success => "success",
+            ExitStatus::Abort => "abort",
+            ExitStatus::Fail => "fail",
+        }
+    }
+}
+
+impl std::fmt::Display for ExitStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ExitStatus {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "success" => Ok(ExitStatus::Success),
+            "abort" => Ok(ExitStatus::Abort),
+            "fail" => Ok(ExitStatus::Fail),
+            _ => Err(format!("unknown exit_status: {s:?}")),
+        }
+    }
+}
+
 /// Final document of a run.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct RunStop {
@@ -113,7 +157,7 @@ pub struct RunStop {
     /// Unix epoch time the run ended.
     pub time: f64,
     /// One of `success` / `abort` / `fail`.
-    pub exit_status: String,
+    pub exit_status: ExitStatus,
     /// Optional human-readable reason.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub reason: Option<String>,
@@ -190,6 +234,36 @@ pub struct Limits {
     pub rds: Option<RdsRange>,
 }
 
+/// Numpy dtype annotation for a [`DataKey`], matching the `dtype_numpy` field in
+/// the event_descriptor JSON schema (`anyOf[string, array-of-pairs]`).
+///
+/// `Scalar` holds a plain numpy dtype string (e.g. `"<f8"`, `"|u1"`).
+/// `Structured` holds a list of `(name, dtype)` pairs for compound/structured
+/// numpy dtypes (e.g. `[("x", "<f4"), ("y", "<f4")]`).
+///
+/// The `#[serde(untagged)]` means serde tries `Scalar` first (string), then
+/// `Structured` (array of 2-element arrays) — matching the schema's `anyOf`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum DtypeNumpy {
+    /// A simple numpy dtype string, e.g. `"<f8"`.
+    Scalar(String),
+    /// A structured numpy dtype: ordered list of `(field_name, dtype_string)` pairs.
+    Structured(Vec<(String, String)>),
+}
+
+impl From<String> for DtypeNumpy {
+    fn from(s: String) -> Self {
+        DtypeNumpy::Scalar(s)
+    }
+}
+
+impl From<&str> for DtypeNumpy {
+    fn from(s: &str) -> Self {
+        DtypeNumpy::Scalar(s.to_owned())
+    }
+}
+
 /// Per-stream descriptor of a single field.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct DataKey {
@@ -199,9 +273,10 @@ pub struct DataKey {
     pub dtype: Dtype,
     /// Shape; `[]` for scalar.
     pub shape: Vec<Option<u64>>,
-    /// Optional numpy dtype string (e.g. `<f8`).
+    /// Optional numpy dtype — a plain string (`Scalar`) or a list of
+    /// `(name, dtype)` pairs for structured types (`Structured`).
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub dtype_numpy: Option<String>,
+    pub dtype_numpy: Option<DtypeNumpy>,
     /// `STREAM:` if data is referenced via StreamResource/StreamDatum.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub external: Option<String>,
@@ -258,7 +333,7 @@ pub fn make_datakey(
     source: impl Into<String>,
     dtype: Dtype,
     shape: Vec<Option<u64>>,
-    dtype_numpy: Option<String>,
+    dtype_numpy: Option<DtypeNumpy>,
     meta: SignalMetadata,
 ) -> DataKey {
     DataKey {
@@ -563,7 +638,7 @@ mod tests {
                 uid: "stop-1".into(),
                 run_start: "run-1".into(),
                 time: 1700000005.0,
-                exit_status: "success".into(),
+                exit_status: ExitStatus::Success,
                 reason: None,
                 num_events: HashMap::new(),
                 ..Default::default()
@@ -585,7 +660,7 @@ mod tests {
             uid: "s".into(),
             run_start: "r".into(),
             time: 0.0,
-            exit_status: "success".into(),
+            exit_status: ExitStatus::Success,
             reason: None,
             num_events: HashMap::new(),
             ..Default::default()
@@ -642,7 +717,7 @@ mod tests {
         assert_eq!(dk.source, "soft://m1");
         assert_eq!(dk.dtype, Dtype::Number);
         assert_eq!(dk.shape, Vec::<Option<u64>>::new());
-        assert_eq!(dk.dtype_numpy.as_deref(), Some("<f8"));
+        assert_eq!(dk.dtype_numpy, Some(DtypeNumpy::Scalar("<f8".into())));
         assert_eq!(dk.units.as_deref(), Some("mm"));
         assert_eq!(dk.precision, Some(3));
         assert_eq!(dk.limits, Some(limits));
@@ -751,6 +826,68 @@ mod tests {
         assert!(!stop.extra.contains_key("data_type"));
         // Re-serializing reproduces the incoming object verbatim.
         assert_eq!(serde_json::to_value(&stop).unwrap(), incoming);
+    }
+
+    #[test]
+    fn exit_status_serde_round_trip() {
+        // Schema enum: success | abort | fail — each must survive JSON round-trip.
+        for (variant, json_str) in [
+            (ExitStatus::Success, "\"success\""),
+            (ExitStatus::Abort, "\"abort\""),
+            (ExitStatus::Fail, "\"fail\""),
+        ] {
+            let ser = serde_json::to_string(&variant).expect("serialize");
+            assert_eq!(ser, json_str);
+            let back: ExitStatus = serde_json::from_str(&ser).expect("deserialize");
+            assert_eq!(back, variant);
+        }
+        // RunStop with exit_status round-trips through serde_json::Value verbatim.
+        let incoming = serde_json::json!({
+            "uid": "stop-1",
+            "run_start": "run-1",
+            "time": 5.0,
+            "exit_status": "abort",
+        });
+        let stop: RunStop = serde_json::from_value(incoming.clone()).unwrap();
+        assert_eq!(stop.exit_status, ExitStatus::Abort);
+        assert_eq!(serde_json::to_value(&stop).unwrap(), incoming);
+    }
+
+    #[test]
+    fn dtype_numpy_serde_round_trip_scalar_and_structured() {
+        // Scalar: JSON string -> DtypeNumpy::Scalar -> same JSON string.
+        let scalar_json = serde_json::json!("<f8");
+        let scalar: DtypeNumpy = serde_json::from_value(scalar_json.clone()).unwrap();
+        assert_eq!(scalar, DtypeNumpy::Scalar("<f8".into()));
+        assert_eq!(serde_json::to_value(&scalar).unwrap(), scalar_json);
+
+        // Structured: JSON array-of-pairs -> DtypeNumpy::Structured -> same JSON.
+        let structured_json = serde_json::json!([["x", "<f4"], ["y", "<f4"]]);
+        let structured: DtypeNumpy = serde_json::from_value(structured_json.clone()).unwrap();
+        assert_eq!(
+            structured,
+            DtypeNumpy::Structured(vec![("x".into(), "<f4".into()), ("y".into(), "<f4".into()),])
+        );
+        assert_eq!(serde_json::to_value(&structured).unwrap(), structured_json);
+
+        // Option<DtypeNumpy> inside a DataKey field round-trips through JSON.
+        let dk = make_datakey(
+            "det://x",
+            Dtype::Array,
+            vec![],
+            Some(DtypeNumpy::Structured(vec![
+                ("real".into(), "<f4".into()),
+                ("imag".into(), "<f4".into()),
+            ])),
+            SignalMetadata::default(),
+        );
+        let json = serde_json::to_value(&dk).unwrap();
+        assert_eq!(
+            json["dtype_numpy"],
+            serde_json::json!([["real", "<f4"], ["imag", "<f4"]])
+        );
+        let back: DataKey = serde_json::from_value(json).unwrap();
+        assert_eq!(back.dtype_numpy, dk.dtype_numpy);
     }
 
     #[test]
