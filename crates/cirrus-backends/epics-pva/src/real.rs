@@ -290,7 +290,7 @@ impl SignalBackend<f64> for EpicsPvaBackend<f64> {
             .ok_or_else(|| CirrusError::Backend(format!("pva: not numeric: {f:?}")))?;
         Ok(ReadingValue {
             value: serde_json::Value::from(v),
-            timestamp: now_ts(),
+            timestamp: pv_field_to_ts(&f).unwrap_or_else(now_ts),
             alarm_severity: pv_field_to_alarm_severity(&f),
             message: None,
         })
@@ -408,7 +408,7 @@ impl SignalBackend<Vec<f64>> for EpicsPvaBackend<Vec<f64>> {
             .ok_or_else(|| CirrusError::Backend(format!("pva: not a numeric array: {f:?}")))?;
         Ok(ReadingValue {
             value: serde_json::Value::from(v),
-            timestamp: now_ts(),
+            timestamp: pv_field_to_ts(&f).unwrap_or_else(now_ts),
             alarm_severity: pv_field_to_alarm_severity(&f),
             message: None,
         })
@@ -505,7 +505,7 @@ impl SignalBackend<String> for EpicsPvaBackend<String> {
             .ok_or_else(|| CirrusError::Backend(format!("pva: not string: {f:?}")))?;
         Ok(ReadingValue {
             value: serde_json::Value::from(s),
-            timestamp: now_ts(),
+            timestamp: pv_field_to_ts(&f).unwrap_or_else(now_ts),
             alarm_severity: pv_field_to_alarm_severity(&f),
             message: None,
         })
@@ -599,7 +599,7 @@ impl SignalBackend<i64> for EpicsPvaBackend<i64> {
             .ok_or_else(|| CirrusError::Backend(format!("pva: not int: {f:?}")))?;
         Ok(ReadingValue {
             value: serde_json::Value::from(i),
-            timestamp: now_ts(),
+            timestamp: pv_field_to_ts(&f).unwrap_or_else(now_ts),
             alarm_severity: pv_field_to_alarm_severity(&f),
             message: None,
         })
@@ -692,7 +692,7 @@ impl SignalBackend<bool> for EpicsPvaBackend<bool> {
             .ok_or_else(|| CirrusError::Backend(format!("pva: not bool: {f:?}")))?;
         Ok(ReadingValue {
             value: serde_json::Value::from(b),
-            timestamp: now_ts(),
+            timestamp: pv_field_to_ts(&f).unwrap_or_else(now_ts),
             alarm_severity: pv_field_to_alarm_severity(&f),
             message: None,
         })
