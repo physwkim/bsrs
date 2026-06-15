@@ -684,9 +684,19 @@ fn queue_item_update(queue: &Arc<StdMutex<PlanQueue>>, params: &Value) -> Value 
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
+    // replace=true: generate a new UID for the replacement item (manager.py:2552).
+    let replace = params
+        .get("replace")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let mut q = queue.lock().unwrap();
     let new_item = QueuedItem::plan(name, item);
-    match q.update(&uid, new_item) {
+    let result = if replace {
+        q.replace_at_uid(&uid, new_item)
+    } else {
+        q.update(&uid, new_item)
+    };
+    match result {
         Some(updated) => json!({
             "success": true,
             "msg": "",

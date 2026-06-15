@@ -117,11 +117,18 @@ impl PlanQueue {
     pub fn get_by_uid(&self, uid: &str) -> Option<&QueuedItem> {
         self.items.iter().find(|i| i.item_uid == uid)
     }
-    /// Update an item by UID. Returns the new item if found.
+    /// Update an item by UID, preserving the UID. Returns the new item if found.
     pub fn update(&mut self, uid: &str, replacement: QueuedItem) -> Option<QueuedItem> {
         let pos = self.items.iter().position(|i| i.item_uid == uid)?;
         let mut new_item = replacement;
         new_item.item_uid = uid.to_string();
+        self.items[pos] = new_item.clone();
+        self.bump_queue_uid();
+        Some(new_item)
+    }
+    /// Replace an item by UID with a fresh UID (bluesky `replace=True` behaviour).
+    pub fn replace_at_uid(&mut self, uid: &str, new_item: QueuedItem) -> Option<QueuedItem> {
+        let pos = self.items.iter().position(|i| i.item_uid == uid)?;
         self.items[pos] = new_item.clone();
         self.bump_queue_uid();
         Some(new_item)
