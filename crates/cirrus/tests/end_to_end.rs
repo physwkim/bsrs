@@ -1044,3 +1044,37 @@ async fn empty_create_save_emits_no_descriptor_or_event() {
         "empty create/save must emit no Descriptor or Event; got {docs:#?}"
     );
 }
+
+#[tokio::test]
+async fn second_open_run_rejected_without_emitting_a_second_start() {
+    // A second OpenRun while the first run is still open is illegal. The
+    // rejection must happen before any side effect — no spurious RunStart,
+    // matching bluesky, which checks run_key in the bundlers before scan_id
+    // resolution and emit (run_engine.py:1849-1851).
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let plan = cirrus_core::plan::plan_box(async_stream::stream! {
+        yield cirrus_core::Msg::OpenRun(Default::default());
+        yield cirrus_core::Msg::OpenRun(Default::default());
+        yield cirrus_core::Msg::CloseRun {
+            exit_status: "success".into(),
+            reason: None,
+        };
+    });
+
+    let result = re.run_async(plan).await.unwrap();
+    assert_eq!(
+        result.exit_status, "fail",
+        "a second OpenRun must fail the run"
+    );
+
+    let docs = sink.snapshot().await;
+    let starts = docs
+        .iter()
+        .filter(|d| matches!(d, cirrus_core::Document::Start(_)))
+        .count();
+    assert_eq!(
+        starts, 1,
+        "a rejected second OpenRun must not emit a second RunStart; got {docs:#?}"
+    );
+}

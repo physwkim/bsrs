@@ -1700,6 +1700,16 @@ impl RunEngine {
     }
 
     async fn open_run(&self, meta: RunMetadata) -> Result<String> {
+        // Reject a second open_run *before* any side effect — bluesky's
+        // `run_key in self._run_bundlers` check precedes scan_id resolution and
+        // document emission (run_engine.py:1849-1851). Doing it here means a
+        // rejected re-open neither advances the scan_id counter nor broadcasts
+        // a spurious RunStart.
+        if self.state.lock().await.bundler.is_some() {
+            return Err(CirrusError::Plan(
+                "OpenRun while a previous run is still open".into(),
+            ));
+        }
         // Merge persistent metadata first; per-run extras override.
         let mut merged: HashMap<String, Value> = {
             let mut m = self.md.lock().unwrap().clone();
@@ -1765,11 +1775,6 @@ impl RunEngine {
         self.broadcast(&Document::Start(start_doc)).await?;
         let interruptions_descriptor = {
             let mut state = self.state.lock().await;
-            if state.bundler.is_some() {
-                return Err(CirrusError::Plan(
-                    "OpenRun while a previous run is still open".into(),
-                ));
-            }
             let mut bundler = RunBundler::new(bundle);
             // Declare the interruptions stream upfront when recording
             // is on at OpenRun. Bluesky declares it inside the Bundler
