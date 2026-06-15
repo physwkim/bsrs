@@ -1543,6 +1543,20 @@ impl RunEngine {
                 Self::reset_checkpoint_state(&mut state);
             }
             Msg::Configure { obj, args } => {
+                // A configure issued between `create` and `save` would change the
+                // object's configuration after readings were already folded into
+                // the open bundle, desyncing the descriptor from its events.
+                // bluesky rejects it with IllegalMessageSequence
+                // (run_engine.py:2515-2517); mirror that. Same bundling-guard
+                // family as the `checkpoint`-in-bundle rejection.
+                {
+                    let state = self.state.lock().await;
+                    if state.bundler.as_ref().is_some_and(|b| b.is_bundling()) {
+                        return Err(CirrusError::Plan(
+                            "Cannot configure after 'create' but before 'save'".into(),
+                        ));
+                    }
+                }
                 obj.configure_dyn(args).await?;
             }
             Msg::Prepare { obj, value, group } => {

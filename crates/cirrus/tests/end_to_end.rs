@@ -415,6 +415,71 @@ async fn read_outside_run_returns_ok_without_bundling() {
     );
 }
 
+struct ConfigurableDev {
+    name: String,
+}
+
+impl cirrus_core::msg::NamedObj for ConfigurableDev {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[async_trait::async_trait]
+impl cirrus_core::msg::ConfigurableObj for ConfigurableDev {
+    async fn read_configuration_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, cirrus_core::reading::ReadingValue>,
+        cirrus_core::error::CirrusError,
+    > {
+        Ok(std::collections::HashMap::new())
+    }
+    async fn describe_configuration_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, cirrus_event_model::DataKey>,
+        cirrus_core::error::CirrusError,
+    > {
+        Ok(std::collections::HashMap::new())
+    }
+    async fn configure_dyn(
+        &self,
+        _args: cirrus_core::ConfigureArgs,
+    ) -> Result<(), cirrus_core::error::CirrusError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn configure_inside_open_bundle_is_rejected() {
+    // bluesky rejects a configure issued between create and save with
+    // IllegalMessageSequence (run_engine.py:2515-2517): changing configuration
+    // mid-bundle would desync the descriptor from readings already folded in.
+    // Same bundling-guard family as checkpoint-in-bundle. The run loop turns the
+    // handler error into RunResult{exit_status:"fail"} (never surfaces as Err).
+    let cfg: Arc<dyn cirrus_core::msg::ConfigurableObj> = Arc::new(ConfigurableDev {
+        name: "cfg_dev".into(),
+    });
+    let re = RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new());
+    let plan = cirrus_core::plan::plan_box(async_stream::stream! {
+        yield cirrus_core::Msg::OpenRun(Default::default());
+        yield cirrus_core::Msg::Create { stream_name: "primary".into() };
+        // Configure while the bundle is open → illegal.
+        yield cirrus_core::Msg::Configure { obj: cfg, args: cirrus_core::ConfigureArgs::default() };
+        yield cirrus_core::Msg::Save;
+        yield cirrus_core::Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let result = re
+        .run_async(plan)
+        .await
+        .expect("run_async returns a RunResult");
+    assert_eq!(
+        result.exit_status, "fail",
+        "configure between create and save must be rejected (pre-fix: ran to \"success\")"
+    );
+}
+
 #[tokio::test]
 async fn abort_closes_run_with_abort_status() {
     let det = SoftDetector::new("a_det");
