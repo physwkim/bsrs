@@ -2049,6 +2049,21 @@ impl RunEngine {
     }
 
     async fn close_run_if_open(&self, exit_status: &str, reason: Option<String>) -> Result<()> {
+        // The RunStop document's `exit_status` is constrained by the event-model
+        // schema to `success` | `abort` | `fail`. The engine's run-result status
+        // additionally uses `halt` (and `no-run`) for its own reporting —
+        // `RunResult.exit_status`, which cirrus-qs consumes — but those must
+        // never reach a *document*. bluesky's `halt()` marks the close as
+        // `abort` (run_engine.py:1442-1450), so normalize `halt` → `abort` here.
+        // This is the sole owner that emits a RunStop, so normalizing once keeps
+        // the broadcast document and the crash-recovery audit snapshot consistent
+        // and schema-valid. (`no-run` cannot reach here: it means no run was
+        // open, so there is no bundler to close.)
+        let exit_status = if exit_status == "halt" {
+            "abort"
+        } else {
+            exit_status
+        };
         let stop_doc = {
             let mut state = self.state.lock().await;
             let stop = state

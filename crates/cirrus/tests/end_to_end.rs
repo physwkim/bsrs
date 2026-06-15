@@ -664,6 +664,57 @@ async fn abort_threads_caller_reason_into_stop_document() {
 }
 
 #[tokio::test]
+async fn halt_emits_schema_valid_abort_in_stop_document() {
+    // bluesky's `halt()` marks the close `exit_status = "abort"`
+    // (run_engine.py:1442-1450); the event-model schema only allows
+    // success|abort|fail. cirrus reports `halt` on `RunResult.exit_status`
+    // (its own richer status, consumed by cirrus-qs) but previously emitted
+    // that same "halt" string on the RunStop *document* — an invalid value no
+    // schema-checking consumer accepts. The document must carry "abort".
+    let det = SoftDetector::new("h_det");
+    let sink = Arc::new(CapturingSink::new());
+    let re = Arc::new(RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]));
+
+    let det_clone = det.clone();
+    let plan = cirrus_core::plan::plan_box(async_stream::stream! {
+        yield cirrus_core::Msg::OpenRun(Default::default());
+        yield cirrus_core::Msg::Create { stream_name: "primary".into() };
+        yield cirrus_core::Msg::Read(det_clone as Arc<dyn cirrus_core::msg::ReadableObj>);
+        yield cirrus_core::Msg::Save;
+        // Pause here; the test halts instead of resuming.
+        yield cirrus_core::Msg::Pause { defer: false };
+        yield cirrus_core::Msg::CloseRun {
+            exit_status: "success".into(),
+            reason: None,
+        };
+    });
+
+    let re_run = re.clone();
+    let join = tokio::spawn(async move { re_run.run_async(plan).await });
+
+    for _ in 0..50 {
+        if re.is_paused() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    re.halt("test");
+    let result = join.await.unwrap().unwrap();
+    // RunResult keeps the engine's richer "halt" status ...
+    assert_eq!(result.exit_status, "halt");
+    // ... but the emitted RunStop document must be the schema-valid "abort".
+    let docs = sink.snapshot().await;
+    if let cirrus_core::Document::Stop(s) = docs.last().unwrap() {
+        assert_eq!(
+            s.exit_status, "abort",
+            "halt must emit a schema-valid exit_status (abort) on the document, not \"halt\""
+        );
+    } else {
+        panic!("last doc was not Stop: {:?}", docs.last());
+    }
+}
+
+#[tokio::test]
 async fn suspender_auto_resumes_engine() {
     use cirrus_engine::Suspender;
     use futures::future::BoxFuture;
