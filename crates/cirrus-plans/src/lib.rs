@@ -23,6 +23,26 @@ use std::time::Duration;
 pub mod stubs {
     use super::*;
 
+    /// Remove redundant (identical) entries from a device list, preserving
+    /// first-appearance order. cirrus's port of bluesky's `separate_devices`
+    /// (utils/__init__.py:773) for a flat device model: bluesky filters out any
+    /// device that has another listed device as an ancestor, and since
+    /// `ancestry(obj)` starts with `obj` itself, an exact duplicate is dropped
+    /// (`[A, A] -> [A]`). cirrus has no device parent/child hierarchy, so the
+    /// only redundancy is an exact duplicate — deduplicated here by `Arc`
+    /// identity. Two *distinct* objects that happen to share a name are NOT
+    /// merged (bluesky keeps both); they remain a genuine data-key collision
+    /// the bundler rejects.
+    fn separate_devices<T: ?Sized>(devices: Vec<Arc<T>>) -> Vec<Arc<T>> {
+        let mut out: Vec<Arc<T>> = Vec::with_capacity(devices.len());
+        for d in devices {
+            if !out.iter().any(|e| Arc::ptr_eq(e, &d)) {
+                out.push(d);
+            }
+        }
+        out
+    }
+
     /// `open_run(md)` — emit `Msg::OpenRun(md)`.
     pub fn open_run(md: RunMetadata) -> Plan {
         plan_box(async_stream::stream! {
@@ -386,6 +406,13 @@ pub mod stubs {
         name: impl Into<String>,
     ) -> Plan {
         let name = name.into();
+        // Drop redundant entries before bundling, mirroring bluesky's
+        // `separate_devices(devices)` call at the head of `trigger_and_read`
+        // (plan_stubs.py:1450). Without it, the same readable passed twice emits
+        // two `Read`s that collide on their shared data keys and abort the run
+        // (the bundler rejects colliding field names); bluesky reads it once.
+        let triggerables = separate_devices(triggerables);
+        let readables = separate_devices(readables);
         plan_box(async_stream::stream! {
             // Skip the trigger/wait pair when nothing is triggerable, mirroring
             // bluesky's `no_wait` guard (plan_stubs.py:1455-1462): a Wait on a
@@ -1792,6 +1819,41 @@ mod tests {
             .position(|m| matches!(m, Msg::Create { .. }))
             .expect("Create present");
         assert!(wait_pos < create_pos, "Wait must precede Create");
+    }
+
+    // The same device passed twice is read/triggered once, mirroring bluesky's
+    // separate_devices() at the head of trigger_and_read. Without dedup the two
+    // Reads share data keys and the bundler aborts the run on the collision.
+    #[tokio::test]
+    async fn trigger_and_read_dedups_repeated_devices() {
+        let t = Arc::new(FakeTriggerable("det".into())) as Arc<dyn TriggerableObj>;
+        let r = Arc::new(FakeReadable("det".into())) as Arc<dyn ReadableObj>;
+        // Same Arc handed in twice in each list.
+        let msgs = drain(stubs::trigger_and_read(
+            vec![t.clone(), t.clone()],
+            vec![r.clone(), r.clone()],
+            "primary",
+        ))
+        .await;
+        assert_eq!(
+            msgs.iter()
+                .filter(|m| matches!(m, Msg::Trigger { .. }))
+                .count(),
+            1,
+            "a device listed twice must be triggered once"
+        );
+        assert_eq!(
+            msgs.iter().filter(|m| matches!(m, Msg::Read(_))).count(),
+            1,
+            "a device listed twice must be read once"
+        );
+        // Exactly one Wait{trig} and one Create/Save still bracket the event.
+        assert_eq!(
+            msgs.iter()
+                .filter(|m| matches!(m, Msg::Wait { .. }))
+                .count(),
+            1
+        );
     }
 
     // Empty triggerables across iterations → zero Wait, one Save per iteration.
