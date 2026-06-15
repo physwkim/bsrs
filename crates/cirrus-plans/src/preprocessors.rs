@@ -131,26 +131,74 @@ pub fn rewindable_wrapper(inner: Plan, on: bool) -> Plan {
     })
 }
 
-/// `monitor_during_wrapper(plan, signals)` — `Monitor` each signal at the
-/// start of the run, `Unmonitor` at the end. Both happen *inside* the run
-/// envelope (after OpenRun, before CloseRun). For now we approximate by
-/// prepending Monitors and appending Unmonitors — caller must ensure the
-/// inner plan opens/closes its own run if desired.
-pub fn monitor_during_wrapper(inner: Plan, signals: Vec<Arc<dyn MonitorableObj>>) -> Plan {
+/// `during_run_wrapper(plan, after_open, before_close)` — insert messages at
+/// the run boundary: `after_open()` is yielded immediately after each
+/// `OpenRun`, and `before_close()` immediately before each `CloseRun`. The
+/// `OpenRun`/`CloseRun` messages themselves are preserved.
+///
+/// This is the single owner of "insert inside the run envelope", mirroring
+/// bluesky's `insert_after_open` / `insert_before_close` `plan_mutator` pair.
+/// Run-scoped messages (`Create`, `Collect`, `Monitor`) inserted this way land
+/// *inside* the run, where the engine's bundler is open — prepending/appending
+/// them around the whole plan puts them outside the run, where `Create`/
+/// `Collect` fail with "… with no open run".
+///
+/// A run-free inner plan (no `OpenRun`/`CloseRun`) gets no insertion, matching
+/// bluesky's "during runs" contract.
+fn during_run_wrapper<FA, FB>(inner: Plan, mut after_open: FA, mut before_close: FB) -> Plan
+where
+    FA: FnMut() -> Vec<Msg> + Send + 'static,
+    FB: FnMut() -> Vec<Msg> + Send + 'static,
+{
     plan_box(async_stream::stream! {
-        for s in &signals {
-            yield Msg::Monitor { obj: s.clone(), name: None };
-        }
         let mut inner = inner;
         while let Some(item) = inner.next().await {
             if let PlanItem::Bare(m) = item {
-                yield m;
+                if matches!(m, Msg::OpenRun(_)) {
+                    yield m;
+                    for msg in after_open() {
+                        yield msg;
+                    }
+                } else if matches!(m, Msg::CloseRun { .. }) {
+                    for msg in before_close() {
+                        yield msg;
+                    }
+                    yield m;
+                } else {
+                    yield m;
+                }
             }
         }
-        for s in signals.into_iter().rev() {
-            yield Msg::Unmonitor(s);
-        }
     })
+}
+
+/// `monitor_during_wrapper(plan, signals)` — `Monitor` each signal immediately
+/// after the run opens and `Unmonitor` immediately before it closes, so the
+/// monitor streams live *inside* the run envelope. Mirrors bluesky's
+/// `monitor_during_wrapper` (preprocessors.py:813), which inserts via
+/// `plan_mutator` after `open_run` / before `close_run`. A run-free inner plan
+/// gets no insertion.
+pub fn monitor_during_wrapper(inner: Plan, signals: Vec<Arc<dyn MonitorableObj>>) -> Plan {
+    let unmon = signals.clone();
+    during_run_wrapper(
+        inner,
+        move || {
+            signals
+                .iter()
+                .map(|s| Msg::Monitor {
+                    obj: s.clone(),
+                    name: None,
+                })
+                .collect()
+        },
+        move || {
+            unmon
+                .iter()
+                .rev()
+                .map(|s| Msg::Unmonitor(s.clone()))
+                .collect()
+        },
+    )
 }
 
 /// `stage_wrapper(plan, devices)` — `Stage` each device before the inner
@@ -172,35 +220,39 @@ pub fn stage_wrapper(inner: Plan, devices: Vec<Arc<dyn StageableObj>>) -> Plan {
     })
 }
 
-/// `baseline_wrapper(plan, devices, name)` — reads each device once into
-/// the named stream (default `"baseline"`) before and after the inner
-/// plan. Implemented as a pre/post `Create + Read* + Save` block.
+/// `baseline_wrapper(plan, devices, name)` — reads each device once into the
+/// named stream (default `"baseline"`) immediately after the run opens and
+/// again immediately before it closes, as a `Create + Read* + Save` block.
+/// Mirrors bluesky's `baseline_wrapper` (preprocessors.py:1202), which records
+/// the baseline after `open_run` and before `close_run` — inside the run, so
+/// the `Create` finds an open bundler. A run-free inner plan gets no baseline.
 pub fn baseline_wrapper(
     inner: Plan,
     devices: Vec<Arc<dyn ReadableObj>>,
     name: impl Into<String>,
 ) -> Plan {
     let stream = name.into();
-    plan_box(async_stream::stream! {
-        // Pre-baseline.
-        yield Msg::Create { stream_name: stream.clone() };
-        for d in &devices {
-            yield Msg::Read(d.clone());
-        }
-        yield Msg::Save;
-        let mut inner = inner;
-        while let Some(item) = inner.next().await {
-            if let PlanItem::Bare(m) = item {
-                yield m;
-            }
-        }
-        // Post-baseline.
-        yield Msg::Create { stream_name: stream };
-        for d in &devices {
-            yield Msg::Read(d.clone());
-        }
-        yield Msg::Save;
-    })
+    let pre_stream = stream.clone();
+    let pre_devices = devices.clone();
+    during_run_wrapper(
+        inner,
+        move || {
+            let mut msgs = vec![Msg::Create {
+                stream_name: pre_stream.clone(),
+            }];
+            msgs.extend(pre_devices.iter().map(|d| Msg::Read(d.clone())));
+            msgs.push(Msg::Save);
+            msgs
+        },
+        move || {
+            let mut msgs = vec![Msg::Create {
+                stream_name: stream.clone(),
+            }];
+            msgs.extend(devices.iter().map(|d| Msg::Read(d.clone())));
+            msgs.push(Msg::Save);
+            msgs
+        },
+    )
 }
 
 /// `finalize_wrapper(plan, final_plan)` — run `final_plan` after `plan`
@@ -307,43 +359,64 @@ pub fn suspend_wrapper(inner: Plan, suspender: Arc<dyn cirrus_core::Suspender>) 
     })
 }
 
-/// `fly_during_wrapper(plan, flyers)` — for the duration of `plan`,
-/// `Kickoff` each `(flyer, collectable)` pair at the start and
-/// `Complete + Collect` at the end. Mirrors bluesky's
-/// `fly_during_wrapper`. Pairs the Flyable + Collectable explicitly
-/// since cirrus's protocol traits split those roles.
+/// `fly_during_wrapper(plan, flyers)` — `Kickoff` each `(flyer, collectable)`
+/// pair immediately after the run opens and `Complete + Collect` immediately
+/// before it closes, so the fly kickoff/collect live *inside* the run envelope.
+/// Mirrors bluesky's `fly_during_wrapper` (preprocessors.py:866), which inserts
+/// via `plan_mutator` after `open_run` / before `close_run`. Pairs the Flyable +
+/// Collectable explicitly since cirrus's protocol traits split those roles.
+///
+/// The kickoff/complete `wait` is only inserted when there is at least one
+/// flyer (`if flyers:`, preprocessors.py:895) — a wait on a group that received
+/// no Kickoff/Complete is a spurious message. A run-free inner plan gets no
+/// insertion (and would have failed anyway: `Collect` requires an open run).
 pub fn fly_during_wrapper(
     inner: Plan,
     flyers: Vec<(Arc<dyn FlyableObj>, Arc<dyn CollectableObj>)>,
 ) -> Plan {
-    plan_box(async_stream::stream! {
-        // Mirror bluesky `fly_during_wrapper`: only insert the kickoff/complete
-        // `wait` when there is at least one flyer (`if flyers:`,
-        // preprocessors.py:895). Waiting on a group that received no Kickoff /
-        // Complete is a spurious message.
-        let any_flyers = !flyers.is_empty();
-        for (f, _) in &flyers {
-            yield Msg::Kickoff { obj: f.clone(), group: Some("fly_kick".into()) };
-        }
-        if any_flyers {
-            yield Msg::Wait { group: "fly_kick".into(), error_on_timeout: true, timeout: None };
-        }
-        let mut inner = inner;
-        while let Some(item) = inner.next().await {
-            if let PlanItem::Bare(m) = item {
-                yield m;
+    let any_flyers = !flyers.is_empty();
+    let close_flyers = flyers.clone();
+    during_run_wrapper(
+        inner,
+        move || {
+            let mut msgs: Vec<Msg> = flyers
+                .iter()
+                .map(|(f, _)| Msg::Kickoff {
+                    obj: f.clone(),
+                    group: Some("fly_kick".into()),
+                })
+                .collect();
+            if any_flyers {
+                msgs.push(Msg::Wait {
+                    group: "fly_kick".into(),
+                    error_on_timeout: true,
+                    timeout: None,
+                });
             }
-        }
-        for (f, _) in &flyers {
-            yield Msg::Complete { obj: f.clone(), group: Some("fly_done".into()) };
-        }
-        if any_flyers {
-            yield Msg::Wait { group: "fly_done".into(), error_on_timeout: true, timeout: None };
-        }
-        for (_, c) in flyers {
-            yield Msg::Collect { obj: c, stream_name: None };
-        }
-    })
+            msgs
+        },
+        move || {
+            let mut msgs: Vec<Msg> = close_flyers
+                .iter()
+                .map(|(f, _)| Msg::Complete {
+                    obj: f.clone(),
+                    group: Some("fly_done".into()),
+                })
+                .collect();
+            if any_flyers {
+                msgs.push(Msg::Wait {
+                    group: "fly_done".into(),
+                    error_on_timeout: true,
+                    timeout: None,
+                });
+            }
+            msgs.extend(close_flyers.iter().map(|(_, c)| Msg::Collect {
+                obj: c.clone(),
+                stream_name: None,
+            }));
+            msgs
+        },
+    )
 }
 
 /// `contingency_wrapper(plan, finally)` — run `plan`; whether it
@@ -713,14 +786,23 @@ mod tests {
         )
     }
 
+    fn run_body() -> Plan {
+        plan_box(async_stream::stream! {
+            yield Msg::OpenRun(RunMetadata::default());
+            yield Msg::Null;
+            yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+        })
+    }
+
     #[tokio::test]
     async fn fly_during_wrapper_skips_wait_when_no_flyers() {
-        // bluesky guards both kickoff/complete waits with `if flyers:`; with no
-        // flyers nothing is inserted and only the inner plan's messages survive.
-        let body = plan_box(async_stream::stream! { yield Msg::Null; });
-        let msgs = drain(fly_during_wrapper(body, vec![])).await;
-        assert_eq!(msgs.len(), 1, "got {msgs:?}");
-        assert!(matches!(&msgs[0], Msg::Null));
+        // No flyers -> no kickoff/complete/wait/collect inserted; the run's own
+        // messages pass through unchanged.
+        let msgs = drain(fly_during_wrapper(run_body(), vec![])).await;
+        assert_eq!(msgs.len(), 3, "got {msgs:?}");
+        assert!(matches!(&msgs[0], Msg::OpenRun(_)));
+        assert!(matches!(&msgs[1], Msg::Null));
+        assert!(matches!(&msgs[2], Msg::CloseRun { .. }));
         assert!(
             !msgs.iter().any(|m| matches!(m, Msg::Wait { .. })),
             "no Wait may be emitted when there are no flyers"
@@ -728,16 +810,90 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fly_during_wrapper_brackets_inner_with_kickoff_wait_complete_collect() {
+    async fn fly_during_wrapper_inserts_kickoff_and_collect_inside_run() {
+        let msgs = drain(fly_during_wrapper(run_body(), vec![fake_flyer("f")])).await;
+        // OpenRun, Kickoff, Wait{fly_kick}, Null, Complete, Wait{fly_done},
+        // Collect, CloseRun — kickoff/collect land INSIDE the run envelope.
+        assert_eq!(msgs.len(), 8, "got {msgs:?}");
+        assert!(matches!(&msgs[0], Msg::OpenRun(_)));
+        assert!(matches!(&msgs[1], Msg::Kickoff { .. }));
+        assert!(matches!(&msgs[2], Msg::Wait { group, .. } if group == "fly_kick"));
+        assert!(matches!(&msgs[3], Msg::Null));
+        assert!(matches!(&msgs[4], Msg::Complete { .. }));
+        assert!(matches!(&msgs[5], Msg::Wait { group, .. } if group == "fly_done"));
+        assert!(matches!(&msgs[6], Msg::Collect { .. }));
+        assert!(matches!(&msgs[7], Msg::CloseRun { .. }));
+    }
+
+    #[tokio::test]
+    async fn during_run_wrappers_insert_nothing_without_a_run() {
+        // The "during runs" contract: a run-free inner plan gets no insertion,
+        // matching bluesky's plan_mutator-on-open_run structure.
         let body = plan_box(async_stream::stream! { yield Msg::Null; });
         let msgs = drain(fly_during_wrapper(body, vec![fake_flyer("f")])).await;
-        // Kickoff, Wait{fly_kick}, Null, Complete, Wait{fly_done}, Collect.
-        assert_eq!(msgs.len(), 6, "got {msgs:?}");
-        assert!(matches!(&msgs[0], Msg::Kickoff { .. }));
-        assert!(matches!(&msgs[1], Msg::Wait { group, .. } if group == "fly_kick"));
+        assert_eq!(msgs.len(), 1, "got {msgs:?}");
+        assert!(matches!(&msgs[0], Msg::Null));
+    }
+
+    struct FakeMonitorable(String);
+    impl cirrus_core::msg::NamedObj for FakeMonitorable {
+        fn name(&self) -> &str {
+            &self.0
+        }
+    }
+    #[async_trait::async_trait]
+    impl ReadableObj for FakeMonitorable {
+        async fn read_dyn(
+            &self,
+        ) -> Result<HashMap<String, cirrus_core::reading::ReadingValue>, CirrusError> {
+            Ok(HashMap::new())
+        }
+        async fn describe_dyn(
+            &self,
+        ) -> Result<HashMap<String, cirrus_event_model::DataKey>, CirrusError> {
+            Ok(HashMap::new())
+        }
+    }
+    #[async_trait::async_trait]
+    impl MonitorableObj for FakeMonitorable {
+        async fn subscribe_dyn(
+            &self,
+        ) -> Result<cirrus_core::subscription::Subscription, CirrusError> {
+            // Never called: monitor_during_wrapper only builds Monitor/Unmonitor
+            // messages; the engine (not the wrapper) performs the subscribe.
+            Err(CirrusError::Plan(
+                "subscribe_dyn not used in wrapper test".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn monitor_during_wrapper_brackets_inside_run() {
+        let sig: Arc<dyn MonitorableObj> = Arc::new(FakeMonitorable("s".into()));
+        let msgs = drain(monitor_during_wrapper(run_body(), vec![sig])).await;
+        // OpenRun, Monitor, Null, Unmonitor, CloseRun.
+        assert_eq!(msgs.len(), 5, "got {msgs:?}");
+        assert!(matches!(&msgs[0], Msg::OpenRun(_)));
+        assert!(matches!(&msgs[1], Msg::Monitor { .. }));
         assert!(matches!(&msgs[2], Msg::Null));
-        assert!(matches!(&msgs[3], Msg::Complete { .. }));
-        assert!(matches!(&msgs[4], Msg::Wait { group, .. } if group == "fly_done"));
-        assert!(matches!(&msgs[5], Msg::Collect { .. }));
+        assert!(matches!(&msgs[3], Msg::Unmonitor(_)));
+        assert!(matches!(&msgs[4], Msg::CloseRun { .. }));
+    }
+
+    #[tokio::test]
+    async fn baseline_wrapper_reads_inside_run() {
+        let dev: Arc<dyn ReadableObj> = Arc::new(FakeStage("d".into()));
+        let msgs = drain(baseline_wrapper(run_body(), vec![dev], "baseline")).await;
+        // OpenRun, Create, Read, Save, Null, Create, Read, Save, CloseRun.
+        assert_eq!(msgs.len(), 9, "got {msgs:?}");
+        assert!(matches!(&msgs[0], Msg::OpenRun(_)));
+        assert!(matches!(&msgs[1], Msg::Create { stream_name } if stream_name == "baseline"));
+        assert!(matches!(&msgs[2], Msg::Read(_)));
+        assert!(matches!(&msgs[3], Msg::Save));
+        assert!(matches!(&msgs[4], Msg::Null));
+        assert!(matches!(&msgs[5], Msg::Create { stream_name } if stream_name == "baseline"));
+        assert!(matches!(&msgs[6], Msg::Read(_)));
+        assert!(matches!(&msgs[7], Msg::Save));
+        assert!(matches!(&msgs[8], Msg::CloseRun { .. }));
     }
 }
