@@ -1108,6 +1108,27 @@ impl RunEngine {
 
     // -- handler ------------------------------------------------------------
 
+    /// Engine-level half of bluesky's `_reset_checkpoint_state`
+    /// (run_engine.py:2461-2467): drop the rewind cache so a subsequent resume
+    /// cannot replay messages issued *before* this point. The single owner of
+    /// "the rewindable region restarts here" — invoked both by the explicit
+    /// checkpoint messages (`Checkpoint` / `ClearCheckpoint` / `Rewindable`)
+    /// and by every commit-point message whose side effect must not be
+    /// straddled by a rewind: stage/unstage, monitor/unmonitor,
+    /// subscribe/unsubscribe (bluesky resets at each:
+    /// run_engine.py:2047/2065/2556/2580/2629/2650). Without it, a pause after
+    /// one of those messages would replay the earlier cached messages on
+    /// resume, re-running side effects bluesky treats as already committed.
+    ///
+    /// bluesky additionally snapshots each open bundler's sequence counters
+    /// here (`RunBundler.reset_checkpoint_state`, bundlers.py:651) as the
+    /// rewind rollback target; cirrus keeps those counters in `RunBundle`
+    /// (cirrus-event-model) and does not yet snapshot them — tracked
+    /// separately alongside `RunBundler::rewind`.
+    fn reset_checkpoint_state(state: &mut EngineState) {
+        state.msg_cache.clear();
+    }
+
     async fn handle(&self, msg: Msg) -> Result<Option<String>> {
         match msg {
             Msg::OpenRun(meta) => {
@@ -1227,7 +1248,9 @@ impl RunEngine {
             }
             Msg::Stage(obj) => {
                 obj.stage_dyn().await?;
-                self.state.lock().await.staged.push(obj);
+                let mut state = self.state.lock().await;
+                state.staged.push(obj);
+                Self::reset_checkpoint_state(&mut state);
             }
             Msg::Unstage(obj) => {
                 obj.unstage_dyn().await?;
@@ -1235,6 +1258,7 @@ impl RunEngine {
                 state
                     .staged
                     .retain(|o| !Arc::ptr_eq(&(o.clone() as Arc<_>), &(obj.clone() as Arc<_>)));
+                Self::reset_checkpoint_state(&mut state);
             }
             Msg::Stop { obj, success } => {
                 obj.stop_dyn(success).await?;
@@ -1316,6 +1340,8 @@ impl RunEngine {
             Msg::Monitor { obj, name } => {
                 let stream = name.unwrap_or_else(|| obj.name().to_string());
                 self.start_monitor(stream, obj).await?;
+                let mut state = self.state.lock().await;
+                Self::reset_checkpoint_state(&mut state);
             }
             Msg::Unmonitor(obj) => {
                 // monitor_tasks is keyed by the monitored object's name (set in
@@ -1325,6 +1351,7 @@ impl RunEngine {
                 state
                     .monitor_tasks
                     .retain(|obj_name, _| obj_name != obj.name());
+                Self::reset_checkpoint_state(&mut state);
             }
             Msg::Wait {
                 group,
@@ -1345,7 +1372,7 @@ impl RunEngine {
             Msg::Checkpoint => {
                 let mut state = self.state.lock().await;
                 // Clear cache up to this point — the rewindable region restarts.
-                state.msg_cache.clear();
+                Self::reset_checkpoint_state(&mut state);
                 state.rewindable = true;
                 let run_uid = state.bundler.as_ref().map(|b| b.start_uid.clone());
                 drop(state);
@@ -1372,7 +1399,7 @@ impl RunEngine {
             Msg::ClearCheckpoint => {
                 let mut state = self.state.lock().await;
                 state.rewindable = false;
-                state.msg_cache.clear();
+                Self::reset_checkpoint_state(&mut state);
             }
             Msg::Pause { defer } => {
                 self.pause(defer);
@@ -1393,7 +1420,7 @@ impl RunEngine {
                 let mut state = self.state.lock().await;
                 if state.rewindable != b {
                     state.rewindable = b;
-                    state.msg_cache.clear();
+                    Self::reset_checkpoint_state(&mut state);
                 }
             }
             Msg::InstallSuspender { id, suspender } => {
@@ -1427,16 +1454,18 @@ impl RunEngine {
             }
             Msg::Subscribe { cb, filter } => {
                 let id = self.subscribe_filtered(filter, cb);
-                self.state.lock().await.temp_subscribers.push(id);
+                {
+                    let mut state = self.state.lock().await;
+                    state.temp_subscribers.push(id);
+                    Self::reset_checkpoint_state(&mut state);
+                }
                 *self.last_msg_result.lock().unwrap() = MsgResult::SubscriptionId { id };
             }
             Msg::Unsubscribe(id) => {
                 self.unsubscribe(id);
-                self.state
-                    .lock()
-                    .await
-                    .temp_subscribers
-                    .retain(|i| *i != id);
+                let mut state = self.state.lock().await;
+                state.temp_subscribers.retain(|i| *i != id);
+                Self::reset_checkpoint_state(&mut state);
             }
             Msg::Configure { obj, args } => {
                 obj.configure_dyn(args).await?;

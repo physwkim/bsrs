@@ -895,3 +895,96 @@ async fn wait_propagates_status_failure_even_when_error_on_timeout_false() {
         "a failed Set status must fail the run even with error_on_timeout=false"
     );
 }
+
+#[tokio::test]
+async fn stage_resets_rewind_cache_so_pre_stage_set_not_replayed_on_resume() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    // Counts how many times the engine drives the motor. If a commit-point
+    // message (here `Stage`) fails to reset the rewind cache, the pre-stage
+    // cached `Set` replays on resume and the counter reaches 2.
+    struct CountingMovable {
+        sets: Arc<AtomicUsize>,
+    }
+    impl cirrus_core::msg::NamedObj for CountingMovable {
+        fn name(&self) -> &str {
+            "stg_motor"
+        }
+    }
+    #[async_trait::async_trait]
+    impl cirrus_core::msg::MovableObj for CountingMovable {
+        async fn set_dyn(&self, _value: f64) -> cirrus_core::status::Status {
+            self.sets.fetch_add(1, Ordering::SeqCst);
+            cirrus_core::status::Status::done()
+        }
+    }
+    // A no-op stageable device — its `Stage` is the commit point under test.
+    struct Dev;
+    impl cirrus_core::msg::NamedObj for Dev {
+        fn name(&self) -> &str {
+            "stg_dev"
+        }
+    }
+    #[async_trait::async_trait]
+    impl cirrus_core::msg::StageableObj for Dev {
+        async fn stage_dyn(&self) -> Result<(), cirrus_core::error::CirrusError> {
+            Ok(())
+        }
+        async fn unstage_dyn(&self) -> Result<(), cirrus_core::error::CirrusError> {
+            Ok(())
+        }
+    }
+
+    let sets = Arc::new(AtomicUsize::new(0));
+    let motor =
+        Arc::new(CountingMovable { sets: sets.clone() }) as Arc<dyn cirrus_core::msg::MovableObj>;
+    let dev = Arc::new(Dev) as Arc<dyn cirrus_core::msg::StageableObj>;
+    let reached = Arc::new(AtomicUsize::new(0));
+
+    let re = Arc::new(RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new()));
+    let reached_clone = reached.clone();
+    let plan = cirrus_core::plan::plan_box(async_stream::stream! {
+        yield cirrus_core::Msg::OpenRun(Default::default());
+        yield cirrus_core::Msg::Checkpoint;
+        // Cacheable Set lands in the rewind cache...
+        yield cirrus_core::Msg::Set { obj: motor, value: 1.0, group: None };
+        // ...then a Stage (commit-point message) must reset the rewind cache,
+        // so a pause AFTER the stage replays nothing on resume.
+        yield cirrus_core::Msg::Stage(dev);
+        reached_clone.store(1, Ordering::SeqCst);
+        yield cirrus_core::Msg::Pause { defer: false };
+        yield cirrus_core::Msg::CloseRun {
+            exit_status: "success".into(),
+            reason: None,
+        };
+    });
+
+    let re_run = re.clone();
+    let join = tokio::spawn(async move { re_run.run_async(plan).await });
+
+    for _ in 0..50 {
+        if reached.load(Ordering::SeqCst) == 1 && re.is_paused() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(re.is_paused(), "engine should be paused after the stage");
+    assert_eq!(
+        sets.load(Ordering::SeqCst),
+        1,
+        "Set should have run exactly once before resume"
+    );
+
+    re.resume();
+    let result = join.await.unwrap().unwrap();
+    assert_eq!(result.exit_status, "success");
+
+    // Pre-fix: Stage did not reset the cache, so the pre-stage Set replayed on
+    // resume and sets reached 2.
+    assert_eq!(
+        sets.load(Ordering::SeqCst),
+        1,
+        "Stage must reset the rewind cache so the pre-stage Set is not replayed on resume"
+    );
+}
