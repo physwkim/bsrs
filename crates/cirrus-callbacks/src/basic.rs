@@ -43,6 +43,14 @@ impl DocumentSink for JsonlSink {
         f.write_all(&line)
             .await
             .map_err(|e| cirrus_core::error::CirrusError::Backend(format!("jsonl write: {e}")))?;
+        // `tokio::fs::File` buffers internally and never flushes on drop: after
+        // `write_all` returns the bytes may still sit in tokio's buffer, so a
+        // reader (or process exit) could miss documents. bluesky's
+        // `JSONLinesWriter` opens-writes-closes per document, flushing each
+        // line; flush after every write to match that per-document durability.
+        f.flush()
+            .await
+            .map_err(|e| cirrus_core::error::CirrusError::Backend(format!("jsonl flush: {e}")))?;
         Ok(())
     }
 }
@@ -112,16 +120,23 @@ mod tests {
     /// JSONL has no out-of-band channel for the document kind, so each line
     /// must be the tagged `{"name","doc"}` wrapper bluesky's `JSONLinesWriter`
     /// emits — not the bare inner dict (which is unrecoverable on read).
+    ///
+    /// The line is read while the sink is still alive, immediately after
+    /// `dispatch` returns: `tokio::fs::File` buffers writes and does not flush
+    /// on drop, so a `dispatch` that omits the flush would leave the file empty
+    /// here (and lose documents on process exit).
     #[tokio::test]
     async fn jsonl_line_is_tagged_name_doc_wrapper() {
         let path = std::env::temp_dir().join(format!("cirrus_jsonl_{}.jsonl", std::process::id()));
         let _ = std::fs::remove_file(&path);
-        {
-            let sink = JsonlSink::open(&path).await.expect("open");
-            sink.dispatch(&stop_doc()).await.expect("dispatch");
-        }
+        let sink = JsonlSink::open(&path).await.expect("open");
+        sink.dispatch(&stop_doc()).await.expect("dispatch");
+        // No drop, no flush helper: dispatch alone must make the line durable.
         let contents = std::fs::read_to_string(&path).expect("read");
-        let line = contents.lines().next().expect("one line");
+        let line = contents
+            .lines()
+            .next()
+            .expect("dispatch must flush the line");
         let v: serde_json::Value = serde_json::from_str(line).expect("parse");
         assert_eq!(v["name"], "stop", "line must carry the document kind: {v}");
         assert_eq!(v["doc"]["exit_status"], "success");
