@@ -21,6 +21,12 @@ fn now_ts() -> f64 {
 struct Inner<T: Clone + Send + Sync + 'static> {
     value: Mutex<T>,
     setpoint: Mutex<T>,
+    /// Wall-clock time the `value` last changed (set at construction and on
+    /// every `put`/`write_now`). ophyd-async stamps the reading once at
+    /// `set_value`/`put` and returns it from every `get_reading`
+    /// (`_soft_signal_backend.py:147-173`); a read must NOT mint a fresh
+    /// timestamp, or an unchanged value would appear to update on every read.
+    timestamp: Mutex<f64>,
     /// Value written by `put(None)` — the ophyd-async `initial_value`
     /// (`_soft_signal_backend.py:164`). Fixed at construction.
     initial: T,
@@ -64,6 +70,7 @@ where
             inner: Arc::new(Inner {
                 value: Mutex::new(initial.clone()),
                 setpoint: Mutex::new(initial.clone()),
+                timestamp: Mutex::new(now_ts()),
                 initial,
                 callbacks: Mutex::new(Vec::new()),
                 next_id: AtomicU64::new(0),
@@ -80,6 +87,7 @@ where
         let inner = Arc::new(Inner {
             value: Mutex::new(self.inner.value.lock().unwrap().clone()),
             setpoint: Mutex::new(self.inner.setpoint.lock().unwrap().clone()),
+            timestamp: Mutex::new(*self.inner.timestamp.lock().unwrap()),
             initial: self.inner.initial.clone(),
             callbacks: Mutex::new(Vec::new()),
             next_id: AtomicU64::new(0),
@@ -96,6 +104,7 @@ where
         let inner = Arc::new(Inner {
             value: Mutex::new(self.inner.value.lock().unwrap().clone()),
             setpoint: Mutex::new(self.inner.setpoint.lock().unwrap().clone()),
+            timestamp: Mutex::new(*self.inner.timestamp.lock().unwrap()),
             initial: self.inner.initial.clone(),
             callbacks: Mutex::new(Vec::new()),
             next_id: AtomicU64::new(0),
@@ -127,6 +136,7 @@ where
     pub fn write_now(&self, v: T) {
         *self.inner.value.lock().unwrap() = v.clone();
         let ts = now_ts();
+        *self.inner.timestamp.lock().unwrap() = ts;
         let cbs: Vec<_> = self
             .inner
             .callbacks
@@ -156,6 +166,7 @@ where
         *self.inner.setpoint.lock().unwrap() = value.clone();
         *self.inner.value.lock().unwrap() = value.clone();
         let ts = now_ts();
+        *self.inner.timestamp.lock().unwrap() = ts;
         let cbs: Vec<_> = self
             .inner
             .callbacks
@@ -183,9 +194,13 @@ where
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
         let v = self.inner.value.lock().unwrap().clone();
+        // The value's last-change time, captured at construction / `put` /
+        // `write_now` — NOT a fresh read-time stamp. Mirrors ophyd-async
+        // returning the stored `self.reading` (`_soft_signal_backend.py:172`).
+        let timestamp = *self.inner.timestamp.lock().unwrap();
         Ok(ReadingValue {
             value: serde_json::to_value(v)?,
-            timestamp: now_ts(),
+            timestamp,
             alarm_severity: None,
             message: None,
         })
@@ -242,5 +257,34 @@ mod tests {
         block_on(SignalBackend::put(&b, None)).unwrap();
         assert_eq!(b.current_value(), 7.0);
         assert_eq!(b.current_setpoint(), 7.0);
+    }
+
+    // get_reading must return the value's last-change timestamp (captured at
+    // put), not a fresh read-time stamp: two reads with no intervening put
+    // return the SAME timestamp, and a put advances it. ophyd-async returns the
+    // stored `self.reading` from every get_reading (_soft_signal_backend.py:172),
+    // so an unchanged value keeps its timestamp instead of appearing to update.
+    #[test]
+    fn get_reading_timestamp_is_put_time_not_read_time() {
+        let b = SoftSignalBackend::new(0.0_f64, Dtype::Number);
+        block_on(SignalBackend::put(&b, Some(1.0))).unwrap();
+        let r1 = block_on(SignalBackend::get_reading(&b)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let r2 = block_on(SignalBackend::get_reading(&b)).unwrap();
+        assert!(
+            (r1.timestamp - r2.timestamp).abs() < f64::EPSILON,
+            "unchanged value must keep its put-time timestamp across reads ({} vs {})",
+            r1.timestamp,
+            r2.timestamp
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        block_on(SignalBackend::put(&b, Some(2.0))).unwrap();
+        let r3 = block_on(SignalBackend::get_reading(&b)).unwrap();
+        assert!(
+            r3.timestamp > r2.timestamp,
+            "a put must advance the reading timestamp ({} !> {})",
+            r3.timestamp,
+            r2.timestamp
+        );
     }
 }
