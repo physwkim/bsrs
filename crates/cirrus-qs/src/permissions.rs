@@ -356,6 +356,27 @@ impl Permissions {
         }
     }
 
+    /// Filter `plan_names` to those allowed for `group`.
+    /// Returns `plan_names` unchanged when RBAC is not enforced or the group
+    /// is not found (tolerates absent / unknown user_group).
+    pub fn filter_plans_for_group<'a>(
+        &self,
+        group: &str,
+        plan_names: &'a [String],
+    ) -> Vec<&'a String> {
+        let g = self.inner.read().unwrap();
+        if !g.enforced {
+            return plan_names.iter().collect();
+        }
+        match g.groups.get(group) {
+            Some(policy) => plan_names
+                .iter()
+                .filter(|n| policy.plan_allowed(n))
+                .collect(),
+            None => plan_names.iter().collect(), // unknown group → return all
+        }
+    }
+
     /// True if `group` has `admin = true`. Used by the dispatcher to
     /// gate per-task lookups (admin-originated task results stay
     /// readable only by other admins).

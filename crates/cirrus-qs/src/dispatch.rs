@@ -84,12 +84,19 @@ pub(crate) fn dispatch(
         // Return rich dicts matching bluesky's wire shape:
         //   {plan_name: {name, description, parameters, module}}
         // (ref: manager.py:_plans_allowed_handler,_plans_existing_handler).
-        "plans_allowed" => json!({
-            "success": true,
-            "msg": "",
-            "plans_allowed": registry.plan_dict(),
-            "plans_allowed_uid": "static",
-        }),
+        // plans_allowed filters by the caller's group (QS-14); tolerate
+        // absent user_group — caller group already resolved from api_key.
+        "plans_allowed" => {
+            let all_names = registry.plan_names();
+            let allowed_names = permissions.filter_plans_for_group(&group, &all_names);
+            let dict = build_plan_dict(allowed_names.into_iter().cloned().collect());
+            json!({
+                "success": true,
+                "msg": "",
+                "plans_allowed": dict,
+                "plans_allowed_uid": "static",
+            })
+        }
         "plans_existing" => json!({
             "success": true,
             "msg": "",
@@ -378,6 +385,22 @@ pub(crate) fn dispatch(
 }
 
 // -- helpers ----------------------------------------------------------------
+
+fn build_plan_dict(names: Vec<String>) -> Value {
+    let mut map = serde_json::Map::new();
+    for name in names {
+        map.insert(
+            name.clone(),
+            json!({
+                "name": name,
+                "description": "",
+                "parameters": [],
+                "module": "cirrus_qs",
+            }),
+        );
+    }
+    Value::Object(map)
+}
 
 fn panic_payload_message(p: Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = p.downcast_ref::<&'static str>() {

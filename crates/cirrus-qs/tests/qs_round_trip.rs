@@ -747,6 +747,66 @@ async fn rbac_filters_plan_name_on_queue_add() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
 
+// -- QS-14: user_group-filtered plan listing --------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn plans_allowed_filtered_by_caller_group() {
+    let toml = r#"
+        default_group = "restricted"
+
+        [user_groups.restricted]
+        allowed_plans = ["count"]
+        allowed_devices = [".*"]
+
+        [user_groups.admin]
+        admin = true
+        allowed_plans = [".*"]
+        allowed_devices = [".*"]
+
+        [api_keys]
+        "admin-key" = "admin"
+    "#;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("permissions.toml");
+    std::fs::write(&path, toml).unwrap();
+
+    let port = rand_port();
+    let mut reg = Registry::new();
+    reg.register_plan_count("count");
+    reg.register_plan_count("scan"); // add a second plan
+    let shutdown = spawn_server_with_perms(reg, port, path);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(port);
+
+    // Restricted group sees only "count".
+    let r = rpc(&req, "plans_allowed", json!({}));
+    let plans = r["plans_allowed"].as_object().expect("must be object");
+    assert!(
+        plans.contains_key("count"),
+        "restricted must see count: {r}"
+    );
+    assert!(
+        !plans.contains_key("scan"),
+        "restricted must NOT see scan: {r}"
+    );
+
+    // Admin group (all plans) sees both.
+    let r = rpc(&req, "plans_allowed", json!({"api_key": "admin-key"}));
+    let plans = r["plans_allowed"].as_object().expect("must be object");
+    assert!(plans.contains_key("count"), "admin must see count: {r}");
+    assert!(plans.contains_key("scan"), "admin must see scan: {r}");
+
+    // Absent user_group param is tolerated (caller group from api_key used).
+    let r = rpc(&req, "plans_allowed", json!({"user_group": "some_group"}));
+    assert_eq!(
+        r["success"], true,
+        "absent/unknown user_group must not error: {r}"
+    );
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
 // -- QS-03: plans_allowed / devices_allowed rich dict ----------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
