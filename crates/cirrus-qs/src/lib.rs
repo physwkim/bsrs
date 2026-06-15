@@ -99,7 +99,7 @@ mod tasks;
 mod transport;
 
 pub use lua_eval::LuaEvaluator;
-pub use methods::{JsonRpcError, RpcRequest, RpcResponse};
+pub use methods::QsRequest;
 pub use permissions::{MethodClass, Permissions};
 pub use queue::{PlanQueue, QueuedItem};
 pub use registry::{LuaExposedEntry, PlanFactory, Registry};

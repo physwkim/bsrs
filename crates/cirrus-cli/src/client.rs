@@ -374,11 +374,11 @@ mod repl {
                     continue;
                 }
             };
-            if let Some(err) = resp.get("error") {
-                eprintln!("error: {err}");
+            if !resp["success"].as_bool().unwrap_or(true) {
+                eprintln!("error: {}", resp["msg"].as_str().unwrap_or("unknown error"));
                 continue;
             }
-            let task_uid = match resp["result"]["task_uid"].as_str() {
+            let task_uid = match resp["task_uid"].as_str() {
                 Some(s) => s.to_string(),
                 None => {
                     eprintln!("lua_eval: no task_uid in response: {resp}");
@@ -407,7 +407,7 @@ mod repl {
                         break;
                     }
                 };
-                let st = s["result"]["status"].as_str().unwrap_or("?");
+                let st = s["status"].as_str().unwrap_or("?");
                 if st == "running" {
                     continue;
                 }
@@ -426,10 +426,10 @@ mod repl {
                         break;
                     }
                 };
-                let stdout = r["result"]["result"]["stdout"].as_str().unwrap_or("");
-                let return_value = r["result"]["result"]["return_value"].as_str();
-                let success = r["result"]["result"]["success"].as_bool().unwrap_or(false);
-                let traceback = r["result"]["result"]["traceback"].as_str().unwrap_or("");
+                let stdout = r["result"]["stdout"].as_str().unwrap_or("");
+                let return_value = r["result"]["return_value"].as_str();
+                let success = r["result"]["success"].as_bool().unwrap_or(false);
+                let traceback = r["result"]["traceback"].as_str().unwrap_or("");
                 if !stdout.is_empty() {
                     println!("{stdout}");
                 }
@@ -503,12 +503,7 @@ mod repl {
     }
 
     fn send_one(sock: &zmq::Socket, method: &str, params: Value) -> Result<Value, String> {
-        let req = json!({
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
-            "id": 1,
-        });
+        let req = json!({"method": method, "params": params});
         let bytes = serde_json::to_vec(&req).map_err(|e| format!("encode: {e}"))?;
         sock.send(bytes, 0).map_err(|e| format!("send: {e}"))?;
         let resp = sock.recv_bytes(0).map_err(|e| format!("recv: {e}"))?;
@@ -620,12 +615,7 @@ fn dispatch(args: ClientArgs) -> Result<Value, String> {
             (method, parsed)
         }
     };
-    let req = json!({
-        "jsonrpc": "2.0",
-        "method": &method,
-        "params": params,
-        "id": 1,
-    });
+    let req = json!({"method": &method, "params": params});
     let bytes = serde_json::to_vec(&req).map_err(|e| format!("encode request: {e}"))?;
 
     let ctx = zmq::Context::new();
@@ -655,16 +645,9 @@ fn dispatch(args: ClientArgs) -> Result<Value, String> {
         )
     })?;
 
-    if let Some(err) = value.get("error") {
-        let msg = err
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("unknown error");
-        let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
-        return Err(format!("server error (code={code}): {msg}"));
-    }
-    if let Some(result) = value.get("result").cloned() {
-        return Ok(result);
+    if !value["success"].as_bool().unwrap_or(true) {
+        let msg = value["msg"].as_str().unwrap_or("unknown error");
+        return Err(format!("server error: {msg}"));
     }
     Ok(value)
 }

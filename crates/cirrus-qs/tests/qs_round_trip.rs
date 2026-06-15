@@ -1,4 +1,8 @@
 //! End-to-end test: REQ → cirrus-qs REP → engine → response.
+//!
+//! All requests use the plain bluesky-queueserver wire format:
+//!   `{"method": ..., "params": {...}}`
+//! Responses are flat dicts `{"success": bool, "msg": str, ...fields...}`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,11 +20,6 @@ fn rand_port() -> u16 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos() as u32;
-    // Use 14 bits of entropy (16384 slots) instead of 10 (1024) so
-    // parallel test runs collide on the IPC socket path far less
-    // often. The "port" here is a stringification ingredient only —
-    // collisions land two tests on the same ipc:// path, so the
-    // second `bind` fails with "Address already in use".
     let base = 32_768u16;
     let offset = ((nanos.wrapping_add(bump as u32 * 16_777_213)) & 0x3FFF) as u16;
     base.saturating_add(offset)
@@ -34,12 +33,12 @@ fn endpoint(port: u16) -> String {
     )
 }
 
+/// Send a plain bluesky-queueserver request `{"method", "params"}` and return
+/// the flat response dict.
 fn rpc(socket: &zmq::Socket, method: &str, params: Value) -> Value {
     let req = json!({
-        "jsonrpc": "2.0",
         "method": method,
         "params": params,
-        "id": 1,
     });
     socket.send(serde_json::to_vec(&req).unwrap(), 0).unwrap();
     let resp = socket.recv_bytes(0).unwrap();
@@ -102,7 +101,7 @@ async fn ping_works() {
 
     let req = req_socket(port);
     let r = rpc(&req, "ping", json!({}));
-    assert_eq!(r["result"]["msg"], "pong");
+    assert_eq!(r["msg"], "pong");
 
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -121,14 +120,14 @@ async fn end_to_end_count_through_qs() {
     let req = req_socket(port);
 
     let r = rpc(&req, "environment_open", json!({}));
-    assert_eq!(r["result"]["success"], true);
+    assert_eq!(r["success"], true);
 
     let r = rpc(&req, "plans_allowed", json!({}));
-    let plans = r["result"]["plans_allowed"].as_array().unwrap();
+    let plans = r["plans_allowed"].as_array().unwrap();
     assert!(plans.iter().any(|v| v == "count"));
 
     let r = rpc(&req, "devices_allowed", json!({}));
-    let devs = r["result"]["devices_allowed"].as_array().unwrap();
+    let devs = r["devices_allowed"].as_array().unwrap();
     assert!(devs.iter().any(|v| v == "det1"));
 
     let r = rpc(
@@ -136,23 +135,23 @@ async fn end_to_end_count_through_qs() {
         "queue_item_add",
         json!({"item": {"name": "count", "args": ["det1", 3]}}),
     );
-    assert_eq!(r["result"]["success"], true);
-    assert_eq!(r["result"]["qsize"], 1);
+    assert_eq!(r["success"], true);
+    assert_eq!(r["qsize"], 1);
 
     let r = rpc(&req, "status", json!({}));
-    assert_eq!(r["result"]["items_in_queue"], 1);
-    assert_eq!(r["result"]["manager_state"], "idle");
+    assert_eq!(r["items_in_queue"], 1);
+    assert_eq!(r["manager_state"], "idle");
 
     let r = rpc(&req, "queue_start", json!({}));
-    assert_eq!(r["result"]["success"], true);
+    assert_eq!(r["success"], true);
 
     let mut done = false;
     for _ in 0..40 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let r = rpc(&req, "status", json!({}));
-        if r["result"]["plans_run"].as_u64().unwrap_or(0) >= 1
-            && r["result"]["items_in_queue"] == 0
-            && r["result"]["manager_state"] == "idle"
+        if r["plans_run"].as_u64().unwrap_or(0) >= 1
+            && r["items_in_queue"] == 0
+            && r["manager_state"] == "idle"
         {
             done = true;
             break;
@@ -179,10 +178,8 @@ async fn unknown_plan_rejected() {
         "queue_item_add",
         json!({"item": {"name": "no_such_plan", "args": []}}),
     );
-    assert!(r["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("unknown plan"));
+    assert!(!r["success"].as_bool().unwrap_or(true));
+    assert!(r["msg"].as_str().unwrap().contains("unknown plan"));
 
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -221,7 +218,6 @@ async fn shutdown_aborts_running_queue_task() {
     rpc(&req, "queue_start", json!({}));
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Confirm the worker is alive and ticking.
     let mid = counter.load(Ordering::SeqCst);
     assert!(mid > 0, "queue worker did not advance pre-shutdown");
 
@@ -229,7 +225,6 @@ async fn shutdown_aborts_running_queue_task() {
     tokio::time::sleep(Duration::from_millis(400)).await;
     let after = counter.load(Ordering::SeqCst);
 
-    // Wait again. If shutdown's abort fired, the counter must NOT advance.
     tokio::time::sleep(Duration::from_millis(500)).await;
     let later = counter.load(Ordering::SeqCst);
     assert_eq!(
@@ -239,7 +234,7 @@ async fn shutdown_aborts_running_queue_task() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn unknown_method_returns_jsonrpc_error() {
+async fn unknown_method_returns_error() {
     let port = rand_port();
     let mut reg = Registry::new();
     reg.register_plan_count("count");
@@ -249,7 +244,8 @@ async fn unknown_method_returns_jsonrpc_error() {
     let req = req_socket(port);
 
     let r = rpc(&req, "no_such_method", json!({}));
-    assert_eq!(r["error"]["code"], -32601);
+    assert!(!r["success"].as_bool().unwrap_or(true));
+    assert!(r["msg"].as_str().unwrap().contains("unknown method"));
 
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -263,8 +259,8 @@ async fn config_get_returns_implementation_metadata() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let req = req_socket(port);
     let r = rpc(&req, "config_get", json!({}));
-    assert_eq!(r["result"]["config"]["implementation"], "cirrus-qs");
-    assert!(r["result"]["config"]["version"].is_string());
+    assert_eq!(r["config"]["implementation"], "cirrus-qs");
+    assert!(r["config"]["version"].is_string());
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
@@ -279,10 +275,7 @@ async fn plans_existing_matches_plans_allowed() {
     let req = req_socket(port);
     let allowed = rpc(&req, "plans_allowed", json!({}));
     let existing = rpc(&req, "plans_existing", json!({}));
-    assert_eq!(
-        allowed["result"]["plans_allowed"],
-        existing["result"]["plans_existing"]
-    );
+    assert_eq!(allowed["plans_allowed"], existing["plans_existing"]);
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
@@ -308,10 +301,10 @@ async fn queue_clear_empties_queue() {
         json!({"item": {"name": "count", "args": ["det1", 1]}}),
     );
     let s = rpc(&req, "status", json!({}));
-    assert_eq!(s["result"]["items_in_queue"], 2);
+    assert_eq!(s["items_in_queue"], 2);
     rpc(&req, "queue_clear", json!({}));
     let s = rpc(&req, "status", json!({}));
-    assert_eq!(s["result"]["items_in_queue"], 0);
+    assert_eq!(s["items_in_queue"], 0);
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
@@ -336,8 +329,8 @@ async fn queue_item_move_and_get_by_uid() {
         "queue_item_add",
         json!({"item": {"name": "count", "args": ["det1", 2]}}),
     );
-    let uid_first = r1["result"]["item_uid"].as_str().unwrap().to_string();
-    let uid_second = r2["result"]["item_uid"].as_str().unwrap().to_string();
+    let uid_first = r1["item_uid"].as_str().unwrap().to_string();
+    let uid_second = r2["item_uid"].as_str().unwrap().to_string();
 
     // Move the second item to the front.
     let mv = rpc(
@@ -345,17 +338,17 @@ async fn queue_item_move_and_get_by_uid() {
         "queue_item_move",
         json!({"uid": uid_second, "pos_dest": "front"}),
     );
-    assert_eq!(mv["result"]["success"], true);
+    assert_eq!(mv["success"], true);
 
     // Verify queue order via queue_get.
     let q = rpc(&req, "queue_get", json!({}));
-    let items = q["result"]["items"].as_array().unwrap();
+    let items = q["items"].as_array().unwrap();
     assert_eq!(items[0]["item_uid"], uid_second);
     assert_eq!(items[1]["item_uid"], uid_first);
 
     // queue_item_get by uid.
     let one = rpc(&req, "queue_item_get", json!({"uid": uid_first}));
-    assert_eq!(one["result"]["item"]["item_uid"], uid_first);
+    assert_eq!(one["item"]["item_uid"], uid_first);
 
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -384,7 +377,7 @@ async fn history_populates_after_run() {
     for _ in 0..40 {
         tokio::time::sleep(Duration::from_millis(80)).await;
         let s = rpc(&req, "status", json!({}));
-        if s["result"]["plans_run"].as_u64().unwrap_or(0) >= 1 {
+        if s["plans_run"].as_u64().unwrap_or(0) >= 1 {
             done = true;
             break;
         }
@@ -392,13 +385,13 @@ async fn history_populates_after_run() {
     assert!(done);
 
     let h = rpc(&req, "history_get", json!({}));
-    let items = h["result"]["items"].as_array().unwrap();
+    let items = h["items"].as_array().unwrap();
     assert!(!items.is_empty(), "history should have at least one item");
     assert_eq!(items[0]["name"], "count");
 
     rpc(&req, "history_clear", json!({}));
     let h = rpc(&req, "history_get", json!({}));
-    assert_eq!(h["result"]["items"].as_array().unwrap().len(), 0);
+    assert_eq!(h["items"].as_array().unwrap().len(), 0);
 
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -418,23 +411,25 @@ async fn lock_blocks_queue_ops_unless_keyed() {
         "lock",
         json!({"lock_key": "secret", "queue": true, "user": "alice"}),
     );
-    assert_eq!(r["result"]["success"], true);
+    assert_eq!(r["success"], true);
 
     // Without lock_key — must be rejected.
     let r = rpc(&req, "queue_clear", json!({}));
-    assert!(r["error"]["message"].as_str().unwrap().contains("locked"));
+    assert!(!r["success"].as_bool().unwrap_or(true));
+    assert!(r["msg"].as_str().unwrap().contains("locked"));
 
     // With wrong key — also rejected.
     let r = rpc(&req, "queue_clear", json!({"lock_key": "wrong"}));
-    assert!(r["error"]["message"].as_str().unwrap().contains("locked"));
+    assert!(!r["success"].as_bool().unwrap_or(true));
+    assert!(r["msg"].as_str().unwrap().contains("locked"));
 
     // With correct key — allowed.
     let r = rpc(&req, "queue_clear", json!({"lock_key": "secret"}));
-    assert_eq!(r["result"]["success"], true);
+    assert_eq!(r["success"], true);
 
     // Unlock.
     let r = rpc(&req, "unlock", json!({"lock_key": "secret"}));
-    assert_eq!(r["result"]["success"], true);
+    assert_eq!(r["success"], true);
 
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -454,8 +449,8 @@ async fn re_metadata_round_trip() {
         json!({"metadata": {"operator": "alice", "beamline": "BL-7"}}),
     );
     let r = rpc(&req, "re_metadata", json!({}));
-    assert_eq!(r["result"]["metadata"]["operator"], "alice");
-    assert_eq!(r["result"]["metadata"]["beamline"], "BL-7");
+    assert_eq!(r["metadata"]["operator"], "alice");
+    assert_eq!(r["metadata"]["beamline"], "BL-7");
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
@@ -467,11 +462,6 @@ async fn not_implemented_methods_return_defined_error() {
     let shutdown = spawn_server(reg, port);
     tokio::time::sleep(Duration::from_millis(300)).await;
     let req = req_socket(port);
-    // Methods that remain registered-but-stub-only (NOT_IMPLEMENTED).
-    // permissions_reload moved out — it's now actually implemented and
-    // gated by RBAC (admin-only), tested separately below. Likewise
-    // permissions_get / manager_test / task_status / task_result return
-    // success (819bf6e wire-compat).
     for m in [
         "permissions_set",
         "script_upload",
@@ -481,9 +471,13 @@ async fn not_implemented_methods_return_defined_error() {
         "manager_kill",
     ] {
         let r = rpc(&req, m, json!({}));
-        assert_eq!(
-            r["error"]["code"], -32099,
-            "method {m} should report NOT_IMPLEMENTED"
+        assert!(
+            !r["success"].as_bool().unwrap_or(true),
+            "method {m} should report failure (not implemented)"
+        );
+        assert!(
+            r["msg"].as_str().unwrap_or("").contains("not implemented"),
+            "method {m} msg should mention 'not implemented': {r}"
         );
     }
     shutdown.shutdown();
@@ -497,8 +491,7 @@ async fn status_includes_bluesky_fields() {
     let shutdown = spawn_server(reg, port);
     tokio::time::sleep(Duration::from_millis(300)).await;
     let req = req_socket(port);
-    let s = rpc(&req, "status", json!({}));
-    let r = &s["result"];
+    let r = rpc(&req, "status", json!({}));
     for k in [
         "manager_state",
         "items_in_queue",
@@ -513,7 +506,7 @@ async fn status_includes_bluesky_fields() {
         "plan_history_uid",
         "lock_info_uid",
     ] {
-        assert!(!r[k].is_null(), "status missing field: {k} (got {s})");
+        assert!(!r[k].is_null(), "status missing field: {k} (got {r})");
     }
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -521,23 +514,19 @@ async fn status_includes_bluesky_fields() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn task_status_returns_completed_for_any_uid() {
-    // bluesky-queueserver clients always poll task_status after
-    // queue_item_execute. cirrus-qs runs synchronously, so we don't
-    // track tasks — but returning a clean "completed" shape keeps
-    // those clients happy.
     let port = rand_port();
     let reg = Registry::new();
     let shutdown = spawn_server(reg, port);
     tokio::time::sleep(Duration::from_millis(300)).await;
     let req = req_socket(port);
     let r = rpc(&req, "task_status", json!({"task_uid": "anything"}));
-    assert_eq!(r["result"]["status"], "completed");
+    assert_eq!(r["status"], "completed");
     let r = rpc(&req, "task_result", json!({"task_uid": "anything"}));
-    assert_eq!(r["result"]["status"], "completed");
+    assert_eq!(r["status"], "completed");
     let r = rpc(&req, "manager_test", json!({}));
-    assert_eq!(r["result"]["success"], true);
+    assert_eq!(r["success"], true);
     let r = rpc(&req, "permissions_get", json!({}));
-    assert!(r["result"]["user_group_permissions"].is_object());
+    assert!(r["user_group_permissions"].is_object());
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
@@ -549,8 +538,8 @@ async fn status_includes_manager_version() {
     let shutdown = spawn_server(reg, port);
     tokio::time::sleep(Duration::from_millis(300)).await;
     let req = req_socket(port);
-    let s = rpc(&req, "status", json!({}));
-    let v = &s["result"]["manager_version"];
+    let r = rpc(&req, "status", json!({}));
+    let v = &r["manager_version"];
     assert!(v.is_string(), "manager_version should be a string, got {v}");
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -568,29 +557,30 @@ async fn device_inspect_returns_state_json() {
 
     let r = rpc(&req, "device_inspect", json!({"name": "det1"}));
     assert!(
-        r["result"]["success"].as_bool().unwrap_or(false),
+        r["success"].as_bool().unwrap_or(false),
         "device_inspect should succeed: {r}"
     );
-    assert_eq!(r["result"]["name"], "det1");
-    assert_eq!(r["result"]["state"]["type"], "SoftDetector");
-    assert_eq!(r["result"]["state"]["name"], "det1");
-    assert!(r["result"]["state"]["counts"].is_number());
+    assert_eq!(r["name"], "det1");
+    assert_eq!(r["state"]["type"], "SoftDetector");
+    assert_eq!(r["state"]["name"], "det1");
+    assert!(r["state"]["counts"].is_number());
 
     // Unknown device.
     let r = rpc(&req, "device_inspect", json!({"name": "nope"}));
     assert!(
-        r["error"]["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("no device"),
+        !r["success"].as_bool().unwrap_or(true),
+        "unknown device should fail: {r}"
+    );
+    assert!(
+        r["msg"].as_str().unwrap_or("").contains("no device"),
         "expected 'no device' message, got {r}"
     );
 
     // Missing name param.
     let r = rpc(&req, "device_inspect", json!({}));
-    assert_eq!(
-        r["error"]["code"], -32602,
-        "missing name → INVALID_PARAMS: {r}"
+    assert!(
+        !r["success"].as_bool().unwrap_or(true),
+        "missing name should fail: {r}"
     );
 
     shutdown.shutdown();
@@ -599,10 +589,6 @@ async fn device_inspect_returns_state_json() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rbac_denies_mutation_for_read_only_group() {
-    // Permissions config: anonymous callers (no api_key) land in
-    // `viewer`, which is read-only. `admin-key` → admin group with full
-    // access. Read-only callers must get NOT_AUTHORIZED on mutating
-    // RPCs and success on info RPCs; admin must succeed on both.
     let toml = r#"
         default_group = "viewer"
 
@@ -631,25 +617,35 @@ async fn rbac_denies_mutation_for_read_only_group() {
 
     // Info RPC always succeeds — even for read_only.
     let r = rpc(&req, "ping", json!({}));
-    assert!(r["result"]["success"].as_bool().unwrap_or(false));
+    assert!(r["success"].as_bool().unwrap_or(false));
 
-    // Mutation RPC: anonymous → denied (NOT_AUTHORIZED).
+    // Mutation RPC: anonymous → denied (RBAC).
     let r = rpc(&req, "queue_clear", json!({}));
-    assert_eq!(r["error"]["code"], -32001, "viewer should be denied: {r}");
+    assert!(
+        !r["success"].as_bool().unwrap_or(true),
+        "viewer should be denied: {r}"
+    );
+    assert!(
+        r["msg"].as_str().unwrap_or("").contains("RBAC"),
+        "viewer denial should mention RBAC: {r}"
+    );
 
     // Mutation RPC: admin-key → succeeds.
     let r = rpc(&req, "queue_clear", json!({"api_key": "admin-key"}));
     assert!(
-        r["result"]["success"].as_bool().unwrap_or(false),
+        r["success"].as_bool().unwrap_or(false),
         "admin should succeed: {r}"
     );
 
     // permissions_reload (Admin class): viewer denied, admin OK.
     let r = rpc(&req, "permissions_reload", json!({}));
-    assert_eq!(r["error"]["code"], -32001, "viewer permissions_reload: {r}");
+    assert!(
+        !r["success"].as_bool().unwrap_or(true),
+        "viewer permissions_reload should be denied: {r}"
+    );
     let r = rpc(&req, "permissions_reload", json!({"api_key": "admin-key"}));
     assert!(
-        r["result"]["success"].as_bool().unwrap_or(false),
+        r["success"].as_bool().unwrap_or(false),
         "admin permissions_reload: {r}"
     );
 
@@ -659,11 +655,6 @@ async fn rbac_denies_mutation_for_read_only_group() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rbac_filters_plan_name_on_queue_add() {
-    // viewer is read-only by default; primary allows only "count"
-    // and "scan_*". queue_item_add with plan name "fly" must be
-    // denied; "count" and "scan_grid" must pass plan-name check
-    // (they may still fail because the plan is not registered, but
-    // the *RBAC* check passes — assert by error code).
     let toml = r#"
         default_group = "primary"
         [user_groups.primary]
@@ -680,26 +671,33 @@ async fn rbac_filters_plan_name_on_queue_add() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let req = req_socket(port);
 
-    // "fly" is not in allowed_plans → NOT_AUTHORIZED.
+    // "fly" is not in allowed_plans → denied.
     let r = rpc(
         &req,
         "queue_item_add",
         json!({"item": {"name": "fly", "args": []}}),
     );
-    assert_eq!(
-        r["error"]["code"], -32001,
+    assert!(
+        !r["success"].as_bool().unwrap_or(true),
         "fly should be RBAC-denied for primary: {r}"
+    );
+    assert!(
+        r["msg"].as_str().unwrap_or("").contains("RBAC"),
+        "fly denial should mention RBAC: {r}"
     );
 
     // "count" passes RBAC (may then fail because it's not registered
-    // in this test's empty Registry, but that's a different code).
+    // in this test's empty Registry, but that's a different failure).
     let r = rpc(
         &req,
         "queue_item_add",
         json!({"item": {"name": "count", "args": []}}),
     );
-    assert_ne!(
-        r["error"]["code"], -32001,
+    // Either it succeeded (registered + RBAC allowed) or it failed for
+    // a non-RBAC reason (plan not registered in this Registry).
+    let msg = r["msg"].as_str().unwrap_or("");
+    assert!(
+        r["success"].as_bool().unwrap_or(false) || !msg.contains("RBAC"),
         "count should not be RBAC-denied: {r}"
     );
 
@@ -710,8 +708,7 @@ async fn rbac_filters_plan_name_on_queue_add() {
 // -- lua_eval async RPC -----------------------------------------------------
 
 /// Mock LuaEvaluator: echoes the source as stdout, parses a leading
-/// integer from `source` as a sleep delay (ms) before completing. Lets
-/// the test drive a "still-running" assertion deterministically.
+/// integer from `source` as a sleep delay (ms) before completing.
 struct MockEval;
 
 #[async_trait::async_trait]
@@ -773,17 +770,14 @@ async fn lua_eval_async_returns_task_uid_and_completes() {
     let req = req_socket(port);
 
     let r = rpc(&req, "lua_eval", json!({"source": "0"}));
-    assert!(r["result"]["success"].as_bool().unwrap_or(false), "{r}");
-    let uid = r["result"]["task_uid"]
-        .as_str()
-        .expect("task_uid")
-        .to_string();
+    assert!(r["success"].as_bool().unwrap_or(false), "{r}");
+    let uid = r["task_uid"].as_str().expect("task_uid").to_string();
 
     let mut completed = false;
     for _ in 0..30 {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let s = rpc(&req, "task_status", json!({"task_uid": uid}));
-        if s["result"]["status"] == "completed" {
+        if s["status"] == "completed" {
             completed = true;
             break;
         }
@@ -791,10 +785,10 @@ async fn lua_eval_async_returns_task_uid_and_completes() {
     assert!(completed, "task_status never reached completed");
 
     let r = rpc(&req, "task_result", json!({"task_uid": uid}));
-    assert_eq!(r["result"]["status"], "completed");
-    assert_eq!(r["result"]["result"]["success"], true);
-    assert_eq!(r["result"]["result"]["stdout"], "echo: 0");
-    assert_eq!(r["result"]["result"]["return_value"], "nil");
+    assert_eq!(r["status"], "completed");
+    assert_eq!(r["result"]["success"], true);
+    assert_eq!(r["result"]["stdout"], "echo: 0");
+    assert_eq!(r["result"]["return_value"], "nil");
 
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -809,16 +803,16 @@ async fn lua_eval_running_state_visible_during_eval() {
     let req = req_socket(port);
 
     let r = rpc(&req, "lua_eval", json!({"source": "500"}));
-    let uid = r["result"]["task_uid"].as_str().unwrap().to_string();
+    let uid = r["task_uid"].as_str().unwrap().to_string();
     tokio::time::sleep(Duration::from_millis(100)).await;
     let s = rpc(&req, "task_status", json!({"task_uid": uid}));
-    assert_eq!(s["result"]["status"], "running", "{s}");
+    assert_eq!(s["status"], "running", "{s}");
 
     let mut completed = false;
     for _ in 0..30 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let s = rpc(&req, "task_status", json!({"task_uid": uid}));
-        if s["result"]["status"] == "completed" {
+        if s["status"] == "completed" {
             completed = true;
             break;
         }
@@ -838,16 +832,16 @@ async fn lua_eval_propagates_failure() {
     let req = req_socket(port);
 
     let r = rpc(&req, "lua_eval", json!({"source": "0 BOOM"}));
-    let uid = r["result"]["task_uid"].as_str().unwrap().to_string();
+    let uid = r["task_uid"].as_str().unwrap().to_string();
     let mut done = false;
     for _ in 0..30 {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let s = rpc(&req, "task_status", json!({"task_uid": uid}));
-        if s["result"]["status"] != "running" {
-            assert_eq!(s["result"]["status"], "failed", "expected failed: {s}");
+        if s["status"] != "running" {
+            assert_eq!(s["status"], "failed", "expected failed: {s}");
             let r2 = rpc(&req, "task_result", json!({"task_uid": uid}));
-            assert_eq!(r2["result"]["result"]["success"], false);
-            assert_eq!(r2["result"]["result"]["traceback"], "synthetic");
+            assert_eq!(r2["result"]["success"], false);
+            assert_eq!(r2["result"]["traceback"], "synthetic");
             done = true;
             break;
         }
@@ -860,8 +854,6 @@ async fn lua_eval_propagates_failure() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lua_eval_rejects_oversize_source() {
-    // R6.1: the dispatcher caps source size at 1 MiB so a runaway
-    // client can't pin daemon memory.
     let port = rand_port();
     let reg = Registry::new();
     let shutdown = spawn_server_with_eval(reg, port, Arc::new(MockEval));
@@ -870,12 +862,9 @@ async fn lua_eval_rejects_oversize_source() {
 
     let huge: String = "a".repeat((1 << 20) + 1);
     let r = rpc(&req, "lua_eval", json!({"source": huge}));
-    assert_eq!(r["error"]["code"], -32602, "{r}");
+    assert!(!r["success"].as_bool().unwrap_or(true), "{r}");
     assert!(
-        r["error"]["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("source too large"),
+        r["msg"].as_str().unwrap_or("").contains("source too large"),
         "expected 'source too large' message: {r}"
     );
 
@@ -883,10 +872,6 @@ async fn lua_eval_rejects_oversize_source() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
 
-/// A LuaEvaluator that always panics. Verifies the dispatcher's
-/// catch_unwind path: a panicking eval future must still call
-/// `tracker.complete` (with an error result) so clients don't
-/// poll a "running" task forever.
 struct PanickingEval;
 
 #[async_trait::async_trait]
@@ -898,10 +883,6 @@ impl cirrus_qs::LuaEvaluator for PanickingEval {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lua_eval_panic_surfaces_as_failed_task() {
-    // R6.2: a panicking eval future would otherwise leave the task
-    // stuck `running` forever (tracker.complete never called).
-    // catch_unwind in the dispatcher recovers and surfaces the panic
-    // as a normal failed result.
     let port = rand_port();
     let reg = Registry::new();
     let shutdown = spawn_server_with_eval(reg, port, Arc::new(PanickingEval));
@@ -909,20 +890,16 @@ async fn lua_eval_panic_surfaces_as_failed_task() {
     let req = req_socket(port);
 
     let r = rpc(&req, "lua_eval", json!({"source": "anything"}));
-    let uid = r["result"]["task_uid"]
-        .as_str()
-        .expect("task_uid")
-        .to_string();
+    let uid = r["task_uid"].as_str().expect("task_uid").to_string();
 
-    // Poll until terminal. Must reach `failed`, not stay `running`.
     let mut got_failed = false;
     for _ in 0..30 {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let s = rpc(&req, "task_status", json!({"task_uid": uid}));
-        if s["result"]["status"] == "failed" {
+        if s["status"] == "failed" {
             got_failed = true;
             let r2 = rpc(&req, "task_result", json!({"task_uid": uid}));
-            let tb = r2["result"]["result"]["traceback"].as_str().unwrap_or("");
+            let tb = r2["result"]["traceback"].as_str().unwrap_or("");
             assert!(
                 tb.contains("panicked") && tb.contains("synthetic"),
                 "traceback should name the panic: {r2}"
@@ -948,7 +925,11 @@ async fn lua_eval_without_evaluator_returns_not_implemented() {
     let req = req_socket(port);
 
     let r = rpc(&req, "lua_eval", json!({"source": "1+1"}));
-    assert_eq!(r["error"]["code"], -32099, "{r}");
+    assert!(!r["success"].as_bool().unwrap_or(true), "{r}");
+    assert!(
+        r["msg"].as_str().unwrap_or("").contains("no Lua evaluator"),
+        "expected 'no Lua evaluator' message: {r}"
+    );
 
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -956,11 +937,6 @@ async fn lua_eval_without_evaluator_returns_not_implemented() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rbac_admin_task_result_blocked_for_non_admin() {
-    // R1.2: admin runs `lua_eval`; the task's stdout / return value
-    // would leak to a viewer polling task_status / task_result if the
-    // dispatcher classified those as plain Info. Per-task RBAC gate
-    // requires the caller to be admin when the originating method
-    // was admin-class.
     let toml = r#"
         default_group = "viewer"
 
@@ -1008,19 +984,19 @@ async fn rbac_admin_task_result_blocked_for_non_admin() {
         "lua_eval",
         json!({"source": "0", "api_key": "boss-key"}),
     );
-    let uid = r["result"]["task_uid"]
-        .as_str()
-        .expect("task_uid")
-        .to_string();
+    let uid = r["task_uid"].as_str().expect("task_uid").to_string();
 
     // Viewer (no api_key) tries to poll status — must be denied.
     let r = rpc(&req, "task_status", json!({"task_uid": uid}));
-    assert_eq!(r["error"]["code"], -32001, "viewer should be denied: {r}");
+    assert!(
+        !r["success"].as_bool().unwrap_or(true),
+        "viewer should be denied: {r}"
+    );
 
     // Viewer tries task_result — also denied.
     let r = rpc(&req, "task_result", json!({"task_uid": uid}));
-    assert_eq!(
-        r["error"]["code"], -32001,
+    assert!(
+        !r["success"].as_bool().unwrap_or(true),
         "viewer task_result should be denied: {r}"
     );
 
@@ -1031,7 +1007,7 @@ async fn rbac_admin_task_result_blocked_for_non_admin() {
         json!({"task_uid": uid, "api_key": "boss-key"}),
     );
     assert!(
-        r["result"]["status"].as_str().is_some(),
+        r["status"].as_str().is_some(),
         "admin task_status should succeed: {r}"
     );
 
