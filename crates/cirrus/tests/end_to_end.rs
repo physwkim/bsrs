@@ -792,3 +792,57 @@ async fn rewindable_false_clears_rewind_cache_no_replay_on_resume() {
         "Rewindable(false) must reset the rewind cache so the pre-toggle Set is not replayed on resume"
     );
 }
+
+#[tokio::test]
+async fn pause_mid_bundle_then_resume_completes_without_create_collision() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    let det = SoftDetector::new("mb_det");
+    let sink = Arc::new(CapturingSink::new());
+    let re = Arc::new(RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]));
+
+    let reached = Arc::new(AtomicUsize::new(0));
+    let reached_clone = reached.clone();
+    let det_clone = det.clone();
+    let plan = cirrus_core::plan::plan_box(async_stream::stream! {
+        yield cirrus_core::Msg::OpenRun(Default::default());
+        yield cirrus_core::Msg::Checkpoint;
+        // Open an event bundle, then pause *before* the paired Save — the
+        // window a suspender / immediate pause can hit inside trigger_and_read
+        // (create … read … save with no intervening checkpoint).
+        yield cirrus_core::Msg::Create { stream_name: "primary".into() };
+        reached_clone.store(1, Ordering::SeqCst);
+        yield cirrus_core::Msg::Pause { defer: false };
+        // After resume: finish the bundle.
+        yield cirrus_core::Msg::Read(det_clone as Arc<dyn cirrus_core::msg::ReadableObj>);
+        yield cirrus_core::Msg::Save;
+        yield cirrus_core::Msg::CloseRun {
+            exit_status: "success".into(),
+            reason: None,
+        };
+    });
+
+    let re_run = re.clone();
+    let join = tokio::spawn(async move { re_run.run_async(plan).await });
+
+    for _ in 0..50 {
+        if reached.load(Ordering::SeqCst) == 1 && re.is_paused() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(re.is_paused(), "engine should be paused mid-bundle");
+
+    re.resume();
+    let result = join.await.unwrap().unwrap();
+    // Pre-fix: the replayed cached Create collides with the still-open bundle
+    // ("create called while a previous bundle is still open") → exit "fail".
+    assert_eq!(
+        result.exit_status, "success",
+        "resume after a mid-bundle pause must cancel the open bundle, not abort"
+    );
+    // Start + Descriptor + 1 Event + Stop = 4 — exactly one event, no abort.
+    let docs = sink.snapshot().await;
+    assert_eq!(docs.len(), 4, "got {docs:#?}");
+}

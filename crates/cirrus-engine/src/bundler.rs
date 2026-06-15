@@ -157,6 +157,24 @@ impl RunBundler {
         Ok(())
     }
 
+    /// Roll back checkpoint state before the rewind cache is replayed on
+    /// resume. Mirrors bluesky's `RunBundler.rewind` (bundlers.py:520-533):
+    /// cancel any bundle left open (created but not yet saved) when the pause
+    /// landed mid-event — after `create`, before the paired `save`. Without
+    /// this, the replayed `Create` collides with the still-open bundle and
+    /// `create` errors with "create called while a previous bundle is still
+    /// open", aborting the run on resume. The replay re-issues `Create` (now
+    /// against `open == None`) and the cached `Read`s, so the bundle and its
+    /// readings are faithfully rebuilt.
+    ///
+    /// bluesky additionally rolls back per-stream sequence counters here;
+    /// cirrus keeps those in `RunBundle` (cirrus-event-model) and does not yet
+    /// snapshot them, so a duplicate event replayed after a post-`save` pause
+    /// advances the seq_num rather than reusing it — tracked separately.
+    pub fn rewind(&mut self) {
+        self.open = None;
+    }
+
     /// Pre-declare a stream (fly scans).
     pub fn declare_stream(
         &mut self,

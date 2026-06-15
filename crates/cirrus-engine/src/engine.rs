@@ -1085,6 +1085,16 @@ impl RunEngine {
             // Move msg_cache → replay_queue so the engine replays
             // from the last checkpoint.
             let cache = std::mem::take(&mut state.msg_cache);
+            // Roll back bundler checkpoint state before replaying — mirrors
+            // bluesky `_rewind` calling `RunBundler.rewind` only when the cache
+            // is non-empty (run_engine.py:1043-1048). Cancels a bundle left
+            // open by a pause that landed mid-event so the replayed `Create`
+            // does not collide with it.
+            if !cache.is_empty() {
+                if let Some(b) = state.bundler.as_mut() {
+                    b.rewind();
+                }
+            }
             state.replay_queue.extend(cache);
             state.pausables.values().cloned().collect()
         };
