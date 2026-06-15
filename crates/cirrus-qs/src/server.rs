@@ -370,6 +370,25 @@ pub(crate) async fn execute_queue_loop(
                 return;
             }
         };
+        // Handle instruction items (ref: manager.py:1154-1165).
+        if item.item_type == "instruction" {
+            if item.name == "queue_stop" {
+                let archived = item.with_result(serde_json::json!({"exit_status": "completed"}));
+                queue.lock().unwrap().push_history(archived);
+                state.lock().unwrap().queue_stop_pending = true;
+                continue; // next iteration checks queue_stop_pending and exits
+            } else {
+                tracing::error!("queue: unknown instruction: {}", item.name);
+                let reason = format!("unknown instruction: {}", item.name);
+                let archived = item.with_result(serde_json::json!({
+                    "exit_status": "fail",
+                    "reason": reason,
+                }));
+                queue.lock().unwrap().push_history(archived);
+                continue;
+            }
+        }
+
         {
             let mut s = state.lock().unwrap();
             s.state = Some(EState::ExecutingQueue);

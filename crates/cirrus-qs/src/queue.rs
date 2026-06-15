@@ -47,6 +47,20 @@ impl QueuedItem {
         }
     }
 
+    /// Build an instruction item (e.g. `queue_stop`), allocating a fresh UID.
+    pub fn instruction(name: impl Into<String>) -> Self {
+        Self {
+            item_uid: Uuid::new_v4().to_string(),
+            item_type: "instruction".into(),
+            name: name.into(),
+            args: Value::Null,
+            meta: Value::Null,
+            user: None,
+            user_group: None,
+            result: None,
+        }
+    }
+
     /// Attach a result (used when archiving into history).
     pub fn with_result(mut self, result: Value) -> Self {
         self.result = Some(result);

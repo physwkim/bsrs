@@ -598,13 +598,14 @@ fn queue_item_add(
         Some(it) => it.clone(),
         None => return err("missing 'item'"),
     };
+    let item_type = item
+        .get("item_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("plan");
     let name = match item.get("name").and_then(|v| v.as_str()) {
         Some(n) => n.to_string(),
         None => return err("item.name required"),
     };
-    if registry.plan(&name).is_none() {
-        return err(format!("unknown plan: {name}"));
-    }
 
     // Positional-insertion params (ref: plan_queue_ops.py:900-968).
     let pos_val = params.get("pos");
@@ -618,7 +619,24 @@ fn queue_item_add(
         return err("ambiguous: cannot specify both 'before_uid' and 'after_uid'");
     }
 
-    let mut queued = QueuedItem::plan(name, item);
+    // Build queue item based on item_type (ref: manager.py:_prepare_item).
+    let mut queued = match item_type {
+        "plan" => {
+            if registry.plan(&name).is_none() {
+                return err(format!("unknown plan: {name}"));
+            }
+            QueuedItem::plan(name, item)
+        }
+        "instruction" => {
+            if name != "queue_stop" {
+                return err(format!(
+                    "unsupported instruction: {name:?} (only 'queue_stop' is supported)"
+                ));
+            }
+            QueuedItem::instruction(name)
+        }
+        other => return err(format!("unsupported item_type: {other:?}")),
+    };
     queued.user = params
         .get("user")
         .and_then(|v| v.as_str())

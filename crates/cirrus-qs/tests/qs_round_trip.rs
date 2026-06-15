@@ -741,6 +741,97 @@ async fn rbac_filters_plan_name_on_queue_add() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
 
+// -- QS-11: instruction item_type ------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_stop_instruction_stops_queue_after_current_plan() {
+    let port = rand_port();
+    let det = SoftDetector::new("det1");
+    let mut reg = Registry::new();
+    reg.register_readable("det1", det as Arc<dyn ReadableObj>);
+    reg.register_plan_count("count");
+    let shutdown = spawn_server(reg, port);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(port);
+
+    rpc(&req, "environment_open", json!({}));
+
+    // Add: plan A, queue_stop instruction, plan B
+    rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": ["det1", 1]}}),
+    );
+    let ri = rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"item_type": "instruction", "name": "queue_stop"}}),
+    );
+    assert_eq!(ri["success"], true, "instruction add failed: {ri}");
+    assert_eq!(
+        ri["item"]["item_type"], "instruction",
+        "item_type must be instruction: {ri}"
+    );
+    rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": ["det1", 2]}}),
+    );
+    assert_eq!(rpc(&req, "status", json!({}))["items_in_queue"], 3);
+
+    rpc(&req, "queue_start", json!({}));
+
+    let mut done = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let s = rpc(&req, "status", json!({}));
+        if s["manager_state"] == "idle" {
+            done = true;
+            break;
+        }
+    }
+    assert!(done, "queue did not reach idle");
+
+    // Plan A ran, then instruction stopped the queue; plan B is still pending.
+    let s = rpc(&req, "status", json!({}));
+    assert_eq!(s["plans_run"], 1, "exactly one plan should have run: {s}");
+    assert_eq!(s["items_in_queue"], 1, "plan B should remain in queue: {s}");
+
+    // Instruction should be in history.
+    let h = rpc(&req, "history_get", json!({}));
+    let hist = h["items"].as_array().unwrap();
+    assert!(
+        hist.iter()
+            .any(|i| i["item_type"] == "instruction" && i["name"] == "queue_stop"),
+        "queue_stop instruction should appear in history: {h}"
+    );
+
+    // Unknown instruction type → rejected.
+    let r = rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"item_type": "instruction", "name": "not_a_real_instruction"}}),
+    );
+    assert!(
+        !r["success"].as_bool().unwrap_or(true),
+        "unknown instruction should fail: {r}"
+    );
+
+    // Unknown item_type → rejected.
+    let r = rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"item_type": "widget", "name": "count"}}),
+    );
+    assert!(
+        !r["success"].as_bool().unwrap_or(true),
+        "unknown item_type should fail: {r}"
+    );
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
 // -- QS-09: positional insertion -------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
