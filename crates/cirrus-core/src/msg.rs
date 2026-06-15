@@ -294,12 +294,17 @@ impl Msg {
     ///
     /// Mirrors bluesky's `UNCACHEABLE_COMMANDS` set
     /// (`run_engine.py` ≈ `_UNCACHEABLE_COMMANDS`).
+    ///
+    /// NB: `Msg::Wait` is intentionally NOT excluded — bluesky caches `wait`
+    /// (it is absent from `_UNCACHEABLE_COMMANDS`, run_engine.py:369-382), so a
+    /// rewind replays the set's synchronization barrier. Dropping it would
+    /// replay `[Set, Read]` without the intervening `Wait`, reading a device
+    /// before its re-issued move completes (a stale value on resume-rewind).
     pub fn is_cacheable(&self) -> bool {
         !matches!(
             self,
             Msg::OpenRun(_)
                 | Msg::CloseRun { .. }
-                | Msg::Wait { .. }
                 | Msg::Pause { .. }
                 | Msg::Resume
                 | Msg::Checkpoint

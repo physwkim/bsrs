@@ -212,6 +212,71 @@ async fn msg_hook_cleared_stops_firing() {
 }
 
 #[tokio::test]
+async fn wait_is_replayed_on_rewind() {
+    // bluesky caches 'wait' (it is absent from _UNCACHEABLE_COMMANDS,
+    // run_engine.py:369-382), so a rewind replays the set's synchronization
+    // barrier. cirrus previously excluded Msg::Wait from is_cacheable(), so a
+    // rewind replayed [Set, Read] WITHOUT the Wait — the re-issued move was not
+    // awaited before the replayed read (a stale value on resume-rewind). Every
+    // replayed Set must be re-paired with its Wait.
+    let motor: Arc<dyn cirrus_core::msg::MovableObj> =
+        Arc::new(cirrus::backends::soft::SoftMotor::new("m", None));
+
+    let seen = Arc::new(StdMutex::new(Vec::<String>::new()));
+    let s = seen.clone();
+    let re = Arc::new(RunEngine::new(vec![]));
+    re.set_msg_hook(Some(Arc::new(move |msg: &Msg| {
+        let repr = format!("{msg:?}");
+        let head = repr.split([' ', '(', '{']).next().unwrap_or("").to_string();
+        s.lock().unwrap().push(head);
+    })));
+
+    let m = motor.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Checkpoint;
+        yield Msg::Set { obj: m.clone(), value: 1.0, group: Some("set".into()) };
+        yield Msg::Wait { group: "set".into(), error_on_timeout: true, timeout: None };
+        // Pause here: the cache holds [Set, Wait]. A resume rewinds and replays
+        // them. Pre-fix the cache held only [Set]; the Wait was dropped.
+        yield Msg::Pause { defer: false };
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+
+    let re_run = re.clone();
+    let join = tokio::spawn(async move { re_run.run_async(plan).await });
+
+    for _ in 0..100 {
+        if re.is_paused() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(re.is_paused(), "engine never paused");
+    re.resume();
+    let result = tokio::time::timeout(Duration::from_secs(5), join)
+        .await
+        .expect("run did not finish (a replayed Wait may have hung)")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.exit_status, "success");
+
+    let names = seen.lock().unwrap().clone();
+    let sets = names.iter().filter(|n| *n == "Set").count();
+    let waits = names.iter().filter(|n| *n == "Wait").count();
+    // Original Set+Wait, then the rewind replays both → 2 of each.
+    assert_eq!(
+        sets, 2,
+        "Set should appear twice (original + replay): {names:?}"
+    );
+    assert_eq!(
+        waits, sets,
+        "every replayed Set must be re-paired with its Wait \
+         (pre-fix: Wait dropped from the rewind replay): {names:?}"
+    );
+}
+
+#[tokio::test]
 async fn subscribe_receives_all_documents() {
     let received = Arc::new(StdMutex::new(Vec::<String>::new()));
     let r = received.clone();
