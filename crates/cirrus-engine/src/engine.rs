@@ -1441,6 +1441,22 @@ impl RunEngine {
                 // start_monitor), so remove the entry whose key == obj.name().
                 // MonitorTask::drop aborts the pump and drops the Subscription.
                 let mut state = self.state.lock().await;
+                // Reject an 'unmonitor' for an object that is not being monitored.
+                // bluesky's bundler raises IllegalMessageSequence ("Cannot
+                // 'unmonitor' {obj}; it is not being monitored.", bundlers.py:544-545)
+                // before touching any subscription. Without this guard a stray
+                // 'unmonitor' — never monitored, or already unmonitored — is a
+                // silent no-op. Symmetric to the Msg::Monitor double-monitor guard
+                // above; `monitored` is the registry, so membership there is the
+                // precondition. The bulk teardown on pause/close (monitor_tasks
+                // .clear / monitored.clear) is intentionally lenient and unaffected
+                // — this guard is on the explicit per-object message path only.
+                if !state.monitored.contains_key(obj.name()) {
+                    return Err(CirrusError::Plan(format!(
+                        "Cannot 'unmonitor' {}; it is not being monitored",
+                        obj.name()
+                    )));
+                }
                 state
                     .monitor_tasks
                     .retain(|obj_name, _| obj_name != obj.name());

@@ -810,6 +810,35 @@ async fn second_monitor_of_same_object_is_rejected() {
 }
 
 #[tokio::test]
+async fn unmonitor_of_unmonitored_object_is_rejected() {
+    // Symmetric partner to second_monitor_of_same_object_is_rejected. bluesky's
+    // bundler raises IllegalMessageSequence ("Cannot 'unmonitor' {obj}; it is
+    // not being monitored.", bundlers.py:544-545) when the object is not in
+    // _monitor_params. cirrus's Unmonitor handler retain/removed silently, so an
+    // 'unmonitor' for a never-monitored object was a no-op the run survived.
+    // This covers the invariant boundary `monitored.contains_key == false`; the
+    // `== true` boundary (valid unmonitor) is covered by
+    // unmonitor_stops_pump_for_custom_named_stream. The run loop turns the
+    // handler error into RunResult{exit_status:"fail"}.
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let mon = TestMonitor::new("mon1");
+    let mon_for_plan: Arc<dyn cirrus_core::msg::MonitorableObj> = mon.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        // Never monitored — this 'unmonitor' must be rejected, not silently
+        // ignored.
+        yield Msg::Unmonitor(mon_for_plan);
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let result = re.run_async(plan).await.unwrap();
+    assert_eq!(
+        result.exit_status, "fail",
+        "an 'unmonitor' for an object that is not monitored must be rejected"
+    );
+}
+
+#[tokio::test]
 async fn unmonitor_stops_pump_for_custom_named_stream() {
     // Regression: monitor_tasks is keyed by the monitored object, not the
     // stream name, so Unmonitor(obj) removes a custom-named monitor's pump.
