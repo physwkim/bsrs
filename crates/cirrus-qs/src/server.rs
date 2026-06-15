@@ -49,6 +49,11 @@ pub struct ServerBuilder {
     /// is born — a fast plan can run to completion before the
     /// watcher catches up.
     checkpoint_hook: Option<CheckpointHook>,
+    /// Explicit CURVE private key (Z85, 40 chars). Takes precedence over
+    /// the `QSERVER_ZMQ_PRIVATE_KEY` env var. If neither is set, CURVE
+    /// is disabled (plaintext). Mirrors the reference's config mechanism
+    /// (comms.py / manager.py).
+    curve_private_key: Option<String>,
 }
 
 impl Default for ServerBuilder {
@@ -62,6 +67,7 @@ impl Default for ServerBuilder {
             lua_evaluator: None,
             engine_slot: None,
             checkpoint_hook: None,
+            curve_private_key: None,
         }
     }
 }
@@ -122,12 +128,30 @@ impl ServerBuilder {
         self.checkpoint_hook = Some(hook);
         self
     }
+    /// Enable ZMQ CURVE encryption using the given Z85-encoded private key
+    /// (40 characters). Overrides the `QSERVER_ZMQ_PRIVATE_KEY` env var.
+    ///
+    /// Mirrors the reference: `comms.py` / `manager.py` accept the private
+    /// key as a config value that is applied to the REP socket before bind.
+    /// Without this (and without the env var), the socket accepts plain-text
+    /// connections.
+    pub fn curve_private_key(mut self, key: impl Into<String>) -> Self {
+        self.curve_private_key = Some(key.into());
+        self
+    }
     /// Commit. Binds the REP / PUB sockets but does not yet start serving.
     pub fn build(self) -> Result<Server> {
         let registry = self
             .registry
             .ok_or_else(|| CirrusError::State("Server requires a Registry".into()))?;
-        let socket = ReqRepSocket::bind(&self.control_address)?;
+        // Resolve CURVE private key: explicit field first, then env var
+        // (mirrors comms.py / manager.py config resolution).
+        let curve_key = self.curve_private_key.or_else(|| {
+            std::env::var("QSERVER_ZMQ_PRIVATE_KEY")
+                .ok()
+                .filter(|s| !s.is_empty())
+        });
+        let socket = ReqRepSocket::bind(&self.control_address, curve_key.as_deref())?;
         let document_sink: Option<Arc<dyn DocumentSink>> = self
             .document_address
             .as_ref()

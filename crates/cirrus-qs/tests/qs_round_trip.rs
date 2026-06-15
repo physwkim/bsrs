@@ -1610,3 +1610,137 @@ async fn msgpack_ping_round_trip_returns_success() {
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
+
+// -- QS-23: ZMQ CURVE encryption -------------------------------------------
+
+/// Build a CURVE-enabled REQ socket with a given server public key (Z85).
+/// Client key pair can be any valid pair — use generate_zmq_keys() for tests.
+fn curve_req_socket(
+    port: u16,
+    server_public_z85: &str,
+    client_pub_z85: &str,
+    client_priv_z85: &str,
+) -> zmq::Socket {
+    let ctx = zmq::Context::new();
+    let sock = ctx.socket(zmq::REQ).unwrap();
+    sock.set_rcvtimeo(3_000).unwrap();
+    sock.set_sndtimeo(3_000).unwrap();
+    sock.set_curve_serverkey(server_public_z85.as_bytes())
+        .unwrap();
+    sock.set_curve_publickey(client_pub_z85.as_bytes()).unwrap();
+    sock.set_curve_secretkey(client_priv_z85.as_bytes())
+        .unwrap();
+    sock.connect(&endpoint(port)).unwrap();
+    sock
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn curve_server_enabled_via_builder_key_round_trip() {
+    if !cirrus_qs::curve_supported() {
+        eprintln!("CURVE not available in this libzmq build — skipping");
+        return;
+    }
+    let (server_pub, server_priv) =
+        cirrus_qs::generate_zmq_keys().expect("generate server keypair");
+    let (client_pub, client_priv) =
+        cirrus_qs::generate_zmq_keys().expect("generate client keypair");
+
+    let port = rand_port();
+    let reg = Registry::new();
+    // Build server with CURVE via the explicit builder method.
+    let server = Server::builder()
+        .control_address(endpoint(port))
+        .document_address(format!(
+            "ipc:///tmp/cirrus-qs-doc-{}-{}.sock",
+            std::process::id(),
+            port
+        ))
+        .registry(reg)
+        .curve_private_key(&server_priv)
+        .build()
+        .expect("CURVE server build");
+    let shutdown = server.shutdown_handle();
+    tokio::spawn(async move {
+        let _ = server.run_async().await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Plain-text connection must NOT work (CURVE server drops unauthenticated frames).
+    // We only assert the CURVE path works; testing plaintext rejection is slow (timeout).
+
+    // CURVE-authenticated client round-trip.
+    let sock = curve_req_socket(port, &server_pub, &client_pub, &client_priv);
+    let r = rpc(&sock, "ping", json!({}));
+    assert_eq!(r["success"], true, "CURVE ping failed: {r}");
+    assert!(
+        r["manager_state"].is_string(),
+        "CURVE ping must return manager_state: {r}"
+    );
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn curve_server_enabled_via_env_var() {
+    if !cirrus_qs::curve_supported() {
+        eprintln!("CURVE not available in this libzmq build — skipping");
+        return;
+    }
+    let (server_pub, server_priv) =
+        cirrus_qs::generate_zmq_keys().expect("generate server keypair");
+    let (client_pub, client_priv) =
+        cirrus_qs::generate_zmq_keys().expect("generate client keypair");
+
+    let port = rand_port();
+    let reg = Registry::new();
+    // Set env var before building — build() reads it exactly once.
+    std::env::set_var("QSERVER_ZMQ_PRIVATE_KEY", &server_priv);
+    let build_result = Server::builder()
+        .control_address(endpoint(port))
+        .document_address(format!(
+            "ipc:///tmp/cirrus-qs-doc-{}-{}.sock",
+            std::process::id(),
+            port
+        ))
+        .registry(reg)
+        .build();
+    // Unset immediately so other tests are unaffected.
+    std::env::remove_var("QSERVER_ZMQ_PRIVATE_KEY");
+
+    let server = build_result.expect("CURVE server via env var");
+    let shutdown = server.shutdown_handle();
+    tokio::spawn(async move {
+        let _ = server.run_async().await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let sock = curve_req_socket(port, &server_pub, &client_pub, &client_priv);
+    let r = rpc(&sock, "ping", json!({}));
+    assert_eq!(r["success"], true, "CURVE-via-env-var ping: {r}");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_curve_when_env_var_unset_plaintext_works() {
+    // Ensure env var is not set for this test.
+    std::env::remove_var("QSERVER_ZMQ_PRIVATE_KEY");
+
+    let port = rand_port();
+    let reg = Registry::new();
+    let shutdown = spawn_server(reg, port);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Plain-text connection must succeed when CURVE is not configured.
+    let sock = req_socket(port);
+    let r = rpc(&sock, "ping", json!({}));
+    assert_eq!(
+        r["success"], true,
+        "plain-text ping must succeed without CURVE: {r}"
+    );
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}

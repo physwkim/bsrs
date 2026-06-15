@@ -29,7 +29,13 @@ pub struct ReqRepSocket {
 
 impl ReqRepSocket {
     /// Bind to a tcp/ipc address.
-    pub fn bind(address: &str) -> Result<Self> {
+    ///
+    /// If `curve_private_key_z85` is `Some(key)`, the socket is configured
+    /// for ZMQ CURVE encryption (`ZMQ_CURVE_SERVER=1`, `ZMQ_CURVE_SECRETKEY`
+    /// set to the provided Z85 key). Mirrors the reference server setup in
+    /// `manager.py::zmq_server_comm`. Without a key the socket accepts
+    /// plain-text connections (reference default).
+    pub fn bind(address: &str, curve_private_key_z85: Option<&str>) -> Result<Self> {
         let ctx = zmq::Context::new();
         let socket = ctx
             .socket(zmq::REP)
@@ -37,6 +43,10 @@ impl ReqRepSocket {
         // Use a 200 ms recv timeout so the rep loop can poll `shutdown` and
         // exit cleanly when the server is dropped.
         let _ = socket.set_rcvtimeo(200);
+        // Apply CURVE before bind, matching the reference's socket setup order.
+        if let Some(key) = curve_private_key_z85 {
+            crate::curve::apply_curve_server_key(&socket, key)?;
+        }
         socket
             .bind(address)
             .map_err(|e| CirrusError::Backend(format!("zmq REP bind {address}: {e}")))?;

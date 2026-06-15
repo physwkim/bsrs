@@ -85,6 +85,7 @@
 
 #![deny(missing_docs)]
 
+mod curve;
 mod dispatch;
 mod lua_eval;
 mod methods;
@@ -98,6 +99,7 @@ mod state;
 mod tasks;
 mod transport;
 
+pub use curve::{curve_supported, generate_zmq_keys};
 pub use lua_eval::LuaEvaluator;
 pub use methods::QsRequest;
 pub use permissions::{MethodClass, Permissions};
