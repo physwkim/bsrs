@@ -524,6 +524,67 @@ async fn clear_suspenders_stops_auto_resume() {
     assert_eq!(result.exit_status, "abort");
 }
 
+// An installed `Suspender` exists to lift a *suspension*; its `watch()` must
+// only be consulted once the engine is actually paused. A running engine must
+// never be watched (the pre-fix watcher force-resumed in a ~100 Hz loop,
+// polling `watch()` and clobbering `is_paused` even with nothing to resume —
+// which made an installed clear-condition suspender override any pause).
+#[tokio::test]
+async fn installed_suspender_not_watched_while_engine_runs() {
+    use cirrus_engine::Suspender;
+    use futures::future::BoxFuture;
+    use std::sync::atomic::{AtomicUsize, Ordering as AOrd};
+    use std::sync::Arc as StdArc;
+    use std::time::Duration;
+
+    // Condition always clear: `watch()` returns immediately and counts polls.
+    struct CountingClear {
+        polls: StdArc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl Suspender for CountingClear {
+        fn name(&self) -> &str {
+            "counting_clear"
+        }
+        fn watch(&self) -> BoxFuture<'static, ()> {
+            let polls = self.polls.clone();
+            Box::pin(async move {
+                polls.fetch_add(1, AOrd::SeqCst);
+            })
+        }
+    }
+
+    let polls = StdArc::new(AtomicUsize::new(0));
+    let susp = StdArc::new(CountingClear {
+        polls: polls.clone(),
+    });
+
+    let re = Arc::new(RunEngine::new(vec![]));
+    let id = re.next_suspender_id();
+    let susp_dyn: Arc<dyn cirrus_engine::Suspender> = susp;
+    let payload: Arc<dyn std::any::Any + Send + Sync> = Arc::new(susp_dyn);
+
+    let plan = cirrus_core::plan::plan_box(async_stream::stream! {
+        yield cirrus_core::Msg::InstallSuspender { id, suspender: payload };
+        yield cirrus_core::Msg::OpenRun(Default::default());
+        // The engine runs normally and is never paused.
+        yield cirrus_core::Msg::Sleep(Duration::from_millis(100));
+        yield cirrus_core::Msg::CloseRun {
+            exit_status: "success".into(),
+            reason: None,
+        };
+        yield cirrus_core::Msg::RemoveSuspender { id };
+    });
+
+    let result = re.run_async(plan).await.unwrap();
+    assert_eq!(result.exit_status, "success");
+    assert_eq!(
+        polls.load(AOrd::SeqCst),
+        0,
+        "installed suspender must not be watched while the engine runs"
+    );
+}
+
 #[tokio::test]
 async fn mvr_reads_position_inside_plan_then_moves_relative() {
     let motor = Arc::new(SoftMotor::new("m1", Some(2.5)));

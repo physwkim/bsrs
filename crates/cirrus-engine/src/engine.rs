@@ -243,6 +243,12 @@ pub struct RunEngine {
     cancel: StdMutex<CancellationToken>,
     permit: Arc<Notify>,
     is_paused: Arc<AtomicBool>,
+    /// Fired on every `is_paused: false → true` transition (immediate
+    /// `pause`, `suspend_until_with`, or a deferred pause applied at a
+    /// checkpoint). Lets installed-`Suspender` watchers park until the
+    /// engine is actually paused instead of busy-looping a resume —
+    /// distinct from `permit` (which wakes the *plan* loop on resume).
+    pause_notify: Arc<Notify>,
     is_running: AtomicBool,
     deferred_pause: AtomicBool,
     is_aborting: AtomicBool,
@@ -365,6 +371,7 @@ impl RunEngine {
             cancel: StdMutex::new(CancellationToken::new()),
             permit: Arc::new(Notify::new()),
             is_paused: Arc::new(AtomicBool::new(false)),
+            pause_notify: Arc::new(Notify::new()),
             is_running: AtomicBool::new(false),
             deferred_pause: AtomicBool::new(false),
             is_aborting: AtomicBool::new(false),
@@ -751,7 +758,7 @@ impl RunEngine {
         fut: BoxFuture<'static, ()>,
         justification: Option<String>,
     ) {
-        self.is_paused.store(true, Ordering::SeqCst);
+        self.mark_paused();
         let me = Arc::downgrade(self);
         let label = justification.unwrap_or_else(|| "suspended".into());
         tokio::spawn(async move {
@@ -788,6 +795,15 @@ impl RunEngine {
         cirrus_core::runtime::block_on(self.run_async(plan))
     }
 
+    /// Single owner of the `is_paused: false → true` transition. Stores the
+    /// flag and signals `pause_notify` so installed-`Suspender` watchers can
+    /// re-arm on the pause edge. Every site that pauses the engine routes
+    /// through here so no watcher misses a suspension.
+    fn mark_paused(&self) {
+        self.is_paused.store(true, Ordering::SeqCst);
+        self.pause_notify.notify_waiters();
+    }
+
     /// External: request a pause. If `defer = true`, the pause takes effect at
     /// the next `Checkpoint`; otherwise immediately at the top of the message
     /// loop.
@@ -795,7 +811,7 @@ impl RunEngine {
         if defer {
             self.deferred_pause.store(true, Ordering::SeqCst);
         } else {
-            self.is_paused.store(true, Ordering::SeqCst);
+            self.mark_paused();
         }
     }
 
@@ -1340,7 +1356,7 @@ impl RunEngine {
                 }
                 // If a deferred_pause is queued, apply it now.
                 if self.deferred_pause.swap(false, Ordering::SeqCst) {
-                    self.is_paused.store(true, Ordering::SeqCst);
+                    self.mark_paused();
                 }
             }
             Msg::ClearCheckpoint => {
@@ -1578,14 +1594,34 @@ impl RunEngine {
 
         let permit = self.permit.clone();
         let paused = self.is_paused.clone();
+        let pause_notify = self.pause_notify.clone();
         let suspender_clone = typed.clone();
         let handle = tokio::spawn(async move {
             loop {
-                let fut = suspender_clone.watch();
-                fut.await;
-                paused.store(false, Ordering::SeqCst);
-                permit.notify_waiters();
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                // Park until the engine is actually paused. The watcher exists
+                // to lift a *suspension*; it must never clear `is_paused` on a
+                // running engine (that would override an unrelated pause and
+                // make the engine un-pausable for as long as this suspender's
+                // condition stays clear). Arm the notification *before*
+                // re-checking the flag so a pause landing between check and
+                // await is never lost.
+                loop {
+                    let notified = pause_notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if paused.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    notified.await;
+                }
+                // Paused: wait for this suspender's condition to clear.
+                suspender_clone.watch().await;
+                // Resume — but only if the engine is still paused. If it was
+                // already resumed/aborted/halted, do nothing and re-arm; this
+                // never force-resumes a running engine.
+                if paused.swap(false, Ordering::SeqCst) {
+                    permit.notify_waiters();
+                }
             }
         });
         let registration = SuspenderHandle::new(id, typed, handle);
