@@ -21,6 +21,12 @@ pub struct QueuedItem {
     /// Free-form metadata attached by the submitter.
     #[serde(default)]
     pub meta: Value,
+    /// User who submitted this item (from params["user"], mirrors bluesky).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// User group of the submitter (from params["user_group"]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_group: Option<String>,
     /// Result of running this item (set when moved into the history).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
@@ -35,6 +41,8 @@ impl QueuedItem {
             name: name.into(),
             args,
             meta: Value::Null,
+            user: None,
+            user_group: None,
             result: None,
         }
     }

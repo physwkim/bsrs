@@ -587,7 +587,15 @@ fn queue_item_add(
     if registry.plan(&name).is_none() {
         return err(format!("unknown plan: {name}"));
     }
-    let queued = QueuedItem::plan(name, item);
+    let mut queued = QueuedItem::plan(name, item);
+    queued.user = params
+        .get("user")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    queued.user_group = params
+        .get("user_group")
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let queued_val = serde_json::to_value(&queued).unwrap();
     let mut q = queue.lock().unwrap();
     q.push_back(queued);
@@ -609,6 +617,14 @@ fn queue_item_add_batch(
         Some(a) => a.clone(),
         None => return err("missing 'items' array"),
     };
+    let batch_user = params
+        .get("user")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let batch_user_group = params
+        .get("user_group")
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let mut added_items: Vec<Value> = Vec::new();
     let mut results: Vec<Value> = Vec::new();
     let mut had_error = false;
@@ -619,7 +635,9 @@ fn queue_item_add_batch(
             .map(str::to_string);
         match name {
             Some(n) if registry.plan(&n).is_some() => {
-                let qi = QueuedItem::plan(n, item);
+                let mut qi = QueuedItem::plan(n, item);
+                qi.user = batch_user.clone();
+                qi.user_group = batch_user_group.clone();
                 let qi_val = serde_json::to_value(&qi).unwrap();
                 queue.lock().unwrap().push_back(qi);
                 added_items.push(qi_val);
