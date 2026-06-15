@@ -1689,6 +1689,39 @@ mod tests {
         }
     }
 
+    /// Locatable motor that counts `locate_dyn` calls, so a test can assert a
+    /// listed-but-unmoved motor is never located by a lazy-capture wrapper.
+    struct CountingMotor {
+        name: String,
+        setpoint: f64,
+        locates: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl NamedObj for CountingMotor {
+        fn name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MovableObj for CountingMotor {
+        async fn set_dyn(&self, _value: f64) -> Status {
+            Status::done()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cirrus_core::msg::LocatableObj for CountingMotor {
+        async fn locate_dyn(&self) -> Result<DynLocation, cirrus_core::error::CirrusError> {
+            self.locates
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(DynLocation {
+                setpoint: self.setpoint,
+                readback: self.setpoint,
+            })
+        }
+    }
+
     /// Readable carried only inside `Msg::Read`; `read_dyn`/`describe_dyn`
     /// are never called by `drain`.
     struct FakeReadable(String);
@@ -2158,6 +2191,86 @@ mod tests {
             named_reset_sets(&msgs),
             vec![("m".to_string(), 10.0)],
             "rel_scan must return the motor to the supplied current"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_positions_only_resets_motors_the_plan_moved() {
+        // Two eligible motors; the inner plan moves only `moved`. bluesky stashes
+        // a motor's reset position lazily at its first `set` (OrderedDict via
+        // insert_reads, preprocessors.py:1177-1189), so a listed-but-unmoved
+        // motor is never restored. Eager capture at wrapper entry wrongly reset
+        // `unmoved` to its start position as well.
+        let moved = Arc::new(FakeMotor {
+            name: "moved".into(),
+            bias: 5.0,
+        }) as Arc<dyn cirrus_core::msg::LocatableObj>;
+        let unmoved = Arc::new(FakeMotor {
+            name: "unmoved".into(),
+            bias: 3.0,
+        }) as Arc<dyn cirrus_core::msg::LocatableObj>;
+        let moved_mv: Arc<dyn MovableObj> = moved.clone();
+        let inner = plan_box(async_stream::stream! {
+            yield Msg::Set { obj: moved_mv, value: 9.0, group: None };
+        });
+        let msgs = drain(preprocessors::reset_positions_wrapper(
+            inner,
+            vec![moved, unmoved],
+        ))
+        .await;
+        assert_eq!(
+            named_reset_sets(&msgs),
+            vec![("moved".to_string(), 5.0)],
+            "reset must restore only the moved motor, not the untouched one"
+        );
+    }
+
+    #[tokio::test]
+    async fn relative_set_locates_only_motors_the_plan_moves() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // bluesky inserts __read_and_stash_a_motor lazily at the first `set` per
+        // motor (preprocessors.py:1136-1148), so a listed motor the plan never
+        // moves is never located, and the moved motor's base is captured at that
+        // first set. Eager snapshot at wrapper entry located *every* listed motor.
+        let moved_locates = Arc::new(AtomicUsize::new(0));
+        let unmoved_locates = Arc::new(AtomicUsize::new(0));
+        let moved = Arc::new(CountingMotor {
+            name: "moved".into(),
+            setpoint: 5.0,
+            locates: moved_locates.clone(),
+        });
+        let unmoved = Arc::new(CountingMotor {
+            name: "unmoved".into(),
+            setpoint: 3.0,
+            locates: unmoved_locates.clone(),
+        });
+        let moved_mv: Arc<dyn MovableObj> = moved.clone();
+        let inner = plan_box(async_stream::stream! {
+            yield Msg::Set { obj: moved_mv, value: 2.0, group: None };
+        });
+        let msgs = drain(preprocessors::relative_set_wrapper(
+            inner,
+            vec![
+                moved as Arc<dyn cirrus_core::msg::LocatableObj>,
+                unmoved as Arc<dyn cirrus_core::msg::LocatableObj>,
+            ],
+        ))
+        .await;
+        assert_eq!(
+            moved_locates.load(Ordering::SeqCst),
+            1,
+            "the moved motor must be located exactly once, at its first set"
+        );
+        assert_eq!(
+            unmoved_locates.load(Ordering::SeqCst),
+            0,
+            "a listed motor the plan never moves must never be located"
+        );
+        // The moved set is biased by the lazily-captured base: 2.0 + 5.0 = 7.0.
+        assert_eq!(
+            set_values(&msgs),
+            vec![7.0],
+            "the moved set must be biased by its lazily-captured base"
         );
     }
 

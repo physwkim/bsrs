@@ -295,30 +295,42 @@ where
 
 /// `relative_set_wrapper(plan, motors)` — for each motor in `motors`,
 /// rewrite every `Msg::Set { obj == motor, value }` into `value + setpoint`,
-/// where `setpoint` is the motor's commanded position, captured *once* at
-/// wrapper start via `locate_dyn`. Mirrors bluesky's `relative_set_wrapper`,
-/// which stashes `location["setpoint"]` for a `Locatable`
-/// (`__read_and_stash_a_motor`, preprocessors.py:1061) — not the readback, so
-/// a relative move is deterministic from the commanded position regardless of
-/// motor jitter/lag. After the inner plan, no automatic restore; pair with
-/// `reset_positions_wrapper` for that.
+/// where `setpoint` is the motor's commanded position. The base is captured
+/// *lazily* at each motor's **first** `Set` via `locate_dyn` — not eagerly at
+/// wrapper entry. Mirrors bluesky's `relative_set_wrapper`, whose `insert_reads`
+/// chains `__read_and_stash_a_motor` before the first set per motor
+/// (preprocessors.py:1136-1148) and stashes `location["setpoint"]` for a
+/// `Locatable` (preprocessors.py:1061) — not the readback, so a relative move is
+/// deterministic from the commanded position regardless of motor jitter/lag.
+/// Lazy capture means the base reflects the motor's position at the moment it is
+/// first moved, and a listed motor the plan never sets is never located. After
+/// the inner plan, no automatic restore; pair with `reset_positions_wrapper`.
 pub fn relative_set_wrapper(inner: Plan, motors: Vec<Arc<dyn LocatableObj>>) -> Plan {
     plan_box(async_stream::stream! {
-        // Snapshot starting positions.
-        let mut starts: HashMap<String, f64> = HashMap::new();
-        for m in &motors {
-            if let Ok(loc) = m.locate_dyn().await {
-                starts.insert(m.name().to_string(), loc.setpoint);
-            }
-        }
-        let names: std::collections::HashSet<String> =
-            motors.iter().map(|m| m.name().to_string()).collect();
+        // Motors eligible for relative rewriting, indexed by name.
+        let by_name: HashMap<String, Arc<dyn LocatableObj>> =
+            motors.iter().map(|m| (m.name().to_string(), m.clone())).collect();
+        // Per-motor base setpoints, filled lazily at each motor's first `Set`.
+        let mut bases: HashMap<String, f64> = HashMap::new();
         let mut inner = inner;
         while let Some(item) = inner.next().await {
             if let PlanItem::Bare(m) = item {
                 let m = match m {
-                    Msg::Set { obj, value, group } if names.contains(obj.name()) => {
-                        let bias = starts.get(obj.name()).copied().unwrap_or(0.0);
+                    Msg::Set { obj, value, group } if by_name.contains_key(obj.name()) => {
+                        let bias = match bases.get(obj.name()) {
+                            Some(b) => *b,
+                            None => {
+                                let base = by_name
+                                    .get(obj.name())
+                                    .expect("guard ensures the motor is eligible")
+                                    .locate_dyn()
+                                    .await
+                                    .map(|loc| loc.setpoint)
+                                    .unwrap_or(0.0);
+                                bases.insert(obj.name().to_string(), base);
+                                base
+                            }
+                        };
                         Msg::Set { obj, value: value + bias, group }
                     }
                     other => other,
@@ -441,24 +453,48 @@ pub fn contingency_wrapper(inner: Plan, finally: Plan) -> Plan {
     finalize_wrapper(inner, finally)
 }
 
-/// `reset_positions_wrapper(plan, motors)` — snapshot motor positions at
-/// start, run the inner plan, then issue `mv` back to the snapshot for
-/// each motor.
+/// `reset_positions_wrapper(plan, motors)` — capture each motor's position
+/// *lazily* at its **first** `Set`, run the inner plan, then issue `mv` back to
+/// the captured position for each motor that was actually moved, in first-moved
+/// order. Mirrors bluesky's `reset_positions_wrapper`, whose `insert_reads`
+/// populates an `OrderedDict` at the first set per motor
+/// (preprocessors.py:1177-1189) and whose `reset()` replays those positions in
+/// insertion order (preprocessors.py:1191-1197). Eager capture at wrapper entry
+/// diverged twice: it restored *every* listed motor even if the plan never moved
+/// it, and it snapshotted at entry rather than at the moment of first motion.
+///
+/// The trailing reset runs only when the inner stream completes normally; the
+/// engine's one-way plan stream cannot deliver an abort back into this wrapper,
+/// so an engine-side abort skips the reset (unlike bluesky's `finalize_wrapper`
+/// composition). That gap is a property of the stream model, not this capture.
 pub fn reset_positions_wrapper(inner: Plan, motors: Vec<Arc<dyn LocatableObj>>) -> Plan {
     plan_box(async_stream::stream! {
-        let mut snapshot: Vec<(Arc<dyn cirrus_core::msg::MovableObj>, f64)> = Vec::new();
-        for m in &motors {
-            if let Ok(loc) = m.locate_dyn().await {
-                snapshot.push((m.clone() as Arc<dyn cirrus_core::msg::MovableObj>, loc.setpoint));
-            }
-        }
+        let by_name: HashMap<String, Arc<dyn LocatableObj>> =
+            motors.iter().map(|m| (m.name().to_string(), m.clone())).collect();
+        // Positions to restore, captured lazily at first `Set`, in first-moved
+        // order. `seen` gates the one-shot capture per eligible motor.
+        let mut initial: Vec<(Arc<dyn cirrus_core::msg::MovableObj>, f64)> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut inner = inner;
         while let Some(item) = inner.next().await {
             if let PlanItem::Bare(m) = item {
+                if let Msg::Set { obj, .. } = &m {
+                    if by_name.contains_key(obj.name()) && seen.insert(obj.name().to_string()) {
+                        let motor = by_name
+                            .get(obj.name())
+                            .expect("guard ensures the motor is eligible");
+                        if let Ok(loc) = motor.locate_dyn().await {
+                            initial.push((
+                                motor.clone() as Arc<dyn cirrus_core::msg::MovableObj>,
+                                loc.setpoint,
+                            ));
+                        }
+                    }
+                }
                 yield m;
             }
         }
-        for (mv_obj, val) in snapshot {
+        for (mv_obj, val) in initial {
             yield Msg::Set { obj: mv_obj, value: val, group: Some("reset".into()) };
         }
         yield Msg::Wait { group: "reset".into(), error_on_timeout: true, timeout: None };
