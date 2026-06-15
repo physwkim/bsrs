@@ -713,3 +713,82 @@ async fn sync_facade_runs_blocking_count() {
     // Start + Descriptor + 3 × Event + Stop = 6
     assert_eq!(docs.len(), 6);
 }
+
+#[tokio::test]
+async fn rewindable_false_clears_rewind_cache_no_replay_on_resume() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    // A movable that counts how many times the engine drives it. If the
+    // rewind cache survives a Rewindable toggle, the cached `Set` replays
+    // on resume and the counter reaches 2.
+    struct CountingMovable {
+        name: String,
+        sets: Arc<AtomicUsize>,
+    }
+    impl cirrus_core::msg::NamedObj for CountingMovable {
+        fn name(&self) -> &str {
+            &self.name
+        }
+    }
+    #[async_trait::async_trait]
+    impl cirrus_core::msg::MovableObj for CountingMovable {
+        async fn set_dyn(&self, _value: f64) -> cirrus_core::status::Status {
+            self.sets.fetch_add(1, Ordering::SeqCst);
+            cirrus_core::status::Status::done()
+        }
+    }
+
+    let sets = Arc::new(AtomicUsize::new(0));
+    let motor_dyn = Arc::new(CountingMovable {
+        name: "rw_motor".into(),
+        sets: sets.clone(),
+    }) as Arc<dyn cirrus_core::msg::MovableObj>;
+    let reached = Arc::new(AtomicUsize::new(0));
+
+    let re = Arc::new(RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new()));
+    let reached_clone = reached.clone();
+    let plan = cirrus_core::plan::plan_box(async_stream::stream! {
+        yield cirrus_core::Msg::OpenRun(Default::default());
+        // Open a rewindable region and cache one Set.
+        yield cirrus_core::Msg::Checkpoint;
+        yield cirrus_core::Msg::Set { obj: motor_dyn, value: 1.0, group: None };
+        // Enter a non-rewindable region. bluesky's `rewindable` setter resets
+        // checkpoint state on this toggle, so the cached Set must NOT survive
+        // to replay on resume.
+        yield cirrus_core::Msg::Rewindable(false);
+        reached_clone.store(1, Ordering::SeqCst);
+        yield cirrus_core::Msg::Pause { defer: false };
+        yield cirrus_core::Msg::CloseRun {
+            exit_status: "success".into(),
+            reason: None,
+        };
+    });
+
+    let re_run = re.clone();
+    let join = tokio::spawn(async move { re_run.run_async(plan).await });
+
+    for _ in 0..50 {
+        if reached.load(Ordering::SeqCst) == 1 && re.is_paused() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(re.is_paused(), "engine should be paused inside the region");
+    assert_eq!(
+        sets.load(Ordering::SeqCst),
+        1,
+        "Set should have run exactly once before resume"
+    );
+
+    re.resume();
+    let result = join.await.unwrap().unwrap();
+    assert_eq!(result.exit_status, "success");
+
+    // The Set must not be replayed: Rewindable(false) reset the rewind cache.
+    assert_eq!(
+        sets.load(Ordering::SeqCst),
+        1,
+        "Rewindable(false) must reset the rewind cache so the pre-toggle Set is not replayed on resume"
+    );
+}

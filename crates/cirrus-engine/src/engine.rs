@@ -1371,7 +1371,20 @@ impl RunEngine {
                 self.resume();
             }
             Msg::Rewindable(b) => {
-                self.state.lock().await.rewindable = b;
+                // Mirror bluesky's `rewindable` setter (run_engine.py:694-699):
+                // a *change* in the rewindable flag resets checkpoint state, so
+                // the resume boundary moves to this toggle rather than replaying
+                // work from before it. In cirrus, "reset checkpoint state" is
+                // clearing `msg_cache` — the same reset the `Checkpoint` /
+                // `ClearCheckpoint` handlers perform. Without it, wrapping a
+                // non-safe-to-rewind bundle in `rewindable_wrapper(_, false)`
+                // would leave the pre-toggle cache live, and a pause inside the
+                // region would replay already-completed messages on resume.
+                let mut state = self.state.lock().await;
+                if state.rewindable != b {
+                    state.rewindable = b;
+                    state.msg_cache.clear();
+                }
             }
             Msg::InstallSuspender { id, suspender } => {
                 self.install_suspender(id, suspender).await?;
