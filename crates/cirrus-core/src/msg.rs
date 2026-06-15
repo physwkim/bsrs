@@ -300,6 +300,14 @@ impl Msg {
     /// rewind replays the set's synchronization barrier. Dropping it would
     /// replay `[Set, Read]` without the intervening `Wait`, reading a device
     /// before its re-issued move completes (a stale value on resume-rewind).
+    ///
+    /// `Msg::Configure` is likewise NOT excluded — bluesky caches `configure`
+    /// (also absent from `_UNCACHEABLE_COMMANDS`) and its `_configure` does not
+    /// reset the checkpoint (run_engine.py:2499-2521), so a rewind replays the
+    /// configure and re-applies the device's settings before the replayed
+    /// trigger/read. Excluding it dropped the configure from the replay, so the
+    /// re-issued acquisition ran under whatever configuration the device had
+    /// drifted to during the pause instead of the one the plan requested.
     pub fn is_cacheable(&self) -> bool {
         !matches!(
             self,
@@ -309,7 +317,6 @@ impl Msg {
                 | Msg::Resume
                 | Msg::Checkpoint
                 | Msg::ClearCheckpoint
-                | Msg::Configure { .. }
                 | Msg::Monitor { .. }
                 | Msg::Unmonitor(_)
                 | Msg::InstallSuspender { .. }

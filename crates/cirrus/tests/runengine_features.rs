@@ -277,6 +277,95 @@ async fn wait_is_replayed_on_rewind() {
 }
 
 #[tokio::test]
+async fn configure_is_replayed_on_rewind() {
+    // bluesky caches 'configure' (absent from _UNCACHEABLE_COMMANDS,
+    // run_engine.py:369-382) and its _configure does not reset the checkpoint,
+    // so a rewind replays the configure to re-apply the device's settings
+    // before the replayed acquisition. cirrus's is_cacheable() previously
+    // excluded Msg::Configure, so the rewind dropped it: the re-issued
+    // acquisition ran under whatever config the device drifted to during the
+    // pause. Invariant boundary: a configure between the checkpoint and the
+    // pause must be re-applied (configure_dyn called twice — once originally,
+    // once on replay).
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct CountingConfigurable {
+        configures: Arc<AtomicUsize>,
+    }
+    impl cirrus_core::msg::NamedObj for CountingConfigurable {
+        fn name(&self) -> &str {
+            "cfg"
+        }
+    }
+    #[async_trait::async_trait]
+    impl cirrus_core::msg::ConfigurableObj for CountingConfigurable {
+        async fn read_configuration_dyn(
+            &self,
+        ) -> Result<
+            std::collections::HashMap<String, cirrus_core::reading::ReadingValue>,
+            cirrus_core::error::CirrusError,
+        > {
+            Ok(std::collections::HashMap::new())
+        }
+        async fn describe_configuration_dyn(
+            &self,
+        ) -> Result<
+            std::collections::HashMap<String, cirrus_event_model::DataKey>,
+            cirrus_core::error::CirrusError,
+        > {
+            Ok(std::collections::HashMap::new())
+        }
+        async fn configure_dyn(
+            &self,
+            _args: cirrus_core::msg::ConfigureArgs,
+        ) -> Result<(), cirrus_core::error::CirrusError> {
+            self.configures.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    let configures = Arc::new(AtomicUsize::new(0));
+    let dev: Arc<dyn cirrus_core::msg::ConfigurableObj> = Arc::new(CountingConfigurable {
+        configures: configures.clone(),
+    });
+
+    let re = Arc::new(RunEngine::new(vec![]));
+    let d = dev.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Checkpoint;
+        yield Msg::Configure { obj: d, args: Default::default() };
+        // Pause here: the cache holds [Configure]. A resume rewinds and replays
+        // it. Pre-fix the cache dropped the Configure entirely.
+        yield Msg::Pause { defer: false };
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+
+    let re_run = re.clone();
+    let join = tokio::spawn(async move { re_run.run_async(plan).await });
+
+    for _ in 0..100 {
+        if re.is_paused() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(re.is_paused(), "engine never paused");
+    re.resume();
+    let result = tokio::time::timeout(Duration::from_secs(5), join)
+        .await
+        .expect("run did not finish")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.exit_status, "success");
+
+    assert_eq!(
+        configures.load(Ordering::SeqCst),
+        2,
+        "configure must be replayed on rewind (original + replay), matching \
+         bluesky caching 'configure'; pre-fix it was dropped from the cache"
+    );
+}
+
+#[tokio::test]
 async fn subscribe_receives_all_documents() {
     let received = Arc::new(StdMutex::new(Vec::<String>::new()));
     let r = received.clone();
