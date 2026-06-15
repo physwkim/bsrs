@@ -101,8 +101,10 @@ pub mod stubs {
     }
 
     /// `mvr(motor, delta)` — relative move. The plan reads the current
-    /// readback via `LocatableObj::locate_dyn` *inside* the generator,
-    /// adds `delta`, then yields `Set`+`Wait` for the absolute target.
+    /// setpoint (commanded position) via `LocatableObj::locate_dyn` *inside*
+    /// the generator, adds `delta`, then yields `Set`+`Wait` for the absolute
+    /// target. Bases on the setpoint, not the readback, matching bluesky's
+    /// `relative_set_wrapper` (`__read_and_stash_a_motor`).
     /// Motor must implement `LocatableObj` (which extends `MovableObj`).
     pub fn mvr(motor: Arc<dyn LocatableObj>, delta: f64) -> Plan {
         plan_box(async_stream::stream! {
@@ -116,7 +118,7 @@ pub mod stubs {
                     return;
                 }
             };
-            let target = loc.readback + delta;
+            let target = loc.setpoint + delta;
             let movable: Arc<dyn MovableObj> = motor;
             yield Msg::Set { obj: movable, value: target, group: Some("mv".into()) };
             yield Msg::Wait { group: "mv".into(), error_on_timeout: true, timeout: None };
@@ -124,10 +126,10 @@ pub mod stubs {
     }
 
     /// `rel_set(motor, value, group)` — set relative to the motor's current
-    /// readback, WITHOUT waiting (bluesky `plan_stubs.rel_set`, default
-    /// `wait=False`). Reads the readback via `LocatableObj::locate_dyn`, adds
-    /// `value`, and yields a single `Msg::Set` to that absolute target under
-    /// the caller's `group`.
+    /// setpoint (commanded position), WITHOUT waiting (bluesky
+    /// `plan_stubs.rel_set`, default `wait=False`). Reads the setpoint via
+    /// `LocatableObj::locate_dyn`, adds `value`, and yields a single `Msg::Set`
+    /// to that absolute target under the caller's `group`.
     ///
     /// Differs from `mvr` only by omitting the trailing `Msg::Wait`. Like
     /// `mvr` — and unlike bluesky's `relative_set_wrapper` composition, which
@@ -143,7 +145,7 @@ pub mod stubs {
                     return;
                 }
             };
-            let target = loc.readback + value;
+            let target = loc.setpoint + value;
             let movable: Arc<dyn MovableObj> = motor;
             yield Msg::Set { obj: movable, value: target, group };
         })
@@ -786,8 +788,8 @@ pub type ScanAxis = (Arc<dyn MovableObj>, Arc<dyn ReadableObj>, f64, f64);
 pub type ListGridAxis = (Arc<dyn MovableObj>, Arc<dyn ReadableObj>, Vec<f64>);
 
 /// One axis of a *relative* list-grid scan: `(motor, motor_reader, points)`,
-/// where `points` are offsets from the motor's current readback and the
-/// motor must be `LocatableObj` so that readback can be snapshotted.
+/// where `points` are offsets from the motor's current setpoint and the
+/// motor must be `LocatableObj` so that the setpoint can be snapshotted.
 pub type RelListGridAxis = (Arc<dyn LocatableObj>, Arc<dyn ReadableObj>, Vec<f64>);
 
 /// `inner_product_scan(dets, num, [(motor1, s1, e1), ...])` — all motors move
@@ -833,7 +835,7 @@ pub fn inner_product_scan(
 /// `x2x_scan(dets, motor1, m1_reader, motor2, m2_reader, start, stop, num)` —
 /// coupled 2:1 *relative* inner-product scan (bluesky `plans.x2x_scan`,
 /// a generalised theta-2theta). `motor1` sweeps `start..stop` relative to its
-/// current readback while `motor2` sweeps `start/2..stop/2` relative to its
+/// current setpoint while `motor2` sweeps `start/2..stop/2` relative to its
 /// own; the two move together each step. Built from [`inner_product_scan`]
 /// run through `relative_set_wrapper`.
 ///
@@ -915,7 +917,7 @@ pub fn list_grid_scan(detectors: Vec<Arc<dyn ReadableObj>>, axes: Vec<ListGridAx
 
 /// `rel_list_grid_scan(dets, axes)` — relative variant of [`list_grid_scan`]
 /// (bluesky `plans.rel_list_grid_scan`). Each axis's positions are offset by
-/// that axis motor's current readback, snapshotted once per motor via
+/// that axis motor's current setpoint, snapshotted once per motor via
 /// `LocatableObj::locate_dyn`.
 ///
 /// As in bluesky, each axis motor is returned to its starting position after
@@ -929,7 +931,7 @@ pub fn rel_list_grid_scan(
     let inner = plan_box(async_stream::stream! {
         let mut abs_axes: Vec<ListGridAxis> = Vec::with_capacity(axes.len());
         for (motor, reader, points) in axes {
-            let bias = motor.locate_dyn().await.map(|l| l.readback).unwrap_or(0.0);
+            let bias = motor.locate_dyn().await.map(|l| l.setpoint).unwrap_or(0.0);
             let abs_points: Vec<f64> = points.iter().map(|p| *p + bias).collect();
             let mv: Arc<dyn MovableObj> = motor;
             abs_axes.push((mv, reader, abs_points));
@@ -1063,7 +1065,7 @@ pub fn ramp_plan(
 }
 
 /// `rel_list_scan` — relative variant of `list_scan`. Reads each motor's
-/// readback once at the start of the plan and offsets the supplied points.
+/// setpoint once at the start of the plan and offsets the supplied points.
 pub fn rel_list_scan(
     detectors: Vec<Arc<dyn ReadableObj>>,
     motor: Arc<dyn LocatableObj>,
@@ -1073,7 +1075,7 @@ pub fn rel_list_scan(
     let reset_motor = motor.clone();
     let inner = plan_box(async_stream::stream! {
         let bias = motor.locate_dyn().await
-            .map(|l| l.readback)
+            .map(|l| l.setpoint)
             .unwrap_or(0.0);
         let abs_points: Vec<f64> = points.iter().map(|p| *p + bias).collect();
         let mv: Arc<dyn MovableObj> = motor;
@@ -1107,8 +1109,8 @@ pub fn rel_grid_scan(
 ) -> Plan {
     let reset_motors: Vec<Arc<dyn LocatableObj>> = vec![motor1.clone(), motor2.clone()];
     let inner = plan_box(async_stream::stream! {
-        let b1 = motor1.locate_dyn().await.map(|l| l.readback).unwrap_or(0.0);
-        let b2 = motor2.locate_dyn().await.map(|l| l.readback).unwrap_or(0.0);
+        let b1 = motor1.locate_dyn().await.map(|l| l.setpoint).unwrap_or(0.0);
+        let b2 = motor2.locate_dyn().await.map(|l| l.setpoint).unwrap_or(0.0);
         let m1mv: Arc<dyn MovableObj> = motor1;
         let m2mv: Arc<dyn MovableObj> = motor2;
         let mut inner = grid_scan(
@@ -1159,7 +1161,7 @@ pub fn log_scan(
 
 /// `rel_log_scan(detectors, motor, motor_readback, start, stop, num)` —
 /// relative variant of [`log_scan`]: the log-spaced targets are offset by the
-/// motor's current readback, snapshotted once via `LocatableObj::locate_dyn`
+/// motor's current setpoint, snapshotted once via `LocatableObj::locate_dyn`
 /// (bluesky `plans.rel_log_scan`, `relative_set_decorator`).
 ///
 /// As in bluesky, the motor is returned to its starting position after the
@@ -1221,7 +1223,7 @@ pub fn spiral_fermat(
 }
 
 /// `rel_spiral(...)` — relative variant of [`spiral`]: the spiral is drawn
-/// around the motors' current readbacks instead of an absolute centre.
+/// around the motors' current setpoints instead of an absolute centre.
 /// Both axis motors are `LocatableObj` so the offsets can be snapshotted
 /// once via `relative_set_wrapper` (bluesky `plans.rel_spiral`).
 ///
@@ -1251,7 +1253,7 @@ pub fn rel_spiral(
 }
 
 /// `rel_spiral_square(...)` — relative variant of [`spiral_square`]; the
-/// square raster spiral is centred on the motors' current readbacks
+/// square raster spiral is centred on the motors' current setpoints
 /// (bluesky `plans.rel_spiral_square`). Returns the motors to start, see
 /// [`rel_spiral`].
 #[allow(clippy::too_many_arguments)]
@@ -1278,7 +1280,7 @@ pub fn rel_spiral_square(
 }
 
 /// `rel_spiral_fermat(...)` — relative variant of [`spiral_fermat`]; the
-/// Fermat (sunflower) spiral is centred on the motors' current readbacks
+/// Fermat (sunflower) spiral is centred on the motors' current setpoints
 /// (bluesky `plans.rel_spiral_fermat`). Returns the motors to start, see
 /// [`rel_spiral`].
 #[allow(clippy::too_many_arguments)]
@@ -1523,7 +1525,7 @@ pub fn tune_centroid(
 }
 
 /// `rel_adaptive_scan(...)` — relative variant of [`adaptive_scan`].
-/// Reads the motor's current readback once at start, adds the
+/// Reads the motor's current setpoint once at start, adds the
 /// supplied `start`/`stop` offsets, and runs `adaptive_scan` over
 /// that absolute range. As in bluesky, the motor is returned to its
 /// starting position after the scan (`reset_positions_decorator`).
@@ -1544,7 +1546,7 @@ pub fn rel_adaptive_scan(
     let reset_motor = motor.clone();
     let inner = plan_box(async_stream::stream! {
         let center = match motor.locate_dyn().await {
-            Ok(loc) => loc.readback,
+            Ok(loc) => loc.setpoint,
             Err(e) => {
                 yield Msg::Fail(format!(
                     "rel_adaptive_scan({}): locate_dyn failed: {e}",
@@ -2250,6 +2252,75 @@ mod tests {
         assert!(
             !msgs.iter().any(|m| matches!(m, Msg::Wait { .. })),
             "rel_set must not emit Wait (unlike mvr)"
+        );
+    }
+
+    #[tokio::test]
+    async fn relative_moves_base_on_setpoint_not_readback() {
+        // Motor whose commanded setpoint (5.0) differs from its actual readback
+        // (4.0) — the only case where the two relative bases diverge. bluesky
+        // stashes location["setpoint"] for a Locatable
+        // (__read_and_stash_a_motor), so a +2 relative move targets 7.0, not
+        // 6.0.
+        struct SplitMotor;
+        impl NamedObj for SplitMotor {
+            fn name(&self) -> &str {
+                "split"
+            }
+        }
+        #[async_trait::async_trait]
+        impl MovableObj for SplitMotor {
+            async fn set_dyn(&self, _value: f64) -> Status {
+                Status::done()
+            }
+        }
+        #[async_trait::async_trait]
+        impl cirrus_core::msg::LocatableObj for SplitMotor {
+            async fn locate_dyn(&self) -> Result<DynLocation, cirrus_core::error::CirrusError> {
+                Ok(DynLocation {
+                    setpoint: 5.0,
+                    readback: 4.0,
+                })
+            }
+        }
+
+        fn set_value(msgs: &[Msg]) -> f64 {
+            msgs.iter()
+                .find_map(|m| match m {
+                    Msg::Set { value, .. } => Some(*value),
+                    _ => None,
+                })
+                .expect("a Set message")
+        }
+
+        let motor: Arc<dyn cirrus_core::msg::LocatableObj> = Arc::new(SplitMotor);
+
+        // rel_set(+2): 5.0 (setpoint) + 2 = 7.0, not 4.0 (readback) + 2 = 6.0.
+        let msgs = drain(stubs::rel_set(motor.clone(), 2.0, None)).await;
+        assert!(
+            (set_value(&msgs) - 7.0).abs() < 1e-9,
+            "rel_set must base on setpoint 5.0 (→7.0), not readback 4.0 (→6.0): got {}",
+            set_value(&msgs)
+        );
+
+        // mvr(+2): same setpoint base.
+        let msgs = drain(stubs::mvr(motor.clone(), 2.0)).await;
+        assert!(
+            (set_value(&msgs) - 7.0).abs() < 1e-9,
+            "mvr must base on setpoint (→7.0): got {}",
+            set_value(&msgs)
+        );
+
+        // relative_set_wrapper rewrites an inner Set(+2) to setpoint + 2 = 7.0.
+        let mv: Arc<dyn MovableObj> = Arc::new(SplitMotor);
+        let inner = plan_box(async_stream::stream! {
+            yield Msg::Set { obj: mv, value: 2.0, group: None };
+        });
+        let msgs = drain(preprocessors::relative_set_wrapper(inner, vec![motor])).await;
+        assert!(
+            (set_value(&msgs) - 7.0).abs() < 1e-9,
+            "relative_set_wrapper must base on setpoint (→7.0): got {}",
+            set_value(&msgs)
         );
     }
 

@@ -294,9 +294,13 @@ where
 }
 
 /// `relative_set_wrapper(plan, motors)` — for each motor in `motors`,
-/// rewrite every `Msg::Set { obj == motor, value }` into `value + readback`,
-/// where `readback` is captured *once* at wrapper start via `locate_dyn`.
-/// After the inner plan, no automatic restore; pair with
+/// rewrite every `Msg::Set { obj == motor, value }` into `value + setpoint`,
+/// where `setpoint` is the motor's commanded position, captured *once* at
+/// wrapper start via `locate_dyn`. Mirrors bluesky's `relative_set_wrapper`,
+/// which stashes `location["setpoint"]` for a `Locatable`
+/// (`__read_and_stash_a_motor`, preprocessors.py:1061) — not the readback, so
+/// a relative move is deterministic from the commanded position regardless of
+/// motor jitter/lag. After the inner plan, no automatic restore; pair with
 /// `reset_positions_wrapper` for that.
 pub fn relative_set_wrapper(inner: Plan, motors: Vec<Arc<dyn LocatableObj>>) -> Plan {
     plan_box(async_stream::stream! {
@@ -304,7 +308,7 @@ pub fn relative_set_wrapper(inner: Plan, motors: Vec<Arc<dyn LocatableObj>>) -> 
         let mut starts: HashMap<String, f64> = HashMap::new();
         for m in &motors {
             if let Ok(loc) = m.locate_dyn().await {
-                starts.insert(m.name().to_string(), loc.readback);
+                starts.insert(m.name().to_string(), loc.setpoint);
             }
         }
         let names: std::collections::HashSet<String> =
@@ -445,7 +449,7 @@ pub fn reset_positions_wrapper(inner: Plan, motors: Vec<Arc<dyn LocatableObj>>) 
         let mut snapshot: Vec<(Arc<dyn cirrus_core::msg::MovableObj>, f64)> = Vec::new();
         for m in &motors {
             if let Ok(loc) = m.locate_dyn().await {
-                snapshot.push((m.clone() as Arc<dyn cirrus_core::msg::MovableObj>, loc.readback));
+                snapshot.push((m.clone() as Arc<dyn cirrus_core::msg::MovableObj>, loc.setpoint));
             }
         }
         let mut inner = inner;
