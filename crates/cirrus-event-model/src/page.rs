@@ -12,18 +12,25 @@
 //! document's descriptor / resource UID is used for the whole page.
 
 use crate::documents::{Datum, DatumPage, Event, EventPage};
+use crate::EventModelError;
 use serde_json::Value;
 use std::collections::HashMap;
 
 /// Transpose a slice of `Event`s into a single `EventPage`.
 ///
 /// All events are assumed to share a descriptor (the first event's descriptor
-/// UID labels the page). Returns an empty page if `events` is empty.
-pub fn pack_event_page(events: &[Event]) -> EventPage {
-    let descriptor = events
-        .first()
-        .map(|e| e.descriptor.clone())
-        .unwrap_or_default();
+/// UID labels the page). Errors with [`EventModelError::EmptyPack`] if `events`
+/// is empty: the page's `descriptor` is taken from the first event and cannot
+/// be null (mirrors the reference `pack_event_page` `ValueError`).
+pub fn pack_event_page(events: &[Event]) -> Result<EventPage, EventModelError> {
+    let descriptor =
+        events
+            .first()
+            .map(|e| e.descriptor.clone())
+            .ok_or(EventModelError::EmptyPack {
+                kind: "Event",
+                field: "descriptor",
+            })?;
     let mut uid = Vec::with_capacity(events.len());
     let mut time = Vec::with_capacity(events.len());
     let mut seq_num = Vec::with_capacity(events.len());
@@ -44,7 +51,7 @@ pub fn pack_event_page(events: &[Event]) -> EventPage {
             filled.entry(k.clone()).or_default().push(v.clone());
         }
     }
-    EventPage {
+    Ok(EventPage {
         uid,
         descriptor,
         time,
@@ -52,7 +59,7 @@ pub fn pack_event_page(events: &[Event]) -> EventPage {
         data,
         timestamps,
         filled,
-    }
+    })
 }
 
 /// Transpose an `EventPage` back into individual `Event`s, one per row.
@@ -90,12 +97,18 @@ pub fn unpack_event_page(page: &EventPage) -> Vec<Event> {
 /// Transpose a slice of `Datum`s into a single `DatumPage`.
 ///
 /// All datums are assumed to share a resource (the first datum's resource UID
-/// labels the page). Returns an empty page if `datums` is empty.
-pub fn pack_datum_page(datums: &[Datum]) -> DatumPage {
-    let resource = datums
-        .first()
-        .map(|d| d.resource.clone())
-        .unwrap_or_default();
+/// labels the page). Errors with [`EventModelError::EmptyPack`] if `datums` is
+/// empty: the page's `resource` is taken from the first datum and cannot be
+/// null (mirrors the reference `pack_datum_page` `ValueError`).
+pub fn pack_datum_page(datums: &[Datum]) -> Result<DatumPage, EventModelError> {
+    let resource =
+        datums
+            .first()
+            .map(|d| d.resource.clone())
+            .ok_or(EventModelError::EmptyPack {
+                kind: "Datum",
+                field: "resource",
+            })?;
     let mut datum_id = Vec::with_capacity(datums.len());
     let mut datum_kwargs: HashMap<String, Vec<Value>> = HashMap::new();
     for d in datums {
@@ -104,11 +117,11 @@ pub fn pack_datum_page(datums: &[Datum]) -> DatumPage {
             datum_kwargs.entry(k.clone()).or_default().push(v.clone());
         }
     }
-    DatumPage {
+    Ok(DatumPage {
         datum_id,
         resource,
         datum_kwargs,
-    }
+    })
 }
 
 /// Transpose a `DatumPage` back into individual `Datum`s, one per row.
@@ -318,7 +331,7 @@ mod tests {
     #[test]
     fn event_page_round_trip() {
         let events = vec![event("e-1", 1, 1.5), event("e-2", 2, 2.5)];
-        let page = pack_event_page(&events);
+        let page = pack_event_page(&events).unwrap();
         assert_eq!(page.uid, vec!["e-1", "e-2"]);
         assert_eq!(page.descriptor, "d-1");
         assert_eq!(page.data["x"], vec![json!(1.5), json!(2.5)]);
@@ -340,7 +353,7 @@ mod tests {
                 datum_kwargs: HashMap::from([("i".into(), json!(2))]),
             },
         ];
-        let page = pack_datum_page(&datums);
+        let page = pack_datum_page(&datums).unwrap();
         assert_eq!(page.datum_id, vec!["r/1", "r/2"]);
         assert_eq!(page.resource, "r");
         let back = unpack_datum_page(&page);
@@ -348,16 +361,43 @@ mod tests {
     }
 
     #[test]
-    fn empty_event_page_is_safe() {
-        let page = pack_event_page(&[]);
-        assert!(page.uid.is_empty());
-        assert!(unpack_event_page(&page).is_empty());
+    fn pack_empty_event_page_is_rejected() {
+        // The reference raises ValueError: an EventPage's `descriptor` (taken
+        // from the first event) cannot be null, so zero events cannot pack.
+        let err = pack_event_page(&[]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EventModelError::EmptyPack {
+                    kind: "Event",
+                    field: "descriptor"
+                }
+            ),
+            "empty pack must error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn pack_empty_datum_page_is_rejected() {
+        // The reference raises ValueError: a DatumPage's `resource` (taken from
+        // the first datum) cannot be null, so zero datums cannot pack.
+        let err = pack_datum_page(&[]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EventModelError::EmptyPack {
+                    kind: "Datum",
+                    field: "resource"
+                }
+            ),
+            "empty pack must error, got {err:?}"
+        );
     }
 
     #[test]
     fn merge_event_pages_concatenates_columns_and_keeps_first_descriptor() {
-        let p1 = pack_event_page(&[event("e-1", 1, 1.5), event("e-2", 2, 2.5)]);
-        let mut p2 = pack_event_page(&[event("e-3", 3, 3.5)]);
+        let p1 = pack_event_page(&[event("e-1", 1, 1.5), event("e-2", 2, 2.5)]).unwrap();
+        let mut p2 = pack_event_page(&[event("e-3", 3, 3.5)]).unwrap();
         // A differing descriptor on a later page must not win.
         p2.descriptor = "d-2".into();
         let merged = merge_event_pages(&[p1, p2]);
@@ -388,7 +428,7 @@ mod tests {
 
     #[test]
     fn merge_event_pages_single_returns_that_page() {
-        let p1 = pack_event_page(&[event("e-1", 1, 1.5)]);
+        let p1 = pack_event_page(&[event("e-1", 1, 1.5)]).unwrap();
         assert_eq!(merge_event_pages(std::slice::from_ref(&p1)), p1);
     }
 
@@ -408,8 +448,9 @@ mod tests {
             event("e-1", 1, 1.5),
             event("e-2", 2, 2.5),
             event("e-3", 3, 3.5),
-        ]);
-        let b = pack_event_page(&[event("e-4", 4, 4.5), event("e-5", 5, 5.5)]);
+        ])
+        .unwrap();
+        let b = pack_event_page(&[event("e-4", 4, 4.5), event("e-5", 5, 5.5)]).unwrap();
         let chunks = rechunk_event_pages(&[a, b], 2);
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0].seq_num, vec![1, 2]);
@@ -440,7 +481,7 @@ mod tests {
 
     #[test]
     fn rechunk_event_pages_chunk_larger_than_total_is_one_page() {
-        let p = pack_event_page(&[event("e-1", 1, 1.5), event("e-2", 2, 2.5)]);
+        let p = pack_event_page(&[event("e-1", 1, 1.5), event("e-2", 2, 2.5)]).unwrap();
         let chunks = rechunk_event_pages(&[p], 10);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].seq_num, vec![1, 2]);
@@ -448,7 +489,7 @@ mod tests {
 
     #[test]
     fn rechunk_event_pages_zero_chunk_and_empty_input_yield_nothing() {
-        let p = pack_event_page(&[event("e-1", 1, 1.5)]);
+        let p = pack_event_page(&[event("e-1", 1, 1.5)]).unwrap();
         assert!(
             rechunk_event_pages(std::slice::from_ref(&p), 0).is_empty(),
             "chunk_size 0 cannot define a chunking"
@@ -469,8 +510,8 @@ mod tests {
 
     #[test]
     fn merge_datum_pages_concatenates_columns_and_keeps_first_resource() {
-        let p1 = pack_datum_page(&[datum("r/1", 1), datum("r/2", 2)]);
-        let mut p2 = pack_datum_page(&[datum("r/3", 3)]);
+        let p1 = pack_datum_page(&[datum("r/1", 1), datum("r/2", 2)]).unwrap();
+        let mut p2 = pack_datum_page(&[datum("r/3", 3)]).unwrap();
         // A differing resource on a later page must not win.
         p2.resource = "r2".into();
         let merged = merge_datum_pages(&[p1, p2]);
@@ -494,7 +535,7 @@ mod tests {
 
     #[test]
     fn merge_datum_pages_single_returns_that_page() {
-        let p1 = pack_datum_page(&[datum("r/1", 1)]);
+        let p1 = pack_datum_page(&[datum("r/1", 1)]).unwrap();
         assert_eq!(merge_datum_pages(std::slice::from_ref(&p1)), p1);
     }
 
@@ -510,8 +551,8 @@ mod tests {
     fn rechunk_datum_pages_splits_uniformly_across_page_boundaries() {
         // 3 + 2 = 5 datums, rechunk to 2 → pages of [2, 2, 1]; the middle chunk
         // straddles the input page boundary (r/3 from page A, r/4 from page B).
-        let a = pack_datum_page(&[datum("r/1", 1), datum("r/2", 2), datum("r/3", 3)]);
-        let b = pack_datum_page(&[datum("r/4", 4), datum("r/5", 5)]);
+        let a = pack_datum_page(&[datum("r/1", 1), datum("r/2", 2), datum("r/3", 3)]).unwrap();
+        let b = pack_datum_page(&[datum("r/4", 4), datum("r/5", 5)]).unwrap();
         let chunks = rechunk_datum_pages(&[a, b], 2);
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0].datum_id, vec!["r/1", "r/2"]);
@@ -541,7 +582,7 @@ mod tests {
 
     #[test]
     fn rechunk_datum_pages_chunk_larger_than_total_is_one_page() {
-        let p = pack_datum_page(&[datum("r/1", 1), datum("r/2", 2)]);
+        let p = pack_datum_page(&[datum("r/1", 1), datum("r/2", 2)]).unwrap();
         let chunks = rechunk_datum_pages(&[p], 10);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].datum_id, vec!["r/1", "r/2"]);
@@ -549,7 +590,7 @@ mod tests {
 
     #[test]
     fn rechunk_datum_pages_zero_chunk_and_empty_input_yield_nothing() {
-        let p = pack_datum_page(&[datum("r/1", 1)]);
+        let p = pack_datum_page(&[datum("r/1", 1)]).unwrap();
         assert!(
             rechunk_datum_pages(std::slice::from_ref(&p), 0).is_empty(),
             "chunk_size 0 cannot define a chunking"

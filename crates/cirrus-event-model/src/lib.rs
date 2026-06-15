@@ -30,6 +30,17 @@ pub enum EventModelError {
     /// A reference UID could not be resolved.
     #[error("unknown reference uid: {0}")]
     UnknownUid(String),
+    /// `pack_event_page` / `pack_datum_page` was called with zero rows. A page
+    /// cannot be built from an empty collection because its `{field}` field
+    /// (taken from the first row) would be null, which the schema forbids.
+    /// Mirrors the reference `ValueError`.
+    #[error("cannot pack an empty {kind} collection: a page's `{field}` field cannot be null")]
+    EmptyPack {
+        /// Row document kind being packed (`Event` or `Datum`).
+        kind: &'static str,
+        /// Page field that would be left null (`descriptor` or `resource`).
+        field: &'static str,
+    },
     /// JSON encode/decode failure.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
