@@ -349,6 +349,7 @@ pub(crate) async fn execute_queue_loop(
         if state.lock().unwrap().queue_stop_pending {
             let mut s = state.lock().unwrap();
             s.queue_stop_pending = false;
+            s.pause_pending = false;
             s.state = Some(EState::Idle);
             return;
         }
@@ -356,7 +357,9 @@ pub(crate) async fn execute_queue_loop(
         let item = match item {
             Some(it) => it,
             None => {
-                state.lock().unwrap().state = Some(EState::Idle);
+                let mut s = state.lock().unwrap();
+                s.state = Some(EState::Idle);
+                s.pause_pending = false;
                 return;
             }
         };
@@ -444,7 +447,9 @@ pub(crate) async fn execute_queue_loop(
         // On non-success, idle out (matches bluesky behaviour: queue_start
         // halts on error).
         if exit_status != "success" {
-            state.lock().unwrap().state = Some(EState::Idle);
+            let mut s = state.lock().unwrap();
+            s.state = Some(EState::Idle);
+            s.pause_pending = false;
             return;
         }
     }

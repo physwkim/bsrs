@@ -188,12 +188,21 @@ pub(crate) fn dispatch(
         }
 
         // -- RunEngine control --------------------------------------------
-        "re_pause" => re_pause(&engine, rt, &req.params),
-        "re_resume" => re_with(&engine, rt, |re| re.resume()),
-        "re_abort" => re_with(&engine, rt, |re| {
-            re.abort("user abort");
-        }),
-        "re_halt" => re_with(&engine, rt, |re| re.halt("user halt")),
+        "re_pause" => re_pause(&state, &engine, rt, &req.params),
+        "re_resume" => {
+            state.lock().unwrap().pause_pending = false;
+            re_with(&engine, rt, |re| re.resume())
+        }
+        "re_abort" => {
+            state.lock().unwrap().pause_pending = false;
+            re_with(&engine, rt, |re| {
+                re.abort("user abort");
+            })
+        }
+        "re_halt" => {
+            state.lock().unwrap().pause_pending = false;
+            re_with(&engine, rt, |re| re.halt("user halt"))
+        }
         "re_stop" => re_with(&engine, rt, |re| re.stop()),
         "re_runs" => re_runs(&state),
         "re_metadata" => re_metadata(&engine, rt, &req.params),
@@ -474,6 +483,7 @@ fn status_response(
         "worker_environment_exists": env_exists,
         "worker_environment_state": if env_exists { "idle" } else { "closed" },
         "queue_stop_pending": st.queue_stop_pending,
+        "pause_pending": st.pause_pending,
         "queue_autostart_enabled": st.queue_autostart_enabled,
         "plan_queue_mode": st.queue_mode,
         "plan_queue_uid": q.queue_uid(),
@@ -852,6 +862,7 @@ fn queue_start(
 }
 
 fn re_pause(
+    state: &Arc<StdMutex<EngineState>>,
     engine: &Arc<Mutex<Option<Arc<RunEngine>>>>,
     rt: &tokio::runtime::Handle,
     params: &Value,
@@ -864,6 +875,7 @@ fn re_pause(
             .map(|s| s == "deferred")
             .unwrap_or(false);
         re.pause(defer);
+        state.lock().unwrap().pause_pending = true;
         json!({"success": true, "msg": ""})
     } else {
         err("no environment")

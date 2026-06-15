@@ -172,6 +172,8 @@ pub struct EngineState {
     pub re_metadata: HashMap<String, serde_json::Value>,
     /// `queue_stop` requested but not yet honored.
     pub queue_stop_pending: bool,
+    /// `re_pause` accepted but the plan has not yet reached a checkpoint.
+    pub pause_pending: bool,
     /// Whether `queue_autostart` is enabled.
     pub queue_autostart_enabled: bool,
     /// Queue execution mode (`{"loop": false}` etc.).
@@ -193,6 +195,7 @@ impl Default for EngineState {
             re_runs: Vec::new(),
             re_metadata: HashMap::new(),
             queue_stop_pending: false,
+            pause_pending: false,
             queue_autostart_enabled: false,
             queue_mode: HashMap::from([("loop".into(), serde_json::Value::Bool(false))]),
             lock: LockInfo::unlocked(),
