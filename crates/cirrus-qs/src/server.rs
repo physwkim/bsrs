@@ -424,7 +424,13 @@ pub(crate) async fn execute_queue_loop(
             s.current_run_uid = run_uid.clone();
             s.current_plan_name = None;
             if let Some(uid) = &run_uid {
-                s.re_runs.push(uid.clone());
+                // Mark any prior entry for this uid as closed (shouldn't happen, but safe).
+                for entry in s.re_runs.iter_mut() {
+                    if &entry.0 == uid {
+                        entry.1 = false;
+                    }
+                }
+                s.re_runs.push((uid.clone(), false));
                 if s.re_runs.len() > 64 {
                     let drop_n = s.re_runs.len() - 64;
                     s.re_runs.drain(0..drop_n);

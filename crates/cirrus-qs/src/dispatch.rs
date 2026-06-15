@@ -208,7 +208,7 @@ pub(crate) fn dispatch(
             re_with(&engine, rt, |re| re.halt("user halt"))
         }
         "re_stop" => re_with(&engine, rt, |re| re.stop()),
-        "re_runs" => re_runs(&state),
+        "re_runs" => re_runs(&state, &req.params),
         "re_metadata" => re_metadata(&engine, rt, &req.params),
 
         // -- locks --------------------------------------------------------
@@ -961,12 +961,21 @@ fn re_with(
     }
 }
 
-fn re_runs(state: &Arc<StdMutex<EngineState>>) -> Value {
+fn re_runs(state: &Arc<StdMutex<EngineState>>, params: &Value) -> Value {
     let st = state.lock().unwrap();
+    let option = params
+        .get("option")
+        .and_then(|v| v.as_str())
+        .unwrap_or("active");
     let runs: Vec<Value> = st
         .re_runs
         .iter()
-        .map(|uid| json!({"uid": uid, "is_open": false}))
+        .filter(|(_, is_open)| match option {
+            "open" => *is_open,
+            "closed" => !is_open,
+            _ => true, // "active" = all
+        })
+        .map(|(uid, is_open)| json!({"uid": uid, "is_open": is_open}))
         .collect();
     json!({"success": true, "msg": "", "run_list": runs, "run_list_uid": "static"})
 }

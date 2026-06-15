@@ -165,8 +165,8 @@ pub struct EngineState {
     pub plans_run: u64,
     /// Total plans failed.
     pub plans_failed: u64,
-    /// Recent run UIDs (most-recent last).
-    pub re_runs: Vec<String>,
+    /// Recent runs as (uid, is_open) pairs (most-recent last).
+    pub re_runs: Vec<(String, bool)>,
     /// Persistent metadata that mirrors `RE.md`. Returned by
     /// `re_metadata` and merged into RunMetadata at OpenRun.
     pub re_metadata: HashMap<String, serde_json::Value>,
