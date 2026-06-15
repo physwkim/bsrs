@@ -585,6 +585,10 @@ pub fn scan(
             ..Default::default()
         });
         for i in 0..num {
+            // Per-step rewind boundary (bluesky one_1d_step.move(): a
+            // Checkpoint before the set, plan_stubs.py:1669). Without it a
+            // pause/resume rewinds the whole run instead of the current step.
+            yield Msg::Checkpoint;
             let pos = start + step * (i as f64);
             yield Msg::Set {
                 obj: motor.clone(),
@@ -624,6 +628,9 @@ pub fn list_scan(
             ..Default::default()
         });
         for pos in points {
+            // Per-step rewind boundary (bluesky one_1d_step.move():
+            // plan_stubs.py:1669).
+            yield Msg::Checkpoint;
             yield Msg::Set {
                 obj: motor.clone(),
                 value: pos,
@@ -721,6 +728,10 @@ pub fn grid_scan(
             ..Default::default()
         });
         for i in 0..n1 {
+            // Row-change rewind boundary: a pause during the slow-axis move
+            // rewinds here, re-driving motor1 (bluesky move_per_step emits a
+            // Checkpoint before the step's moves, plan_stubs.py:1695).
+            yield Msg::Checkpoint;
             let p1 = s1 + step1 * (i as f64);
             yield Msg::Set {
                 obj: motor1.clone(),
@@ -733,6 +744,10 @@ pub fn grid_scan(
                 timeout: None,
             };
             for j in 0..n2 {
+                // Per-point rewind boundary for the fast axis (motor1 is
+                // already settled at p1 above). Mirrors one Checkpoint per
+                // grid point (bluesky move_per_step, plan_stubs.py:1695).
+                yield Msg::Checkpoint;
                 let p2 = s2 + step2 * (j as f64);
                 yield Msg::Set {
                     obj: motor2.clone(),
@@ -791,6 +806,9 @@ pub fn inner_product_scan(
             ..Default::default()
         });
         for row in pts {
+            // Per-step rewind boundary before this point's moves (bluesky
+            // move_per_step, plan_stubs.py:1695).
+            yield Msg::Checkpoint;
             for (i, val) in row.iter().enumerate() {
                 yield Msg::Set {
                     obj: axes[i].0.clone(),
@@ -860,6 +878,9 @@ pub fn scan_nd(
             ..Default::default()
         });
         for row in points {
+            // Per-step rewind boundary before this point's moves (bluesky
+            // move_per_step, plan_stubs.py:1695).
+            yield Msg::Checkpoint;
             for (i, v) in row.iter().enumerate() {
                 if i >= motors.len() { break; }
                 yield Msg::Set {
@@ -947,6 +968,8 @@ pub fn spiral_square(
             ..Default::default()
         });
         for (x, y) in pts {
+            // Per-point rewind boundary (bluesky move_per_step, :1695).
+            yield Msg::Checkpoint;
             yield Msg::Set { obj: x_motor.clone(), value: x, group: Some("set".into()) };
             yield Msg::Set { obj: y_motor.clone(), value: y, group: Some("set".into()) };
             yield Msg::Wait { group: "set".into(), error_on_timeout: true, timeout: None };
@@ -986,6 +1009,8 @@ pub fn spiral(
             ..Default::default()
         });
         for (x, y) in pts {
+            // Per-point rewind boundary (bluesky move_per_step, :1695).
+            yield Msg::Checkpoint;
             yield Msg::Set { obj: x_motor.clone(), value: x, group: Some("set".into()) };
             yield Msg::Set { obj: y_motor.clone(), value: y, group: Some("set".into()) };
             yield Msg::Wait { group: "set".into(), error_on_timeout: true, timeout: None };
@@ -1178,6 +1203,8 @@ pub fn spiral_fermat(
             ..Default::default()
         });
         for (x, y) in pts {
+            // Per-point rewind boundary (bluesky move_per_step, :1695).
+            yield Msg::Checkpoint;
             yield Msg::Set { obj: x_motor.clone(), value: x, group: Some("set".into()) };
             yield Msg::Set { obj: y_motor.clone(), value: y, group: Some("set".into()) };
             yield Msg::Wait { group: "set".into(), error_on_timeout: true, timeout: None };
@@ -1366,6 +1393,9 @@ pub fn adaptive_scan(
             if (direction > 0.0 && pos > stop) || (direction < 0.0 && pos < stop) {
                 break;
             }
+            // Per-step rewind boundary (bluesky one_1d_step.move(): :1669).
+            // After the break checks, so a terminal iteration emits none.
+            yield Msg::Checkpoint;
             yield Msg::Set { obj: motor.clone(), value: pos, group: Some("set".into()) };
             yield Msg::Wait {
                 group: "set".into(),
@@ -1449,6 +1479,8 @@ pub fn tune_centroid(
         let mut sum_y = 0.0_f64;
         let mut last_pos = start;
         for i in 0..num {
+            // Per-step rewind boundary (bluesky one_1d_step.move(): :1669).
+            yield Msg::Checkpoint;
             let pos = start + step * (i as f64);
             last_pos = pos;
             yield Msg::Set { obj: motor.clone(), value: pos, group: Some("set".into()) };
@@ -2124,6 +2156,77 @@ mod tests {
             named_reset_sets(&msgs),
             vec![("m".to_string(), 10.0)],
             "rel_scan must return the motor to the supplied current"
+        );
+    }
+
+    // Each scan step is a rewind boundary: a Checkpoint precedes every
+    // step Set (bluesky one_1d_step.move(), plan_stubs.py:1669).
+    #[tokio::test]
+    async fn scan_checkpoints_before_each_step() {
+        let motor = Arc::new(FakeMotor {
+            name: "m".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let msgs = drain(scan(vec![], motor, rdr("m_rbv"), 0.0, 10.0, 3)).await;
+        assert_eq!(
+            msgs.iter().filter(|m| matches!(m, Msg::Checkpoint)).count(),
+            3,
+            "one Checkpoint per step"
+        );
+        for (idx, m) in msgs.iter().enumerate() {
+            if matches!(m, Msg::Set { group, .. } if group.as_deref() == Some("set")) {
+                assert!(
+                    idx > 0 && matches!(msgs[idx - 1], Msg::Checkpoint),
+                    "step Set at {idx} not immediately preceded by Checkpoint"
+                );
+            }
+        }
+    }
+
+    // A delegating rel_ plan inherits the base plan's per-step checkpoints.
+    #[tokio::test]
+    async fn rel_scan_inherits_step_checkpoints() {
+        let motor = Arc::new(FakeMotor {
+            name: "m".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let msgs = drain(rel_scan(vec![], motor, rdr("m_rbv"), 10.0, -2.0, 2.0, 3)).await;
+        assert_eq!(
+            msgs.iter().filter(|m| matches!(m, Msg::Checkpoint)).count(),
+            3,
+            "rel_scan delegates to scan, inheriting its per-step checkpoints"
+        );
+    }
+
+    // A 2x2 grid emits one Checkpoint per slow-axis row plus one per point.
+    #[tokio::test]
+    async fn grid_scan_checkpoints_rows_and_points() {
+        let m1 = Arc::new(FakeMotor {
+            name: "m1".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let m2 = Arc::new(FakeMotor {
+            name: "m2".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let msgs = drain(grid_scan(
+            vec![],
+            m1,
+            rdr("m1r"),
+            0.0,
+            1.0,
+            2,
+            m2,
+            rdr("m2r"),
+            0.0,
+            1.0,
+            2,
+        ))
+        .await;
+        assert_eq!(
+            msgs.iter().filter(|m| matches!(m, Msg::Checkpoint)).count(),
+            6,
+            "grid_scan: one Checkpoint per row (2) + one per point (4)"
         );
     }
 
