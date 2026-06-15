@@ -582,8 +582,7 @@ mod tests {
 
         // complete() must block — no frames yet.
         let det_c = det.clone();
-        let complete =
-            tokio::spawn(async move { Flyable::complete(&*det_c).await.success() });
+        let complete = tokio::spawn(async move { Flyable::complete(&*det_c).await.success() });
 
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(
