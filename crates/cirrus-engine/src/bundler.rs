@@ -9,9 +9,24 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// State of one open bundle (between `create` and `save`/`drop`).
+///
+/// All descriptor-shaping accumulators (`data_keys`, `object_keys`, `hints`)
+/// live *here*, per bundle — not on the `RunBundler` — so a `drop` discards
+/// them with the bundle and they cannot leak into the next bundle's
+/// descriptor. This mirrors bluesky, which builds each descriptor from the
+/// per-event `_objs_read` / `read_cache`, both reset on the next `create`
+/// (bundlers.py:357,385); a dropped bundle's reads never reach the next
+/// descriptor.
 struct OpenBundle {
     stream_name: String,
     readings: HashMap<String, ReadingValue>,
+    /// Data keys accumulated from this bundle's `Read`s, used to synthesize
+    /// the stream descriptor at `save`.
+    data_keys: HashMap<String, DataKey>,
+    /// Object → field-list mapping accumulated for this bundle's descriptor.
+    object_keys: HashMap<String, Vec<String>>,
+    /// Object → fields hint accumulator for this bundle's descriptor.
+    hints: Option<HashMap<String, PerObjectHint>>,
     /// Whether at least one `Read` has been folded into this bundle. The
     /// cirrus equivalent of bluesky's `_objs_read` non-emptiness: a `save`
     /// with no preceding `read` emits no Event (bundlers.py:570-573).
@@ -29,18 +44,12 @@ pub struct RunBundler {
     bundle: Arc<RunBundle>,
     /// Per-stream descriptor cache, keyed by stream name.
     descriptors: HashMap<String, DescriptorState>,
-    /// Per-stream accumulated data keys (populated as Read messages arrive).
-    stream_data_keys: HashMap<String, HashMap<String, DataKey>>,
     /// Currently open event bundle, if any.
     open: Option<OpenBundle>,
     /// Run start UID.
     pub start_uid: String,
     /// Configuration accumulated for the next descriptor.
     pending_config: HashMap<String, Configuration>,
-    /// Object → fields hint accumulator.
-    pending_hints: Option<HashMap<String, PerObjectHint>>,
-    /// Object → field-list mapping accumulated for descriptors.
-    pending_object_keys: HashMap<String, Vec<String>>,
     /// Snapshot of per-stream sequence counters taken at the last checkpoint,
     /// used to roll them back on `rewind` so a replayed `save` re-emits the same
     /// `seq_num`. `None` when no checkpoint region is active. bluesky
@@ -55,11 +64,8 @@ impl RunBundler {
             start_uid: bundle.start_uid().to_string(),
             bundle,
             descriptors: HashMap::new(),
-            stream_data_keys: HashMap::new(),
             open: None,
             pending_config: HashMap::new(),
-            pending_hints: None,
-            pending_object_keys: HashMap::new(),
             seq_snapshot: None,
         }
     }
@@ -89,6 +95,9 @@ impl RunBundler {
         self.open = Some(OpenBundle {
             stream_name,
             readings: HashMap::new(),
+            data_keys: HashMap::new(),
+            object_keys: HashMap::new(),
+            hints: None,
             had_read: false,
         });
         Ok(())
@@ -107,7 +116,6 @@ impl RunBundler {
             .as_mut()
             .ok_or_else(|| CirrusError::Plan("read with no open bundle".into()))?;
         bundle.had_read = true;
-        let stream_name = bundle.stream_name.clone();
         // Reject colliding field names within one event bundle. Two reads in the
         // same create/save that share a data key would silently overwrite each
         // other (last write wins), dropping one object's reading and leaving the
@@ -122,15 +130,15 @@ impl RunBundler {
         for (k, v) in readings {
             bundle.readings.insert(k, v);
         }
-        // Stash data keys for descriptor synthesis at save time.
-        let s = self.stream_data_keys.entry(stream_name).or_default();
+        // Stash data keys on the bundle for descriptor synthesis at save time.
+        // Per-bundle (not RunBundler-level) so a `drop` discards them.
         for (k, v) in data_keys {
-            s.insert(k, v);
+            bundle.data_keys.insert(k, v);
         }
-        // Hints + object_keys
+        // Hints + object_keys, likewise per-bundle.
         if let (Some(obj), Some(fields)) = (object_name, hint_fields) {
-            self.pending_object_keys.insert(obj.clone(), fields.clone());
-            let hint_map = self.pending_hints.get_or_insert_with(HashMap::new);
+            bundle.object_keys.insert(obj.clone(), fields.clone());
+            let hint_map = bundle.hints.get_or_insert_with(HashMap::new);
             hint_map.entry(obj).or_default().fields = Some(fields);
         }
         Ok(())
@@ -139,7 +147,7 @@ impl RunBundler {
     /// Save the open bundle as documents. Emits a Descriptor on first save
     /// per stream, then an Event.
     pub fn save(&mut self) -> Result<Vec<Document>> {
-        let bundle = self
+        let mut bundle = self
             .open
             .take()
             .ok_or_else(|| CirrusError::Plan("save with no open bundle".into()))?;
@@ -160,17 +168,12 @@ impl RunBundler {
             .map(|d| d.uid.is_empty())
             .unwrap_or(true);
         if needs_descriptor {
-            let data_keys = self
-                .stream_data_keys
-                .get(&stream_name)
-                .cloned()
-                .unwrap_or_default();
             let (descriptor, _new) = self.bundle.descriptor(
                 &stream_name,
-                data_keys,
+                std::mem::take(&mut bundle.data_keys),
                 std::mem::take(&mut self.pending_config),
-                std::mem::take(&mut self.pending_hints),
-                std::mem::take(&mut self.pending_object_keys),
+                bundle.hints.take(),
+                std::mem::take(&mut bundle.object_keys),
             );
             self.descriptors.insert(
                 stream_name.clone(),

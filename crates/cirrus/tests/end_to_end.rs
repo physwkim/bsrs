@@ -1452,3 +1452,128 @@ async fn kickoff_without_open_run_is_rejected_before_flyer_starts() {
         "a rejected Kickoff must not start the flyer hardware"
     );
 }
+
+/// A readable whose single data key equals its name, so two instances produce
+/// distinct, non-colliding fields.
+struct KeyedReadable {
+    name: String,
+}
+
+impl cirrus_core::msg::NamedObj for KeyedReadable {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[async_trait::async_trait]
+impl cirrus_core::msg::ReadableObj for KeyedReadable {
+    async fn read_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, cirrus_core::reading::ReadingValue>,
+        cirrus_core::error::CirrusError,
+    > {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            self.name.clone(),
+            cirrus_core::reading::ReadingValue {
+                value: serde_json::Value::from(1.0),
+                timestamp: 0.0,
+                alarm_severity: None,
+                message: None,
+            },
+        );
+        Ok(m)
+    }
+    async fn describe_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, cirrus_event_model::DataKey>,
+        cirrus_core::error::CirrusError,
+    > {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            self.name.clone(),
+            cirrus_event_model::DataKey {
+                source: format!("test://{}", self.name),
+                dtype: cirrus_event_model::Dtype::Number,
+                shape: vec![],
+                dtype_numpy: Some("<f8".into()),
+                external: None,
+                units: None,
+                precision: None,
+                object_name: None,
+                dims: None,
+                limits: None,
+                choices: None,
+            },
+        );
+        Ok(m)
+    }
+}
+
+#[tokio::test]
+async fn dropped_bundle_reads_do_not_leak_into_next_descriptor() {
+    // bluesky builds each descriptor from the per-event `_objs_read`, which the
+    // next `create` clears (bundlers.py:385); a dropped bundle's reads never
+    // reach the next descriptor. cirrus previously accumulated descriptor data
+    // keys at the RunBundler level and `drop` did not clear them, so reads in a
+    // dropped bundle (before the stream's first descriptor existed) leaked
+    // their data keys into the next descriptor — advertising fields the event
+    // never carried.
+    let det_a: Arc<dyn cirrus_core::msg::ReadableObj> = Arc::new(KeyedReadable {
+        name: "det_a".into(),
+    });
+    let det_b: Arc<dyn cirrus_core::msg::ReadableObj> = Arc::new(KeyedReadable {
+        name: "det_b".into(),
+    });
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+
+    let plan = cirrus_core::plan::plan_box(async_stream::stream! {
+        yield cirrus_core::Msg::OpenRun(Default::default());
+        // First bundle reads det_a, then is DROPPED (no descriptor emitted yet).
+        yield cirrus_core::Msg::Create { stream_name: "primary".into() };
+        yield cirrus_core::Msg::Read(det_a);
+        yield cirrus_core::Msg::Drop;
+        // Second bundle reads only det_b, then is saved → first descriptor.
+        yield cirrus_core::Msg::Create { stream_name: "primary".into() };
+        yield cirrus_core::Msg::Read(det_b);
+        yield cirrus_core::Msg::Save;
+        yield cirrus_core::Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+
+    let result = re.run_async(plan).await.unwrap();
+    assert_eq!(result.exit_status, "success");
+
+    let docs = sink.snapshot().await;
+    let descriptor = docs
+        .iter()
+        .find_map(|d| match d {
+            cirrus_core::Document::Descriptor(desc) => Some(desc.clone()),
+            _ => None,
+        })
+        .expect("expected a Descriptor for the primary stream");
+    assert!(
+        descriptor.data_keys.contains_key("det_b"),
+        "descriptor must advertise the device the saved bundle actually read"
+    );
+    assert!(
+        !descriptor.data_keys.contains_key("det_a"),
+        "descriptor must NOT advertise det_a, whose read was dropped; got keys {:?}",
+        descriptor.data_keys.keys().collect::<Vec<_>>()
+    );
+
+    let event = docs
+        .iter()
+        .find_map(|d| match d {
+            cirrus_core::Document::Event(ev) => Some(ev.clone()),
+            _ => None,
+        })
+        .expect("expected an Event for the saved bundle");
+    assert!(event.data.contains_key("det_b"));
+    assert!(
+        !event.data.contains_key("det_a"),
+        "event must not carry the dropped det_a reading"
+    );
+}
