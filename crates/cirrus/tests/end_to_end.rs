@@ -614,6 +614,56 @@ async fn abort_closes_run_with_abort_status() {
 }
 
 #[tokio::test]
+async fn abort_threads_caller_reason_into_stop_document() {
+    // bluesky's `RE.abort(reason)` stores the reason (run_engine.py:1336) and
+    // surfaces it on the RunStop document (:1792). cirrus previously dropped the
+    // caller's reason and hardcoded "user-requested abort", losing the
+    // diagnostic. The reason the caller passes must reach the stop doc.
+    let det = SoftDetector::new("a_det");
+    let sink = Arc::new(CapturingSink::new());
+    let re = Arc::new(RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]));
+
+    let det_clone = det.clone();
+    let plan = cirrus_core::plan::plan_box(async_stream::stream! {
+        yield cirrus_core::Msg::OpenRun(Default::default());
+        yield cirrus_core::Msg::Create { stream_name: "primary".into() };
+        yield cirrus_core::Msg::Read(det_clone as Arc<dyn cirrus_core::msg::ReadableObj>);
+        yield cirrus_core::Msg::Save;
+        // Pause here; the test aborts (with a reason) instead of resuming.
+        yield cirrus_core::Msg::Pause { defer: false };
+        yield cirrus_core::Msg::CloseRun {
+            exit_status: "success".into(),
+            reason: None,
+        };
+    });
+
+    let re_run = re.clone();
+    let join = tokio::spawn(async move { re_run.run_async(plan).await });
+
+    for _ in 0..50 {
+        if re.is_paused() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    re.abort("detector overheated");
+    let result = join.await.unwrap().unwrap();
+    assert_eq!(result.exit_status, "abort");
+    let docs = sink.snapshot().await;
+    if let cirrus_core::Document::Stop(s) = docs.last().unwrap() {
+        assert_eq!(s.exit_status, "abort");
+        assert_eq!(
+            s.reason.as_deref(),
+            Some("detector overheated"),
+            "abort(reason) must thread the caller's reason into the RunStop document \
+             (pre-fix: hardcoded \"user-requested abort\")"
+        );
+    } else {
+        panic!("last doc was not Stop: {:?}", docs.last());
+    }
+}
+
+#[tokio::test]
 async fn suspender_auto_resumes_engine() {
     use cirrus_engine::Suspender;
     use futures::future::BoxFuture;

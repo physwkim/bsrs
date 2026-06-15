@@ -254,6 +254,14 @@ pub struct RunEngine {
     is_aborting: AtomicBool,
     is_halting: AtomicBool,
     is_stopping: AtomicBool,
+    /// Caller-supplied reason for an interrupt (`abort`/`halt`), surfaced on
+    /// the `RunStop` document of the closed run. Single owner of the interrupt
+    /// reason: the interrupt entry points write it, `run_loop` reads it when
+    /// closing the run, and `run_async` clears it so a previous run's reason
+    /// cannot leak into this one. Mirrors bluesky's `RunEngine._reason`
+    /// (run_engine.py:1336 set in `_abort_coro`, read at :1765 and passed to
+    /// `close_run` :1792, reset at `_run` start :1497).
+    interrupt_reason: StdMutex<String>,
     sigint_count: AtomicU8,
     suspender_count: AtomicU64,
     sub_counter: AtomicU64,
@@ -393,6 +401,7 @@ impl RunEngine {
             is_aborting: AtomicBool::new(false),
             is_halting: AtomicBool::new(false),
             is_stopping: AtomicBool::new(false),
+            interrupt_reason: StdMutex::new(String::new()),
             sigint_count: AtomicU8::new(0),
             suspender_count: AtomicU64::new(0),
             sub_counter: AtomicU64::new(0),
@@ -477,6 +486,9 @@ impl RunEngine {
         self.is_aborting.store(false, Ordering::SeqCst);
         self.is_halting.store(false, Ordering::SeqCst);
         self.is_stopping.store(false, Ordering::SeqCst);
+        // Clear any interrupt reason left by a previous run so it cannot leak
+        // into this run's RunStop (bluesky run_engine.py:1497).
+        self.interrupt_reason.lock().unwrap().clear();
         self.is_paused.store(false, Ordering::SeqCst);
         // Reset SIGINT 3-tap counter — a previous session's taps must
         // not put a fresh run into the abort/halt path on the very
@@ -840,15 +852,20 @@ impl RunEngine {
     }
 
     /// External: abort the run. Closes the open run with `exit_status="abort"`.
-    pub fn abort(&self, _reason: impl Into<String>) {
+    /// The `reason` is threaded onto the closing `RunStop` document, matching
+    /// bluesky's `RE.abort(reason)` (run_engine.py:1336).
+    pub fn abort(&self, reason: impl Into<String>) {
+        *self.interrupt_reason.lock().unwrap() = reason.into();
         self.is_aborting.store(true, Ordering::SeqCst);
         self.is_paused.store(false, Ordering::SeqCst);
         self.cancel.lock().unwrap().cancel();
         self.permit.notify_waiters();
     }
 
-    /// External: halt — like abort but skips run-level cleanup.
-    pub fn halt(&self, _reason: impl Into<String>) {
+    /// External: halt — like abort but skips run-level cleanup. The `reason` is
+    /// threaded onto the closing `RunStop` document.
+    pub fn halt(&self, reason: impl Into<String>) {
+        *self.interrupt_reason.lock().unwrap() = reason.into();
         self.is_halting.store(true, Ordering::SeqCst);
         self.is_aborting.store(true, Ordering::SeqCst);
         self.is_paused.store(false, Ordering::SeqCst);
@@ -864,6 +881,19 @@ impl RunEngine {
         self.is_paused.store(false, Ordering::SeqCst);
         self.cancel.lock().unwrap().cancel();
         self.permit.notify_waiters();
+    }
+
+    /// The caller-supplied interrupt reason as a `RunStop` `reason` field: an
+    /// empty reason maps to `None` (bluesky's default `_reason = ""` surfaces as
+    /// no reason), a non-empty one to `Some`. Read by `run_loop` when an
+    /// `abort`/`halt`/`stop` closes the run.
+    fn stop_reason(&self) -> Option<String> {
+        let r = self.interrupt_reason.lock().unwrap();
+        if r.is_empty() {
+            None
+        } else {
+            Some(r.clone())
+        }
     }
 
     /// Whether a pause is currently in effect.
@@ -973,11 +1003,10 @@ impl RunEngine {
         // Close the open run with the right status. `stop` and the natural-end
         // case both close as "success".
         if exit_status == "abort" || exit_status == "halt" {
-            let reason = if exit_status == "halt" {
-                None
-            } else {
-                Some("user-requested abort".into())
-            };
+            // Reason comes from the caller (`abort(reason)` / `halt(reason)`),
+            // not a hardcoded string — bluesky threads `_reason` onto the stop
+            // document (run_engine.py:1792).
+            let reason = self.stop_reason();
             self.close_run_if_open(&exit_status, reason).await?;
             return Ok(RunResult {
                 run_uid,
@@ -985,7 +1014,9 @@ impl RunEngine {
             });
         }
         if exit_status == "success" && self.is_stopping.load(Ordering::SeqCst) {
-            self.close_run_if_open("success", Some("user-requested stop".into()))
+            // `stop()` sets no reason, so this resolves to `None` (bluesky's
+            // default `_reason = ""`), not a hardcoded "user-requested stop".
+            self.close_run_if_open("success", self.stop_reason())
                 .await?;
             return Ok(RunResult {
                 run_uid,
