@@ -72,6 +72,7 @@ pub(crate) fn dispatch(
                 "runtime": "rust",
                 "version": env!("CARGO_PKG_VERSION"),
                 "wire_protocol": "bluesky-queueserver-compatible (subset)",
+                "ip_connect_info": {},
             },
         }),
 
