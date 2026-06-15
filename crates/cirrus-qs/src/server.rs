@@ -306,7 +306,7 @@ fn rep_loop(
 ) -> Result<()> {
     let stop_requested = Arc::new(AtomicBool::new(false));
     while !socket.is_shutdown() {
-        let req = match socket.try_recv() {
+        let (req, encoding) = match socket.try_recv() {
             Ok(Some(r)) => r,
             Ok(None) => continue, // recv timeout, poll shutdown again
             Err(_) => continue,   // parse error already responded
@@ -326,7 +326,7 @@ fn rep_loop(
             checkpoint_hook.clone(),
             stop_requested.clone(),
         );
-        if let Err(e) = socket.send(&resp) {
+        if let Err(e) = socket.send(&resp, encoding) {
             tracing::warn!(target: "cirrus-qs", "rep_loop: send error: {e}");
         }
         if stop_requested.load(std::sync::atomic::Ordering::SeqCst) {

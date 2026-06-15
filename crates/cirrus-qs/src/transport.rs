@@ -6,6 +6,18 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
+/// Wire encoding for a single REQ/REP exchange.
+///
+/// The server probes the first byte of each inbound frame:
+/// `0x7B` (the ASCII `{`) → JSON; anything else → msgpack.
+/// The response is encoded in the same format as the request,
+/// matching the bluesky-queueserver client behaviour (ref: comms.py).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MsgEncoding {
+    Json,
+    MsgPack,
+}
+
 /// Wraps a 0MQ REP socket. `try_recv` waits for a request; `send` posts a response.
 #[derive(Clone)]
 pub struct ReqRepSocket {
@@ -45,30 +57,56 @@ impl ReqRepSocket {
         self.shutdown.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Try receive — returns `Ok(None)` on timeout, `Ok(Some(req))` on a
-    /// valid request, `Err(_)` on a parse failure (error already replied).
-    pub fn try_recv(&self) -> Result<Option<QsRequest>> {
+    /// Try receive — returns `Ok(None)` on timeout, `Ok(Some((req, encoding)))` on a
+    /// valid request, `Err(_)` on a parse failure (error already replied in same encoding).
+    pub fn try_recv(&self) -> Result<Option<(QsRequest, MsgEncoding)>> {
         let s = self.socket.lock().unwrap();
         match s.recv_bytes(0) {
-            Ok(bytes) => match serde_json::from_slice(&bytes) {
-                Ok(req) => Ok(Some(req)),
-                Err(e) => {
-                    let resp = json!({"success": false, "msg": format!("invalid request: {e}")});
-                    let _ = s.send(serde_json::to_vec(&resp).unwrap_or_default(), 0);
-                    Err(CirrusError::Backend(format!("zmq REP parse: {e}")))
+            Ok(bytes) => {
+                let enc = if bytes.first() == Some(&b'{') {
+                    MsgEncoding::Json
+                } else {
+                    MsgEncoding::MsgPack
+                };
+                let parse_result: std::result::Result<QsRequest, String> = match enc {
+                    MsgEncoding::Json => serde_json::from_slice(&bytes).map_err(|e| e.to_string()),
+                    MsgEncoding::MsgPack => {
+                        rmp_serde::from_slice(&bytes).map_err(|e| e.to_string())
+                    }
+                };
+                match parse_result {
+                    Ok(req) => Ok(Some((req, enc))),
+                    Err(e) => {
+                        let resp =
+                            json!({"success": false, "msg": format!("invalid request: {e}")});
+                        let error_bytes = encode_value(&resp, enc);
+                        let _ = s.send(error_bytes, 0);
+                        Err(CirrusError::Backend(format!("zmq REP parse: {e}")))
+                    }
                 }
-            },
+            }
             Err(zmq::Error::EAGAIN) => Ok(None),
             Err(e) => Err(CirrusError::Backend(format!("zmq REP recv: {e}"))),
         }
     }
 
     /// Send a flat-dict response. Must be called in lock-step with `try_recv` (REP socket).
-    pub fn send(&self, resp: &Value) -> Result<()> {
+    /// `encoding` must match the encoding returned by the corresponding `try_recv` call.
+    pub fn send(&self, resp: &Value, encoding: MsgEncoding) -> Result<()> {
         let s = self.socket.lock().unwrap();
-        let bytes = serde_json::to_vec(resp)?;
+        let bytes = encode_value(resp, encoding);
         s.send(bytes, 0)
             .map_err(|e| CirrusError::Backend(format!("zmq REP send: {e}")))?;
         Ok(())
+    }
+}
+
+/// Encode `value` using the specified encoding.
+/// For msgpack, string map keys are used (`to_vec_named`) so Python clients
+/// can index by key name, matching `msgpack.packb` / `msgpack.unpackb` defaults.
+fn encode_value(value: &Value, enc: MsgEncoding) -> Vec<u8> {
+    match enc {
+        MsgEncoding::Json => serde_json::to_vec(value).unwrap_or_default(),
+        MsgEncoding::MsgPack => rmp_serde::to_vec_named(value).unwrap_or_default(),
     }
 }

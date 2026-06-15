@@ -1518,3 +1518,95 @@ async fn rbac_admin_task_result_blocked_for_non_admin() {
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
+
+// -- QS-12: msgpack encoding -----------------------------------------------
+
+/// Send a raw msgpack request (not via the JSON `rpc` helper) and return raw response bytes.
+fn rpc_msgpack_raw(socket: &zmq::Socket, method: &str, params: serde_json::Value) -> Vec<u8> {
+    let msg = serde_json::json!({"method": method, "params": params});
+    let bytes = rmp_serde::to_vec_named(&msg).expect("msgpack encode");
+    // First byte must NOT be b'{' so the server routes to the msgpack path.
+    assert_ne!(
+        bytes.first().copied(),
+        Some(b'{'),
+        "msgpack-encoded message must not start with 0x7B"
+    );
+    socket.send(bytes, 0).unwrap();
+    socket.recv_bytes(0).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn msgpack_request_receives_msgpack_response() {
+    let port = rand_port();
+    let reg = Registry::new();
+    let shutdown = spawn_server(reg, port);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let ctx = zmq::Context::new();
+    let sock = ctx.socket(zmq::REQ).unwrap();
+    sock.set_rcvtimeo(3_000).unwrap();
+    sock.set_sndtimeo(3_000).unwrap();
+    sock.connect(&endpoint(port)).unwrap();
+
+    // Send status via msgpack; response must also be msgpack.
+    let resp_bytes = rpc_msgpack_raw(&sock, "status", serde_json::json!({}));
+    assert_ne!(
+        resp_bytes.first().copied(),
+        Some(b'{'),
+        "response to a msgpack request must be msgpack, not JSON: first byte = {:?}",
+        resp_bytes.first()
+    );
+    let resp_mp: serde_json::Value =
+        rmp_serde::from_slice(&resp_bytes).expect("response must be valid msgpack");
+    assert_eq!(
+        resp_mp["success"], true,
+        "msgpack status must succeed: {resp_mp}"
+    );
+    assert!(
+        resp_mp["manager_state"].is_string(),
+        "msgpack response must include manager_state: {resp_mp}"
+    );
+
+    // JSON request on a separate socket still replies JSON.
+    let json_sock = req_socket(port);
+    let json_resp = rpc(&json_sock, "status", serde_json::json!({}));
+    assert_eq!(
+        json_resp["success"], true,
+        "JSON path still works: {json_resp}"
+    );
+
+    // Both paths must return the same manager_state.
+    assert_eq!(
+        resp_mp["manager_state"], json_resp["manager_state"],
+        "msgpack and JSON paths must return the same manager_state"
+    );
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn msgpack_ping_round_trip_returns_success() {
+    let port = rand_port();
+    let reg = Registry::new();
+    let shutdown = spawn_server(reg, port);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let ctx = zmq::Context::new();
+    let sock = ctx.socket(zmq::REQ).unwrap();
+    sock.set_rcvtimeo(3_000).unwrap();
+    sock.set_sndtimeo(3_000).unwrap();
+    sock.connect(&endpoint(port)).unwrap();
+
+    let resp_bytes = rpc_msgpack_raw(&sock, "ping", serde_json::json!({}));
+    assert_ne!(
+        resp_bytes.first().copied(),
+        Some(b'{'),
+        "ping reply must be msgpack"
+    );
+    let v: serde_json::Value = rmp_serde::from_slice(&resp_bytes).expect("msgpack decode");
+    assert_eq!(v["success"], true, "msgpack ping: {v}");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}

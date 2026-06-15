@@ -878,6 +878,7 @@ dependencies = [
  "metrics 0.24.5",
  "metrics-exporter-prometheus",
  "regex",
+ "rmp-serde",
  "serde",
  "serde_json",
  "tempfile",
