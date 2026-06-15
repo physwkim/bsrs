@@ -60,6 +60,7 @@ mod tests {
             exit_status: "success".into(),
             reason: None,
             num_events: Default::default(),
+            ..Default::default()
         })
     }
 

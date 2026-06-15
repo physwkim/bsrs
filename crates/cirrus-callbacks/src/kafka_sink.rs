@@ -135,6 +135,7 @@ mod tests {
             exit_status: "success".into(),
             reason: None,
             num_events: HashMap::new(),
+            ..Default::default()
         })
     }
 

@@ -249,6 +249,7 @@ mod tests {
             exit_status: "success".into(),
             reason: None,
             num_events: std::collections::HashMap::new(),
+            ..Default::default()
         })
     }
 

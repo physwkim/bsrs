@@ -84,7 +84,7 @@ pub struct RunStart {
 // -- run_stop.json ------------------------------------------------------------
 
 /// Final document of a run.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct RunStop {
     /// UID of this stop document.
     pub uid: String,
@@ -100,6 +100,14 @@ pub struct RunStop {
     /// Per-stream sequence-number counters at run close.
     #[serde(skip_serializing_if = "HashMap::is_empty", default)]
     pub num_events: HashMap<String, u64>,
+    /// Free-form recursive run-level metadata (`data_type` in the schema).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub data_type: Option<Value>,
+    /// Free-form additional metadata. The schema permits any key without `.`
+    /// or `/` (`patternProperties "^([^./]+)$"`), so unknown keys must
+    /// round-trip rather than be dropped — mirrors [`RunStart::extra`].
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
 }
 
 // -- event_descriptor.json ----------------------------------------------------
@@ -538,6 +546,7 @@ mod tests {
                 exit_status: "success".into(),
                 reason: None,
                 num_events: HashMap::new(),
+                ..Default::default()
             }),
         ];
         let json = serde_json::to_string(&docs).unwrap();
@@ -559,6 +568,7 @@ mod tests {
             exit_status: "success".into(),
             reason: None,
             num_events: HashMap::new(),
+            ..Default::default()
         });
         let page = Document::EventPage(EventPage {
             uid: vec![],
@@ -694,5 +704,32 @@ mod tests {
                 "empty `{absent}` must not serialize"
             );
         }
+    }
+
+    #[test]
+    fn run_stop_preserves_unknown_keys_and_data_type() {
+        // The run_stop schema permits any key without `.`/`/`
+        // (`patternProperties "^([^./]+)$"`) plus `data_type`, so a stop
+        // document carrying beamline-specific metadata must round-trip those
+        // keys instead of dropping them.
+        let incoming = serde_json::json!({
+            "uid": "stop-1",
+            "run_start": "run-1",
+            "time": 5.0,
+            "exit_status": "success",
+            "data_type": {"detector": "pilatus"},
+            "operator": "alice",
+        });
+        let stop: RunStop = serde_json::from_value(incoming.clone()).unwrap();
+        assert_eq!(
+            stop.data_type,
+            Some(serde_json::json!({"detector": "pilatus"}))
+        );
+        assert_eq!(stop.extra.get("operator"), Some(&Value::from("alice")));
+        // Known fields must not leak into `extra`.
+        assert!(!stop.extra.contains_key("exit_status"));
+        assert!(!stop.extra.contains_key("data_type"));
+        // Re-serializing reproduces the incoming object verbatim.
+        assert_eq!(serde_json::to_value(&stop).unwrap(), incoming);
     }
 }

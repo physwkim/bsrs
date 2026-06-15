@@ -201,6 +201,7 @@ impl RunBundle {
             exit_status: exit_status.to_string(),
             reason,
             num_events,
+            ..Default::default()
         }
     }
 
