@@ -1297,7 +1297,20 @@ impl RunEngine {
             Msg::Stage(obj) => {
                 obj.stage_dyn().await?;
                 let mut state = self.state.lock().await;
-                state.staged.push(obj);
+                // bluesky `_staged` is a set (run_engine.py:509, 2555): a device
+                // is tracked at most once, so the run-end unstage walk — and any
+                // explicit `Unstage` — balances each stage with exactly one
+                // unstage. A bare `Vec` push would record a redundant stage of
+                // the same device twice and unstage it twice at cleanup. Match
+                // the identity test used by the `Unstage` retain below so add and
+                // remove agree.
+                if !state
+                    .staged
+                    .iter()
+                    .any(|o| Arc::ptr_eq(&(o.clone() as Arc<_>), &(obj.clone() as Arc<_>)))
+                {
+                    state.staged.push(obj);
+                }
                 Self::reset_checkpoint_state(&mut state);
             }
             Msg::Unstage(obj) => {

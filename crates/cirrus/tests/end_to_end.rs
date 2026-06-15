@@ -1356,3 +1356,49 @@ async fn close_run_without_open_run_is_rejected() {
         "CloseRun with no open run must be rejected"
     );
 }
+
+#[tokio::test]
+async fn double_stage_of_same_device_unstages_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // bluesky `_staged` is a set (run_engine.py:509, 2555): staging a device
+    // twice records it once, so the run-end unstage walk balances each stage
+    // with exactly one unstage. A Vec-backed registry that pushes on every
+    // `Stage` would unstage the device twice at cleanup.
+    struct CountingStageable {
+        unstages: Arc<AtomicUsize>,
+    }
+    impl cirrus_core::msg::NamedObj for CountingStageable {
+        fn name(&self) -> &str {
+            "cs"
+        }
+    }
+    #[async_trait::async_trait]
+    impl cirrus_core::msg::StageableObj for CountingStageable {
+        async fn stage_dyn(&self) -> Result<(), cirrus_core::error::CirrusError> {
+            Ok(())
+        }
+        async fn unstage_dyn(&self) -> Result<(), cirrus_core::error::CirrusError> {
+            self.unstages.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let unstages = Arc::new(AtomicUsize::new(0));
+    let dev = Arc::new(CountingStageable {
+        unstages: unstages.clone(),
+    }) as Arc<dyn cirrus_core::msg::StageableObj>;
+    let re = RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new());
+    let dev_plan = dev.clone();
+    // Stage the *same* device twice; the run-end cleanup is the only unstage.
+    let plan = cirrus_core::plan::plan_box(async_stream::stream! {
+        yield cirrus_core::Msg::Stage(dev_plan.clone());
+        yield cirrus_core::Msg::Stage(dev_plan);
+    });
+
+    re.run_async(plan).await.unwrap();
+    assert_eq!(
+        unstages.load(Ordering::SeqCst),
+        1,
+        "a device staged twice must be unstaged exactly once at run end"
+    );
+}
