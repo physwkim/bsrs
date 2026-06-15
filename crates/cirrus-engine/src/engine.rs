@@ -36,6 +36,20 @@ use crate::bundler::RunBundler;
 use crate::sink::DocumentSink;
 use crate::suspender::{Suspender, SuspenderHandle};
 
+/// Mint a process-unique stream name for a `monitor` Msg that carries no
+/// explicit `name`. Mirrors bluesky's bundler, which defaults the monitor
+/// stream name to `short_uid("monitor")` (`bundlers.py:469`) — a fresh unique
+/// label, **not** the device name. Defaulting to `obj.name()` collides with any
+/// stream already declared under that same name (via `create`/`declare_stream`):
+/// `start_monitor` would then reuse that stream's first-wins descriptor and emit
+/// the monitor's events against its (differently-keyed) schema. A unique
+/// `monitor-N` label cannot collide with a device name, so a name-less monitor
+/// always gets its own descriptor.
+fn default_monitor_stream_name() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    format!("monitor-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
 /// State the engine reports via [`RunEngine::state`]. Mirrors bluesky's
 /// `RunEngine.state` enum (idle / running / paused / aborting / halting).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1491,7 +1505,7 @@ impl RunEngine {
                         )));
                     }
                 }
-                let stream = name.unwrap_or_else(|| obj.name().to_string());
+                let stream = name.unwrap_or_else(default_monitor_stream_name);
                 self.start_monitor(stream.clone(), obj.clone()).await?;
                 let mut state = self.state.lock().await;
                 // Record the registration so the monitor survives a pause: the

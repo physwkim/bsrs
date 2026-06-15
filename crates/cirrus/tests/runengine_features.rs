@@ -836,6 +836,55 @@ async fn monitor_emits_descriptor_then_events() {
 }
 
 #[tokio::test]
+async fn bare_monitor_default_stream_name_is_unique_not_device_name() {
+    // bluesky defaults a name-less `monitor` stream to short_uid("monitor")
+    // (bundlers.py:469) — a unique label that cannot collide with a stream
+    // already declared under the device's own name. cirrus previously defaulted
+    // the stream name to obj.name(); a `create`/`declare_stream` for a same-named
+    // stream would then make start_monitor reuse that descriptor (first-wins) and
+    // emit monitor events against its differently-keyed schema. Invariant
+    // boundary: a name-less monitor's descriptor name must be a fresh
+    // "monitor-*" label, never the device name.
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let mon = TestMonitor::new("mon1");
+    let mon_for_plan: Arc<dyn cirrus_core::msg::MonitorableObj> = mon.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Monitor { obj: mon_for_plan.clone(), name: None };
+        yield Msg::Sleep(Duration::from_millis(20));
+        yield Msg::Unmonitor(mon_for_plan);
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    re.run_async(plan).await.unwrap();
+
+    // record_interruptions is off by default, so the only Descriptor is the
+    // monitor's own stream descriptor.
+    let docs = sink.snapshot().await;
+    let names: Vec<String> = docs
+        .iter()
+        .filter_map(|d| match d {
+            Document::Descriptor(desc) => desc.name.clone(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        names.len(),
+        1,
+        "expected exactly one monitor descriptor; got {names:?}"
+    );
+    let name = &names[0];
+    assert!(
+        name.starts_with("monitor-"),
+        "a name-less monitor must default to a unique 'monitor-*' stream, not the device name; got {name:?}"
+    );
+    assert_ne!(
+        name, "mon1",
+        "the monitor default stream name must not be the device name (collision risk)"
+    );
+}
+
+#[tokio::test]
 async fn second_monitor_of_same_object_is_rejected() {
     // bluesky rejects a 'monitor' for an already-monitored object with
     // IllegalMessageSequence (bundlers.py:470-471) BEFORE subscribing or
