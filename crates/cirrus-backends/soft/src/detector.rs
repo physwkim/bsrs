@@ -123,15 +123,18 @@ pub struct SoftDetectorControl {
     deadtime: Duration,
     arm_count: Arc<AtomicU64>,
     target: Arc<AtomicU64>,
+    index_tx: Arc<watch::Sender<u64>>,
 }
 
 impl SoftDetectorControl {
     /// Build with a fixed deadtime.
     pub fn new(deadtime: Duration) -> Self {
+        let (tx, _rx) = watch::channel(0u64);
         Self {
             deadtime,
             arm_count: Arc::new(AtomicU64::new(0)),
             target: Arc::new(AtomicU64::new(1)),
+            index_tx: Arc::new(tx),
         }
     }
 
@@ -143,6 +146,11 @@ impl SoftDetectorControl {
     /// Shared target frame count.
     pub fn target(&self) -> Arc<AtomicU64> {
         self.target.clone()
+    }
+
+    /// Subscribe to the index watch channel driven by `arm()`.
+    pub fn subscribe_index(&self) -> watch::Receiver<u64> {
+        self.index_tx.subscribe()
     }
 }
 
@@ -166,7 +174,8 @@ impl DetectorControl for SoftDetectorControl {
         Ok(())
     }
     async fn arm(&self) -> Status {
-        self.arm_count.fetch_add(1, Ordering::SeqCst);
+        let new = self.arm_count.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = self.index_tx.send(new);
         Status::done()
     }
     async fn wait_for_idle(&self) -> Result<()> {
@@ -182,7 +191,6 @@ impl DetectorControl for SoftDetectorControl {
 /// `StreamResource` + `StreamDatum` documents.
 pub struct SoftDetectorWriter {
     name: String,
-    indices_tx: watch::Sender<u64>,
     indices_rx: watch::Receiver<u64>,
     counter: Arc<AtomicU64>,
     /// Tracks whether we already emitted the StreamResource.
@@ -198,13 +206,16 @@ pub struct SoftDetectorWriter {
 }
 
 impl SoftDetectorWriter {
-    /// Build with a counter handle (typically borrowed from a `SoftDetectorControl`).
-    pub fn new(name: impl Into<String>, counter: Arc<AtomicU64>) -> Self {
-        let (tx, rx) = watch::channel(0);
+    /// Build with a counter handle and a watch receiver driven by the paired
+    /// `SoftDetectorControl` (obtained via `SoftDetectorControl::subscribe_index`).
+    pub fn new(
+        name: impl Into<String>,
+        counter: Arc<AtomicU64>,
+        indices_rx: watch::Receiver<u64>,
+    ) -> Self {
         Self {
             name: name.into(),
-            indices_tx: tx,
-            indices_rx: rx,
+            indices_rx,
             counter,
             resource_emitted: std::sync::Mutex::new(None),
             last_emitted: AtomicU64::new(0),
@@ -218,12 +229,6 @@ impl SoftDetectorWriter {
     /// correct run UID.
     pub async fn bind_to_run(&self, compose: Arc<cirrus_event_model::compose::RunBundle>) {
         *self.compose.lock().await = Some(compose);
-    }
-
-    /// Externally bump the index counter and notify watchers.
-    pub fn bump_index(&self) {
-        let new_count = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
-        let _ = self.indices_tx.send(new_count);
     }
 }
 
@@ -309,8 +314,10 @@ pub fn soft_detector(
 ) -> StandardDetector<SoftDetectorControl, SoftDetectorWriter> {
     let control = SoftDetectorControl::new(Duration::from_micros(0));
     let counter = control.arm_count();
-    let writer = SoftDetectorWriter::new(name, counter);
-    StandardDetector::new(writer.name.clone(), control, writer)
+    let indices_rx = control.subscribe_index();
+    let name: String = name.into();
+    let writer = SoftDetectorWriter::new(name.clone(), counter, indices_rx);
+    StandardDetector::new(name, control, writer)
 }
 
 #[cfg(test)]
