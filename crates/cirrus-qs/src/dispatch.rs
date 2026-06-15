@@ -582,8 +582,9 @@ fn queue_item_add_batch(
         Some(a) => a.clone(),
         None => return err("missing 'items' array"),
     };
-    let mut added = Vec::new();
-    let mut errors = Vec::new();
+    let mut added_items: Vec<Value> = Vec::new();
+    let mut results: Vec<Value> = Vec::new();
+    let mut had_error = false;
     for item in items {
         let name = item
             .get("name")
@@ -592,20 +593,29 @@ fn queue_item_add_batch(
         match name {
             Some(n) if registry.plan(&n).is_some() => {
                 let qi = QueuedItem::plan(n, item);
-                let uid = qi.item_uid.clone();
+                let qi_val = serde_json::to_value(&qi).unwrap();
                 queue.lock().unwrap().push_back(qi);
-                added.push(uid);
+                added_items.push(qi_val);
+                results.push(json!({"success": true, "msg": ""}));
             }
-            Some(n) => errors.push(format!("unknown plan: {n}")),
-            None => errors.push("item.name required".to_string()),
+            Some(n) => {
+                let msg = format!("unknown plan: {n}");
+                results.push(json!({"success": false, "msg": msg}));
+                had_error = true;
+            }
+            None => {
+                results.push(json!({"success": false, "msg": "item.name required"}));
+                had_error = true;
+            }
         }
     }
     let q = queue.lock().unwrap();
     json!({
-        "success": errors.is_empty(),
-        "msg": if errors.is_empty() { "".into() } else { errors.join("; ") },
+        "success": !had_error,
+        "msg": if had_error { "one or more items failed" } else { "" },
         "qsize": q.len(),
-        "items_added": added,
+        "items": added_items,
+        "results": results,
         "plan_queue_uid": q.queue_uid(),
     })
 }
