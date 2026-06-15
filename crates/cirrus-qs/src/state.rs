@@ -94,7 +94,7 @@ impl LockInfo {
     }
 }
 
-fn now_iso8601() -> String {
+pub(crate) fn now_iso8601() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

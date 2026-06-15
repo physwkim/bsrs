@@ -459,6 +459,8 @@ fn status_response(
     json!({
         "success": true,
         "msg": "",
+        "status_uid": uuid::Uuid::new_v4().to_string(),
+        "time": crate::state::now_iso8601(),
         "manager_state": st.state.map(|s| s.as_str()).unwrap_or("environment_closed"),
         "manager_version": env!("CARGO_PKG_VERSION"),
         "msg_recv": "",
