@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use cirrus_callbacks::TiledSink;
 use cirrus_engine::DocumentSink;
-use cirrus_event_model::{Document, RunStart, RunStop};
+use cirrus_event_model::{Document, ExitStatus, RunStart, RunStop};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -108,7 +108,7 @@ fn make_run_stop() -> RunStop {
         uid: "stop-1".into(),
         run_start: "run-1".into(),
         time: 2.0,
-        exit_status: "success".into(),
+        exit_status: ExitStatus::Success,
         reason: None,
         num_events: HashMap::new(),
         ..Default::default()

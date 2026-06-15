@@ -103,14 +103,14 @@ impl DocumentSink for StderrTraceSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cirrus_event_model::{Document, RunStop};
+    use cirrus_event_model::{Document, ExitStatus, RunStop};
 
     fn stop_doc() -> Document {
         Document::Stop(RunStop {
             uid: "u".into(),
             run_start: "r".into(),
             time: 0.0,
-            exit_status: "success".into(),
+            exit_status: ExitStatus::Success,
             reason: None,
             num_events: Default::default(),
             ..Default::default()

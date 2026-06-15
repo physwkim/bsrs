@@ -13,9 +13,9 @@ pub mod page;
 
 pub use documents::{
     make_datakey, Configuration, DataKey, Datum, DatumPage, DimensionItem, DocFilter, Document,
-    Dtype, Event, EventDescriptor, EventPage, Hints, Limits, LimitsRange, PerObjectHint,
-    Projections, RdsRange, Reading, Resource, RunStart, RunStop, SignalMetadata, StreamDatum,
-    StreamRange, StreamResource,
+    Dtype, Event, EventDescriptor, EventPage, ExitStatus, Hints, Limits, LimitsRange,
+    PerObjectHint, Projections, RdsRange, Reading, Resource, RunStart, RunStop, SignalMetadata,
+    StreamDatum, StreamRange, StreamResource,
 };
 pub use page::{
     merge_datum_pages, merge_event_pages, pack_datum_page, pack_event_page, rechunk_datum_pages,

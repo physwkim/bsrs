@@ -103,6 +103,50 @@ pub struct RunStart {
 
 // -- run_stop.json ------------------------------------------------------------
 
+/// Valid values of [`RunStop::exit_status`], matching the `exit_status` enum in
+/// the run_stop JSON schema (`success` | `abort` | `fail`).
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExitStatus {
+    /// Run completed normally.
+    #[default]
+    Success,
+    /// Run was aborted by the user (or normalised from `halt`).
+    Abort,
+    /// Run ended due to an error.
+    Fail,
+}
+
+impl ExitStatus {
+    /// Return the lowercase string representation (`"success"` / `"abort"` /
+    /// `"fail"`), identical to what serde serialises.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExitStatus::Success => "success",
+            ExitStatus::Abort => "abort",
+            ExitStatus::Fail => "fail",
+        }
+    }
+}
+
+impl std::fmt::Display for ExitStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ExitStatus {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "success" => Ok(ExitStatus::Success),
+            "abort" => Ok(ExitStatus::Abort),
+            "fail" => Ok(ExitStatus::Fail),
+            _ => Err(format!("unknown exit_status: {s:?}")),
+        }
+    }
+}
+
 /// Final document of a run.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct RunStop {
@@ -113,7 +157,7 @@ pub struct RunStop {
     /// Unix epoch time the run ended.
     pub time: f64,
     /// One of `success` / `abort` / `fail`.
-    pub exit_status: String,
+    pub exit_status: ExitStatus,
     /// Optional human-readable reason.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub reason: Option<String>,
@@ -563,7 +607,7 @@ mod tests {
                 uid: "stop-1".into(),
                 run_start: "run-1".into(),
                 time: 1700000005.0,
-                exit_status: "success".into(),
+                exit_status: ExitStatus::Success,
                 reason: None,
                 num_events: HashMap::new(),
                 ..Default::default()
@@ -585,7 +629,7 @@ mod tests {
             uid: "s".into(),
             run_start: "r".into(),
             time: 0.0,
-            exit_status: "success".into(),
+            exit_status: ExitStatus::Success,
             reason: None,
             num_events: HashMap::new(),
             ..Default::default()
@@ -750,6 +794,31 @@ mod tests {
         assert!(!stop.extra.contains_key("exit_status"));
         assert!(!stop.extra.contains_key("data_type"));
         // Re-serializing reproduces the incoming object verbatim.
+        assert_eq!(serde_json::to_value(&stop).unwrap(), incoming);
+    }
+
+    #[test]
+    fn exit_status_serde_round_trip() {
+        // Schema enum: success | abort | fail — each must survive JSON round-trip.
+        for (variant, json_str) in [
+            (ExitStatus::Success, "\"success\""),
+            (ExitStatus::Abort, "\"abort\""),
+            (ExitStatus::Fail, "\"fail\""),
+        ] {
+            let ser = serde_json::to_string(&variant).expect("serialize");
+            assert_eq!(ser, json_str);
+            let back: ExitStatus = serde_json::from_str(&ser).expect("deserialize");
+            assert_eq!(back, variant);
+        }
+        // RunStop with exit_status round-trips through serde_json::Value verbatim.
+        let incoming = serde_json::json!({
+            "uid": "stop-1",
+            "run_start": "run-1",
+            "time": 5.0,
+            "exit_status": "abort",
+        });
+        let stop: RunStop = serde_json::from_value(incoming.clone()).unwrap();
+        assert_eq!(stop.exit_status, ExitStatus::Abort);
         assert_eq!(serde_json::to_value(&stop).unwrap(), incoming);
     }
 

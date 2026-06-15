@@ -32,7 +32,7 @@ async fn count_plan_emits_expected_document_sequence() {
     // RunStart and RunStop should reference each other.
     if let (Start(start), Stop(stop)) = (&docs[0], &docs[7]) {
         assert_eq!(stop.run_start, start.uid);
-        assert_eq!(stop.exit_status, "success");
+        assert_eq!(stop.exit_status, ExitStatus::Success);
         assert_eq!(stop.num_events.get("primary").copied(), Some(5));
     }
 }
@@ -607,7 +607,7 @@ async fn abort_closes_run_with_abort_status() {
     let docs = sink.snapshot().await;
     // Last doc must be a RunStop with exit_status="abort".
     if let cirrus_core::Document::Stop(s) = docs.last().unwrap() {
-        assert_eq!(s.exit_status, "abort");
+        assert_eq!(s.exit_status, ExitStatus::Abort);
     } else {
         panic!("last doc was not Stop: {:?}", docs.last());
     }
@@ -651,7 +651,7 @@ async fn abort_threads_caller_reason_into_stop_document() {
     assert_eq!(result.exit_status, "abort");
     let docs = sink.snapshot().await;
     if let cirrus_core::Document::Stop(s) = docs.last().unwrap() {
-        assert_eq!(s.exit_status, "abort");
+        assert_eq!(s.exit_status, ExitStatus::Abort);
         assert_eq!(
             s.reason.as_deref(),
             Some("detector overheated"),
@@ -706,7 +706,8 @@ async fn halt_emits_schema_valid_abort_in_stop_document() {
     let docs = sink.snapshot().await;
     if let cirrus_core::Document::Stop(s) = docs.last().unwrap() {
         assert_eq!(
-            s.exit_status, "abort",
+            s.exit_status,
+            ExitStatus::Abort,
             "halt must emit a schema-valid exit_status (abort) on the document, not \"halt\""
         );
     } else {
