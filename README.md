@@ -1,5 +1,9 @@
 # bsrs
 
+[![CI](https://github.com/physwkim/bsrs/actions/workflows/ci.yml/badge.svg)](https://github.com/physwkim/bsrs/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/physwkim/bsrs)](https://github.com/physwkim/bsrs/releases/latest)
+[![License: BSD-3-Clause](https://img.shields.io/badge/License-BSD%203--Clause-blue.svg)](LICENSE)
+
 A Rust-native re-implementation of the [bluesky](https://blueskyproject.io)
 acquisition stack — RunEngine, devices, plans, document sinks — built so a
 beamline data-acquisition daemon can run without dragging a Python interpreter
@@ -154,9 +158,9 @@ each opt-in feature on every push.
 
 ## Documentation
 
-User-facing book (mdbook source):
-[`book/src/`](book/src/) — quickstart, migration, CLI tour,
-operational runbook, architecture overview.
+Hosted book: <https://physwkim.github.io/bsrs/> — quickstart, migration,
+CLI tour, operational runbook, architecture overview
+([mdbook source](book/src/)).
 
 Design notes (numbered for read-in-order):
 
@@ -174,4 +178,4 @@ Design notes (numbered for read-in-order):
 
 ## License
 
-BSD-3-Clause.
+[BSD-3-Clause](LICENSE).
