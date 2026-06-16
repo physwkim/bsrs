@@ -61,34 +61,34 @@ jobs:
       # ZMQ document sink — needs libzmq.
       - name: install libzmq
         run: sudo apt-get update && sudo apt-get install -y libzmq3-dev pkg-config
-      - name: build/test cirrus-callbacks --features zmq
-        run: cargo test -p cirrus-callbacks --features zmq --no-fail-fast
+      - name: build/test bsrs-callbacks --features zmq
+        run: cargo test -p bsrs-callbacks --features zmq --no-fail-fast
       # Tiled document sink — pulls in tiled-client (HTTP).
-      - name: build/test cirrus-callbacks --features tiled
-        run: cargo test -p cirrus-callbacks --features tiled --no-fail-fast
-      # Lua `tiled.*` read-side bindings on cirrus-cli.
-      - name: build/test cirrus-cli --features tiled
-        run: cargo test -p cirrus-cli --features tiled --no-fail-fast
+      - name: build/test bsrs-callbacks --features tiled
+        run: cargo test -p bsrs-callbacks --features tiled --no-fail-fast
+      # Lua `tiled.*` read-side bindings on bsrs-cli.
+      - name: build/test bsrs-cli --features tiled
+        run: cargo test -p bsrs-cli --features tiled --no-fail-fast
       # Kafka document sink — pure-Rust kafka crate, no librdkafka.
-      - name: build/test cirrus-callbacks --features kafka
-        run: cargo test -p cirrus-callbacks --features kafka --no-fail-fast
-      # Prometheus metrics endpoint for cirrus-qs.
-      - name: build/test cirrus-qs --features metrics
-        run: cargo test -p cirrus-qs --features metrics --no-fail-fast
+      - name: build/test bsrs-callbacks --features kafka
+        run: cargo test -p bsrs-callbacks --features kafka --no-fail-fast
+      # Prometheus metrics endpoint for bsrs-qs.
+      - name: build/test bsrs-qs --features metrics
+        run: cargo test -p bsrs-qs --features metrics --no-fail-fast
       # HDF5 detector frame sink — pure-Rust rust-hdf5, no system libhdf5.
-      - name: build/test cirrus-stream --features hdf5
-        run: cargo test -p cirrus-stream --features hdf5 --no-fail-fast
+      - name: build/test bsrs-stream --features hdf5
+        run: cargo test -p bsrs-stream --features hdf5 --no-fail-fast
       # PVA monitor source — pulls in epics-pva-rs.
-      - name: build cirrus-stream --features pva
-        run: cargo build -p cirrus-stream --features pva
+      - name: build bsrs-stream --features pva
+        run: cargo build -p bsrs-stream --features pva
       # Real EPICS CA backend — pulls in epics-ca-rs + epics-base-rs.
       # Build-only for now (live IOC integration deferred to a
       # dedicated job that needs a softIoc subprocess).
-      - name: build cirrus-backend-epics-ca --features real
-        run: cargo build -p cirrus-backend-epics-ca --features real
+      - name: build bsrs-backend-epics-ca --features real
+        run: cargo build -p bsrs-backend-epics-ca --features real
       # Real EPICS PVA backend.
-      - name: build cirrus-backend-epics-pva --features real
-        run: cargo build -p cirrus-backend-epics-pva --features real
-      # Wired `cirrus frame-source` (PVA + HDF5 + ZMQ).
-      - name: build cirrus-cli --features frame-source
-        run: cargo build -p cirrus-cli --features frame-source
+      - name: build bsrs-backend-epics-pva --features real
+        run: cargo build -p bsrs-backend-epics-pva --features real
+      # Wired `bsrs frame-source` (PVA + HDF5 + ZMQ).
+      - name: build bsrs-cli --features frame-source
+        run: cargo build -p bsrs-cli --features frame-source
