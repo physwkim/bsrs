@@ -40,10 +40,10 @@ mod table;
 
 use std::sync::Arc;
 
-use bsrs_core::msg::{LocatableObj, MovableObj, ReadableObj};
-use bsrs_host::checkpoint_store::{default_path as default_ckpt_path, JsonlCheckpointStore};
-use bsrs_host::manager_lua::ManagerLuaState;
-use bsrs_qs::{Registry, Server};
+use bsrs::core::msg::{LocatableObj, MovableObj, ReadableObj};
+use bsrs::host::checkpoint_store::{default_path as default_ckpt_path, JsonlCheckpointStore};
+use bsrs::host::manager_lua::ManagerLuaState;
+use bsrs::qs::{Registry, Server};
 use clap::Parser;
 use tokio::sync::Mutex as TMutex;
 
@@ -71,7 +71,7 @@ fn main() {
     // CA bootstrap must run BEFORE the tokio runtime is built (rule:
     // `ca_context()` calls `block_on` once and panics from inside an
     // active runtime). Same pattern as `bsrs qs-manager`.
-    bsrs_host::ca_devices::bootstrap_ca();
+    bsrs::host::ca_devices::bootstrap_ca();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -92,7 +92,7 @@ async fn run(args: Args) -> i32 {
     reg.register_plan_count("count");
 
     // ---- single-axis CA devices (so plain plans still work) ----
-    let ph_mtr = match bsrs_host::ca_devices::CaMotor::connect_async(
+    let ph_mtr = match bsrs::host::ca_devices::CaMotor::connect_async(
         "ph_mtr",
         "mini:ph:mtr.VAL",
         "mini:ph:mtr.RBV",
@@ -111,7 +111,7 @@ async fn run(args: Args) -> i32 {
     tracing::info!(target: "mini-beamline-qs", "registered ph_mtr");
 
     let ph_det =
-        match bsrs_host::ca_devices::CaDetector::connect_async("ph_det", "mini:ph:DetValue_RBV")
+        match bsrs::host::ca_devices::CaDetector::connect_async("ph_det", "mini:ph:DetValue_RBV")
             .await
         {
             Ok(d) => d,
@@ -167,7 +167,7 @@ async fn run(args: Args) -> i32 {
     // ---- daemon-side Lua bridge + checkpoint store ----
     let engine_slot = Arc::new(TMutex::new(None));
     let registry_for_lua = Arc::new(reg.clone());
-    let evaluator: Arc<dyn bsrs_qs::LuaEvaluator> =
+    let evaluator: Arc<dyn bsrs::qs::LuaEvaluator> =
         Arc::new(ManagerLuaState::new(engine_slot.clone(), registry_for_lua));
 
     let ckpt_path = args.checkpoints.clone().unwrap_or_else(default_ckpt_path);

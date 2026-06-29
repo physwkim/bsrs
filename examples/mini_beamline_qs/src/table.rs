@@ -12,11 +12,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bsrs_core::error::Result;
-use bsrs_core::msg::{NamedObj, ReadableObj};
-use bsrs_core::reading::ReadingValue;
-use bsrs_event_model::DataKey;
-use bsrs_host::ca_devices::CaMotor;
+use bsrs::core::error::Result;
+use bsrs::core::msg::{NamedObj, ReadableObj};
+use bsrs::core::reading::ReadingValue;
+use bsrs::event_model::DataKey;
+use bsrs::host::ca_devices::CaMotor;
 
 /// Composite 2-axis table.
 pub struct Table {
@@ -72,12 +72,12 @@ impl ReadableObj for Table {
     }
 }
 
-#[bsrs_derive::lua_methods]
+#[bsrs::lua_methods]
 impl Table {
     /// Issue parallel puts on both axes and await both completions.
     #[lua_method]
     pub async fn move_to_xy(&self, x: f64, y: f64) -> Result<(), String> {
-        use bsrs_core::msg::MovableObj;
+        use bsrs::core::msg::MovableObj;
         let (sx, sy) = tokio::join!(self.x.set_dyn(x), self.y.set_dyn(y));
         let (rx, ry) = tokio::join!(sx, sy);
         rx.map_err(|e| format!("x: {e:?}"))?;
@@ -88,7 +88,7 @@ impl Table {
     /// Current position as `{x=..., y=...}`. Lua receives a table.
     #[lua_method]
     pub async fn at_xy(&self) -> Result<serde_json::Value, String> {
-        use bsrs_core::msg::LocatableObj;
+        use bsrs::core::msg::LocatableObj;
         let (lx, ly) = tokio::join!(self.x.locate_dyn(), self.y.locate_dyn());
         let lx = lx.map_err(|e| e.to_string())?;
         let ly = ly.map_err(|e| e.to_string())?;

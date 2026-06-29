@@ -3,30 +3,83 @@ name = "bsrs"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Bsrs facade — re-exports `ophyd_async` and `ophyd` modules."
+repository.workspace = true
+description = "A Rust port of the bluesky / ophyd / ophyd-async data-acquisition stack with EPICS (CA/PVA) backends, a queue-server daemon, and a Lua host runtime."
+
+[lib]
+name = "bsrs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bsrs"
+path = "src/bin/bsrs/main.rs"
+required-features = ["cli"]
+
+[features]
+default = []
+# --- document sinks / integrations (callbacks) ---
+zmq = ["dep:zmq", "dep:rmp-serde"]
+kafka = ["dep:kafka", "dep:rmp-serde"]
+tiled = ["dep:tiled-rs", "dep:url"]
+# --- EPICS backends (real, otherwise stubs) ---
+ca = ["dep:epics-ca-rs", "dep:epics-base-rs"]
+pva = ["dep:epics-pva-rs"]
+# --- stream reference source/sink ---
+hdf5 = ["dep:rust-hdf5"]
+# --- queue-server daemon (module `qs`) ---
+qs = ["zmq", "dep:regex", "dep:toml"]
+metrics = ["qs", "dep:metrics", "dep:metrics-exporter-prometheus"]
+# --- host runtime (Lua bridge, module `host`); needs the qs module ---
+host = ["qs", "dep:mlua"]
+# --- CLI binary (`bsrs` / `qs` subcommands); EPICS-capable like the old default ---
+cli = ["host", "ca", "pva", "dep:clap", "dep:rustyline", "dep:tracing-subscriber"]
+# --- `bsrs frame-source` real backends (PVA monitor source + HDF5 sink) ---
+frame-source = ["cli", "pva", "hdf5"]
 
 [dependencies]
-bsrs-core.workspace = true
-bsrs-engine.workspace = true
-bsrs-event-model.workspace = true
-bsrs-plans.workspace = true
-bsrs-devices.workspace = true
-bsrs-protocols-async.workspace = true
-bsrs-protocols-sync.workspace = true
-bsrs-callbacks.workspace = true
-bsrs-stream.workspace = true
-bsrs-backend-soft = { path = "../bsrs-backends/soft" }
-bsrs-backend-mock = { path = "../bsrs-backends/mock" }
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+async-trait.workspace = true
+async-stream.workspace = true
 bytes.workspace = true
 futures.workspace = true
-async-stream.workspace = true
-async-trait.workspace = true
+pin-project-lite.workspace = true
+serde.workspace = true
 serde_json.workspace = true
-bsrs-engine.workspace = true
-bsrs-backend-epics-ca = { path = "../bsrs-backends/epics-ca", features = ["real"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net"] }
+tokio-stream.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+bsrs-derive.workspace = true
+
+# optional integrations / backends
+zmq = { workspace = true, optional = true }
+rmp-serde = { version = "1", optional = true }
+regex = { version = "1", optional = true }
+toml = { version = "0.8", optional = true }
+url = { version = "2", optional = true }
+kafka = { version = "0.10", optional = true, default-features = false, features = ["snappy"] }
+tiled-rs = { version = "0.1.3", default-features = false, optional = true }
+mlua = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+rustyline = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+metrics = { version = "0.24", optional = true }
+metrics-exporter-prometheus = { version = "0.16", optional = true, default-features = false, features = ["http-listener"] }
+epics-ca-rs = { version = "0.16.2", optional = true }
+epics-base-rs = { version = "0.16.2", optional = true }
+epics-pva-rs = { version = "0.16.2", optional = true }
+rust-hdf5 = { version = "0.2", features = ["deflate"], optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }
+async-trait.workspace = true
+async-stream.workspace = true
+bytes.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile = "3"
 criterion = { version = "0.5", features = ["async_tokio"] }
 
 [[bench]]
@@ -36,3 +89,11 @@ harness = false
 [[bench]]
 name = "document_fanout"
 harness = false
+
+[[example]]
+name = "mini_beamline_scan"
+required-features = ["ca"]
+
+[[example]]
+name = "qs_beamline"
+required-features = ["qs"]

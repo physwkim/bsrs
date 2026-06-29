@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use bsrs::backends::soft::{SoftDetector, SoftMotor};
 use bsrs::callbacks::StderrTraceSink;
+use bsrs::core::msg::{MovableObj, ReadableObj};
 use bsrs::prelude::*;
-use bsrs_core::msg::{MovableObj, ReadableObj};
 
 #[tokio::main]
 async fn main() -> Result<()> {

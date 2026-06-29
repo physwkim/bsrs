@@ -32,11 +32,11 @@
 
 use std::sync::Arc;
 
-use bsrs_backend_soft::{SoftDetector, SoftMotor};
-use bsrs_core::msg::{MovableObj, ReadableObj};
-use bsrs_core::plan::Plan;
-use bsrs_core::Document;
-use bsrs_engine::{DocumentCallback, DocumentSink, RunEngine};
+use bsrs::backends::soft::{SoftDetector, SoftMotor};
+use bsrs::core::msg::{MovableObj, ReadableObj};
+use bsrs::core::plan::Plan;
+use bsrs::core::Document;
+use bsrs::engine::{DocumentCallback, DocumentSink, RunEngine};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
@@ -59,7 +59,7 @@ impl PySoftMotor {
     }
 
     fn name(&self) -> String {
-        bsrs_core::msg::NamedObj::name(&*self.inner).to_string()
+        bsrs::core::msg::NamedObj::name(&*self.inner).to_string()
     }
 
     /// `motor.read()` — read the device's signals as a
@@ -78,7 +78,7 @@ impl PySoftMotor {
     fn set(&self, py: Python<'_>, value: f64) -> PyResult<()> {
         let m: Arc<dyn MovableObj> = self.inner.clone();
         py.allow_threads(move || {
-            bsrs_core::runtime::block_on(async move {
+            bsrs::core::runtime::block_on(async move {
                 let status = m.set_dyn(value).await;
                 status.await
             })
@@ -107,7 +107,7 @@ impl PySoftDetector {
     }
 
     fn name(&self) -> String {
-        bsrs_core::msg::NamedObj::name(&*self.inner).to_string()
+        bsrs::core::msg::NamedObj::name(&*self.inner).to_string()
     }
 
     /// `detector.read()` — read the detector's signals as a
@@ -169,7 +169,7 @@ impl PyRunEngine {
         })?;
         let re = self.inner.clone();
         py.allow_threads(move || {
-            let r = bsrs_core::runtime::block_on(re.run_async(plan));
+            let r = bsrs::core::runtime::block_on(re.run_async(plan));
             match r {
                 Ok(rr) => Ok((rr.exit_status, rr.run_uid)),
                 Err(e) => Err(PyRuntimeError::new_err(format!("RunEngine: {e}"))),
@@ -208,7 +208,7 @@ impl PyRunEngine {
 /// inner document body (no enum tag), matching the `(name, doc)` pair a
 /// bluesky `RunEngine.subscribe` callback receives.
 fn doc_name_and_value(doc: &Document) -> (&'static str, serde_json::Value) {
-    use bsrs_core::Document::*;
+    use bsrs::core::Document::*;
     let v = |r: Result<serde_json::Value, serde_json::Error>| r.unwrap_or(serde_json::Value::Null);
     match doc {
         Start(d) => ("start", v(serde_json::to_value(d))),
@@ -264,7 +264,7 @@ fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyObject {
 /// dict. Shared by `SoftMotor.read` and `SoftDetector.read`.
 fn read_obj(py: Python<'_>, obj: Arc<dyn ReadableObj>) -> PyResult<PyObject> {
     let reading = py
-        .allow_threads(move || bsrs_core::runtime::block_on(async move { obj.read_dyn().await }))
+        .allow_threads(move || bsrs::core::runtime::block_on(async move { obj.read_dyn().await }))
         .map_err(|e| PyRuntimeError::new_err(format!("read: {e}")))?;
     let value = serde_json::to_value(&reading).unwrap_or(serde_json::Value::Null);
     Ok(json_to_py(py, &value))
@@ -276,7 +276,7 @@ fn read_obj(py: Python<'_>, obj: Arc<dyn ReadableObj>) -> PyResult<PyObject> {
 fn describe_obj(py: Python<'_>, obj: Arc<dyn ReadableObj>) -> PyResult<PyObject> {
     let desc = py
         .allow_threads(move || {
-            bsrs_core::runtime::block_on(async move { obj.describe_dyn().await })
+            bsrs::core::runtime::block_on(async move { obj.describe_dyn().await })
         })
         .map_err(|e| PyRuntimeError::new_err(format!("describe: {e}")))?;
     let value = serde_json::to_value(&desc).unwrap_or(serde_json::Value::Null);
@@ -299,7 +299,7 @@ fn count(detectors: &Bound<'_, PyList>, num: usize) -> PyResult<PyPlan> {
         }
     }
     Ok(PyPlan {
-        inner: Mutex::new(Some(bsrs_plans::count(dets, num))),
+        inner: Mutex::new(Some(bsrs::plans::count(dets, num))),
         label: format!("count(n={num})"),
     })
 }
@@ -330,7 +330,7 @@ fn scan(
     let mv: Arc<dyn MovableObj> = motor.borrow().inner.clone();
     let mr: Arc<dyn ReadableObj> = motor_reader.borrow().inner.clone();
     Ok(PyPlan {
-        inner: Mutex::new(Some(bsrs_plans::scan(dets, mv, mr, start, stop, num))),
+        inner: Mutex::new(Some(bsrs::plans::scan(dets, mv, mr, start, stop, num))),
         label: format!("scan({start}..{stop}, n={num})"),
     })
 }
@@ -370,7 +370,7 @@ fn grid_scan(
     let mv2: Arc<dyn MovableObj> = m2.borrow().inner.clone();
     let mr2: Arc<dyn ReadableObj> = m2_reader.borrow().inner.clone();
     Ok(PyPlan {
-        inner: Mutex::new(Some(bsrs_plans::grid_scan(
+        inner: Mutex::new(Some(bsrs::plans::grid_scan(
             dets, mv1, mr1, s1, e1, n1, mv2, mr2, s2, e2, n2,
         ))),
         label: format!("grid_scan({n1}x{n2})"),
@@ -380,7 +380,7 @@ fn grid_scan(
 /// `bsrs_native.rel_scan(detectors, motor, motor_reader, current, start, stop, num)`
 /// — bluesky `bp.rel_scan` mirror. `start`/`stop` are relative to `current`,
 /// the motor's present position (read it via `motor.read()` first), matching
-/// the `bsrs_plans::rel_scan` contract.
+/// the `bsrs::plans::rel_scan` contract.
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 fn rel_scan(
@@ -407,7 +407,7 @@ fn rel_scan(
     let mvbl: Arc<dyn MovableObj> = motor.borrow().inner.clone();
     let mr: Arc<dyn ReadableObj> = motor_reader.borrow().inner.clone();
     Ok(PyPlan {
-        inner: Mutex::new(Some(bsrs_plans::rel_scan(
+        inner: Mutex::new(Some(bsrs::plans::rel_scan(
             dets, mvbl, mr, current, start, stop, num,
         ))),
         label: format!("rel_scan({start}..{stop} @ {current}, n={num})"),
@@ -420,7 +420,7 @@ fn rel_scan(
 fn mv(motor: &Bound<'_, PySoftMotor>, value: f64) -> PyPlan {
     let mvbl: Arc<dyn MovableObj> = motor.borrow().inner.clone();
     PyPlan {
-        inner: Mutex::new(Some(bsrs_plans::stubs::mv(mvbl, value))),
+        inner: Mutex::new(Some(bsrs::plans::stubs::mv(mvbl, value))),
         label: format!("mv({value})"),
     }
 }

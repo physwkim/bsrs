@@ -31,16 +31,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bsrs_backend_epics_ca::EpicsCaBackend;
-use bsrs_core::error::{BsrsError, Result};
-use bsrs_core::msg::{DynLocation, LocatableObj, MovableObj, NamedObj, ReadableObj, StoppableObj};
-use bsrs_core::reading::ReadingValue;
-use bsrs_core::status::Status;
+use bsrs::backends::epics_ca::EpicsCaBackend;
+use bsrs::core::error::{BsrsError, Result};
+use bsrs::core::msg::{DynLocation, LocatableObj, MovableObj, NamedObj, ReadableObj, StoppableObj};
+use bsrs::core::reading::ReadingValue;
+use bsrs::core::status::Status;
 #[allow(unused_imports)]
-use bsrs_devices::{Signal, SignalConfig};
-use bsrs_engine::{DocumentSink, RunEngine};
-use bsrs_event_model::{DataKey, Dtype};
-use bsrs_protocols_async::SignalBackend;
+use bsrs::devices::{Signal, SignalConfig};
+use bsrs::engine::{DocumentSink, RunEngine};
+use bsrs::event_model::{DataKey, Dtype};
+use bsrs::protocols_async::SignalBackend;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -115,8 +115,10 @@ impl MovableObj for CaMotor {
         // layer (CP-11).
         match tokio::time::timeout(Duration::from_secs(30), self.setpoint.put(Some(value))).await {
             Ok(Ok(())) => Status::done(),
-            Ok(Err(e)) => Status::fail(bsrs_core::status::StatusError::Failed(format!("set: {e}"))),
-            Err(_) => Status::fail(bsrs_core::status::StatusError::Failed(
+            Ok(Err(e)) => {
+                Status::fail(bsrs::core::status::StatusError::Failed(format!("set: {e}")))
+            }
+            Err(_) => Status::fail(bsrs::core::status::StatusError::Failed(
                 "set: timed out after 30s".into(),
             )),
         }
@@ -210,11 +212,11 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // `ca_context()` block_on's CaClient::new() once. Calling it from
     // inside a tokio runtime panics with "Cannot start a runtime from
     // within a runtime". After this call the global is cached.
-    let _ = bsrs_backend_epics_ca::ca_context();
+    let _ = bsrs::backends::epics_ca::ca_context();
 
     // Drive the rest on bsrs's runtime so all subsequent
     // block_on / spawn calls share the same handle.
-    bsrs_core::runtime::bsrs_runtime().block_on(async_main())
+    bsrs::core::runtime::bsrs_runtime().block_on(async_main())
 }
 
 async fn async_main() -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -241,13 +243,14 @@ async fn async_main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Capture every Document to a JSONL file at /tmp for offline
     // inspection.
     let jsonl_path = format!("/tmp/bsrs_mini_beamline_{}.jsonl", std::process::id());
-    let sink: Arc<dyn DocumentSink> = Arc::new(bsrs_callbacks::JsonlSink::open(&jsonl_path).await?);
+    let sink: Arc<dyn DocumentSink> =
+        Arc::new(bsrs::callbacks::JsonlSink::open(&jsonl_path).await?);
 
     let re = RunEngine::new(vec![sink.clone()]);
 
     // Scan from -8 to 8 in 17 points (covers the PinHole gaussian
     // peak at center=0, sigma=5).
-    let plan = bsrs_plans::scan(
+    let plan = bsrs::plans::scan(
         vec![det.clone() as Arc<dyn ReadableObj>],
         motor.clone() as Arc<dyn MovableObj>,
         motor.clone() as Arc<dyn ReadableObj>,

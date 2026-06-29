@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 use bsrs::backends::soft::{SoftDetector, SoftMotor};
+use bsrs::core::msg::{LocatableObj, MovableObj, ReadableObj, StoppableObj};
 use bsrs::prelude::*;
-use bsrs_core::msg::{LocatableObj, MovableObj, ReadableObj, StoppableObj};
 
 #[tokio::test]
 async fn position_read_set_trigger_short_names() {
@@ -83,8 +83,8 @@ async fn ext_traits_work_on_concrete_types_too() {
 async fn bluesky_style_compose_in_plan_factory() {
     // A plain helper that uses Ext methods to build a Plan body
     // (without _dyn suffix anywhere in the user code).
-    use bsrs_core::msg::Msg;
-    use bsrs_core::plan::{plan_box, Plan};
+    use bsrs::core::msg::Msg;
+    use bsrs::core::plan::{plan_box, Plan};
     use futures::StreamExt;
 
     fn move_then_read(

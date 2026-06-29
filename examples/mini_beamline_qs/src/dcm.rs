@@ -22,12 +22,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bsrs_core::error::Result;
-use bsrs_core::msg::{DynLocation, LocatableObj, MovableObj, NamedObj, ReadableObj};
-use bsrs_core::reading::ReadingValue;
-use bsrs_core::status::Status;
-use bsrs_event_model::DataKey;
-use bsrs_host::ca_devices::{CaDetector, CaMotor};
+use bsrs::core::error::Result;
+use bsrs::core::msg::{DynLocation, LocatableObj, MovableObj, NamedObj, ReadableObj};
+use bsrs::core::reading::ReadingValue;
+use bsrs::core::status::Status;
+use bsrs::event_model::DataKey;
+use bsrs::host::ca_devices::{CaDetector, CaMotor};
 
 /// Composite DCM: energy axis + theta readback.
 pub struct Dcm {
@@ -98,7 +98,7 @@ impl LocatableObj for Dcm {
     }
 }
 
-#[bsrs_derive::lua_methods]
+#[bsrs::lua_methods]
 impl Dcm {
     /// Move energy to `keV` and wait for completion. Equivalent to
     /// `dcm:set(keV):wait()` but spelled out.

@@ -87,31 +87,31 @@ pub fn derive_device(input: TokenStream) -> TokenStream {
         if let Some(template) = parse_string_attr(field, "signal") {
             let kind_expr = parse_kind(field);
             field_inits.push(quote! {
-                #id: ::bsrs_devices::Signal::new(
-                    ::std::sync::Arc::new(::bsrs_devices::__derive::default_backend(
-                        &::bsrs_devices::__derive::expand(#template, prefix),
+                #id: ::bsrs::devices::Signal::new(
+                    ::std::sync::Arc::new(::bsrs::devices::__derive::default_backend(
+                        &::bsrs::devices::__derive::expand(#template, prefix),
                     )),
-                    ::bsrs_devices::SignalConfig {
-                        source: ::bsrs_devices::__derive::expand(#template, prefix),
+                    ::bsrs::devices::SignalConfig {
+                        source: ::bsrs::devices::__derive::expand(#template, prefix),
                         kind: #kind_expr,
-                        name: ::bsrs_devices::__derive::expand(#template, prefix),
+                        name: ::bsrs::devices::__derive::expand(#template, prefix),
                     },
                 ),
             });
             field_inits_named.push(quote! {
-                #id: ::bsrs_devices::Signal::new(
-                    ::std::sync::Arc::new(::bsrs_devices::__derive::default_backend(
-                        &::bsrs_devices::__derive::expand(#template, prefix),
+                #id: ::bsrs::devices::Signal::new(
+                    ::std::sync::Arc::new(::bsrs::devices::__derive::default_backend(
+                        &::bsrs::devices::__derive::expand(#template, prefix),
                     )),
-                    ::bsrs_devices::SignalConfig {
-                        source: ::bsrs_devices::__derive::expand(#template, prefix),
+                    ::bsrs::devices::SignalConfig {
+                        source: ::bsrs::devices::__derive::expand(#template, prefix),
                         kind: #kind_expr,
                         name: ::std::format!("{}-{}", dev_name, #id_str),
                     },
                 ),
             });
             connect_calls.push(quote! {
-                ::bsrs_devices::__derive::connect_signal(&self.#id, timeout)
+                ::bsrs::devices::__derive::connect_signal(&self.#id, timeout)
             });
             walk_pushes.push(quote! {
                 out.push((::std::format!("{}{}", prefix, #id_str), self.#id.source()));
@@ -122,11 +122,11 @@ pub fn derive_device(input: TokenStream) -> TokenStream {
         if let Some(template) = parse_string_attr(field, "device") {
             let ty = strip_arc(&field.ty);
             field_inits.push(quote! {
-                #id: <#ty>::new(&::bsrs_devices::__derive::expand(#template, prefix)),
+                #id: <#ty>::new(&::bsrs::devices::__derive::expand(#template, prefix)),
             });
             field_inits_named.push(quote! {
                 #id: <#ty>::new_named(
-                    &::bsrs_devices::__derive::expand(#template, prefix),
+                    &::bsrs::devices::__derive::expand(#template, prefix),
                     &::std::format!("{}-{}", dev_name, #id_str),
                 ),
             });
@@ -134,7 +134,7 @@ pub fn derive_device(input: TokenStream) -> TokenStream {
                 ::std::boxed::Box::pin(async move { self.#id.connect_all(timeout).await })
             });
             walk_pushes.push(quote! {
-                ::bsrs_devices::Device::walk_signal_sources(
+                ::bsrs::devices::Device::walk_signal_sources(
                     &self.#id,
                     &::std::format!("{}{}.", prefix, #id_str),
                     out,
@@ -165,10 +165,10 @@ pub fn derive_device(input: TokenStream) -> TokenStream {
         quote! { Ok(()) }
     } else {
         quote! {
-            ::bsrs_devices::__derive::try_join_all_connects(vec![
+            ::bsrs::devices::__derive::try_join_all_connects(vec![
                 #( ::std::boxed::Box::pin(#connect_calls)
                     as ::std::pin::Pin<::std::boxed::Box<
-                        dyn ::std::future::Future<Output = ::bsrs_core::error::Result<()>>
+                        dyn ::std::future::Future<Output = ::bsrs::core::error::Result<()>>
                             + ::std::marker::Send
                             + '_
                     >>, )*
@@ -207,12 +207,12 @@ pub fn derive_device(input: TokenStream) -> TokenStream {
             pub async fn connect_all(
                 &self,
                 timeout: ::std::time::Duration,
-            ) -> ::bsrs_core::error::Result<()> {
+            ) -> ::bsrs::core::error::Result<()> {
                 #connect_block
             }
         }
 
-        impl #impl_g ::bsrs_devices::Device for #name #ty_g #where_g {
+        impl #impl_g ::bsrs::devices::Device for #name #ty_g #where_g {
             fn name(&self) -> &str {
                 &self.name
             }
@@ -220,7 +220,7 @@ pub fn derive_device(input: TokenStream) -> TokenStream {
                 &'a self,
                 timeout: ::std::time::Duration,
             ) -> ::std::pin::Pin<::std::boxed::Box<
-                dyn ::std::future::Future<Output = ::bsrs_core::error::Result<()>>
+                dyn ::std::future::Future<Output = ::bsrs::core::error::Result<()>>
                     + ::std::marker::Send
                     + 'a,
             >> {
@@ -272,16 +272,16 @@ fn parse_kind(field: &Field) -> TokenStream2 {
                     .take_while(|c| c.is_alphanumeric() || *c == '_')
                     .collect();
                 return match word.as_str() {
-                    "hinted" => quote! { ::bsrs_core::Kind::Hinted },
-                    "config" => quote! { ::bsrs_core::Kind::Config },
-                    "normal" => quote! { ::bsrs_core::Kind::Normal },
-                    "omitted" => quote! { ::bsrs_core::Kind::Omitted },
-                    _ => quote! { ::bsrs_core::Kind::Normal },
+                    "hinted" => quote! { ::bsrs::core::Kind::Hinted },
+                    "config" => quote! { ::bsrs::core::Kind::Config },
+                    "normal" => quote! { ::bsrs::core::Kind::Normal },
+                    "omitted" => quote! { ::bsrs::core::Kind::Omitted },
+                    _ => quote! { ::bsrs::core::Kind::Normal },
                 };
             }
         }
     }
-    quote! { ::bsrs_core::Kind::Normal }
+    quote! { ::bsrs::core::Kind::Normal }
 }
 
 /// If the type is `Arc<T>`, strip to `T` (so `T::new(...)` resolves).
@@ -403,7 +403,7 @@ pub fn lua_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
         for (i, ty) in arg_types.iter().enumerate() {
             let ident = quote::format_ident!("arg{}", i);
             arg_parses.push(quote! {
-                let #ident: #ty = ::bsrs_core::lua_exposable::__macro_support::serde_json::from_value(args[#i].clone())
+                let #ident: #ty = ::bsrs::core::lua_exposable::__macro_support::serde_json::from_value(args[#i].clone())
                     .map_err(|e| format!(
                         concat!("lua_method '", #fn_name_str, "': arg #", stringify!(#i), ": {}"),
                         e
@@ -414,7 +414,7 @@ pub fn lua_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
         let call = if is_async {
             quote! {
-                ::bsrs_core::runtime::bsrs_runtime()
+                ::bsrs::core::runtime::bsrs_runtime()
                     .block_on(this_typed.#fn_name(#(#arg_idents),*))
             }
         } else {
@@ -432,21 +432,21 @@ pub fn lua_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     quote! {
                         let r = #call;
                         match r {
-                            Ok(v) => ::bsrs_core::lua_exposable::__macro_support::serde_json::to_value(v).map_err(|e| e.to_string()),
+                            Ok(v) => ::bsrs::core::lua_exposable::__macro_support::serde_json::to_value(v).map_err(|e| e.to_string()),
                             Err(e) => Err(::std::string::ToString::to_string(&e)),
                         }
                     }
                 } else {
                     quote! {
                         let v = #call;
-                        ::bsrs_core::lua_exposable::__macro_support::serde_json::to_value(v).map_err(|e| e.to_string())
+                        ::bsrs::core::lua_exposable::__macro_support::serde_json::to_value(v).map_err(|e| e.to_string())
                     }
                 }
             }
         };
 
         entries.push(quote! {
-            ::bsrs_core::lua_exposable::LuaMethodEntry {
+            ::bsrs::core::lua_exposable::LuaMethodEntry {
                 name: #fn_name_str,
                 arity: #arity,
                 dispatch: |this, args| {
@@ -489,9 +489,9 @@ pub fn lua_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
     original.items = stripped_items;
 
     let lua_impl = quote! {
-        impl ::bsrs_core::lua_exposable::LuaExposable for #self_ty {
-            fn lua_methods() -> &'static [::bsrs_core::lua_exposable::LuaMethodEntry] {
-                static METHODS: &[::bsrs_core::lua_exposable::LuaMethodEntry] = &[
+        impl ::bsrs::core::lua_exposable::LuaExposable for #self_ty {
+            fn lua_methods() -> &'static [::bsrs::core::lua_exposable::LuaMethodEntry] {
+                static METHODS: &[::bsrs::core::lua_exposable::LuaMethodEntry] = &[
                     #(#entries),*
                 ];
                 METHODS
