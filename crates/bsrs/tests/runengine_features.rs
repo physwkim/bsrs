@@ -27,6 +27,24 @@ fn one_count_plan() -> Plan {
     bsrs::ophyd_async::count(vec![det], 1)
 }
 
+/// Poll the sink until `pred` holds over its captured documents, instead of
+/// relying on fixed sleeps to guess engine progress. Fixed sleeps are
+/// load-sensitive and, worse, `pause()`/`resume()` only flip a flag —
+/// `state()` reflects the *request*, not the loop's acknowledgment — while
+/// `record_interruption` is a no-op until `OpenRun` declares the stream. So
+/// the only reliable signals are the documents the engine loop actually
+/// emits. The upper bound turns a genuine regression into a clear failure
+/// rather than a hang.
+async fn wait_for_docs(sink: &CapturingSink, what: &str, pred: impl Fn(&[Document]) -> bool) {
+    for _ in 0..1000 {
+        if pred(&sink.snapshot().await) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("'{what}' did not occur within ~5s");
+}
+
 #[tokio::test]
 async fn state_idle_after_construction() {
     let re = RunEngine::new(vec![]);
@@ -1930,9 +1948,32 @@ async fn record_interruptions_emits_descriptor_and_events() {
         yield Msg::CloseRun { exit_status: "success".into(), reason: None };
     });
     let join = tokio::spawn(async move { re2.run_async(plan).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Synchronize on documents the engine loop actually emits, not fixed
+    // sleeps. `record_interruption` is a no-op until `OpenRun` has declared
+    // the interruptions stream, and `pause()`/`resume()` only flip a flag
+    // (`state()` reflects the request, not the loop's acknowledgment). So:
+    // (1) wait for the interruptions Descriptor — proves the run is open and
+    //     the stream declared, so a subsequent pause will be recorded;
+    // (2) pause, then wait for the recorded "pause" Event — proves the loop
+    //     observed the pause and parked on the resume permit.
+    // Resuming before the loop acknowledges the pause would clear the flag
+    // before it is ever observed, recording nothing (`got 0`).
+    wait_for_docs(&sink, "interruptions descriptor", |docs| {
+        docs.iter().any(
+            |d| matches!(d, Document::Descriptor(d) if d.name.as_deref() == Some("interruptions")),
+        )
+    })
+    .await;
     re.pause(false);
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    wait_for_docs(&sink, "pause interruption event", |docs| {
+        docs.iter().any(|d| match d {
+            Document::Event(e) => {
+                e.data.get("interruption").and_then(|v| v.as_str()) == Some("pause")
+            }
+            _ => false,
+        })
+    })
+    .await;
     re.resume();
     let _ = join.await.unwrap().unwrap();
 
