@@ -36,14 +36,27 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            workspace_args: --workspace
+          - os: macos-latest
+            workspace_args: --workspace
+          # Windows builds the whole workspace except mini-beamline-qs:
+          # that example pulls host+ca -> qs -> zmq, and the `zmq` crate
+          # compiles its vendored zeromq C++ source, which needs POSIX
+          # networking headers (sys/socket.h, netdb.h) unavailable on
+          # Windows. Everything else — core, the epics-ca/pva backends,
+          # the tiled/hdf5/kafka sinks, the pyo3 bindings — cross-compiles
+          # cleanly; the zmq path is covered by the Linux `features` job.
+          - os: windows-latest
+            workspace_args: --workspace --exclude mini-beamline-qs
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --no-fail-fast
-      - run: cargo build --workspace --release
+      - run: cargo test ${{ matrix.workspace_args }} --no-fail-fast
+      - run: cargo build ${{ matrix.workspace_args }} --release
       - run: cargo run --example async_count --quiet
       - run: cargo run --example sync_count --quiet
       - run: cargo run --example scan_motor --quiet
