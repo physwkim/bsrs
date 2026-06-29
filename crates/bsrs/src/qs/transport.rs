@@ -22,6 +22,10 @@ pub enum MsgEncoding {
 #[derive(Clone)]
 pub struct ReqRepSocket {
     socket: Arc<StdMutex<zmq::Socket>>,
+    /// The resolved bind endpoint. For a wildcard bind such as
+    /// `tcp://127.0.0.1:*` this is the concrete OS-assigned address
+    /// (`tcp://127.0.0.1:54321`), so clients can connect to it.
+    endpoint: String,
     /// When set to true (e.g. by `Server::shutdown`), the next `recv` poll
     /// returns `None` and the rep loop exits cleanly.
     shutdown: Arc<std::sync::atomic::AtomicBool>,
@@ -50,10 +54,23 @@ impl ReqRepSocket {
         socket
             .bind(address)
             .map_err(|e| BsrsError::Backend(format!("zmq REP bind {address}: {e}")))?;
+        // Resolve the actual bound address: a wildcard port (`tcp://...:*`)
+        // is assigned a concrete port by the OS, which clients need to connect.
+        let endpoint = socket
+            .get_last_endpoint()
+            .map_err(|e| BsrsError::Backend(format!("zmq REP last endpoint: {e}")))?
+            .map_err(|_| BsrsError::Backend("zmq REP endpoint not valid UTF-8".into()))?;
         Ok(Self {
             socket: Arc::new(StdMutex::new(socket)),
+            endpoint,
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
+    }
+
+    /// The resolved bind endpoint (e.g. `tcp://127.0.0.1:54321` for a
+    /// wildcard `tcp://127.0.0.1:*` bind).
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
     }
 
     /// Signal the rep loop to exit at its next iteration.

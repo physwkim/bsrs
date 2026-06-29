@@ -284,6 +284,13 @@ impl Server {
         self.state.clone()
     }
 
+    /// The resolved control (REP) endpoint this server bound to. For a
+    /// wildcard bind (`tcp://127.0.0.1:*`) this is the concrete OS-assigned
+    /// address.
+    pub fn control_endpoint(&self) -> &str {
+        self.socket.endpoint()
+    }
+
     /// Get a `ServerShutdown` handle. Calling it signals the REP loop to
     /// exit at its next iteration (within ~200 ms) and aborts any
     /// in-flight queue execution task.
@@ -310,6 +317,11 @@ impl ServerShutdown {
         if let Some(h) = self.queue_task.lock().unwrap().take() {
             h.abort();
         }
+    }
+
+    /// The resolved control (REP) endpoint the server bound to.
+    pub fn control_endpoint(&self) -> &str {
+        self.socket.endpoint()
     }
 }
 

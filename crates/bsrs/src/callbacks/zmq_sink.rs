@@ -40,6 +40,10 @@ pub enum Serializer {
 /// compatible envelope.
 pub struct ZmqDocumentSink {
     socket: Arc<StdMutex<zmq::Socket>>,
+    /// The resolved bind address. For a wildcard bind (`tcp://127.0.0.1:*`)
+    /// this is the concrete OS-assigned address; for `connect` it is the
+    /// address that was connected to.
+    endpoint: String,
     prefix: Vec<u8>,
     serializer: Serializer,
 }
@@ -54,8 +58,15 @@ impl ZmqDocumentSink {
         socket
             .bind(address)
             .map_err(|e| BsrsError::Backend(format!("zmq bind {address}: {e}")))?;
+        // Resolve the actual bound address so a wildcard port (`tcp://...:*`)
+        // can be discovered by subscribers.
+        let endpoint = socket
+            .get_last_endpoint()
+            .map_err(|e| BsrsError::Backend(format!("zmq last endpoint: {e}")))?
+            .map_err(|_| BsrsError::Backend("zmq endpoint not valid UTF-8".into()))?;
         Ok(Self {
             socket: Arc::new(StdMutex::new(socket)),
+            endpoint,
             prefix: Vec::new(),
             serializer: Serializer::Msgpack,
         })
@@ -72,9 +83,16 @@ impl ZmqDocumentSink {
             .map_err(|e| BsrsError::Backend(format!("zmq connect {address}: {e}")))?;
         Ok(Self {
             socket: Arc::new(StdMutex::new(socket)),
+            endpoint: address.to_string(),
             prefix: Vec::new(),
             serializer: Serializer::Msgpack,
         })
+    }
+
+    /// The resolved bind/connect address (e.g. `tcp://127.0.0.1:54321` for a
+    /// wildcard `tcp://127.0.0.1:*` bind).
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
     }
 
     /// Override the prefix bytes. Must not contain `b' '`.
@@ -177,6 +195,7 @@ mod tests {
         let socket = ctx.socket(zmq::PUB).unwrap();
         let sink = ZmqDocumentSink {
             socket: Arc::new(StdMutex::new(socket)),
+            endpoint: String::new(),
             prefix: Vec::new(),
             serializer: Serializer::Msgpack,
         };
@@ -194,6 +213,7 @@ mod tests {
         let socket = ctx.socket(zmq::PUB).unwrap();
         let sink = ZmqDocumentSink {
             socket: Arc::new(StdMutex::new(socket)),
+            endpoint: String::new(),
             prefix: Vec::new(),
             serializer: Serializer::Msgpack,
         };

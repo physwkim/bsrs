@@ -255,17 +255,10 @@ mod tests {
 
     #[tokio::test]
     async fn pub_sub_round_trip_msgpack() {
-        let addr = format!(
-            "ipc:///tmp/bsrs-zmq-source-test-{}-{}.sock",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as u64
-        );
-        let sink = ZmqDocumentSink::bind(&addr)
+        let sink = ZmqDocumentSink::bind("tcp://127.0.0.1:*")
             .expect("bind sink")
             .with_serializer(Serializer::Msgpack);
+        let addr = sink.endpoint().to_string();
         let src = ZmqDocumentSource::connect(&addr)
             .expect("connect source")
             .with_serializer(Serializer::Msgpack);
@@ -300,17 +293,13 @@ mod tests {
     // Neutering the fix (dropping `set_unsubscribe`) never emits that frame.
     #[test]
     fn subscribe_prefix_drops_the_match_all_default() {
-        let addr = format!(
-            "ipc:///tmp/bsrs-zmq-xpub-test-{}-{}.sock",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as u64
-        );
         let ctx = zmq::Context::new();
         let xpub = ctx.socket(zmq::XPUB).expect("xpub socket");
-        xpub.bind(&addr).expect("xpub bind");
+        xpub.bind("tcp://127.0.0.1:*").expect("xpub bind");
+        let addr = xpub
+            .get_last_endpoint()
+            .unwrap()
+            .expect("xpub endpoint utf-8");
         xpub.set_rcvtimeo(100).unwrap();
 
         // connect() subscribes the match-all default b"".
@@ -358,17 +347,10 @@ mod tests {
         use crate::engine::RunEngine;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let addr = format!(
-            "ipc:///tmp/bsrs-zmq-inject-test-{}-{}.sock",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as u64
-        );
-        let sink = ZmqDocumentSink::bind(&addr)
+        let sink = ZmqDocumentSink::bind("tcp://127.0.0.1:*")
             .expect("bind sink")
             .with_serializer(Serializer::Msgpack);
+        let addr = sink.endpoint().to_string();
         let cancel = CancellationToken::new();
         let src = Arc::new(
             ZmqDocumentSource::connect(&addr)
