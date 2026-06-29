@@ -27,14 +27,48 @@ fn one_count_plan() -> Plan {
     bsrs::ophyd_async::count(vec![det], 1)
 }
 
-/// Poll the sink until `pred` holds over its captured documents, instead of
-/// relying on fixed sleeps to guess engine progress. Fixed sleeps are
-/// load-sensitive and, worse, `pause()`/`resume()` only flip a flag —
-/// `state()` reflects the *request*, not the loop's acknowledgment — while
-/// `record_interruption` is a no-op until `OpenRun` declares the stream. So
-/// the only reliable signals are the documents the engine loop actually
-/// emits. The upper bound turns a genuine regression into a clear failure
-/// rather than a hang.
+// -- Deterministic test synchronization --------------------------------------
+//
+// These tests drive the engine from a separate task and then observe a
+// loop-driven side effect (state change, device-hook counter, emitted
+// Document). Fixed `sleep`s to bridge that async gap are load-sensitive: on a
+// busy runner the spawned plan may not have progressed far enough, so the
+// assertion races the engine. Two engine facts make a fixed sleep especially
+// fragile: `run_async` resets `is_paused = false` at startup (run_engine.rs:
+// 506), so a `pause()` issued before the engine is Running is wiped; and
+// `record_interruption` is a no-op until `OpenRun` has declared the stream.
+//
+// The helpers below replace fixed sleeps with bounded polling of the exact
+// signal each test depends on:
+//   * input gate — wait until the engine is `Running` before issuing a
+//     pause/suspend/signal (it is then parked at the first awaiting message
+//     with all leading plan messages already processed, on the single-threaded
+//     test runtime), so the action can never be wiped by the startup reset;
+//   * output wait — poll the asserted condition (state / counter / Document)
+//     so the assertion only runs once the loop has actually produced it.
+// Each helper is bounded so a genuine regression fails clearly, not by hanging.
+
+/// Poll `pred` until it holds. For synchronous reads — `state()`, device-hook
+/// counters, receiver counts.
+async fn wait_until(what: &str, pred: impl Fn() -> bool) {
+    for _ in 0..1000 {
+        if pred() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("'{what}' did not occur within ~5s");
+}
+
+/// Wait until the engine reports `target`. `state()` reflects the *requested*
+/// state for manual pause/resume (set synchronously), but for suspender- and
+/// loop-driven transitions it flips asynchronously — polling covers both.
+async fn wait_for_state(re: &RunEngine, target: EngineRunState) {
+    wait_until(&format!("state == {target:?}"), || re.state() == target).await;
+}
+
+/// Poll the sink until `pred` holds over its captured documents — for
+/// assertions on emitted Documents (interruption events, monitor events).
 async fn wait_for_docs(sink: &CapturingSink, what: &str, pred: impl Fn(&[Document]) -> bool) {
     for _ in 0..1000 {
         if pred(&sink.snapshot().await) {
@@ -572,11 +606,11 @@ async fn suspend_bool_high_pauses_on_high_resumes_on_low() {
         yield Msg::Sleep(Duration::from_millis(50));
     });
     let join = tokio::spawn(async move { re2.run_async(plan).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_state(&re, EngineRunState::Running).await;
 
     // Trigger BAD: signal goes high → engine should pause.
     tx.send(true).unwrap();
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    wait_for_state(&re, EngineRunState::Paused).await;
     assert_eq!(
         re.state(),
         EngineRunState::Paused,
@@ -608,10 +642,10 @@ async fn suspend_bool_low_pauses_on_low_resumes_on_high() {
         yield Msg::Sleep(Duration::from_millis(50));
     });
     let join = tokio::spawn(async move { re2.run_async(plan).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_state(&re, EngineRunState::Running).await;
 
     tx.send(false).unwrap();
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    wait_for_state(&re, EngineRunState::Paused).await;
     assert_eq!(re.state(), EngineRunState::Paused);
 
     tx.send(true).unwrap();
@@ -638,10 +672,10 @@ async fn suspend_threshold_floor_pauses_when_below() {
         yield Msg::Sleep(Duration::from_millis(50));
     });
     let join = tokio::spawn(async move { re2.run_async(plan).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_state(&re, EngineRunState::Running).await;
 
     tx.send(40.0).unwrap();
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    wait_for_state(&re, EngineRunState::Paused).await;
     assert_eq!(re.state(), EngineRunState::Paused);
 
     tx.send(80.0).unwrap();
@@ -668,11 +702,11 @@ async fn suspend_outside_band_pauses_outside_resumes_inside() {
         yield Msg::Sleep(Duration::from_millis(50));
     });
     let join = tokio::spawn(async move { re2.run_async(plan).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_state(&re, EngineRunState::Running).await;
 
     // Leave the band above the top edge → pause.
     tx.send(35.0).unwrap();
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    wait_for_state(&re, EngineRunState::Paused).await;
     assert_eq!(
         re.state(),
         EngineRunState::Paused,
@@ -707,10 +741,10 @@ async fn suspend_when_changed_allow_resume_pauses_then_resumes() {
         yield Msg::Sleep(Duration::from_millis(50));
     });
     let join = tokio::spawn(async move { re2.run_async(plan).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_state(&re, EngineRunState::Running).await;
 
     tx.send("shutdown".to_string()).unwrap();
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    wait_for_state(&re, EngineRunState::Paused).await;
     assert_eq!(
         re.state(),
         EngineRunState::Paused,
@@ -745,10 +779,10 @@ async fn suspend_when_changed_no_resume_requires_manual_resume() {
         yield Msg::Sleep(Duration::from_millis(50));
     });
     let join = tokio::spawn(async move { re2.run_async(plan).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_state(&re, EngineRunState::Running).await;
 
     tx.send(1).unwrap(); // deviate → pause
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    wait_for_state(&re, EngineRunState::Paused).await;
     assert_eq!(re.state(), EngineRunState::Paused);
 
     // Return to expected: must NOT auto-resume (one-shot).
@@ -1227,8 +1261,13 @@ async fn close_run_tears_down_active_monitor_not_explicitly_unmonitored() {
     let join = tokio::spawn(async move { re_run.run_async(plan).await });
 
     // Inside the post-close window (close fires ~50ms in; the trailing sleep
-    // runs to ~550ms; plan-end cleanup is only after that).
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    // runs to ~550ms; plan-end cleanup is only after that). Confirm the monitor
+    // first subscribes, then is torn down by close_run (not plan-end cleanup).
+    wait_until("monitor subscribed", || mon.tx.receiver_count() == 1).await;
+    wait_until("close_run unsubscribed the monitor", || {
+        mon.tx.receiver_count() == 0
+    })
+    .await;
     let receivers = mon.tx.receiver_count();
 
     join.await.unwrap().unwrap();
@@ -1264,7 +1303,10 @@ async fn monitor_survives_pause_and_resume() {
     let join = tokio::spawn(async move { re_run.run_async(plan).await });
 
     // The pump subscribes synchronously in start_monitor → 1 receiver running.
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    wait_until("monitor subscribed while running", || {
+        re.state() == EngineRunState::Running && mon.tx.receiver_count() == 1
+    })
+    .await;
     assert_eq!(re.state(), EngineRunState::Running);
     assert_eq!(
         mon.tx.receiver_count(),
@@ -1274,7 +1316,7 @@ async fn monitor_survives_pause_and_resume() {
 
     // Pause suspends the monitor: the live pump is dropped, releasing the sub.
     re.pause(false);
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    wait_until("pump dropped on pause", || mon.tx.receiver_count() == 0).await;
     assert_eq!(re.state(), EngineRunState::Paused);
     assert_eq!(
         mon.tx.receiver_count(),
@@ -1284,7 +1326,10 @@ async fn monitor_survives_pause_and_resume() {
 
     // Resume must re-install the monitor from the kept registry.
     re.resume();
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    wait_until("monitor restored on resume", || {
+        re.state() == EngineRunState::Running && mon.tx.receiver_count() == 1
+    })
+    .await;
     assert_eq!(re.state(), EngineRunState::Running);
     assert_eq!(
         mon.tx.receiver_count(),
@@ -1294,7 +1339,12 @@ async fn monitor_survives_pause_and_resume() {
 
     // A value pushed AFTER resume must flow through the restored pump as an Event.
     mon.push(42.0, 42.0);
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    wait_for_docs(&sink, "post-resume monitor event", |docs| {
+        docs.iter().any(|d| {
+            matches!(d, Document::Event(ev) if ev.data.get("mon_pr") == Some(&Value::from(42.0)))
+        })
+    })
+    .await;
 
     join.await.unwrap().unwrap();
 
@@ -1324,10 +1374,10 @@ async fn pause_changes_state_to_paused() {
         yield Msg::Sleep(Duration::from_millis(50));
     });
     let join = tokio::spawn(async move { re2.run_async(plan).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_state(&re, EngineRunState::Running).await;
     assert_eq!(re.state(), EngineRunState::Running);
     re.pause(false);
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    wait_for_state(&re, EngineRunState::Paused).await;
     assert_eq!(re.state(), EngineRunState::Paused);
     re.resume();
     let _ = join.await.unwrap();
@@ -1381,9 +1431,9 @@ async fn pause_calls_stop_on_pause_for_set_movables() {
         yield Msg::CloseRun { exit_status: "success".into(), reason: None };
     });
     let join = tokio::spawn(async move { re2.run_async(plan).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_state(&re, EngineRunState::Running).await;
     re.pause(false);
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    wait_until("stop_on_pause fired", || stops.load(Ordering::SeqCst) >= 1).await;
     assert!(
         stops.load(Ordering::SeqCst) >= 1,
         "stop_on_pause should fire for movables touched by Msg::Set"
@@ -1572,9 +1622,9 @@ async fn pausable_hooks_fire_on_pause_and_resume() {
         yield Msg::Sleep(Duration::from_millis(50));
     });
     let join = tokio::spawn(async move { re2.run_async(plan).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_state(&re, EngineRunState::Running).await;
     re.pause(false);
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    wait_until("pause_dyn fired", || paused.load(Ordering::SeqCst) >= 1).await;
     assert_eq!(
         paused.load(Ordering::SeqCst),
         1,
@@ -1607,9 +1657,9 @@ async fn register_pausable_via_msg() {
         yield Msg::UnregisterPausable(dev);
     });
     let join = tokio::spawn(async move { re2.run_async(plan).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_state(&re, EngineRunState::Running).await;
     re.pause(false);
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    wait_until("pause_dyn fired", || paused.load(Ordering::SeqCst) >= 1).await;
     re.resume();
     let _ = join.await.unwrap();
     assert!(paused.load(Ordering::SeqCst) >= 1);
@@ -1627,9 +1677,9 @@ async fn request_suspend_pauses_engine() {
         yield Msg::Sleep(Duration::from_millis(50));
     });
     let join = tokio::spawn(async move { re2.run_async(plan).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_state(&re, EngineRunState::Running).await;
     re.request_suspend("shutter closed");
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    wait_for_state(&re, EngineRunState::Paused).await;
     assert_eq!(
         re.state(),
         EngineRunState::Paused,
@@ -1654,12 +1704,12 @@ async fn suspend_until_pauses_then_auto_resumes() {
         yield Msg::Sleep(Duration::from_millis(50));
     });
     let join = tokio::spawn(async move { re2.run_async(plan).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_state(&re, EngineRunState::Running).await;
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     re.suspend_until(Box::pin(async move {
         let _ = rx.await;
     }));
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    wait_for_state(&re, EngineRunState::Paused).await;
     assert_eq!(re.state(), EngineRunState::Paused);
     let _ = tx.send(());
     let _ = tokio::time::timeout(Duration::from_secs(2), join)
@@ -2031,9 +2081,8 @@ async fn record_interruptions_off_emits_nothing() {
         yield Msg::CloseRun { exit_status: "success".into(), reason: None };
     });
     let join = tokio::spawn(async move { re2.run_async(plan).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_state(&re, EngineRunState::Running).await;
     re.pause(false);
-    tokio::time::sleep(Duration::from_millis(30)).await;
     re.resume();
     let _ = join.await.unwrap().unwrap();
     let docs = sink.snapshot().await;
@@ -2061,7 +2110,12 @@ async fn suspend_until_with_records_justification() {
         yield Msg::CloseRun { exit_status: "success".into(), reason: None };
     });
     let join = tokio::spawn(async move { re2.run_async(plan).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_docs(&sink, "interruptions descriptor", |docs| {
+        docs.iter().any(
+            |d| matches!(d, Document::Descriptor(d) if d.name.as_deref() == Some("interruptions")),
+        )
+    })
+    .await;
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     re.suspend_until_with(
         Box::pin(async move {
@@ -2069,7 +2123,15 @@ async fn suspend_until_with_records_justification() {
         }),
         Some("shutter closed".into()),
     );
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    wait_for_docs(&sink, "justification recorded", |docs| {
+        docs.iter().any(|d| match d {
+            Document::Event(e) => {
+                e.data.get("interruption").and_then(|v| v.as_str()) == Some("shutter closed")
+            }
+            _ => false,
+        })
+    })
+    .await;
     let _ = tx.send(());
     let _ = tokio::time::timeout(Duration::from_secs(2), join)
         .await
