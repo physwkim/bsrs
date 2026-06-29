@@ -17,12 +17,13 @@ use crate::event_model::{make_datakey, DataKey, Dtype, Limits, LimitsRange, Sign
 use crate::protocols_async::{ReadingValueCallback, SignalBackend};
 use async_trait::async_trait;
 use epics_base_rs::server::snapshot::{ControlInfo, DbrClass, DisplayInfo};
+use epics_base_rs::types::WallTime;
 use epics_ca_rs::client::{CaChannel, CaClient};
-use epics_ca_rs::{DbFieldType, EpicsValue};
+use epics_ca_rs::{DbFieldType, EpicsValue, PvString};
 use std::array;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::sync::Notify;
 
 const SHARDS: usize = 64;
@@ -34,14 +35,12 @@ fn shard_for(pv: &str) -> usize {
     (h.finish() as usize) % SHARDS
 }
 
-/// Convert a CA snapshot's `SystemTime` to epoch seconds. A `DbrClass::Time`
+/// Convert a CA snapshot's `WallTime` to epoch seconds. A `DbrClass::Time`
 /// read carries the server's processing time in `snap.timestamp`, which is the
 /// reading timestamp ophyd-async reports (`epics/core/_aioca.py:305-310`,
 /// `FORMAT_TIME`); the monitor path already stamps from the same field.
-fn ts_to_f64(t: SystemTime) -> f64 {
-    t.duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or_default()
+fn ts_to_f64(t: WallTime) -> f64 {
+    t.since_unix_epoch().as_secs_f64()
 }
 
 /// Process-wide CA context.
@@ -281,7 +280,7 @@ async fn ctrl_metadata(
     let mut meta = SignalMetadata::default();
     if let Some(d) = snap.display.as_ref() {
         if want_units && !d.units.is_empty() {
-            meta.units = Some(d.units.clone());
+            meta.units = Some(d.units.as_str_lossy().into_owned());
         }
         if want_precision {
             meta.precision = Some(d.precision as i64);
@@ -310,7 +309,10 @@ fn f64_to_wire(t: DbFieldType, v: f64) -> EpicsValue {
         DbFieldType::Short => EpicsValue::Short(v as i16),
         DbFieldType::Char => EpicsValue::Char(v as u8),
         DbFieldType::Enum => EpicsValue::Enum(v as u16),
-        DbFieldType::String => EpicsValue::String(format!("{v}")),
+        DbFieldType::UInt64 => EpicsValue::UInt64(v as u64),
+        DbFieldType::UShort => EpicsValue::UShort(v as u16),
+        DbFieldType::ULong => EpicsValue::ULong(v as u32),
+        DbFieldType::String => EpicsValue::String(format!("{v}").into()),
     }
 }
 
@@ -324,7 +326,10 @@ fn i64_to_wire(t: DbFieldType, v: i64) -> EpicsValue {
         DbFieldType::Short => EpicsValue::Short(v as i16),
         DbFieldType::Char => EpicsValue::Char(v as u8),
         DbFieldType::Enum => EpicsValue::Enum(v as u16),
-        DbFieldType::String => EpicsValue::String(format!("{v}")),
+        DbFieldType::UInt64 => EpicsValue::UInt64(v as u64),
+        DbFieldType::UShort => EpicsValue::UShort(v as u16),
+        DbFieldType::ULong => EpicsValue::ULong(v as u32),
+        DbFieldType::String => EpicsValue::String(format!("{v}").into()),
     }
 }
 
@@ -377,6 +382,9 @@ fn f64s_to_wire(t: DbFieldType, v: Vec<f64>) -> EpicsValue {
         DbFieldType::Short => EpicsValue::ShortArray(v.iter().map(|x| *x as i16).collect()),
         DbFieldType::Char => EpicsValue::CharArray(v.iter().map(|x| *x as u8).collect()),
         DbFieldType::Enum => EpicsValue::EnumArray(v.iter().map(|x| *x as u16).collect()),
+        DbFieldType::UInt64 => EpicsValue::UInt64Array(v.iter().map(|x| *x as u64).collect()),
+        DbFieldType::UShort => EpicsValue::UShortArray(v.iter().map(|x| *x as u16).collect()),
+        DbFieldType::ULong => EpicsValue::ULongArray(v.iter().map(|x| *x as u32).collect()),
     }
 }
 
@@ -404,12 +412,12 @@ fn epics_to_bool(v: &EpicsValue) -> Option<bool> {
 /// gracefully on get.
 fn epics_to_string(v: &EpicsValue, kind: CaStringKind) -> Option<String> {
     match (kind, v) {
-        (CaStringKind::Short, EpicsValue::String(s)) => Some(s.clone()),
+        (CaStringKind::Short, EpicsValue::String(s)) => Some(s.as_str_lossy().into_owned()),
         (CaStringKind::Long, EpicsValue::CharArray(bytes)) => {
             let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
             Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
         }
-        (CaStringKind::Long, EpicsValue::String(s)) => Some(s.clone()),
+        (CaStringKind::Long, EpicsValue::String(s)) => Some(s.as_str_lossy().into_owned()),
         (CaStringKind::Short, EpicsValue::CharArray(bytes)) => {
             let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
             Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
@@ -422,7 +430,7 @@ fn epics_to_string(v: &EpicsValue, kind: CaStringKind) -> Option<String> {
 /// Long-string puts append a NUL terminator (areaDetector convention).
 fn string_to_epics(s: &str, kind: CaStringKind) -> EpicsValue {
     match kind {
-        CaStringKind::Short => EpicsValue::String(s.to_string()),
+        CaStringKind::Short => EpicsValue::String(s.into()),
         CaStringKind::Long => {
             let mut bytes = s.as_bytes().to_vec();
             bytes.push(0);
@@ -518,11 +526,7 @@ impl SignalBackend<f64> for EpicsCaBackend<f64> {
             };
             while let Some(Ok(snap)) = sub.recv().await {
                 if let Some(f) = epics_to_f64(&snap.value) {
-                    let ts = snap
-                        .timestamp
-                        .duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_secs_f64())
-                        .unwrap_or_default();
+                    let ts = ts_to_f64(snap.timestamp);
                     cb(&f, ts, Some(alarm_severity(snap.alarm.severity)));
                 }
             }
@@ -617,11 +621,7 @@ impl SignalBackend<Vec<f64>> for EpicsCaBackend<Vec<f64>> {
             };
             while let Some(Ok(snap)) = sub.recv().await {
                 if let Some(v) = epics_to_vec_f64(&snap.value) {
-                    let ts = snap
-                        .timestamp
-                        .duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_secs_f64())
-                        .unwrap_or_default();
+                    let ts = ts_to_f64(snap.timestamp);
                     cb(&v, ts, Some(alarm_severity(snap.alarm.severity)));
                 }
             }
@@ -714,11 +714,7 @@ impl SignalBackend<String> for EpicsCaBackend<String> {
             };
             while let Some(Ok(snap)) = sub.recv().await {
                 if let Some(s) = epics_to_string(&snap.value, kind) {
-                    let ts = snap
-                        .timestamp
-                        .duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_secs_f64())
-                        .unwrap_or_default();
+                    let ts = ts_to_f64(snap.timestamp);
                     cb(&s, ts, Some(alarm_severity(snap.alarm.severity)));
                 }
             }
@@ -815,11 +811,7 @@ impl SignalBackend<i64> for EpicsCaBackend<i64> {
             };
             while let Some(Ok(snap)) = sub.recv().await {
                 if let Some(i) = epics_to_i64(&snap.value) {
-                    let ts = snap
-                        .timestamp
-                        .duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_secs_f64())
-                        .unwrap_or_default();
+                    let ts = ts_to_f64(snap.timestamp);
                     cb(&i, ts, Some(alarm_severity(snap.alarm.severity)));
                 }
             }
@@ -904,11 +896,7 @@ impl SignalBackend<bool> for EpicsCaBackend<bool> {
             };
             while let Some(Ok(snap)) = sub.recv().await {
                 if let Some(b) = epics_to_bool(&snap.value) {
-                    let ts = snap
-                        .timestamp
-                        .duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_secs_f64())
-                        .unwrap_or_default();
+                    let ts = ts_to_f64(snap.timestamp);
                     cb(&b, ts, Some(alarm_severity(snap.alarm.severity)));
                 }
             }
@@ -958,9 +946,18 @@ fn epics_to_enum_label(v: &EpicsValue, choices: &[String]) -> Option<String> {
         EpicsValue::Enum(idx) => Some(enum_index_to_label(*idx, choices)),
         EpicsValue::Short(i) => Some(enum_index_to_label(*i as u16, choices)),
         EpicsValue::Long(i) => Some(enum_index_to_label(*i as u16, choices)),
-        EpicsValue::String(s) => Some(s.clone()),
+        EpicsValue::String(s) => Some(s.as_str_lossy().into_owned()),
         _ => None,
     }
+}
+
+/// EPICS enum choice labels arrive as `PvString` (raw wire bytes); bsrs
+/// models choices as UTF-8 `String`, so convert lossily at this boundary.
+fn enum_labels_to_strings(labels: Vec<PvString>) -> Vec<String> {
+    labels
+        .into_iter()
+        .map(|s| s.as_str_lossy().into_owned())
+        .collect()
 }
 
 /// CA backend for `DBR_ENUM` PVs (`mbbi`/`mbbo`, areaDetector `ImageMode`,
@@ -1005,7 +1002,10 @@ impl CaEnumBackend {
             .get_with_metadata(DbrClass::Ctrl)
             .await
             .map_err(|e| BsrsError::Backend(format!("ca enum ctrl get {}: {e}", self.pv)))?;
-        let choices = snap.enums.map(|e| e.strings).unwrap_or_default();
+        let choices = snap
+            .enums
+            .map(|e| enum_labels_to_strings(e.strings))
+            .unwrap_or_default();
         // First writer wins; a concurrent fetch resolves to the same labels.
         let _ = self.choices.set(choices);
         Ok(self.choices.get().cloned().unwrap_or_default())
@@ -1115,7 +1115,7 @@ impl SignalBackend<String> for CaEnumBackend {
                     .get_with_metadata(DbrClass::Ctrl)
                     .await
                     .ok()
-                    .and_then(|s| s.enums.map(|e| e.strings))
+                    .and_then(|s| s.enums.map(|e| enum_labels_to_strings(e.strings)))
                     .unwrap_or_default(),
             };
             let mut sub = match ch.subscribe().await {
@@ -1124,11 +1124,7 @@ impl SignalBackend<String> for CaEnumBackend {
             };
             while let Some(Ok(snap)) = sub.recv().await {
                 if let Some(label) = epics_to_enum_label(&snap.value, &choices) {
-                    let ts = snap
-                        .timestamp
-                        .duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_secs_f64())
-                        .unwrap_or_default();
+                    let ts = ts_to_f64(snap.timestamp);
                     cb(&label, ts, Some(alarm_severity(snap.alarm.severity)));
                 }
             }

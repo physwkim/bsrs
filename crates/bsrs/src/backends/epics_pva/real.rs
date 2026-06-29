@@ -151,7 +151,7 @@ fn pv_string_array(p: &PvField) -> Option<Vec<String>> {
     values
         .iter()
         .map(|v| match v {
-            ScalarValue::String(s) => Some(s.clone()),
+            ScalarValue::String(s) => Some(s.as_str_lossy().into_owned()),
             _ => None,
         })
         .collect()
@@ -182,7 +182,7 @@ fn pv_enum_to_label(fields: &[(String, PvField)]) -> Option<String> {
 
 fn pv_field_to_string(p: &PvField) -> Option<String> {
     match p {
-        PvField::Scalar(ScalarValue::String(s)) => Some(s.clone()),
+        PvField::Scalar(ScalarValue::String(s)) => Some(s.as_str_lossy().into_owned()),
         PvField::Structure(s) => {
             // NTEnum value substructure `{ index, choices }`: decode the
             // selected label. Checked before the NTScalar `value` recursion
@@ -325,7 +325,7 @@ fn pv_field_to_metadata(p: &PvField, want_units: bool, want_precision: bool) -> 
         if want_units {
             if let Some(PvField::Scalar(ScalarValue::String(u))) = field(display, "units") {
                 if !u.is_empty() {
-                    meta.units = Some(u.clone());
+                    meta.units = Some(u.as_str_lossy().into_owned());
                 }
             }
         }
@@ -576,7 +576,7 @@ impl SignalBackend<String> for EpicsPvaBackend<String> {
             .map_err(|e| BsrsError::Backend(format!("pva connect {}: {e}", self.pv)))
     }
     async fn put(&self, value: Option<String>) -> Result<()> {
-        let f = PvField::Scalar(ScalarValue::String(value.unwrap_or_default()));
+        let f = PvField::Scalar(ScalarValue::String(value.unwrap_or_default().into()));
         self.client
             .pvput_pv_field(&self.pv, &f)
             .await
@@ -882,7 +882,7 @@ mod tests {
             PvField::ScalarArrayTyped(epics_pva_rs::pvdata::TypedScalarArray::String(
                 choices
                     .iter()
-                    .map(|s| s.to_string())
+                    .map(|s| s.to_string().into())
                     .collect::<Vec<_>>()
                     .into(),
             ))
@@ -890,7 +890,7 @@ mod tests {
             PvField::ScalarArray(
                 choices
                     .iter()
-                    .map(|s| ScalarValue::String(s.to_string()))
+                    .map(|s| ScalarValue::String(s.to_string().into()))
                     .collect(),
             )
         };

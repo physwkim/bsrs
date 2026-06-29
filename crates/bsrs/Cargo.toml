@@ -66,9 +66,9 @@ rustyline = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 metrics = { version = "0.24", optional = true }
 metrics-exporter-prometheus = { version = "0.16", optional = true, default-features = false, features = ["http-listener"] }
-epics-ca-rs = { version = "0.16.2", optional = true }
-epics-base-rs = { version = "0.16.2", optional = true }
-epics-pva-rs = { version = "0.16.2", optional = true }
+epics-ca-rs = { version = "0.20.3", optional = true }
+epics-base-rs = { version = "0.20.3", optional = true }
+epics-pva-rs = { version = "0.20.3", optional = true }
 rust-hdf5 = { version = "0.2", features = ["deflate"], optional = true }
 
 [dev-dependencies]
