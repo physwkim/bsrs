@@ -48,9 +48,9 @@ jobs:
       - run: cargo run --example sync_count --quiet
       - run: cargo run --example scan_motor --quiet
 
-  # Verify each opt-in feature compiles and its tests pass. Default
-  # CI runs without these features so the matrix above stays fast;
-  # this job catches feature-gated regressions.
+  # Verify each opt-in feature of the consolidated `bsrs` crate compiles
+  # and its tests pass. Default CI runs without these features so the
+  # matrix above stays fast; this job catches feature-gated regressions.
   features:
     name: opt-in features
     runs-on: ubuntu-latest
@@ -58,37 +58,35 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # ZMQ document sink — needs libzmq.
+      # zmq / qs / metrics / cli all link the ZMQ transport — needs libzmq.
       - name: install libzmq
         run: sudo apt-get update && sudo apt-get install -y libzmq3-dev pkg-config
-      - name: build/test bsrs-callbacks --features zmq
-        run: cargo test -p bsrs-callbacks --features zmq --no-fail-fast
-      # Tiled document sink — pulls in tiled-client (HTTP).
-      - name: build/test bsrs-callbacks --features tiled
-        run: cargo test -p bsrs-callbacks --features tiled --no-fail-fast
-      # Lua `tiled.*` read-side bindings on bsrs-cli.
-      - name: build/test bsrs-cli --features tiled
-        run: cargo test -p bsrs-cli --features tiled --no-fail-fast
+      # ZMQ document sink.
+      - name: test bsrs --features zmq
+        run: cargo test -p bsrs --features zmq --no-fail-fast
+      # Tiled document sink — pulls in tiled-rs (HTTP).
+      - name: test bsrs --features tiled
+        run: cargo test -p bsrs --features tiled --no-fail-fast
+      # Lua `tiled.*` read-side bindings, exercised through the CLI/REPL.
+      - name: test bsrs --features cli,tiled
+        run: cargo test -p bsrs --features cli,tiled --no-fail-fast
       # Kafka document sink — pure-Rust kafka crate, no librdkafka.
-      - name: build/test bsrs-callbacks --features kafka
-        run: cargo test -p bsrs-callbacks --features kafka --no-fail-fast
-      # Prometheus metrics endpoint for bsrs-qs.
-      - name: build/test bsrs-qs --features metrics
-        run: cargo test -p bsrs-qs --features metrics --no-fail-fast
+      - name: test bsrs --features kafka
+        run: cargo test -p bsrs --features kafka --no-fail-fast
+      # Queue-server daemon + Prometheus metrics endpoint (metrics -> qs).
+      - name: test bsrs --features metrics
+        run: cargo test -p bsrs --features metrics --no-fail-fast
       # HDF5 detector frame sink — pure-Rust rust-hdf5, no system libhdf5.
-      - name: build/test bsrs-stream --features hdf5
-        run: cargo test -p bsrs-stream --features hdf5 --no-fail-fast
-      # PVA monitor source — pulls in epics-pva-rs.
-      - name: build bsrs-stream --features pva
-        run: cargo build -p bsrs-stream --features pva
+      - name: test bsrs --features hdf5
+        run: cargo test -p bsrs --features hdf5 --no-fail-fast
       # Real EPICS CA backend — pulls in epics-ca-rs + epics-base-rs.
       # Build-only for now (live IOC integration deferred to a
       # dedicated job that needs a softIoc subprocess).
-      - name: build bsrs-backend-epics-ca --features real
-        run: cargo build -p bsrs-backend-epics-ca --features real
-      # Real EPICS PVA backend.
-      - name: build bsrs-backend-epics-pva --features real
-        run: cargo build -p bsrs-backend-epics-pva --features real
-      # Wired `bsrs frame-source` (PVA + HDF5 + ZMQ).
-      - name: build bsrs-cli --features frame-source
-        run: cargo build -p bsrs-cli --features frame-source
+      - name: build bsrs --features ca
+        run: cargo build -p bsrs --features ca
+      # Real EPICS PVA backend — pulls in epics-pva-rs.
+      - name: build bsrs --features pva
+        run: cargo build -p bsrs --features pva
+      # Wired `bsrs frame-source` (CLI + PVA monitor source + HDF5 sink).
+      - name: build bsrs --features frame-source
+        run: cargo build -p bsrs --features frame-source
