@@ -1734,9 +1734,9 @@ checksum = "869b0adbda23651a9c5c0c3d270aac9fcb52e8622a8f2b17e57802d7791962f2"
 
 [[package]]
 name = "epics-base-rs"
-version = "0.20.3"
+version = "0.20.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e509a355ac8d5fa81450df13b08b9aca691dd12a67dbabce4e0b4e60c282bac7"
+checksum = "f9350a9b0f97e098d66f3eec1b710c6e08a822e70c089879a328aa05f2ebfb3b"
 dependencies = [
  "bytes",
  "chrono",
@@ -1756,9 +1756,9 @@ dependencies = [
 
 [[package]]
 name = "epics-ca-rs"
-version = "0.20.3"
+version = "0.20.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "511fefc270b9874dad78a8d57b7eb0b187b72c8e6797731cde9360b117dad048"
+checksum = "0b5b3d49bc440d3aa407ba470e2c0368c7587c5a979513d2406cacc729d02a2d"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1791,9 +1791,9 @@ dependencies = [
 
 [[package]]
 name = "epics-pva-rs"
-version = "0.20.3"
+version = "0.20.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0e58ef561ffb4f66b739bc0ecb78e36b7c795ce014a4713c30a0bdfbc8099a4"
+checksum = "52797107d779a6ffe8b127ade1dfdcd02069913098d4d424a74835f0d5941826"
 dependencies = [
  "bytes",
  "chrono",
@@ -6389,7 +6389,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

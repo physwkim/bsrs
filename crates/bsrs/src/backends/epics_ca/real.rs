@@ -312,6 +312,7 @@ fn f64_to_wire(t: DbFieldType, v: f64) -> EpicsValue {
         DbFieldType::UInt64 => EpicsValue::UInt64(v as u64),
         DbFieldType::UShort => EpicsValue::UShort(v as u16),
         DbFieldType::ULong => EpicsValue::ULong(v as u32),
+        DbFieldType::UChar => EpicsValue::UChar(v as u8),
         DbFieldType::String => EpicsValue::String(format!("{v}").into()),
     }
 }
@@ -329,6 +330,7 @@ fn i64_to_wire(t: DbFieldType, v: i64) -> EpicsValue {
         DbFieldType::UInt64 => EpicsValue::UInt64(v as u64),
         DbFieldType::UShort => EpicsValue::UShort(v as u16),
         DbFieldType::ULong => EpicsValue::ULong(v as u32),
+        DbFieldType::UChar => EpicsValue::UChar(v as u8),
         DbFieldType::String => EpicsValue::String(format!("{v}").into()),
     }
 }
@@ -385,6 +387,7 @@ fn f64s_to_wire(t: DbFieldType, v: Vec<f64>) -> EpicsValue {
         DbFieldType::UInt64 => EpicsValue::UInt64Array(v.iter().map(|x| *x as u64).collect()),
         DbFieldType::UShort => EpicsValue::UShortArray(v.iter().map(|x| *x as u16).collect()),
         DbFieldType::ULong => EpicsValue::ULongArray(v.iter().map(|x| *x as u32).collect()),
+        DbFieldType::UChar => EpicsValue::UCharArray(v.iter().map(|x| *x as u8).collect()),
     }
 }
 
@@ -1317,6 +1320,12 @@ mod tests {
             EpicsValue::CharArray(a) => assert_eq!(a, vec![65u8]),
             other => panic!("expected CharArray, got {other:?}"),
         }
+        // Unsigned 8-bit: 200 fits u8 but overflows the signed `Char` (i8),
+        // so this also pins the unsigned interpretation of the new arm.
+        match f64s_to_wire(DbFieldType::UChar, vec![200.0]) {
+            EpicsValue::UCharArray(a) => assert_eq!(a, vec![200u8]),
+            other => panic!("expected UCharArray, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1377,6 +1386,8 @@ mod tests {
             (DbFieldType::Short, 2),
             (DbFieldType::Enum, 2),
             (DbFieldType::Char, 1),
+            // DBF_UCHAR promotes to DBR_CHAR on the wire: 1 byte, like Char.
+            (DbFieldType::UChar, 1),
         ];
         for (t, want) in cases {
             assert_eq!(
