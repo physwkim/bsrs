@@ -1,7 +1,8 @@
 //! EPICS PV Access backend for bsrs.
 //!
-//! Like the CA backend, this crate is feature-gated. Default build = stub;
-//! `--features real` wires up `epics-pva-rs::PvaClient`.
+//! Like the CA backend, this is feature-gated. The `pva` feature (on by
+//! default) wires up `epics-pva-rs::PvaClient`; `--no-default-features`
+//! falls back to a stub that errors on call.
 
 #![deny(missing_docs)]
 

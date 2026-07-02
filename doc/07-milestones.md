@@ -6,7 +6,7 @@
 |---|---|---|
 | M0 | ✅ done | `bsrs-event-model` + `bsrs-core` + protocols (async + sync) |
 | M1 | ✅ done | `bsrs-backends/soft` + `bsrs-engine` + `count` plan + `JsonlSink` |
-| M2 | ⚠️ partial | `bsrs-backends/epics-ca` real impl behind `--features real` (compiles, no live IOC test) |
+| M2 | ⚠️ partial | `bsrs-backends/epics-ca` real impl behind `--features ca` (compiles, no live IOC test) |
 | M3 | ✅ done | `StandardDetector<C, W>` + `BinaryFrameSink` (DetectorWriter) + `scan` plan |
 | M4 | ✅ done | pause / resume / checkpoint / suspender + SIGINT 3-tap |
 | M5 | ✅ done | `bsrs-backends/epics-pva` real impl + `PvaMonitorSource` (NTNDArray zero-copy) + `BinaryFrameSink` |

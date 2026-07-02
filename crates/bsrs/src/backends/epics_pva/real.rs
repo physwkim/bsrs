@@ -1044,7 +1044,7 @@ mod tests {
     // Live-IOC monitor smoke test. Marked #[ignore] because it
     // requires the mini-beamline mini_ioc to be running and reachable.
     // Run manually with:
-    //   cargo test -p bsrs-backend-epics-pva --features real \
+    //   cargo test -p bsrs --features pva \
     //       --lib pva_monitor_live_mini_current -- --ignored --nocapture
     // PV `mini:current` is a 1Hz oscillating beam-current readback —
     // we should get multiple callback invocations within 3 seconds.

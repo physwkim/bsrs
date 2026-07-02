@@ -1,4 +1,4 @@
-//! Stub backend used when the `real` feature is disabled.
+//! Stub backend used when the `ca` feature is off (`--no-default-features`).
 
 use crate::core::error::{BsrsError, Result};
 use crate::core::reading::ReadingValue;
@@ -9,9 +9,9 @@ use async_trait::async_trait;
 use serde::Serialize;
 use std::time::Duration;
 
-const DISABLED: &str = "epics-ca backend disabled — build with --features real";
+const DISABLED: &str = "epics-ca backend disabled — build with --features ca";
 
-/// Stub backend that always errors. Replace by enabling the `real` feature.
+/// Stub backend that always errors. Replace by enabling the `ca` feature.
 pub struct EpicsCaBackend<T: Clone + Send + Sync + 'static> {
     pv: String,
     _marker: std::marker::PhantomData<T>,

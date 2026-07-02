@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 use std::time::Duration;
 
-const DISABLED: &str = "epics-pva backend disabled — build with --features real";
+const DISABLED: &str = "epics-pva backend disabled — build with --features pva";
 
 /// Stub PVA backend.
 pub struct EpicsPvaBackend<T: Clone + Send + Sync + 'static> {
