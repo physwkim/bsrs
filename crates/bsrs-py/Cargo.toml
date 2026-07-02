@@ -3,6 +3,7 @@ name = "bsrs-py"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 description = "Python bindings (PyO3) for bsrs — RunEngine + soft devices + plan factories."
 
 [lib]
@@ -11,10 +12,9 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"] }
-bsrs-core.workspace = true
-bsrs-engine.workspace = true
-bsrs-plans.workspace = true
-bsrs-backend-soft.workspace = true
+# Consolidated single crate: core + engine + plans + soft backend are all
+# always-on modules, so no feature flags are needed here.
+bsrs.workspace = true
 serde_json.workspace = true
 
 [features]

@@ -15,16 +15,68 @@ use std::time::Duration;
 
 use bsrs::backends::soft::SoftDetector;
 use bsrs::callbacks::CapturingSink;
+use bsrs::core::msg::Msg;
+use bsrs::core::plan::{plan_box, Plan};
+use bsrs::engine::EngineRunState;
+use bsrs::event_model::{DocFilter, Document};
 use bsrs::prelude::*;
-use bsrs_core::msg::Msg;
-use bsrs_core::plan::{plan_box, Plan};
-use bsrs_engine::EngineRunState;
-use bsrs_event_model::{DocFilter, Document};
 use serde_json::Value;
 
 fn one_count_plan() -> Plan {
     let det = SoftDetector::new("det1");
     bsrs::ophyd_async::count(vec![det], 1)
+}
+
+// -- Deterministic test synchronization --------------------------------------
+//
+// These tests drive the engine from a separate task and then observe a
+// loop-driven side effect (state change, device-hook counter, emitted
+// Document). Fixed `sleep`s to bridge that async gap are load-sensitive: on a
+// busy runner the spawned plan may not have progressed far enough, so the
+// assertion races the engine. Two engine facts make a fixed sleep especially
+// fragile: `run_async` resets `is_paused = false` at startup (run_engine.rs:
+// 506), so a `pause()` issued before the engine is Running is wiped; and
+// `record_interruption` is a no-op until `OpenRun` has declared the stream.
+//
+// The helpers below replace fixed sleeps with bounded polling of the exact
+// signal each test depends on:
+//   * input gate — wait until the engine is `Running` before issuing a
+//     pause/suspend/signal (it is then parked at the first awaiting message
+//     with all leading plan messages already processed, on the single-threaded
+//     test runtime), so the action can never be wiped by the startup reset;
+//   * output wait — poll the asserted condition (state / counter / Document)
+//     so the assertion only runs once the loop has actually produced it.
+// Each helper is bounded so a genuine regression fails clearly, not by hanging.
+
+/// Poll `pred` until it holds. For synchronous reads — `state()`, device-hook
+/// counters, receiver counts.
+async fn wait_until(what: &str, pred: impl Fn() -> bool) {
+    for _ in 0..1000 {
+        if pred() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("'{what}' did not occur within ~5s");
+}
+
+/// Wait until the engine reports `target`. `state()` reflects the *requested*
+/// state for manual pause/resume (set synchronously), but for suspender- and
+/// loop-driven transitions it flips asynchronously — polling covers both.
+async fn wait_for_state(re: &RunEngine, target: EngineRunState) {
+    wait_until(&format!("state == {target:?}"), || re.state() == target).await;
+}
+
+/// Poll the sink until `pred` holds over its captured documents — for
+/// assertions on emitted Documents (interruption events, monitor events).
+async fn wait_for_docs(sink: &CapturingSink, what: &str, pred: impl Fn(&[Document]) -> bool) {
+    for _ in 0..1000 {
+        if pred(&sink.snapshot().await) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("'{what}' did not occur within ~5s");
 }
 
 #[tokio::test]
@@ -122,7 +174,7 @@ async fn md_validator_rejects_run() {
     let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
     re.set_md_validator(Some(Arc::new(|md| {
         if md.contains_key("forbidden") {
-            Err(bsrs_core::error::BsrsError::Plan("forbidden key".into()))
+            Err(bsrs::core::error::BsrsError::Plan("forbidden key".into()))
         } else {
             Ok(())
         }
@@ -217,7 +269,7 @@ async fn wait_is_replayed_on_rewind() {
     // rewind replayed [Set, Read] WITHOUT the Wait — the re-issued move was not
     // awaited before the replayed read (a stale value on resume-rewind). Every
     // replayed Set must be re-paired with its Wait.
-    let motor: Arc<dyn bsrs_core::msg::MovableObj> =
+    let motor: Arc<dyn bsrs::core::msg::MovableObj> =
         Arc::new(bsrs::backends::soft::SoftMotor::new("m", None));
 
     let seen = Arc::new(StdMutex::new(Vec::<String>::new()));
@@ -289,39 +341,39 @@ async fn configure_is_replayed_on_rewind() {
     struct CountingConfigurable {
         configures: Arc<AtomicUsize>,
     }
-    impl bsrs_core::msg::NamedObj for CountingConfigurable {
+    impl bsrs::core::msg::NamedObj for CountingConfigurable {
         fn name(&self) -> &str {
             "cfg"
         }
     }
     #[async_trait::async_trait]
-    impl bsrs_core::msg::ConfigurableObj for CountingConfigurable {
+    impl bsrs::core::msg::ConfigurableObj for CountingConfigurable {
         async fn read_configuration_dyn(
             &self,
         ) -> Result<
-            std::collections::HashMap<String, bsrs_core::reading::ReadingValue>,
-            bsrs_core::error::BsrsError,
+            std::collections::HashMap<String, bsrs::core::reading::ReadingValue>,
+            bsrs::core::error::BsrsError,
         > {
             Ok(std::collections::HashMap::new())
         }
         async fn describe_configuration_dyn(
             &self,
         ) -> Result<
-            std::collections::HashMap<String, bsrs_event_model::DataKey>,
-            bsrs_core::error::BsrsError,
+            std::collections::HashMap<String, bsrs::event_model::DataKey>,
+            bsrs::core::error::BsrsError,
         > {
             Ok(std::collections::HashMap::new())
         }
         async fn configure_dyn(
             &self,
-            _args: bsrs_core::msg::ConfigureArgs,
-        ) -> Result<(), bsrs_core::error::BsrsError> {
+            _args: bsrs::core::msg::ConfigureArgs,
+        ) -> Result<(), bsrs::core::error::BsrsError> {
             self.configures.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
     let configures = Arc::new(AtomicUsize::new(0));
-    let dev: Arc<dyn bsrs_core::msg::ConfigurableObj> = Arc::new(CountingConfigurable {
+    let dev: Arc<dyn bsrs::core::msg::ConfigurableObj> = Arc::new(CountingConfigurable {
         configures: configures.clone(),
     });
 
@@ -496,7 +548,7 @@ async fn msg_publish_goes_through_broadcast() {
     let sink = Arc::new(CapturingSink::new());
     let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
 
-    let resource = Document::Resource(bsrs_event_model::Resource {
+    let resource = Document::Resource(bsrs::event_model::Resource {
         uid: "r-1".into(),
         spec: "AD_HDF5_SWMR_STREAM".into(),
         root: "/data".into(),
@@ -542,7 +594,7 @@ async fn unknown_custom_command_errors() {
 
 #[tokio::test]
 async fn suspend_bool_high_pauses_on_high_resumes_on_low() {
-    use bsrs_engine::SuspendBoolHigh;
+    use bsrs::engine::SuspendBoolHigh;
     let (tx, rx) = tokio::sync::watch::channel(false);
     let re = Arc::new(RunEngine::new(vec![]));
     let _watcher = SuspendBoolHigh::new("shutter", rx).install(re.clone());
@@ -554,11 +606,11 @@ async fn suspend_bool_high_pauses_on_high_resumes_on_low() {
         yield Msg::Sleep(Duration::from_millis(50));
     });
     let join = tokio::spawn(async move { re2.run_async(plan).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_state(&re, EngineRunState::Running).await;
 
     // Trigger BAD: signal goes high → engine should pause.
     tx.send(true).unwrap();
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    wait_for_state(&re, EngineRunState::Paused).await;
     assert_eq!(
         re.state(),
         EngineRunState::Paused,
@@ -578,7 +630,7 @@ async fn suspend_bool_high_pauses_on_high_resumes_on_low() {
 
 #[tokio::test]
 async fn suspend_bool_low_pauses_on_low_resumes_on_high() {
-    use bsrs_engine::SuspendBoolLow;
+    use bsrs::engine::SuspendBoolLow;
     let (tx, rx) = tokio::sync::watch::channel(true);
     let re = Arc::new(RunEngine::new(vec![]));
     let _watcher = SuspendBoolLow::new("beam", rx).install(re.clone());
@@ -590,10 +642,10 @@ async fn suspend_bool_low_pauses_on_low_resumes_on_high() {
         yield Msg::Sleep(Duration::from_millis(50));
     });
     let join = tokio::spawn(async move { re2.run_async(plan).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_state(&re, EngineRunState::Running).await;
 
     tx.send(false).unwrap();
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    wait_for_state(&re, EngineRunState::Paused).await;
     assert_eq!(re.state(), EngineRunState::Paused);
 
     tx.send(true).unwrap();
@@ -607,7 +659,7 @@ async fn suspend_bool_low_pauses_on_low_resumes_on_high() {
 
 #[tokio::test]
 async fn suspend_threshold_floor_pauses_when_below() {
-    use bsrs_engine::{SuspendThreshold, ThresholdDirection};
+    use bsrs::engine::{SuspendThreshold, ThresholdDirection};
     let (tx, rx) = tokio::sync::watch::channel(100.0_f64);
     let re = Arc::new(RunEngine::new(vec![]));
     let _watcher = SuspendThreshold::new("beam_current", rx, 50.0, ThresholdDirection::BadIfBelow)
@@ -620,10 +672,10 @@ async fn suspend_threshold_floor_pauses_when_below() {
         yield Msg::Sleep(Duration::from_millis(50));
     });
     let join = tokio::spawn(async move { re2.run_async(plan).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_state(&re, EngineRunState::Running).await;
 
     tx.send(40.0).unwrap();
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    wait_for_state(&re, EngineRunState::Paused).await;
     assert_eq!(re.state(), EngineRunState::Paused);
 
     tx.send(80.0).unwrap();
@@ -638,7 +690,7 @@ async fn suspend_threshold_floor_pauses_when_below() {
 #[tokio::test]
 async fn suspend_outside_band_pauses_outside_resumes_inside() {
     // ENG-13: pause when value leaves (band_bottom, band_top), resume inside.
-    use bsrs_engine::SuspendOutsideBand;
+    use bsrs::engine::SuspendOutsideBand;
     let (tx, rx) = tokio::sync::watch::channel(25.0_f64); // inside (20, 30)
     let re = Arc::new(RunEngine::new(vec![]));
     let _watcher = SuspendOutsideBand::new("temperature", rx, 20.0, 30.0).install(re.clone());
@@ -650,11 +702,11 @@ async fn suspend_outside_band_pauses_outside_resumes_inside() {
         yield Msg::Sleep(Duration::from_millis(50));
     });
     let join = tokio::spawn(async move { re2.run_async(plan).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_state(&re, EngineRunState::Running).await;
 
     // Leave the band above the top edge → pause.
     tx.send(35.0).unwrap();
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    wait_for_state(&re, EngineRunState::Paused).await;
     assert_eq!(
         re.state(),
         EngineRunState::Paused,
@@ -675,7 +727,7 @@ async fn suspend_outside_band_pauses_outside_resumes_inside() {
 async fn suspend_when_changed_allow_resume_pauses_then_resumes() {
     // ENG-13: with allow_resume, deviating from `expected` pauses; returning
     // to `expected` auto-resumes.
-    use bsrs_engine::SuspendWhenChanged;
+    use bsrs::engine::SuspendWhenChanged;
     let (tx, rx) = tokio::sync::watch::channel("operate".to_string());
     let re = Arc::new(RunEngine::new(vec![]));
     let _watcher = SuspendWhenChanged::new("facility_mode", rx, "operate".to_string())
@@ -689,10 +741,10 @@ async fn suspend_when_changed_allow_resume_pauses_then_resumes() {
         yield Msg::Sleep(Duration::from_millis(50));
     });
     let join = tokio::spawn(async move { re2.run_async(plan).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_state(&re, EngineRunState::Running).await;
 
     tx.send("shutdown".to_string()).unwrap();
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    wait_for_state(&re, EngineRunState::Paused).await;
     assert_eq!(
         re.state(),
         EngineRunState::Paused,
@@ -712,7 +764,7 @@ async fn suspend_when_changed_allow_resume_pauses_then_resumes() {
 async fn suspend_when_changed_no_resume_requires_manual_resume() {
     // ENG-13: default (allow_resume=false) is one-shot — returning to
     // `expected` does NOT auto-resume; only a manual RE.resume() lifts it.
-    use bsrs_engine::SuspendWhenChanged;
+    use bsrs::engine::SuspendWhenChanged;
     let (tx, rx) = tokio::sync::watch::channel(0_i64);
     // Keep a receiver alive: the one-shot watcher drops its own on trip, and
     // we still want `tx.send` to succeed afterwards to prove it does nothing.
@@ -727,10 +779,10 @@ async fn suspend_when_changed_no_resume_requires_manual_resume() {
         yield Msg::Sleep(Duration::from_millis(50));
     });
     let join = tokio::spawn(async move { re2.run_async(plan).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_state(&re, EngineRunState::Running).await;
 
     tx.send(1).unwrap(); // deviate → pause
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    wait_for_state(&re, EngineRunState::Paused).await;
     assert_eq!(re.state(), EngineRunState::Paused);
 
     // Return to expected: must NOT auto-resume (one-shot).
@@ -794,12 +846,12 @@ async fn msg_fail_marks_run_failed_with_reason() {
 
 struct TestMonitor {
     name: String,
-    tx: tokio::sync::watch::Sender<bsrs_core::reading::ReadingValue>,
+    tx: tokio::sync::watch::Sender<bsrs::core::reading::ReadingValue>,
 }
 
 impl TestMonitor {
     fn new(name: &str) -> Arc<Self> {
-        let (tx, _rx) = tokio::sync::watch::channel(bsrs_core::reading::ReadingValue {
+        let (tx, _rx) = tokio::sync::watch::channel(bsrs::core::reading::ReadingValue {
             value: Value::from(0.0),
             timestamp: 0.0,
             alarm_severity: None,
@@ -811,31 +863,31 @@ impl TestMonitor {
         })
     }
     fn push(&self, v: f64, ts: f64) {
-        let _ = self.tx.send(bsrs_core::reading::ReadingValue {
+        let _ = self.tx.send(bsrs::core::reading::ReadingValue {
             value: Value::from(v),
             timestamp: ts,
             alarm_severity: None,
             message: None,
         });
     }
-    fn rx(&self) -> tokio::sync::watch::Receiver<bsrs_core::reading::ReadingValue> {
+    fn rx(&self) -> tokio::sync::watch::Receiver<bsrs::core::reading::ReadingValue> {
         self.tx.subscribe()
     }
 }
 
-impl bsrs_core::msg::NamedObj for TestMonitor {
+impl bsrs::core::msg::NamedObj for TestMonitor {
     fn name(&self) -> &str {
         &self.name
     }
 }
 
 #[async_trait::async_trait]
-impl bsrs_core::msg::ReadableObj for TestMonitor {
+impl bsrs::core::msg::ReadableObj for TestMonitor {
     async fn read_dyn(
         &self,
     ) -> Result<
-        std::collections::HashMap<String, bsrs_core::reading::ReadingValue>,
-        bsrs_core::error::BsrsError,
+        std::collections::HashMap<String, bsrs::core::reading::ReadingValue>,
+        bsrs::core::error::BsrsError,
     > {
         let v = self.tx.borrow().clone();
         let mut out = std::collections::HashMap::new();
@@ -845,15 +897,15 @@ impl bsrs_core::msg::ReadableObj for TestMonitor {
     async fn describe_dyn(
         &self,
     ) -> Result<
-        std::collections::HashMap<String, bsrs_event_model::DataKey>,
-        bsrs_core::error::BsrsError,
+        std::collections::HashMap<String, bsrs::event_model::DataKey>,
+        bsrs::core::error::BsrsError,
     > {
         let mut out = std::collections::HashMap::new();
         out.insert(
             self.name.clone(),
-            bsrs_event_model::DataKey {
+            bsrs::event_model::DataKey {
                 source: format!("test://{}", self.name),
-                dtype: bsrs_event_model::Dtype::Number,
+                dtype: bsrs::event_model::Dtype::Number,
                 shape: vec![],
                 dtype_numpy: Some("<f8".into()),
                 external: None,
@@ -870,14 +922,14 @@ impl bsrs_core::msg::ReadableObj for TestMonitor {
 }
 
 #[async_trait::async_trait]
-impl bsrs_core::msg::MonitorableObj for TestMonitor {
+impl bsrs::core::msg::MonitorableObj for TestMonitor {
     async fn subscribe_dyn(
         &self,
-    ) -> Result<bsrs_core::subscription::Subscription, bsrs_core::error::BsrsError> {
+    ) -> Result<bsrs::core::subscription::Subscription, bsrs::core::error::BsrsError> {
         let rx = self.rx();
-        Ok(bsrs_core::subscription::Subscription::new(
+        Ok(bsrs::core::subscription::Subscription::new(
             rx,
-            bsrs_core::status::SubToken::noop(),
+            bsrs::core::status::SubToken::noop(),
         ))
     }
 }
@@ -887,7 +939,7 @@ async fn monitor_emits_descriptor_then_events() {
     let sink = Arc::new(CapturingSink::new());
     let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
     let mon = TestMonitor::new("mon1");
-    let mon_for_plan: Arc<dyn bsrs_core::msg::MonitorableObj> = mon.clone();
+    let mon_for_plan: Arc<dyn bsrs::core::msg::MonitorableObj> = mon.clone();
 
     let mon_for_drive = mon.clone();
     let plan = plan_box(async_stream::stream! {
@@ -935,7 +987,7 @@ async fn bare_monitor_default_stream_name_is_unique_not_device_name() {
     let sink = Arc::new(CapturingSink::new());
     let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
     let mon = TestMonitor::new("mon1");
-    let mon_for_plan: Arc<dyn bsrs_core::msg::MonitorableObj> = mon.clone();
+    let mon_for_plan: Arc<dyn bsrs::core::msg::MonitorableObj> = mon.clone();
     let plan = plan_box(async_stream::stream! {
         yield Msg::OpenRun(Default::default());
         yield Msg::Monitor { obj: mon_for_plan.clone(), name: None };
@@ -982,7 +1034,7 @@ async fn second_monitor_of_same_object_is_rejected() {
     let sink = Arc::new(CapturingSink::new());
     let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
     let mon = TestMonitor::new("mon1");
-    let mon_for_plan: Arc<dyn bsrs_core::msg::MonitorableObj> = mon.clone();
+    let mon_for_plan: Arc<dyn bsrs::core::msg::MonitorableObj> = mon.clone();
     let plan = plan_box(async_stream::stream! {
         yield Msg::OpenRun(Default::default());
         yield Msg::Monitor { obj: mon_for_plan.clone(), name: Some("stream_a".into()) };
@@ -1024,7 +1076,7 @@ async fn unmonitor_of_unmonitored_object_is_rejected() {
     let sink = Arc::new(CapturingSink::new());
     let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
     let mon = TestMonitor::new("mon1");
-    let mon_for_plan: Arc<dyn bsrs_core::msg::MonitorableObj> = mon.clone();
+    let mon_for_plan: Arc<dyn bsrs::core::msg::MonitorableObj> = mon.clone();
     let plan = plan_box(async_stream::stream! {
         yield Msg::OpenRun(Default::default());
         // Never monitored — this 'unmonitor' must be rejected, not silently
@@ -1044,12 +1096,12 @@ async fn unmonitor_of_unmonitored_object_is_rejected() {
 struct DescribeCountingMonitor {
     name: String,
     describes: Arc<AtomicU64>,
-    tx: tokio::sync::watch::Sender<bsrs_core::reading::ReadingValue>,
+    tx: tokio::sync::watch::Sender<bsrs::core::reading::ReadingValue>,
 }
 
 impl DescribeCountingMonitor {
     fn new(name: &str) -> (Arc<Self>, Arc<AtomicU64>) {
-        let (tx, _rx) = tokio::sync::watch::channel(bsrs_core::reading::ReadingValue {
+        let (tx, _rx) = tokio::sync::watch::channel(bsrs::core::reading::ReadingValue {
             value: Value::from(0.0),
             timestamp: 0.0,
             alarm_severity: None,
@@ -1067,27 +1119,27 @@ impl DescribeCountingMonitor {
     }
 }
 
-impl bsrs_core::msg::NamedObj for DescribeCountingMonitor {
+impl bsrs::core::msg::NamedObj for DescribeCountingMonitor {
     fn name(&self) -> &str {
         &self.name
     }
 }
 
 #[async_trait::async_trait]
-impl bsrs_core::msg::ReadableObj for DescribeCountingMonitor {
+impl bsrs::core::msg::ReadableObj for DescribeCountingMonitor {
     async fn read_dyn(
         &self,
     ) -> Result<
-        std::collections::HashMap<String, bsrs_core::reading::ReadingValue>,
-        bsrs_core::error::BsrsError,
+        std::collections::HashMap<String, bsrs::core::reading::ReadingValue>,
+        bsrs::core::error::BsrsError,
     > {
         Ok(std::collections::HashMap::new())
     }
     async fn describe_dyn(
         &self,
     ) -> Result<
-        std::collections::HashMap<String, bsrs_event_model::DataKey>,
-        bsrs_core::error::BsrsError,
+        std::collections::HashMap<String, bsrs::event_model::DataKey>,
+        bsrs::core::error::BsrsError,
     > {
         self.describes.fetch_add(1, Ordering::SeqCst);
         Ok(std::collections::HashMap::new())
@@ -1095,13 +1147,13 @@ impl bsrs_core::msg::ReadableObj for DescribeCountingMonitor {
 }
 
 #[async_trait::async_trait]
-impl bsrs_core::msg::MonitorableObj for DescribeCountingMonitor {
+impl bsrs::core::msg::MonitorableObj for DescribeCountingMonitor {
     async fn subscribe_dyn(
         &self,
-    ) -> Result<bsrs_core::subscription::Subscription, bsrs_core::error::BsrsError> {
-        Ok(bsrs_core::subscription::Subscription::new(
+    ) -> Result<bsrs::core::subscription::Subscription, bsrs::core::error::BsrsError> {
+        Ok(bsrs::core::subscription::Subscription::new(
             self.tx.subscribe(),
-            bsrs_core::status::SubToken::noop(),
+            bsrs::core::status::SubToken::noop(),
         ))
     }
 }
@@ -1117,7 +1169,7 @@ async fn monitor_without_open_run_does_not_describe_the_device() {
     // either way, so the boundary is the describe COUNT, not exit_status:
     // 0 with the guard, 1 without (start_monitor describes, then fails).
     let (mon, describes) = DescribeCountingMonitor::new("mon1");
-    let mon_for_plan: Arc<dyn bsrs_core::msg::MonitorableObj> = mon;
+    let mon_for_plan: Arc<dyn bsrs::core::msg::MonitorableObj> = mon;
     let re = RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new());
     let plan = plan_box(async_stream::stream! {
         // No OpenRun — the monitor must be rejected before any describe.
@@ -1145,7 +1197,7 @@ async fn unmonitor_stops_pump_for_custom_named_stream() {
     let sink = Arc::new(CapturingSink::new());
     let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
     let mon = TestMonitor::new("mon1");
-    let mon_for_plan: Arc<dyn bsrs_core::msg::MonitorableObj> = mon.clone();
+    let mon_for_plan: Arc<dyn bsrs::core::msg::MonitorableObj> = mon.clone();
     let mon_for_drive = mon.clone();
     let plan = plan_box(async_stream::stream! {
         yield Msg::OpenRun(Default::default());
@@ -1194,7 +1246,7 @@ async fn close_run_tears_down_active_monitor_not_explicitly_unmonitored() {
     // holds the only receiver.
     let re = Arc::new(RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new()));
     let mon = TestMonitor::new("mon_close");
-    let mon_for_plan: Arc<dyn bsrs_core::msg::MonitorableObj> = mon.clone();
+    let mon_for_plan: Arc<dyn bsrs::core::msg::MonitorableObj> = mon.clone();
     let plan = plan_box(async_stream::stream! {
         yield Msg::OpenRun(Default::default());
         yield Msg::Monitor { obj: mon_for_plan, name: None };
@@ -1209,8 +1261,13 @@ async fn close_run_tears_down_active_monitor_not_explicitly_unmonitored() {
     let join = tokio::spawn(async move { re_run.run_async(plan).await });
 
     // Inside the post-close window (close fires ~50ms in; the trailing sleep
-    // runs to ~550ms; plan-end cleanup is only after that).
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    // runs to ~550ms; plan-end cleanup is only after that). Confirm the monitor
+    // first subscribes, then is torn down by close_run (not plan-end cleanup).
+    wait_until("monitor subscribed", || mon.tx.receiver_count() == 1).await;
+    wait_until("close_run unsubscribed the monitor", || {
+        mon.tx.receiver_count() == 0
+    })
+    .await;
     let receivers = mon.tx.receiver_count();
 
     join.await.unwrap().unwrap();
@@ -1232,7 +1289,7 @@ async fn monitor_survives_pause_and_resume() {
     let sink = Arc::new(CapturingSink::new());
     let re = Arc::new(RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]));
     let mon = TestMonitor::new("mon_pr");
-    let mon_for_plan: Arc<dyn bsrs_core::msg::MonitorableObj> = mon.clone();
+    let mon_for_plan: Arc<dyn bsrs::core::msg::MonitorableObj> = mon.clone();
     let plan = plan_box(async_stream::stream! {
         yield Msg::OpenRun(Default::default());
         yield Msg::Monitor { obj: mon_for_plan, name: None };
@@ -1246,7 +1303,10 @@ async fn monitor_survives_pause_and_resume() {
     let join = tokio::spawn(async move { re_run.run_async(plan).await });
 
     // The pump subscribes synchronously in start_monitor → 1 receiver running.
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    wait_until("monitor subscribed while running", || {
+        re.state() == EngineRunState::Running && mon.tx.receiver_count() == 1
+    })
+    .await;
     assert_eq!(re.state(), EngineRunState::Running);
     assert_eq!(
         mon.tx.receiver_count(),
@@ -1256,7 +1316,7 @@ async fn monitor_survives_pause_and_resume() {
 
     // Pause suspends the monitor: the live pump is dropped, releasing the sub.
     re.pause(false);
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    wait_until("pump dropped on pause", || mon.tx.receiver_count() == 0).await;
     assert_eq!(re.state(), EngineRunState::Paused);
     assert_eq!(
         mon.tx.receiver_count(),
@@ -1266,7 +1326,10 @@ async fn monitor_survives_pause_and_resume() {
 
     // Resume must re-install the monitor from the kept registry.
     re.resume();
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    wait_until("monitor restored on resume", || {
+        re.state() == EngineRunState::Running && mon.tx.receiver_count() == 1
+    })
+    .await;
     assert_eq!(re.state(), EngineRunState::Running);
     assert_eq!(
         mon.tx.receiver_count(),
@@ -1276,7 +1339,12 @@ async fn monitor_survives_pause_and_resume() {
 
     // A value pushed AFTER resume must flow through the restored pump as an Event.
     mon.push(42.0, 42.0);
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    wait_for_docs(&sink, "post-resume monitor event", |docs| {
+        docs.iter().any(|d| {
+            matches!(d, Document::Event(ev) if ev.data.get("mon_pr") == Some(&Value::from(42.0)))
+        })
+    })
+    .await;
 
     join.await.unwrap().unwrap();
 
@@ -1306,10 +1374,10 @@ async fn pause_changes_state_to_paused() {
         yield Msg::Sleep(Duration::from_millis(50));
     });
     let join = tokio::spawn(async move { re2.run_async(plan).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_state(&re, EngineRunState::Running).await;
     assert_eq!(re.state(), EngineRunState::Running);
     re.pause(false);
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    wait_for_state(&re, EngineRunState::Paused).await;
     assert_eq!(re.state(), EngineRunState::Paused);
     re.resume();
     let _ = join.await.unwrap();
@@ -1328,18 +1396,18 @@ struct StopCountingMovable {
     stops: Arc<AtomicU64>,
 }
 
-impl bsrs_core::msg::NamedObj for StopCountingMovable {
+impl bsrs::core::msg::NamedObj for StopCountingMovable {
     fn name(&self) -> &str {
         &self.name
     }
 }
 
 #[async_trait::async_trait]
-impl bsrs_core::msg::MovableObj for StopCountingMovable {
-    async fn set_dyn(&self, _value: f64) -> bsrs_core::status::Status {
-        bsrs_core::status::Status::done()
+impl bsrs::core::msg::MovableObj for StopCountingMovable {
+    async fn set_dyn(&self, _value: f64) -> bsrs::core::status::Status {
+        bsrs::core::status::Status::done()
     }
-    async fn stop_on_pause(&self, _success: bool) -> Result<(), bsrs_core::error::BsrsError> {
+    async fn stop_on_pause(&self, _success: bool) -> Result<(), bsrs::core::error::BsrsError> {
         self.stops.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -1348,7 +1416,7 @@ impl bsrs_core::msg::MovableObj for StopCountingMovable {
 #[tokio::test]
 async fn pause_calls_stop_on_pause_for_set_movables() {
     let stops = Arc::new(AtomicU64::new(0));
-    let mover: Arc<dyn bsrs_core::msg::MovableObj> = Arc::new(StopCountingMovable {
+    let mover: Arc<dyn bsrs::core::msg::MovableObj> = Arc::new(StopCountingMovable {
         name: "m1".into(),
         stops: stops.clone(),
     });
@@ -1363,9 +1431,9 @@ async fn pause_calls_stop_on_pause_for_set_movables() {
         yield Msg::CloseRun { exit_status: "success".into(), reason: None };
     });
     let join = tokio::spawn(async move { re2.run_async(plan).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_state(&re, EngineRunState::Running).await;
     re.pause(false);
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    wait_until("stop_on_pause fired", || stops.load(Ordering::SeqCst) >= 1).await;
     assert!(
         stops.load(Ordering::SeqCst) >= 1,
         "stop_on_pause should fire for movables touched by Msg::Set"
@@ -1377,7 +1445,7 @@ async fn pause_calls_stop_on_pause_for_set_movables() {
 #[tokio::test]
 async fn cleanup_calls_stop_on_pause_for_touched_movables() {
     let stops = Arc::new(AtomicU64::new(0));
-    let mover: Arc<dyn bsrs_core::msg::MovableObj> = Arc::new(StopCountingMovable {
+    let mover: Arc<dyn bsrs::core::msg::MovableObj> = Arc::new(StopCountingMovable {
         name: "m1".into(),
         stops: stops.clone(),
     });
@@ -1402,24 +1470,24 @@ struct ScriptedPreparable {
     captured: Arc<StdMutex<Vec<Value>>>,
 }
 
-impl bsrs_core::msg::NamedObj for ScriptedPreparable {
+impl bsrs::core::msg::NamedObj for ScriptedPreparable {
     fn name(&self) -> &str {
         &self.name
     }
 }
 
 #[async_trait::async_trait]
-impl bsrs_core::msg::PreparableObj for ScriptedPreparable {
-    async fn prepare_dyn(&self, value: Value) -> bsrs_core::status::Status {
+impl bsrs::core::msg::PreparableObj for ScriptedPreparable {
+    async fn prepare_dyn(&self, value: Value) -> bsrs::core::status::Status {
         self.captured.lock().unwrap().push(value);
-        bsrs_core::status::Status::done()
+        bsrs::core::status::Status::done()
     }
 }
 
 #[tokio::test]
 async fn prepare_invokes_device_and_groups_status() {
     let captured = Arc::new(StdMutex::new(Vec::<Value>::new()));
-    let dev: Arc<dyn bsrs_core::msg::PreparableObj> = Arc::new(ScriptedPreparable {
+    let dev: Arc<dyn bsrs::core::msg::PreparableObj> = Arc::new(ScriptedPreparable {
         name: "flyer".into(),
         captured: captured.clone(),
     });
@@ -1452,7 +1520,9 @@ async fn wait_for_runs_factories_concurrently() {
     let l1 = log.clone();
     let l2 = log.clone();
     let f1: Arc<
-        dyn Fn() -> futures::future::BoxFuture<'static, bsrs_core::error::Result<()>> + Send + Sync,
+        dyn Fn() -> futures::future::BoxFuture<'static, bsrs::core::error::Result<()>>
+            + Send
+            + Sync,
     > = Arc::new(move || {
         let l = l1.clone();
         Box::pin(async move {
@@ -1462,7 +1532,9 @@ async fn wait_for_runs_factories_concurrently() {
         })
     });
     let f2: Arc<
-        dyn Fn() -> futures::future::BoxFuture<'static, bsrs_core::error::Result<()>> + Send + Sync,
+        dyn Fn() -> futures::future::BoxFuture<'static, bsrs::core::error::Result<()>>
+            + Send
+            + Sync,
     > = Arc::new(move || {
         let l = l2.clone();
         Box::pin(async move {
@@ -1485,7 +1557,9 @@ async fn wait_for_runs_factories_concurrently() {
 #[tokio::test]
 async fn wait_for_times_out() {
     let f: Arc<
-        dyn Fn() -> futures::future::BoxFuture<'static, bsrs_core::error::Result<()>> + Send + Sync,
+        dyn Fn() -> futures::future::BoxFuture<'static, bsrs::core::error::Result<()>>
+            + Send
+            + Sync,
     > = Arc::new(|| {
         Box::pin(async move {
             tokio::time::sleep(Duration::from_secs(10)).await;
@@ -1511,19 +1585,19 @@ struct PauseTracker {
     resumed: Arc<AtomicU64>,
 }
 
-impl bsrs_core::msg::NamedObj for PauseTracker {
+impl bsrs::core::msg::NamedObj for PauseTracker {
     fn name(&self) -> &str {
         &self.name
     }
 }
 
 #[async_trait::async_trait]
-impl bsrs_core::msg::PausableObj for PauseTracker {
-    async fn pause_dyn(&self) -> Result<(), bsrs_core::error::BsrsError> {
+impl bsrs::core::msg::PausableObj for PauseTracker {
+    async fn pause_dyn(&self) -> Result<(), bsrs::core::error::BsrsError> {
         self.paused.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
-    async fn resume_dyn(&self) -> Result<(), bsrs_core::error::BsrsError> {
+    async fn resume_dyn(&self) -> Result<(), bsrs::core::error::BsrsError> {
         self.resumed.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -1533,7 +1607,7 @@ impl bsrs_core::msg::PausableObj for PauseTracker {
 async fn pausable_hooks_fire_on_pause_and_resume() {
     let paused = Arc::new(AtomicU64::new(0));
     let resumed = Arc::new(AtomicU64::new(0));
-    let dev: Arc<dyn bsrs_core::msg::PausableObj> = Arc::new(PauseTracker {
+    let dev: Arc<dyn bsrs::core::msg::PausableObj> = Arc::new(PauseTracker {
         name: "pausable_dev".into(),
         paused: paused.clone(),
         resumed: resumed.clone(),
@@ -1548,9 +1622,9 @@ async fn pausable_hooks_fire_on_pause_and_resume() {
         yield Msg::Sleep(Duration::from_millis(50));
     });
     let join = tokio::spawn(async move { re2.run_async(plan).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_state(&re, EngineRunState::Running).await;
     re.pause(false);
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    wait_until("pause_dyn fired", || paused.load(Ordering::SeqCst) >= 1).await;
     assert_eq!(
         paused.load(Ordering::SeqCst),
         1,
@@ -1569,7 +1643,7 @@ async fn pausable_hooks_fire_on_pause_and_resume() {
 async fn register_pausable_via_msg() {
     let paused = Arc::new(AtomicU64::new(0));
     let resumed = Arc::new(AtomicU64::new(0));
-    let dev: Arc<dyn bsrs_core::msg::PausableObj> = Arc::new(PauseTracker {
+    let dev: Arc<dyn bsrs::core::msg::PausableObj> = Arc::new(PauseTracker {
         name: "via_msg".into(),
         paused: paused.clone(),
         resumed: resumed.clone(),
@@ -1583,9 +1657,9 @@ async fn register_pausable_via_msg() {
         yield Msg::UnregisterPausable(dev);
     });
     let join = tokio::spawn(async move { re2.run_async(plan).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_state(&re, EngineRunState::Running).await;
     re.pause(false);
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    wait_until("pause_dyn fired", || paused.load(Ordering::SeqCst) >= 1).await;
     re.resume();
     let _ = join.await.unwrap();
     assert!(paused.load(Ordering::SeqCst) >= 1);
@@ -1603,9 +1677,9 @@ async fn request_suspend_pauses_engine() {
         yield Msg::Sleep(Duration::from_millis(50));
     });
     let join = tokio::spawn(async move { re2.run_async(plan).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_state(&re, EngineRunState::Running).await;
     re.request_suspend("shutter closed");
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    wait_for_state(&re, EngineRunState::Paused).await;
     assert_eq!(
         re.state(),
         EngineRunState::Paused,
@@ -1630,12 +1704,12 @@ async fn suspend_until_pauses_then_auto_resumes() {
         yield Msg::Sleep(Duration::from_millis(50));
     });
     let join = tokio::spawn(async move { re2.run_async(plan).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_state(&re, EngineRunState::Running).await;
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     re.suspend_until(Box::pin(async move {
         let _ = rx.await;
     }));
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    wait_for_state(&re, EngineRunState::Paused).await;
     assert_eq!(re.state(), EngineRunState::Paused);
     let _ = tx.send(());
     let _ = tokio::time::timeout(Duration::from_secs(2), join)
@@ -1663,7 +1737,7 @@ async fn input_with_handler_returns_text() {
     });
     re.run_async(plan).await.unwrap();
     match re.take_msg_result() {
-        bsrs_engine::MsgResult::Input { text } => assert_eq!(text, "answer:name?"),
+        bsrs::engine::MsgResult::Input { text } => assert_eq!(text, "answer:name?"),
         other => panic!("expected MsgResult::Input, got {other:?}"),
     }
 }
@@ -1688,7 +1762,7 @@ async fn re_class_reports_engine_name() {
     });
     re.run_async(plan).await.unwrap();
     match re.take_msg_result() {
-        bsrs_engine::MsgResult::EngineClass { name } => assert_eq!(name, "bsrs.RunEngine"),
+        bsrs::engine::MsgResult::EngineClass { name } => assert_eq!(name, "bsrs.RunEngine"),
         other => panic!("expected MsgResult::EngineClass, got {other:?}"),
     }
 }
@@ -1699,7 +1773,7 @@ async fn re_class_reports_engine_name() {
 async fn msg_subscribe_receives_documents_and_auto_unsubscribes() {
     let count = Arc::new(AtomicU64::new(0));
     let c2 = count.clone();
-    let cb: bsrs_core::msg::SubscribeCallback = Arc::new(move |_d| {
+    let cb: bsrs::core::msg::SubscribeCallback = Arc::new(move |_d| {
         c2.fetch_add(1, Ordering::SeqCst);
     });
     let re = RunEngine::new(vec![]);
@@ -1731,7 +1805,7 @@ async fn msg_subscribe_receives_documents_and_auto_unsubscribes() {
 async fn msg_unsubscribe_removes_callback_immediately() {
     let count = Arc::new(AtomicU64::new(0));
     let c2 = count.clone();
-    let cb: bsrs_core::msg::SubscribeCallback = Arc::new(move |_d| {
+    let cb: bsrs::core::msg::SubscribeCallback = Arc::new(move |_d| {
         c2.fetch_add(1, Ordering::SeqCst);
     });
     let re = Arc::new(RunEngine::new(vec![]));
@@ -1791,11 +1865,11 @@ async fn scan_id_source_overrides_auto_increment() {
 
 #[tokio::test]
 async fn preprocessor_wraps_plan() {
-    use bsrs_core::plan::PlanItem;
+    use bsrs::core::plan::PlanItem;
     use futures::StreamExt;
     let count = Arc::new(AtomicU64::new(0));
     let c2 = count.clone();
-    let pp: bsrs_engine::Preprocessor = Arc::new(move |inner: Plan| {
+    let pp: bsrs::engine::Preprocessor = Arc::new(move |inner: Plan| {
         let c = c2.clone();
         plan_box(async_stream::stream! {
             let mut inner = inner;
@@ -1827,7 +1901,7 @@ async fn run_async_with_per_call_md_lands_in_runstart() {
     let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
     let mut md = std::collections::HashMap::new();
     md.insert("operator".into(), Value::String("bob".into()));
-    let opts = bsrs_engine::RunOptions { md, subs: vec![] };
+    let opts = bsrs::engine::RunOptions { md, subs: vec![] };
     re.run_async_with(one_count_plan(), opts).await.unwrap();
     let docs = sink.snapshot().await;
     let start = match &docs[0] {
@@ -1863,7 +1937,7 @@ async fn per_call_md_wins_over_per_run_open_run_extra() {
     let plan = plan_box(async_stream::stream! {
         let mut extra = std::collections::HashMap::new();
         extra.insert("operator".to_string(), Value::String("plan".into()));
-        yield Msg::OpenRun(bsrs_core::msg::RunMetadata {
+        yield Msg::OpenRun(bsrs::core::msg::RunMetadata {
             extra,
             ..Default::default()
         });
@@ -1871,7 +1945,7 @@ async fn per_call_md_wins_over_per_run_open_run_extra() {
     });
     let mut md = std::collections::HashMap::new();
     md.insert("operator".into(), Value::String("user".into()));
-    let opts = bsrs_engine::RunOptions { md, subs: vec![] };
+    let opts = bsrs::engine::RunOptions { md, subs: vec![] };
     re.run_async_with(plan, opts).await.unwrap();
     let docs = sink.snapshot().await;
     let start = match &docs[0] {
@@ -1890,7 +1964,7 @@ async fn run_async_with_temp_subs_auto_remove_at_run_end() {
     let count = Arc::new(AtomicU64::new(0));
     let c2 = count.clone();
     let re = RunEngine::new(vec![]);
-    let opts = bsrs_engine::RunOptions {
+    let opts = bsrs::engine::RunOptions {
         md: Default::default(),
         subs: vec![Arc::new(move |_d: &Document| {
             c2.fetch_add(1, Ordering::SeqCst);
@@ -1924,9 +1998,32 @@ async fn record_interruptions_emits_descriptor_and_events() {
         yield Msg::CloseRun { exit_status: "success".into(), reason: None };
     });
     let join = tokio::spawn(async move { re2.run_async(plan).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Synchronize on documents the engine loop actually emits, not fixed
+    // sleeps. `record_interruption` is a no-op until `OpenRun` has declared
+    // the interruptions stream, and `pause()`/`resume()` only flip a flag
+    // (`state()` reflects the request, not the loop's acknowledgment). So:
+    // (1) wait for the interruptions Descriptor — proves the run is open and
+    //     the stream declared, so a subsequent pause will be recorded;
+    // (2) pause, then wait for the recorded "pause" Event — proves the loop
+    //     observed the pause and parked on the resume permit.
+    // Resuming before the loop acknowledges the pause would clear the flag
+    // before it is ever observed, recording nothing (`got 0`).
+    wait_for_docs(&sink, "interruptions descriptor", |docs| {
+        docs.iter().any(
+            |d| matches!(d, Document::Descriptor(d) if d.name.as_deref() == Some("interruptions")),
+        )
+    })
+    .await;
     re.pause(false);
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    wait_for_docs(&sink, "pause interruption event", |docs| {
+        docs.iter().any(|d| match d {
+            Document::Event(e) => {
+                e.data.get("interruption").and_then(|v| v.as_str()) == Some("pause")
+            }
+            _ => false,
+        })
+    })
+    .await;
     re.resume();
     let _ = join.await.unwrap().unwrap();
 
@@ -1984,9 +2081,8 @@ async fn record_interruptions_off_emits_nothing() {
         yield Msg::CloseRun { exit_status: "success".into(), reason: None };
     });
     let join = tokio::spawn(async move { re2.run_async(plan).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_state(&re, EngineRunState::Running).await;
     re.pause(false);
-    tokio::time::sleep(Duration::from_millis(30)).await;
     re.resume();
     let _ = join.await.unwrap().unwrap();
     let docs = sink.snapshot().await;
@@ -2014,7 +2110,12 @@ async fn suspend_until_with_records_justification() {
         yield Msg::CloseRun { exit_status: "success".into(), reason: None };
     });
     let join = tokio::spawn(async move { re2.run_async(plan).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_docs(&sink, "interruptions descriptor", |docs| {
+        docs.iter().any(
+            |d| matches!(d, Document::Descriptor(d) if d.name.as_deref() == Some("interruptions")),
+        )
+    })
+    .await;
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     re.suspend_until_with(
         Box::pin(async move {
@@ -2022,7 +2123,15 @@ async fn suspend_until_with_records_justification() {
         }),
         Some("shutter closed".into()),
     );
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    wait_for_docs(&sink, "justification recorded", |docs| {
+        docs.iter().any(|d| match d {
+            Document::Event(e) => {
+                e.data.get("interruption").and_then(|v| v.as_str()) == Some("shutter closed")
+            }
+            _ => false,
+        })
+    })
+    .await;
     let _ = tx.send(());
     let _ = tokio::time::timeout(Duration::from_secs(2), join)
         .await

@@ -30,18 +30,23 @@ frames into a `FramePipe` that fans out to one or more sinks.
 
 ## EPICS backends
 
-| Crate                       | Feature | Behavior without feature           |
-| --------------------------- | ------- | ---------------------------------- |
-| `bsrs-backend-epics-ca`   | `real`  | Stub backend that errors on call   |
-| `bsrs-backend-epics-pva`  | `real`  | Stub backend that errors on call   |
+Both EPICS backends live in the consolidated `bsrs` crate as features
+that are **on by default**:
+
+| Crate  | Feature | Behavior without the feature       |
+| ------ | ------- | ---------------------------------- |
+| `bsrs` | `ca`    | Stub backend that errors on call   |
+| `bsrs` | `pva`   | Stub backend that errors on call   |
 
 ```sh
-cargo build -p bsrs-backend-epics-ca --features real
+# Real backends build by default; opt out for an EPICS-free build:
+cargo build -p bsrs --no-default-features
 ```
 
-The stub-by-default lets the rest of the workspace compile cleanly
-on systems without EPICS. CI build-tests both the stub and the
-`real` paths; live IOC integration testing is on the roadmap.
+`--no-default-features` swaps in the stub backends so the rest of the
+workspace compiles cleanly on systems without EPICS. CI build-tests
+both the stub and the real paths; live IOC integration testing is on
+the roadmap.
 
 ## Lua read-side surface
 

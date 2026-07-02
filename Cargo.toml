@@ -2,27 +2,10 @@
 resolver = "2"
 default-members = [
     "crates/bsrs",
-    "crates/bsrs-cli",
 ]
 members = [
-    "crates/bsrs-event-model",
-    "crates/bsrs-core",
-    "crates/bsrs-derive",
-    "crates/bsrs-protocols-async",
-    "crates/bsrs-protocols-sync",
-    "crates/bsrs-engine",
-    "crates/bsrs-plans",
-    "crates/bsrs-devices",
-    "crates/bsrs-backends/soft",
-    "crates/bsrs-backends/mock",
-    "crates/bsrs-backends/epics-ca",
-    "crates/bsrs-backends/epics-pva",
-    "crates/bsrs-stream",
-    "crates/bsrs-callbacks",
     "crates/bsrs",
-    "crates/bsrs-cli",
-    "crates/bsrs-host",
-    "crates/bsrs-qs",
+    "crates/bsrs-derive",
     "crates/bsrs-py",
     "examples/mini_beamline_qs",
 ]
@@ -55,21 +38,10 @@ zmq = "0.10"
 mlua = { version = "0.11", features = ["lua54", "vendored", "send"] }
 rustyline = "14"
 
-# internal
-bsrs-event-model    = { path = "crates/bsrs-event-model" }
-bsrs-core           = { path = "crates/bsrs-core" }
-bsrs-protocols-async = { path = "crates/bsrs-protocols-async" }
-bsrs-protocols-sync  = { path = "crates/bsrs-protocols-sync" }
-bsrs-engine         = { path = "crates/bsrs-engine" }
-bsrs-plans          = { path = "crates/bsrs-plans" }
-bsrs-devices        = { path = "crates/bsrs-devices" }
-bsrs-backend-soft   = { path = "crates/bsrs-backends/soft" }
-bsrs-backend-mock   = { path = "crates/bsrs-backends/mock" }
-bsrs-stream         = { path = "crates/bsrs-stream" }
-bsrs-callbacks      = { path = "crates/bsrs-callbacks" }
-bsrs-derive         = { path = "crates/bsrs-derive" }
-bsrs-qs             = { path = "crates/bsrs-qs" }
-bsrs-host           = { path = "crates/bsrs-host" }
+# internal — the only surviving library crate besides the consolidated `bsrs`
+# is the proc-macro companion (a proc-macro cannot be a module of a normal crate).
+bsrs                = { version = "0.1.0", path = "crates/bsrs" }
+bsrs-derive         = { version = "0.1.0", path = "crates/bsrs-derive" }
 
 [profile.dev]
 opt-level = 1

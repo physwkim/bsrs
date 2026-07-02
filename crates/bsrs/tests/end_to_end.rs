@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use bsrs::backends::soft::{SoftDetector, SoftMotor};
 use bsrs::callbacks::CapturingSink;
+use bsrs::core::msg::{LocatableObj, StoppableObj};
 use bsrs::prelude::*;
-use bsrs_core::msg::{LocatableObj, StoppableObj};
 
 #[tokio::test]
 async fn count_plan_emits_expected_document_sequence() {
@@ -21,7 +21,7 @@ async fn count_plan_emits_expected_document_sequence() {
     let docs = sink.snapshot().await;
     assert_eq!(docs.len(), 8, "expected 8 documents, got {}", docs.len());
 
-    use bsrs_core::Document::*;
+    use bsrs::core::Document::*;
     assert!(matches!(&docs[0], Start(_)), "doc 0 is RunStart");
     assert!(matches!(&docs[1], Descriptor(_)), "doc 1 is Descriptor");
     for (i, d) in docs.iter().enumerate().take(7).skip(2) {
@@ -43,11 +43,11 @@ async fn adaptive_scan_runs_to_completion() {
     let motor = Arc::new(SoftMotor::new("m1", Some(0.0)));
     let sink = Arc::new(CapturingSink::new());
     let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
-    let plan = bsrs_plans::adaptive_scan(
-        vec![det.clone() as Arc<dyn bsrs_core::msg::ReadableObj>],
+    let plan = bsrs::plans::adaptive_scan(
+        vec![det.clone() as Arc<dyn bsrs::core::msg::ReadableObj>],
         "det1_counts",
-        motor.clone() as Arc<dyn bsrs_core::msg::MovableObj>,
-        motor.clone() as Arc<dyn bsrs_core::msg::ReadableObj>,
+        motor.clone() as Arc<dyn bsrs::core::msg::MovableObj>,
+        motor.clone() as Arc<dyn bsrs::core::msg::ReadableObj>,
         0.0,
         2.0,
         0.1,
@@ -67,11 +67,11 @@ async fn tune_centroid_moves_motor_to_computed_center() {
     let det = SoftDetector::new("det1");
     let motor = Arc::new(SoftMotor::new("m1", Some(0.0)));
     let re = RunEngine::new(vec![]);
-    let plan = bsrs_plans::tune_centroid(
-        vec![det.clone() as Arc<dyn bsrs_core::msg::ReadableObj>],
+    let plan = bsrs::plans::tune_centroid(
+        vec![det.clone() as Arc<dyn bsrs::core::msg::ReadableObj>],
         "det1_counts",
-        motor.clone() as Arc<dyn bsrs_core::msg::MovableObj>,
-        motor.clone() as Arc<dyn bsrs_core::msg::ReadableObj>,
+        motor.clone() as Arc<dyn bsrs::core::msg::MovableObj>,
+        motor.clone() as Arc<dyn bsrs::core::msg::ReadableObj>,
         0.0,
         4.0,
         5,
@@ -94,9 +94,9 @@ async fn scan_plan_emits_motor_and_detector_readings() {
     let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
 
     let plan = bsrs::ophyd_async::scan(
-        vec![det.clone() as Arc<dyn bsrs_core::msg::ReadableObj>],
-        motor.clone() as Arc<dyn bsrs_core::msg::MovableObj>,
-        motor.clone() as Arc<dyn bsrs_core::msg::ReadableObj>,
+        vec![det.clone() as Arc<dyn bsrs::core::msg::ReadableObj>],
+        motor.clone() as Arc<dyn bsrs::core::msg::MovableObj>,
+        motor.clone() as Arc<dyn bsrs::core::msg::ReadableObj>,
         0.0,
         4.0,
         5,
@@ -109,7 +109,7 @@ async fn scan_plan_emits_motor_and_detector_readings() {
     assert_eq!(docs.len(), 8);
 
     // Descriptor should carry both motor and detector data keys.
-    if let bsrs_core::Document::Descriptor(d) = &docs[1] {
+    if let bsrs::core::Document::Descriptor(d) = &docs[1] {
         assert!(
             d.data_keys.contains_key("m1"),
             "missing motor key: {:?}",
@@ -123,8 +123,8 @@ async fn scan_plan_emits_motor_and_detector_readings() {
 
 #[tokio::test]
 async fn binary_frame_sink_writes_and_emits_stream_docs() {
+    use bsrs::protocols_async::{DetectorWriter, Frame, FrameSink};
     use bsrs::stream::sinks::BinaryFrameSink;
-    use bsrs_protocols_async::{DetectorWriter, Frame, FrameSink};
     use futures::StreamExt;
 
     let tmp = tempdir().unwrap();
@@ -202,7 +202,7 @@ mod tempdir_shim {
 #[tokio::test]
 async fn fly_plan_drives_standard_detector_to_completion() {
     use bsrs::backends::soft::SoftDetector as ScalarDet;
-    use bsrs_core::msg::{CollectableObj, FlyableObj, StageableObj};
+    use bsrs::core::msg::{CollectableObj, FlyableObj, StageableObj};
     let _ = ScalarDet::new("ignored"); // ensure the import path is real
 
     let det = Arc::new(bsrs::backends::soft::detector::soft_detector("flydet"));
@@ -221,7 +221,7 @@ async fn fly_plan_drives_standard_detector_to_completion() {
     // RunStart, Descriptor (from describe_collect), StreamResource +
     // StreamDatum (from collect), Event (from collect), RunStop.
     assert!(docs.len() >= 4, "got {} docs: {:?}", docs.len(), docs);
-    use bsrs_core::Document::*;
+    use bsrs::core::Document::*;
     assert!(matches!(&docs[0], Start(_)));
     assert!(matches!(&docs[docs.len() - 1], Stop(_)));
 
@@ -270,21 +270,21 @@ async fn pause_then_resume_completes_run_with_success() {
     let pre_count = Arc::new(AtomicUsize::new(0));
     let pre_count_clone = pre_count.clone();
     let det_clone = det.clone();
-    let plan = bsrs_core::plan::plan_box(async_stream::stream! {
-        yield bsrs_core::Msg::OpenRun(Default::default());
-        yield bsrs_core::Msg::Create { stream_name: "primary".into() };
-        yield bsrs_core::Msg::Read(det_clone.clone() as Arc<dyn bsrs_core::msg::ReadableObj>);
-        yield bsrs_core::Msg::Save;
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        yield bsrs::core::Msg::Create { stream_name: "primary".into() };
+        yield bsrs::core::Msg::Read(det_clone.clone() as Arc<dyn bsrs::core::msg::ReadableObj>);
+        yield bsrs::core::Msg::Save;
         // ...checkpoint here...
-        yield bsrs_core::Msg::Checkpoint;
+        yield bsrs::core::Msg::Checkpoint;
         // signal that we've passed the first batch:
         pre_count_clone.store(1, Ordering::SeqCst);
-        yield bsrs_core::Msg::Pause { defer: false };
+        yield bsrs::core::Msg::Pause { defer: false };
         // After resume: another read-save + close.
-        yield bsrs_core::Msg::Create { stream_name: "primary".into() };
-        yield bsrs_core::Msg::Read(det_clone as Arc<dyn bsrs_core::msg::ReadableObj>);
-        yield bsrs_core::Msg::Save;
-        yield bsrs_core::Msg::CloseRun {
+        yield bsrs::core::Msg::Create { stream_name: "primary".into() };
+        yield bsrs::core::Msg::Read(det_clone as Arc<dyn bsrs::core::msg::ReadableObj>);
+        yield bsrs::core::Msg::Save;
+        yield bsrs::core::Msg::CloseRun {
             exit_status: "success".into(),
             reason: None,
         };
@@ -339,18 +339,18 @@ async fn rewind_rolls_back_seq_num_so_replayed_save_reemits_same_seq_num() {
     let reached = Arc::new(AtomicUsize::new(0));
     let reached_clone = reached.clone();
     let det_clone = det.clone();
-    let plan = bsrs_core::plan::plan_box(async_stream::stream! {
-        yield bsrs_core::Msg::OpenRun(Default::default());
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::OpenRun(Default::default());
         // Checkpoint BEFORE the bundle, so create/read/save are cached and
         // replayed on resume.
-        yield bsrs_core::Msg::Checkpoint;
-        yield bsrs_core::Msg::Create { stream_name: "primary".into() };
-        yield bsrs_core::Msg::Read(det_clone as Arc<dyn bsrs_core::msg::ReadableObj>);
-        yield bsrs_core::Msg::Save;
+        yield bsrs::core::Msg::Checkpoint;
+        yield bsrs::core::Msg::Create { stream_name: "primary".into() };
+        yield bsrs::core::Msg::Read(det_clone as Arc<dyn bsrs::core::msg::ReadableObj>);
+        yield bsrs::core::Msg::Save;
         reached_clone.store(1, Ordering::SeqCst);
-        yield bsrs_core::Msg::Pause { defer: false };
+        yield bsrs::core::Msg::Pause { defer: false };
         // The cached create/read/save replay here on resume.
-        yield bsrs_core::Msg::CloseRun {
+        yield bsrs::core::Msg::CloseRun {
             exit_status: "success".into(),
             reason: None,
         };
@@ -401,9 +401,9 @@ async fn read_outside_run_returns_ok_without_bundling() {
     let det = SoftDetector::new("rd_det");
     let re = RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new());
     let det_clone = det.clone();
-    let plan = bsrs_core::plan::plan_box(async_stream::stream! {
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
         // No OpenRun: a bare Read.
-        yield bsrs_core::Msg::Read(det_clone as Arc<dyn bsrs_core::msg::ReadableObj>);
+        yield bsrs::core::Msg::Read(det_clone as Arc<dyn bsrs::core::msg::ReadableObj>);
     });
     let result = re
         .run_async(plan)
@@ -419,34 +419,34 @@ struct ConfigurableDev {
     name: String,
 }
 
-impl bsrs_core::msg::NamedObj for ConfigurableDev {
+impl bsrs::core::msg::NamedObj for ConfigurableDev {
     fn name(&self) -> &str {
         &self.name
     }
 }
 
 #[async_trait::async_trait]
-impl bsrs_core::msg::ConfigurableObj for ConfigurableDev {
+impl bsrs::core::msg::ConfigurableObj for ConfigurableDev {
     async fn read_configuration_dyn(
         &self,
     ) -> Result<
-        std::collections::HashMap<String, bsrs_core::reading::ReadingValue>,
-        bsrs_core::error::BsrsError,
+        std::collections::HashMap<String, bsrs::core::reading::ReadingValue>,
+        bsrs::core::error::BsrsError,
     > {
         Ok(std::collections::HashMap::new())
     }
     async fn describe_configuration_dyn(
         &self,
     ) -> Result<
-        std::collections::HashMap<String, bsrs_event_model::DataKey>,
-        bsrs_core::error::BsrsError,
+        std::collections::HashMap<String, bsrs::event_model::DataKey>,
+        bsrs::core::error::BsrsError,
     > {
         Ok(std::collections::HashMap::new())
     }
     async fn configure_dyn(
         &self,
-        _args: bsrs_core::ConfigureArgs,
-    ) -> Result<(), bsrs_core::error::BsrsError> {
+        _args: bsrs::core::ConfigureArgs,
+    ) -> Result<(), bsrs::core::error::BsrsError> {
         Ok(())
     }
 }
@@ -458,17 +458,17 @@ async fn configure_inside_open_bundle_is_rejected() {
     // mid-bundle would desync the descriptor from readings already folded in.
     // Same bundling-guard family as checkpoint-in-bundle. The run loop turns the
     // handler error into RunResult{exit_status:"fail"} (never surfaces as Err).
-    let cfg: Arc<dyn bsrs_core::msg::ConfigurableObj> = Arc::new(ConfigurableDev {
+    let cfg: Arc<dyn bsrs::core::msg::ConfigurableObj> = Arc::new(ConfigurableDev {
         name: "cfg_dev".into(),
     });
     let re = RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new());
-    let plan = bsrs_core::plan::plan_box(async_stream::stream! {
-        yield bsrs_core::Msg::OpenRun(Default::default());
-        yield bsrs_core::Msg::Create { stream_name: "primary".into() };
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        yield bsrs::core::Msg::Create { stream_name: "primary".into() };
         // Configure while the bundle is open → illegal.
-        yield bsrs_core::Msg::Configure { obj: cfg, args: bsrs_core::ConfigureArgs::default() };
-        yield bsrs_core::Msg::Save;
-        yield bsrs_core::Msg::CloseRun { exit_status: "success".into(), reason: None };
+        yield bsrs::core::Msg::Configure { obj: cfg, args: bsrs::core::ConfigureArgs::default() };
+        yield bsrs::core::Msg::Save;
+        yield bsrs::core::Msg::CloseRun { exit_status: "success".into(), reason: None };
     });
     let result = re
         .run_async(plan)
@@ -484,26 +484,26 @@ struct CollidingReadable {
     name: String,
 }
 
-impl bsrs_core::msg::NamedObj for CollidingReadable {
+impl bsrs::core::msg::NamedObj for CollidingReadable {
     fn name(&self) -> &str {
         &self.name
     }
 }
 
 #[async_trait::async_trait]
-impl bsrs_core::msg::ReadableObj for CollidingReadable {
+impl bsrs::core::msg::ReadableObj for CollidingReadable {
     async fn read_dyn(
         &self,
     ) -> Result<
-        std::collections::HashMap<String, bsrs_core::reading::ReadingValue>,
-        bsrs_core::error::BsrsError,
+        std::collections::HashMap<String, bsrs::core::reading::ReadingValue>,
+        bsrs::core::error::BsrsError,
     > {
         // Every instance reports the SAME field name, so two of them read into
         // one bundle collide.
         let mut m = std::collections::HashMap::new();
         m.insert(
             "shared_key".to_string(),
-            bsrs_core::reading::ReadingValue {
+            bsrs::core::reading::ReadingValue {
                 value: serde_json::Value::from(1.0),
                 timestamp: 0.0,
                 alarm_severity: None,
@@ -515,15 +515,15 @@ impl bsrs_core::msg::ReadableObj for CollidingReadable {
     async fn describe_dyn(
         &self,
     ) -> Result<
-        std::collections::HashMap<String, bsrs_event_model::DataKey>,
-        bsrs_core::error::BsrsError,
+        std::collections::HashMap<String, bsrs::event_model::DataKey>,
+        bsrs::core::error::BsrsError,
     > {
         let mut m = std::collections::HashMap::new();
         m.insert(
             "shared_key".to_string(),
-            bsrs_event_model::DataKey {
+            bsrs::event_model::DataKey {
                 source: format!("test://{}", self.name),
-                dtype: bsrs_event_model::Dtype::Number,
+                dtype: bsrs::event_model::Dtype::Number,
                 shape: vec![],
                 dtype_numpy: Some("<f8".into()),
                 external: None,
@@ -546,21 +546,21 @@ async fn colliding_data_keys_in_one_event_are_rejected() {
     // would drop one object's reading and desync the descriptor from the event.
     // bsrs previously did a last-write-wins HashMap insert. The run loop turns
     // the handler error into RunResult{exit_status:"fail"}.
-    let a: Arc<dyn bsrs_core::msg::ReadableObj> = Arc::new(CollidingReadable {
+    let a: Arc<dyn bsrs::core::msg::ReadableObj> = Arc::new(CollidingReadable {
         name: "coll_a".into(),
     });
-    let b: Arc<dyn bsrs_core::msg::ReadableObj> = Arc::new(CollidingReadable {
+    let b: Arc<dyn bsrs::core::msg::ReadableObj> = Arc::new(CollidingReadable {
         name: "coll_b".into(),
     });
     let re = RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new());
-    let plan = bsrs_core::plan::plan_box(async_stream::stream! {
-        yield bsrs_core::Msg::OpenRun(Default::default());
-        yield bsrs_core::Msg::Create { stream_name: "primary".into() };
-        yield bsrs_core::Msg::Read(a);
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        yield bsrs::core::Msg::Create { stream_name: "primary".into() };
+        yield bsrs::core::Msg::Read(a);
         // Second read with the SAME field name → collision.
-        yield bsrs_core::Msg::Read(b);
-        yield bsrs_core::Msg::Save;
-        yield bsrs_core::Msg::CloseRun { exit_status: "success".into(), reason: None };
+        yield bsrs::core::Msg::Read(b);
+        yield bsrs::core::Msg::Save;
+        yield bsrs::core::Msg::CloseRun { exit_status: "success".into(), reason: None };
     });
     let result = re
         .run_async(plan)
@@ -579,14 +579,14 @@ async fn abort_closes_run_with_abort_status() {
     let re = Arc::new(RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]));
 
     let det_clone = det.clone();
-    let plan = bsrs_core::plan::plan_box(async_stream::stream! {
-        yield bsrs_core::Msg::OpenRun(Default::default());
-        yield bsrs_core::Msg::Create { stream_name: "primary".into() };
-        yield bsrs_core::Msg::Read(det_clone as Arc<dyn bsrs_core::msg::ReadableObj>);
-        yield bsrs_core::Msg::Save;
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        yield bsrs::core::Msg::Create { stream_name: "primary".into() };
+        yield bsrs::core::Msg::Read(det_clone as Arc<dyn bsrs::core::msg::ReadableObj>);
+        yield bsrs::core::Msg::Save;
         // Pause here; the test will abort instead of resuming.
-        yield bsrs_core::Msg::Pause { defer: false };
-        yield bsrs_core::Msg::CloseRun {
+        yield bsrs::core::Msg::Pause { defer: false };
+        yield bsrs::core::Msg::CloseRun {
             exit_status: "success".into(),
             reason: None,
         };
@@ -606,7 +606,7 @@ async fn abort_closes_run_with_abort_status() {
     assert_eq!(result.exit_status, "abort");
     let docs = sink.snapshot().await;
     // Last doc must be a RunStop with exit_status="abort".
-    if let bsrs_core::Document::Stop(s) = docs.last().unwrap() {
+    if let bsrs::core::Document::Stop(s) = docs.last().unwrap() {
         assert_eq!(s.exit_status, ExitStatus::Abort);
     } else {
         panic!("last doc was not Stop: {:?}", docs.last());
@@ -624,14 +624,14 @@ async fn abort_threads_caller_reason_into_stop_document() {
     let re = Arc::new(RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]));
 
     let det_clone = det.clone();
-    let plan = bsrs_core::plan::plan_box(async_stream::stream! {
-        yield bsrs_core::Msg::OpenRun(Default::default());
-        yield bsrs_core::Msg::Create { stream_name: "primary".into() };
-        yield bsrs_core::Msg::Read(det_clone as Arc<dyn bsrs_core::msg::ReadableObj>);
-        yield bsrs_core::Msg::Save;
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        yield bsrs::core::Msg::Create { stream_name: "primary".into() };
+        yield bsrs::core::Msg::Read(det_clone as Arc<dyn bsrs::core::msg::ReadableObj>);
+        yield bsrs::core::Msg::Save;
         // Pause here; the test aborts (with a reason) instead of resuming.
-        yield bsrs_core::Msg::Pause { defer: false };
-        yield bsrs_core::Msg::CloseRun {
+        yield bsrs::core::Msg::Pause { defer: false };
+        yield bsrs::core::Msg::CloseRun {
             exit_status: "success".into(),
             reason: None,
         };
@@ -650,7 +650,7 @@ async fn abort_threads_caller_reason_into_stop_document() {
     let result = join.await.unwrap().unwrap();
     assert_eq!(result.exit_status, "abort");
     let docs = sink.snapshot().await;
-    if let bsrs_core::Document::Stop(s) = docs.last().unwrap() {
+    if let bsrs::core::Document::Stop(s) = docs.last().unwrap() {
         assert_eq!(s.exit_status, ExitStatus::Abort);
         assert_eq!(
             s.reason.as_deref(),
@@ -676,14 +676,14 @@ async fn halt_emits_schema_valid_abort_in_stop_document() {
     let re = Arc::new(RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]));
 
     let det_clone = det.clone();
-    let plan = bsrs_core::plan::plan_box(async_stream::stream! {
-        yield bsrs_core::Msg::OpenRun(Default::default());
-        yield bsrs_core::Msg::Create { stream_name: "primary".into() };
-        yield bsrs_core::Msg::Read(det_clone as Arc<dyn bsrs_core::msg::ReadableObj>);
-        yield bsrs_core::Msg::Save;
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        yield bsrs::core::Msg::Create { stream_name: "primary".into() };
+        yield bsrs::core::Msg::Read(det_clone as Arc<dyn bsrs::core::msg::ReadableObj>);
+        yield bsrs::core::Msg::Save;
         // Pause here; the test halts instead of resuming.
-        yield bsrs_core::Msg::Pause { defer: false };
-        yield bsrs_core::Msg::CloseRun {
+        yield bsrs::core::Msg::Pause { defer: false };
+        yield bsrs::core::Msg::CloseRun {
             exit_status: "success".into(),
             reason: None,
         };
@@ -704,7 +704,7 @@ async fn halt_emits_schema_valid_abort_in_stop_document() {
     assert_eq!(result.exit_status, "halt");
     // ... but the emitted RunStop document must be the schema-valid "abort".
     let docs = sink.snapshot().await;
-    if let bsrs_core::Document::Stop(s) = docs.last().unwrap() {
+    if let bsrs::core::Document::Stop(s) = docs.last().unwrap() {
         assert_eq!(
             s.exit_status,
             ExitStatus::Abort,
@@ -717,7 +717,7 @@ async fn halt_emits_schema_valid_abort_in_stop_document() {
 
 #[tokio::test]
 async fn suspender_auto_resumes_engine() {
-    use bsrs_engine::Suspender;
+    use bsrs::engine::Suspender;
     use futures::future::BoxFuture;
     use std::sync::atomic::{AtomicBool, Ordering as AOrd};
     use std::sync::Arc as StdArc;
@@ -754,19 +754,19 @@ async fn suspender_auto_resumes_engine() {
     let re = Arc::new(RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]));
 
     let id = re.next_suspender_id();
-    let gate_dyn: Arc<dyn bsrs_engine::Suspender> = gate;
+    let gate_dyn: Arc<dyn bsrs::engine::Suspender> = gate;
     let payload: Arc<dyn std::any::Any + Send + Sync> = Arc::new(gate_dyn);
 
-    let plan = bsrs_core::plan::plan_box(async_stream::stream! {
-        yield bsrs_core::Msg::InstallSuspender { id, suspender: payload };
-        yield bsrs_core::Msg::OpenRun(Default::default());
-        yield bsrs_core::Msg::Pause { defer: false };
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::InstallSuspender { id, suspender: payload };
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        yield bsrs::core::Msg::Pause { defer: false };
         // After auto-resume:
-        yield bsrs_core::Msg::CloseRun {
+        yield bsrs::core::Msg::CloseRun {
             exit_status: "success".into(),
             reason: None,
         };
-        yield bsrs_core::Msg::RemoveSuspender { id };
+        yield bsrs::core::Msg::RemoveSuspender { id };
     });
 
     let re_run = re.clone();
@@ -796,7 +796,7 @@ async fn suspender_auto_resumes_engine() {
 // until aborted. Verifies the bluesky `RunEngine.clear_suspenders` parity API.
 #[tokio::test]
 async fn clear_suspenders_stops_auto_resume() {
-    use bsrs_engine::Suspender;
+    use bsrs::engine::Suspender;
     use futures::future::BoxFuture;
     use std::sync::atomic::{AtomicBool, Ordering as AOrd};
     use std::sync::Arc as StdArc;
@@ -833,16 +833,16 @@ async fn clear_suspenders_stops_auto_resume() {
     let re = Arc::new(RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]));
 
     let id = re.next_suspender_id();
-    let gate_dyn: Arc<dyn bsrs_engine::Suspender> = gate;
+    let gate_dyn: Arc<dyn bsrs::engine::Suspender> = gate;
     let payload: Arc<dyn std::any::Any + Send + Sync> = Arc::new(gate_dyn);
 
-    let plan = bsrs_core::plan::plan_box(async_stream::stream! {
-        yield bsrs_core::Msg::InstallSuspender { id, suspender: payload };
-        yield bsrs_core::Msg::OpenRun(Default::default());
-        yield bsrs_core::Msg::Pause { defer: false };
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::InstallSuspender { id, suspender: payload };
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        yield bsrs::core::Msg::Pause { defer: false };
         // Reached only if something resumes the engine — which must NOT happen
         // after clear_suspenders, so this run is expected to abort while paused.
-        yield bsrs_core::Msg::CloseRun {
+        yield bsrs::core::Msg::CloseRun {
             exit_status: "success".into(),
             reason: None,
         };
@@ -890,7 +890,7 @@ async fn clear_suspenders_stops_auto_resume() {
 // which made an installed clear-condition suspender override any pause).
 #[tokio::test]
 async fn installed_suspender_not_watched_while_engine_runs() {
-    use bsrs_engine::Suspender;
+    use bsrs::engine::Suspender;
     use futures::future::BoxFuture;
     use std::sync::atomic::{AtomicUsize, Ordering as AOrd};
     use std::sync::Arc as StdArc;
@@ -920,19 +920,19 @@ async fn installed_suspender_not_watched_while_engine_runs() {
 
     let re = Arc::new(RunEngine::new(vec![]));
     let id = re.next_suspender_id();
-    let susp_dyn: Arc<dyn bsrs_engine::Suspender> = susp;
+    let susp_dyn: Arc<dyn bsrs::engine::Suspender> = susp;
     let payload: Arc<dyn std::any::Any + Send + Sync> = Arc::new(susp_dyn);
 
-    let plan = bsrs_core::plan::plan_box(async_stream::stream! {
-        yield bsrs_core::Msg::InstallSuspender { id, suspender: payload };
-        yield bsrs_core::Msg::OpenRun(Default::default());
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::InstallSuspender { id, suspender: payload };
+        yield bsrs::core::Msg::OpenRun(Default::default());
         // The engine runs normally and is never paused.
-        yield bsrs_core::Msg::Sleep(Duration::from_millis(100));
-        yield bsrs_core::Msg::CloseRun {
+        yield bsrs::core::Msg::Sleep(Duration::from_millis(100));
+        yield bsrs::core::Msg::CloseRun {
             exit_status: "success".into(),
             reason: None,
         };
-        yield bsrs_core::Msg::RemoveSuspender { id };
+        yield bsrs::core::Msg::RemoveSuspender { id };
     });
 
     let result = re.run_async(plan).await.unwrap();
@@ -950,7 +950,7 @@ async fn mvr_reads_position_inside_plan_then_moves_relative() {
     let re = RunEngine::new(vec![]);
 
     // mvr should: locate (readback=2.5) → set(2.5+1.5=4.0) → wait.
-    let plan = bsrs_plans::stubs::mvr(motor.clone() as Arc<dyn LocatableObj>, 1.5);
+    let plan = bsrs::plans::stubs::mvr(motor.clone() as Arc<dyn LocatableObj>, 1.5);
     re.run_async(plan).await.unwrap();
 
     let loc = LocatableObj::locate_dyn(motor.as_ref()).await.unwrap();
@@ -971,14 +971,14 @@ async fn stop_plan_dispatches_through_engine() {
         calls: AtomicU32,
     }
     #[async_trait::async_trait]
-    impl bsrs_core::msg::NamedObj for CountingStoppable {
+    impl bsrs::core::msg::NamedObj for CountingStoppable {
         fn name(&self) -> &str {
             &self.name
         }
     }
     #[async_trait::async_trait]
     impl StoppableObj for CountingStoppable {
-        async fn stop_dyn(&self, _success: bool) -> bsrs_core::error::Result<()> {
+        async fn stop_dyn(&self, _success: bool) -> bsrs::core::error::Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -989,25 +989,25 @@ async fn stop_plan_dispatches_through_engine() {
         calls: AtomicU32::new(0),
     });
     let re = RunEngine::new(vec![]);
-    let plan = bsrs_plans::stubs::stop(s.clone() as Arc<dyn StoppableObj>);
+    let plan = bsrs::plans::stubs::stop(s.clone() as Arc<dyn StoppableObj>);
     re.run_async(plan).await.unwrap();
     assert_eq!(s.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
 async fn spiral_square_emits_expected_event_count() {
-    use bsrs_core::msg::MovableObj;
+    use bsrs::core::msg::MovableObj;
     let det = SoftDetector::new("d");
     let xm = Arc::new(SoftMotor::new("xm", Some(0.0)));
     let ym = Arc::new(SoftMotor::new("ym", Some(0.0)));
     let sink = Arc::new(CapturingSink::new());
     let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
-    let plan = bsrs_plans::spiral_square(
-        vec![det as Arc<dyn bsrs_core::msg::ReadableObj>],
+    let plan = bsrs::plans::spiral_square(
+        vec![det as Arc<dyn bsrs::core::msg::ReadableObj>],
         xm.clone() as Arc<dyn MovableObj>,
-        xm.clone() as Arc<dyn bsrs_core::msg::ReadableObj>,
+        xm.clone() as Arc<dyn bsrs::core::msg::ReadableObj>,
         ym.clone() as Arc<dyn MovableObj>,
-        ym.clone() as Arc<dyn bsrs_core::msg::ReadableObj>,
+        ym.clone() as Arc<dyn bsrs::core::msg::ReadableObj>,
         0.0,
         0.0,
         4.0,
@@ -1026,17 +1026,17 @@ async fn spiral_square_emits_expected_event_count() {
 
 #[tokio::test]
 async fn run_wrapper_emits_open_and_close_run() {
-    use bsrs_core::msg::ReadableObj;
-    use bsrs_plans::preprocessors::run_wrapper;
+    use bsrs::core::msg::ReadableObj;
+    use bsrs::plans::preprocessors::run_wrapper;
     let det = SoftDetector::new("rwd");
-    let body = bsrs_core::plan::plan_box(async_stream::stream! {
-        yield bsrs_core::Msg::Create { stream_name: "primary".into() };
-        yield bsrs_core::Msg::Read(det.clone() as Arc<dyn ReadableObj>);
-        yield bsrs_core::Msg::Save;
+    let body = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::Create { stream_name: "primary".into() };
+        yield bsrs::core::Msg::Read(det.clone() as Arc<dyn ReadableObj>);
+        yield bsrs::core::Msg::Save;
     });
     let wrapped = run_wrapper(
         body,
-        bsrs_core::msg::RunMetadata {
+        bsrs::core::msg::RunMetadata {
             plan_name: Some("wrapper-test".into()),
             ..Default::default()
         },
@@ -1085,16 +1085,16 @@ async fn rewindable_false_clears_rewind_cache_no_replay_on_resume() {
         name: String,
         sets: Arc<AtomicUsize>,
     }
-    impl bsrs_core::msg::NamedObj for CountingMovable {
+    impl bsrs::core::msg::NamedObj for CountingMovable {
         fn name(&self) -> &str {
             &self.name
         }
     }
     #[async_trait::async_trait]
-    impl bsrs_core::msg::MovableObj for CountingMovable {
-        async fn set_dyn(&self, _value: f64) -> bsrs_core::status::Status {
+    impl bsrs::core::msg::MovableObj for CountingMovable {
+        async fn set_dyn(&self, _value: f64) -> bsrs::core::status::Status {
             self.sets.fetch_add(1, Ordering::SeqCst);
-            bsrs_core::status::Status::done()
+            bsrs::core::status::Status::done()
         }
     }
 
@@ -1102,23 +1102,23 @@ async fn rewindable_false_clears_rewind_cache_no_replay_on_resume() {
     let motor_dyn = Arc::new(CountingMovable {
         name: "rw_motor".into(),
         sets: sets.clone(),
-    }) as Arc<dyn bsrs_core::msg::MovableObj>;
+    }) as Arc<dyn bsrs::core::msg::MovableObj>;
     let reached = Arc::new(AtomicUsize::new(0));
 
     let re = Arc::new(RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new()));
     let reached_clone = reached.clone();
-    let plan = bsrs_core::plan::plan_box(async_stream::stream! {
-        yield bsrs_core::Msg::OpenRun(Default::default());
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::OpenRun(Default::default());
         // Open a rewindable region and cache one Set.
-        yield bsrs_core::Msg::Checkpoint;
-        yield bsrs_core::Msg::Set { obj: motor_dyn, value: 1.0, group: None };
+        yield bsrs::core::Msg::Checkpoint;
+        yield bsrs::core::Msg::Set { obj: motor_dyn, value: 1.0, group: None };
         // Enter a non-rewindable region. bluesky's `rewindable` setter resets
         // checkpoint state on this toggle, so the cached Set must NOT survive
         // to replay on resume.
-        yield bsrs_core::Msg::Rewindable(false);
+        yield bsrs::core::Msg::Rewindable(false);
         reached_clone.store(1, Ordering::SeqCst);
-        yield bsrs_core::Msg::Pause { defer: false };
-        yield bsrs_core::Msg::CloseRun {
+        yield bsrs::core::Msg::Pause { defer: false };
+        yield bsrs::core::Msg::CloseRun {
             exit_status: "success".into(),
             reason: None,
         };
@@ -1164,19 +1164,19 @@ async fn pause_mid_bundle_then_resume_completes_without_create_collision() {
     let reached = Arc::new(AtomicUsize::new(0));
     let reached_clone = reached.clone();
     let det_clone = det.clone();
-    let plan = bsrs_core::plan::plan_box(async_stream::stream! {
-        yield bsrs_core::Msg::OpenRun(Default::default());
-        yield bsrs_core::Msg::Checkpoint;
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        yield bsrs::core::Msg::Checkpoint;
         // Open an event bundle, then pause *before* the paired Save — the
         // window a suspender / immediate pause can hit inside trigger_and_read
         // (create … read … save with no intervening checkpoint).
-        yield bsrs_core::Msg::Create { stream_name: "primary".into() };
+        yield bsrs::core::Msg::Create { stream_name: "primary".into() };
         reached_clone.store(1, Ordering::SeqCst);
-        yield bsrs_core::Msg::Pause { defer: false };
+        yield bsrs::core::Msg::Pause { defer: false };
         // After resume: finish the bundle.
-        yield bsrs_core::Msg::Read(det_clone as Arc<dyn bsrs_core::msg::ReadableObj>);
-        yield bsrs_core::Msg::Save;
-        yield bsrs_core::Msg::CloseRun {
+        yield bsrs::core::Msg::Read(det_clone as Arc<dyn bsrs::core::msg::ReadableObj>);
+        yield bsrs::core::Msg::Save;
+        yield bsrs::core::Msg::CloseRun {
             exit_status: "success".into(),
             reason: None,
         };
@@ -1215,31 +1215,31 @@ async fn wait_propagates_status_failure_even_when_error_on_timeout_false() {
     // always raises (run_engine.py:2384) while error_on_timeout suppresses only
     // WaitForTimeoutError (:2341-2346).
     struct FailingMotor;
-    impl bsrs_core::msg::NamedObj for FailingMotor {
+    impl bsrs::core::msg::NamedObj for FailingMotor {
         fn name(&self) -> &str {
             "boom"
         }
     }
     #[async_trait::async_trait]
-    impl bsrs_core::msg::MovableObj for FailingMotor {
-        async fn set_dyn(&self, _value: f64) -> bsrs_core::status::Status {
-            bsrs_core::status::Status::fail(bsrs_core::status::StatusError::Failed(
+    impl bsrs::core::msg::MovableObj for FailingMotor {
+        async fn set_dyn(&self, _value: f64) -> bsrs::core::status::Status {
+            bsrs::core::status::Status::fail(bsrs::core::status::StatusError::Failed(
                 "move failed".into(),
             ))
         }
     }
 
-    let motor = Arc::new(FailingMotor) as Arc<dyn bsrs_core::msg::MovableObj>;
+    let motor = Arc::new(FailingMotor) as Arc<dyn bsrs::core::msg::MovableObj>;
     let re = RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new());
-    let plan = bsrs_core::plan::plan_box(async_stream::stream! {
-        yield bsrs_core::Msg::OpenRun(Default::default());
-        yield bsrs_core::Msg::Set { obj: motor, value: 1.0, group: Some("g".into()) };
-        yield bsrs_core::Msg::Wait {
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        yield bsrs::core::Msg::Set { obj: motor, value: 1.0, group: Some("g".into()) };
+        yield bsrs::core::Msg::Wait {
             group: "g".into(),
             error_on_timeout: false,
             timeout: None,
         };
-        yield bsrs_core::Msg::CloseRun {
+        yield bsrs::core::Msg::CloseRun {
             exit_status: "success".into(),
             reason: None,
         };
@@ -1266,54 +1266,54 @@ async fn stage_resets_rewind_cache_so_pre_stage_set_not_replayed_on_resume() {
     struct CountingMovable {
         sets: Arc<AtomicUsize>,
     }
-    impl bsrs_core::msg::NamedObj for CountingMovable {
+    impl bsrs::core::msg::NamedObj for CountingMovable {
         fn name(&self) -> &str {
             "stg_motor"
         }
     }
     #[async_trait::async_trait]
-    impl bsrs_core::msg::MovableObj for CountingMovable {
-        async fn set_dyn(&self, _value: f64) -> bsrs_core::status::Status {
+    impl bsrs::core::msg::MovableObj for CountingMovable {
+        async fn set_dyn(&self, _value: f64) -> bsrs::core::status::Status {
             self.sets.fetch_add(1, Ordering::SeqCst);
-            bsrs_core::status::Status::done()
+            bsrs::core::status::Status::done()
         }
     }
     // A no-op stageable device — its `Stage` is the commit point under test.
     struct Dev;
-    impl bsrs_core::msg::NamedObj for Dev {
+    impl bsrs::core::msg::NamedObj for Dev {
         fn name(&self) -> &str {
             "stg_dev"
         }
     }
     #[async_trait::async_trait]
-    impl bsrs_core::msg::StageableObj for Dev {
-        async fn stage_dyn(&self) -> Result<(), bsrs_core::error::BsrsError> {
+    impl bsrs::core::msg::StageableObj for Dev {
+        async fn stage_dyn(&self) -> Result<(), bsrs::core::error::BsrsError> {
             Ok(())
         }
-        async fn unstage_dyn(&self) -> Result<(), bsrs_core::error::BsrsError> {
+        async fn unstage_dyn(&self) -> Result<(), bsrs::core::error::BsrsError> {
             Ok(())
         }
     }
 
     let sets = Arc::new(AtomicUsize::new(0));
     let motor =
-        Arc::new(CountingMovable { sets: sets.clone() }) as Arc<dyn bsrs_core::msg::MovableObj>;
-    let dev = Arc::new(Dev) as Arc<dyn bsrs_core::msg::StageableObj>;
+        Arc::new(CountingMovable { sets: sets.clone() }) as Arc<dyn bsrs::core::msg::MovableObj>;
+    let dev = Arc::new(Dev) as Arc<dyn bsrs::core::msg::StageableObj>;
     let reached = Arc::new(AtomicUsize::new(0));
 
     let re = Arc::new(RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new()));
     let reached_clone = reached.clone();
-    let plan = bsrs_core::plan::plan_box(async_stream::stream! {
-        yield bsrs_core::Msg::OpenRun(Default::default());
-        yield bsrs_core::Msg::Checkpoint;
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        yield bsrs::core::Msg::Checkpoint;
         // Cacheable Set lands in the rewind cache...
-        yield bsrs_core::Msg::Set { obj: motor, value: 1.0, group: None };
+        yield bsrs::core::Msg::Set { obj: motor, value: 1.0, group: None };
         // ...then a Stage (commit-point message) must reset the rewind cache,
         // so a pause AFTER the stage replays nothing on resume.
-        yield bsrs_core::Msg::Stage(dev);
+        yield bsrs::core::Msg::Stage(dev);
         reached_clone.store(1, Ordering::SeqCst);
-        yield bsrs_core::Msg::Pause { defer: false };
-        yield bsrs_core::Msg::CloseRun {
+        yield bsrs::core::Msg::Pause { defer: false };
+        yield bsrs::core::Msg::CloseRun {
             exit_status: "success".into(),
             reason: None,
         };
@@ -1355,13 +1355,13 @@ async fn checkpoint_inside_open_bundle_is_rejected() {
     // raises IllegalMessageSequence (run_engine.py:2444-2446); bsrs must
     // reject it, failing the run rather than silently checkpointing mid-bundle.
     let re = RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new());
-    let plan = bsrs_core::plan::plan_box(async_stream::stream! {
-        yield bsrs_core::Msg::OpenRun(Default::default());
-        yield bsrs_core::Msg::Create { stream_name: "primary".into() };
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        yield bsrs::core::Msg::Create { stream_name: "primary".into() };
         // Bundle is open here — this checkpoint is illegal.
-        yield bsrs_core::Msg::Checkpoint;
-        yield bsrs_core::Msg::Save;
-        yield bsrs_core::Msg::CloseRun {
+        yield bsrs::core::Msg::Checkpoint;
+        yield bsrs::core::Msg::Save;
+        yield bsrs::core::Msg::CloseRun {
             exit_status: "success".into(),
             reason: None,
         };
@@ -1381,11 +1381,11 @@ async fn empty_create_save_emits_no_descriptor_or_event() {
     // was read ("Do not create empty Events.", bundlers.py:570-573).
     let sink = Arc::new(CapturingSink::new());
     let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
-    let plan = bsrs_core::plan::plan_box(async_stream::stream! {
-        yield bsrs_core::Msg::OpenRun(Default::default());
-        yield bsrs_core::Msg::Create { stream_name: "primary".into() };
-        yield bsrs_core::Msg::Save;
-        yield bsrs_core::Msg::CloseRun {
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        yield bsrs::core::Msg::Create { stream_name: "primary".into() };
+        yield bsrs::core::Msg::Save;
+        yield bsrs::core::Msg::CloseRun {
             exit_status: "success".into(),
             reason: None,
         };
@@ -1412,10 +1412,10 @@ async fn second_open_run_rejected_without_emitting_a_second_start() {
     // resolution and emit (run_engine.py:1849-1851).
     let sink = Arc::new(CapturingSink::new());
     let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
-    let plan = bsrs_core::plan::plan_box(async_stream::stream! {
-        yield bsrs_core::Msg::OpenRun(Default::default());
-        yield bsrs_core::Msg::OpenRun(Default::default());
-        yield bsrs_core::Msg::CloseRun {
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        yield bsrs::core::Msg::CloseRun {
             exit_status: "success".into(),
             reason: None,
         };
@@ -1430,7 +1430,7 @@ async fn second_open_run_rejected_without_emitting_a_second_start() {
     let docs = sink.snapshot().await;
     let starts = docs
         .iter()
-        .filter(|d| matches!(d, bsrs_core::Document::Start(_)))
+        .filter(|d| matches!(d, bsrs::core::Document::Start(_)))
         .count();
     assert_eq!(
         starts, 1,
@@ -1445,8 +1445,8 @@ async fn close_run_without_open_run_is_rejected() {
     // run rather than silently accept it. (The internal run-end cleanup path
     // stays lenient — only the explicit message is guarded.)
     let re = RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new());
-    let plan = bsrs_core::plan::plan_box(async_stream::stream! {
-        yield bsrs_core::Msg::CloseRun {
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::CloseRun {
             exit_status: "success".into(),
             reason: None,
         };
@@ -1469,17 +1469,17 @@ async fn double_stage_of_same_device_unstages_once() {
     struct CountingStageable {
         unstages: Arc<AtomicUsize>,
     }
-    impl bsrs_core::msg::NamedObj for CountingStageable {
+    impl bsrs::core::msg::NamedObj for CountingStageable {
         fn name(&self) -> &str {
             "cs"
         }
     }
     #[async_trait::async_trait]
-    impl bsrs_core::msg::StageableObj for CountingStageable {
-        async fn stage_dyn(&self) -> Result<(), bsrs_core::error::BsrsError> {
+    impl bsrs::core::msg::StageableObj for CountingStageable {
+        async fn stage_dyn(&self) -> Result<(), bsrs::core::error::BsrsError> {
             Ok(())
         }
-        async fn unstage_dyn(&self) -> Result<(), bsrs_core::error::BsrsError> {
+        async fn unstage_dyn(&self) -> Result<(), bsrs::core::error::BsrsError> {
             self.unstages.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -1488,13 +1488,13 @@ async fn double_stage_of_same_device_unstages_once() {
     let unstages = Arc::new(AtomicUsize::new(0));
     let dev = Arc::new(CountingStageable {
         unstages: unstages.clone(),
-    }) as Arc<dyn bsrs_core::msg::StageableObj>;
+    }) as Arc<dyn bsrs::core::msg::StageableObj>;
     let re = RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new());
     let dev_plan = dev.clone();
     // Stage the *same* device twice; the run-end cleanup is the only unstage.
-    let plan = bsrs_core::plan::plan_box(async_stream::stream! {
-        yield bsrs_core::Msg::Stage(dev_plan.clone());
-        yield bsrs_core::Msg::Stage(dev_plan);
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::Stage(dev_plan.clone());
+        yield bsrs::core::Msg::Stage(dev_plan);
     });
 
     re.run_async(plan).await.unwrap();
@@ -1517,30 +1517,30 @@ async fn kickoff_without_open_run_is_rejected_before_flyer_starts() {
     struct CountingFlyer {
         kickoffs: Arc<AtomicUsize>,
     }
-    impl bsrs_core::msg::NamedObj for CountingFlyer {
+    impl bsrs::core::msg::NamedObj for CountingFlyer {
         fn name(&self) -> &str {
             "countfly"
         }
     }
     #[async_trait::async_trait]
-    impl bsrs_core::msg::FlyableObj for CountingFlyer {
-        async fn kickoff_dyn(&self) -> bsrs_core::status::Status {
+    impl bsrs::core::msg::FlyableObj for CountingFlyer {
+        async fn kickoff_dyn(&self) -> bsrs::core::status::Status {
             self.kickoffs.fetch_add(1, Ordering::SeqCst);
-            bsrs_core::status::Status::done()
+            bsrs::core::status::Status::done()
         }
-        async fn complete_dyn(&self) -> bsrs_core::status::Status {
-            bsrs_core::status::Status::done()
+        async fn complete_dyn(&self) -> bsrs::core::status::Status {
+            bsrs::core::status::Status::done()
         }
     }
 
     let kickoffs = Arc::new(AtomicUsize::new(0));
     let flyer = Arc::new(CountingFlyer {
         kickoffs: kickoffs.clone(),
-    }) as Arc<dyn bsrs_core::msg::FlyableObj>;
+    }) as Arc<dyn bsrs::core::msg::FlyableObj>;
     let re = RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new());
     // Kickoff with no preceding OpenRun.
-    let plan = bsrs_core::plan::plan_box(async_stream::stream! {
-        yield bsrs_core::Msg::Kickoff { obj: flyer, group: None };
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::Kickoff { obj: flyer, group: None };
     });
 
     let result = re.run_async(plan).await.unwrap();
@@ -1570,21 +1570,21 @@ async fn collect_without_open_run_does_not_describe_the_flyer() {
     struct DescribeCountingCollectable {
         describes: Arc<AtomicUsize>,
     }
-    impl bsrs_core::msg::NamedObj for DescribeCountingCollectable {
+    impl bsrs::core::msg::NamedObj for DescribeCountingCollectable {
         fn name(&self) -> &str {
             "countcollect"
         }
     }
     #[async_trait::async_trait]
-    impl bsrs_core::msg::CollectableObj for DescribeCountingCollectable {
+    impl bsrs::core::msg::CollectableObj for DescribeCountingCollectable {
         async fn describe_collect_dyn(
             &self,
         ) -> Result<
             std::collections::HashMap<
                 String,
-                std::collections::HashMap<String, bsrs_event_model::DataKey>,
+                std::collections::HashMap<String, bsrs::event_model::DataKey>,
             >,
-            bsrs_core::error::BsrsError,
+            bsrs::core::error::BsrsError,
         > {
             self.describes.fetch_add(1, Ordering::SeqCst);
             Ok(std::collections::HashMap::new())
@@ -1597,7 +1597,7 @@ async fn collect_without_open_run_does_not_describe_the_flyer() {
                 std::collections::HashMap<String, serde_json::Value>,
                 std::collections::HashMap<String, f64>,
             )>,
-            bsrs_core::error::BsrsError,
+            bsrs::core::error::BsrsError,
         > {
             Ok(Vec::new())
         }
@@ -1606,11 +1606,11 @@ async fn collect_without_open_run_does_not_describe_the_flyer() {
     let describes = Arc::new(AtomicUsize::new(0));
     let coll = Arc::new(DescribeCountingCollectable {
         describes: describes.clone(),
-    }) as Arc<dyn bsrs_core::msg::CollectableObj>;
+    }) as Arc<dyn bsrs::core::msg::CollectableObj>;
     let re = RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new());
     // Collect with no preceding OpenRun.
-    let plan = bsrs_core::plan::plan_box(async_stream::stream! {
-        yield bsrs_core::Msg::Collect { obj: coll, stream_name: None };
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::Collect { obj: coll, stream_name: None };
     });
 
     let result = re.run_async(plan).await.unwrap();
@@ -1631,24 +1631,24 @@ struct KeyedReadable {
     name: String,
 }
 
-impl bsrs_core::msg::NamedObj for KeyedReadable {
+impl bsrs::core::msg::NamedObj for KeyedReadable {
     fn name(&self) -> &str {
         &self.name
     }
 }
 
 #[async_trait::async_trait]
-impl bsrs_core::msg::ReadableObj for KeyedReadable {
+impl bsrs::core::msg::ReadableObj for KeyedReadable {
     async fn read_dyn(
         &self,
     ) -> Result<
-        std::collections::HashMap<String, bsrs_core::reading::ReadingValue>,
-        bsrs_core::error::BsrsError,
+        std::collections::HashMap<String, bsrs::core::reading::ReadingValue>,
+        bsrs::core::error::BsrsError,
     > {
         let mut m = std::collections::HashMap::new();
         m.insert(
             self.name.clone(),
-            bsrs_core::reading::ReadingValue {
+            bsrs::core::reading::ReadingValue {
                 value: serde_json::Value::from(1.0),
                 timestamp: 0.0,
                 alarm_severity: None,
@@ -1660,15 +1660,15 @@ impl bsrs_core::msg::ReadableObj for KeyedReadable {
     async fn describe_dyn(
         &self,
     ) -> Result<
-        std::collections::HashMap<String, bsrs_event_model::DataKey>,
-        bsrs_core::error::BsrsError,
+        std::collections::HashMap<String, bsrs::event_model::DataKey>,
+        bsrs::core::error::BsrsError,
     > {
         let mut m = std::collections::HashMap::new();
         m.insert(
             self.name.clone(),
-            bsrs_event_model::DataKey {
+            bsrs::event_model::DataKey {
                 source: format!("test://{}", self.name),
-                dtype: bsrs_event_model::Dtype::Number,
+                dtype: bsrs::event_model::Dtype::Number,
                 shape: vec![],
                 dtype_numpy: Some("<f8".into()),
                 external: None,
@@ -1693,26 +1693,26 @@ async fn dropped_bundle_reads_do_not_leak_into_next_descriptor() {
     // dropped bundle (before the stream's first descriptor existed) leaked
     // their data keys into the next descriptor — advertising fields the event
     // never carried.
-    let det_a: Arc<dyn bsrs_core::msg::ReadableObj> = Arc::new(KeyedReadable {
+    let det_a: Arc<dyn bsrs::core::msg::ReadableObj> = Arc::new(KeyedReadable {
         name: "det_a".into(),
     });
-    let det_b: Arc<dyn bsrs_core::msg::ReadableObj> = Arc::new(KeyedReadable {
+    let det_b: Arc<dyn bsrs::core::msg::ReadableObj> = Arc::new(KeyedReadable {
         name: "det_b".into(),
     });
     let sink = Arc::new(CapturingSink::new());
     let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
 
-    let plan = bsrs_core::plan::plan_box(async_stream::stream! {
-        yield bsrs_core::Msg::OpenRun(Default::default());
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::OpenRun(Default::default());
         // First bundle reads det_a, then is DROPPED (no descriptor emitted yet).
-        yield bsrs_core::Msg::Create { stream_name: "primary".into() };
-        yield bsrs_core::Msg::Read(det_a);
-        yield bsrs_core::Msg::Drop;
+        yield bsrs::core::Msg::Create { stream_name: "primary".into() };
+        yield bsrs::core::Msg::Read(det_a);
+        yield bsrs::core::Msg::Drop;
         // Second bundle reads only det_b, then is saved → first descriptor.
-        yield bsrs_core::Msg::Create { stream_name: "primary".into() };
-        yield bsrs_core::Msg::Read(det_b);
-        yield bsrs_core::Msg::Save;
-        yield bsrs_core::Msg::CloseRun { exit_status: "success".into(), reason: None };
+        yield bsrs::core::Msg::Create { stream_name: "primary".into() };
+        yield bsrs::core::Msg::Read(det_b);
+        yield bsrs::core::Msg::Save;
+        yield bsrs::core::Msg::CloseRun { exit_status: "success".into(), reason: None };
     });
 
     let result = re.run_async(plan).await.unwrap();
@@ -1722,7 +1722,7 @@ async fn dropped_bundle_reads_do_not_leak_into_next_descriptor() {
     let descriptor = docs
         .iter()
         .find_map(|d| match d {
-            bsrs_core::Document::Descriptor(desc) => Some(desc.clone()),
+            bsrs::core::Document::Descriptor(desc) => Some(desc.clone()),
             _ => None,
         })
         .expect("expected a Descriptor for the primary stream");
@@ -1739,7 +1739,7 @@ async fn dropped_bundle_reads_do_not_leak_into_next_descriptor() {
     let event = docs
         .iter()
         .find_map(|d| match d {
-            bsrs_core::Document::Event(ev) => Some(ev.clone()),
+            bsrs::core::Document::Event(ev) => Some(ev.clone()),
             _ => None,
         })
         .expect("expected an Event for the saved bundle");

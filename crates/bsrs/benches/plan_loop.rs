@@ -8,8 +8,8 @@
 use std::sync::Arc;
 
 use bsrs::backends::soft::SoftDetector;
-use bsrs_core::msg::ReadableObj;
-use bsrs_engine::RunEngine;
+use bsrs::core::msg::ReadableObj;
+use bsrs::engine::RunEngine;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
 fn bench_count_loop(c: &mut Criterion) {
@@ -23,7 +23,7 @@ fn bench_count_loop(c: &mut Criterion) {
             b.to_async(&rt).iter(|| async move {
                 let det = SoftDetector::new("d");
                 let re = RunEngine::new(vec![]);
-                let plan = bsrs_plans::count(vec![det as Arc<dyn ReadableObj>], n);
+                let plan = bsrs::plans::count(vec![det as Arc<dyn ReadableObj>], n);
                 let r = re.run_async(plan).await.unwrap();
                 assert_eq!(r.exit_status, "success");
             });

@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bsrs::backends::soft::SoftDetector;
-use bsrs_core::msg::ReadableObj;
-use bsrs_engine::{DocumentCallback, RunEngine};
-use bsrs_event_model::Document;
+use bsrs::core::msg::ReadableObj;
+use bsrs::engine::{DocumentCallback, RunEngine};
+use bsrs::event_model::Document;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
 fn bench_fanout(c: &mut Criterion) {
@@ -35,7 +35,7 @@ fn bench_fanout(c: &mut Criterion) {
                 },
                 |(re, _counter)| async move {
                     let det = SoftDetector::new("d");
-                    let plan = bsrs_plans::count(vec![det as Arc<dyn ReadableObj>], 10);
+                    let plan = bsrs::plans::count(vec![det as Arc<dyn ReadableObj>], 10);
                     let r = re.run_async(plan).await.unwrap();
                     assert_eq!(r.exit_status, "success");
                 },
