@@ -16,7 +16,11 @@ path = "src/bin/bsrs/main.rs"
 required-features = ["cli"]
 
 [features]
-default = []
+# EPICS CA/PVA are the core backends of this stack, so they build by
+# default: `cargo build/test` and the default CI matrix compile the real
+# backends (and catch upstream API breaks like a new DbFieldType variant).
+# `--no-default-features` still yields the stub-backend / EPICS-free build.
+default = ["ca", "pva"]
 # --- document sinks / integrations (callbacks) ---
 zmq = ["dep:zmq", "dep:rmp-serde"]
 kafka = ["dep:kafka", "dep:rmp-serde"]
