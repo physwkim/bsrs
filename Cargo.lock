@@ -778,7 +778,7 @@ dependencies = [
  "epics-pva-rs",
  "futures",
  "kafka",
- "metrics 0.24.5",
+ "metrics 0.24.6",
  "metrics-exporter-prometheus",
  "mlua",
  "pin-project-lite",
@@ -3204,9 +3204,9 @@ dependencies = [
 
 [[package]]
 name = "metrics"
-version = "0.24.5"
+version = "0.24.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff56c2e7dce6bd462e3b8919986a617027481b1dcc703175b58cf9dd98a2f071"
+checksum = "89550ee9f79e88fef3119de263694973a8adb26c21d75322164fb8c493039fe2"
 dependencies = [
  "portable-atomic",
  "rapidhash",
@@ -3224,7 +3224,7 @@ dependencies = [
  "hyper-util",
  "indexmap",
  "ipnet",
- "metrics 0.24.5",
+ "metrics 0.24.6",
  "metrics-util",
  "quanta",
  "thiserror 1.0.69",
@@ -3241,7 +3241,7 @@ dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
  "hashbrown 0.15.5",
- "metrics 0.24.5",
+ "metrics 0.24.6",
  "quanta",
  "rand 0.9.4",
  "rand_xoshiro",
