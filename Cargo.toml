@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.80"
 license = "BSD-3-Clause"
@@ -40,8 +40,8 @@ rustyline = "14"
 
 # internal — the only surviving library crate besides the consolidated `bsrs`
 # is the proc-macro companion (a proc-macro cannot be a module of a normal crate).
-bsrs                = { version = "0.1.0", path = "crates/bsrs" }
-bsrs-derive         = { version = "0.1.0", path = "crates/bsrs-derive" }
+bsrs                = { version = "0.2.0", path = "crates/bsrs" }
+bsrs-derive         = { version = "0.2.0", path = "crates/bsrs-derive" }
 
 [profile.dev]
 opt-level = 1

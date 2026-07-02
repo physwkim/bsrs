@@ -4,6 +4,40 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-07-02
+
+Workspace consolidation and EPICS backend modernization. The 18-crate
+workspace is now a single `bsrs` crate (plus the `bsrs-derive` proc-macro
+companion), and the EPICS Channel Access / PV Access backends build by
+default.
+
+### Changed
+
+- **18 crates consolidated into a single `bsrs` crate.** All former
+  `bsrs-*` library crates (engine, plans, core, devices, event-model,
+  callbacks, qs, host, backends, …) are now modules of one crate behind
+  Cargo features; the only remaining companion is `bsrs-derive` (a
+  proc-macro crate cannot be a module of a normal crate).
+- **EPICS `ca`/`pva` backends build by default** (`default = ["ca", "pva"]`),
+  so the default build and CI compile the real backends. Use
+  `--no-default-features` for the stub / EPICS-free build.
+- **Bumped `epics-base-rs` / `epics-ca-rs` / `epics-pva-rs` 0.16.2 → 0.20.4**
+  and migrated to the new API; handle the new `DbFieldType::UChar`
+  (`DBF_UCHAR` / `epicsUInt8`) native type in the CA wire encoders.
+
+### CI / tests
+
+- Run the full test suite on Windows alongside Linux and macOS (unified
+  3-OS matrix), including `mini-beamline-qs`; bind ephemeral TCP instead of
+  Unix IPC in the qs/zmq tests so they run on Windows.
+- Deflake the RunEngine pause/suspend/monitor tests via bounded state
+  polling instead of fixed sleeps.
+
+### Docs
+
+- Correct the stale backend enable instructions (`--features real` →
+  `--features ca` / `--features pva`).
+
 ## [0.1.0] - 2026-06-16
 
 Initial release of **bsrs**, a Rust port of the bluesky / ophyd /
@@ -136,4 +170,5 @@ wire- and behaviour-parity with the upstream Python projects.
 
 - `doc/gap-analysis/`: bluesky/ophyd/ophyd-async parity gap inventory.
 
+[0.2.0]: https://github.com/physwkim/bsrs/releases/tag/v0.2.0
 [0.1.0]: https://github.com/physwkim/bsrs/releases/tag/v0.1.0
