@@ -70,6 +70,26 @@ pub const AD_IMAGE_MODE_MULTIPLE: i64 = 1;
 /// `NDFile.template`: 0=Single, 1=Capture, 2=Stream).
 pub const AD_FILE_WRITE_MODE_STREAM: i64 = 2;
 
+/// Map an areaDetector `DataType_RBV` (`NDDataType_t` enum ordering) to the
+/// corresponding numpy dtype string (little-endian; single-byte types carry no
+/// byte order). Returns `None` for an unknown code. Matches
+/// `np.dtype(datatype).str` in ophyd-async's `get_ndarray_resource_info`.
+pub const fn ad_datatype_to_numpy(dt: i64) -> Option<&'static str> {
+    Some(match dt {
+        0 => "|i1", // NDInt8
+        1 => "|u1", // NDUInt8
+        2 => "<i2", // NDInt16
+        3 => "<u2", // NDUInt16
+        4 => "<i4", // NDInt32
+        5 => "<u4", // NDUInt32
+        6 => "<i8", // NDInt64
+        7 => "<u8", // NDUInt64
+        8 => "<f4", // NDFloat32
+        9 => "<f8", // NDFloat64
+        _ => return None,
+    })
+}
+
 fn join(prefix: &str, suffix: &str) -> String {
     format!("{prefix}{suffix}")
 }
@@ -375,6 +395,13 @@ pub struct NdFile {
     /// The `StreamResource` URI is built from this readback so it points
     /// at the file the IOC actually wrote, not at a re-derived guess.
     pub full_file_name_rbv: Arc<EpicsCaBackend<String>>,
+    /// `ArraySize0_RBV`/`ArraySize1_RBV`/`ArraySize2_RBV` (longin) — the
+    /// dimensions of the incoming NDArray, fastest-varying first. Zero for
+    /// unused dimensions. Read at `open()` to shape the emitted `DataKey`.
+    pub array_size_rbv: [Arc<EpicsCaBackend<i64>>; 3],
+    /// `DataType_RBV` (mbbi) — the NDArray element type (`NDDataType_t`
+    /// ordering), mapped to a numpy dtype string for the `DataKey`.
+    pub data_type_rbv: Arc<EpicsCaBackend<i64>>,
 }
 
 impl NdFile {
@@ -405,6 +432,12 @@ impl NdFile {
                 &prefix,
                 "FullFileName_RBV",
             ))),
+            array_size_rbv: [
+                Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "ArraySize0_RBV"))),
+                Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "ArraySize1_RBV"))),
+                Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "ArraySize2_RBV"))),
+            ],
+            data_type_rbv: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "DataType_RBV"))),
             plugin,
         }
     }
@@ -434,6 +467,18 @@ impl NdFile {
         h?;
         i?;
         j?;
+        // Frame-info readbacks (shape + dtype), connected in a second batch to
+        // keep the tuple manageable.
+        let (k, l, m, n) = tokio::join!(
+            SignalBackend::<i64>::connect(self.array_size_rbv[0].as_ref(), timeout),
+            SignalBackend::<i64>::connect(self.array_size_rbv[1].as_ref(), timeout),
+            SignalBackend::<i64>::connect(self.array_size_rbv[2].as_ref(), timeout),
+            SignalBackend::<i64>::connect(self.data_type_rbv.as_ref(), timeout),
+        );
+        k?;
+        l?;
+        m?;
+        n?;
         Ok(())
     }
 
@@ -512,6 +557,33 @@ impl NdFile {
     pub async fn full_file_name(&self) -> Result<String> {
         let s = SignalBackend::<String>::get_value(self.full_file_name_rbv.as_ref()).await?;
         Ok(s.trim_end_matches('\0').to_string())
+    }
+
+    /// Discover the incoming frame's shape and numpy dtype from
+    /// `ArraySize{0,1,2}_RBV` + `DataType_RBV`. Zero-sized dimensions are
+    /// dropped (unused / not yet primed), fastest-varying first — matching
+    /// ophyd-async's `get_ndarray_resource_info` (`_data_logic.py`). Errors if
+    /// `DataType_RBV` is not a known `NDDataType_t`.
+    pub async fn frame_info(&self) -> Result<(Vec<u64>, String)> {
+        let (s0, s1, s2, dt) = tokio::join!(
+            SignalBackend::<i64>::get_value(self.array_size_rbv[0].as_ref()),
+            SignalBackend::<i64>::get_value(self.array_size_rbv[1].as_ref()),
+            SignalBackend::<i64>::get_value(self.array_size_rbv[2].as_ref()),
+            SignalBackend::<i64>::get_value(self.data_type_rbv.as_ref()),
+        );
+        let shape: Vec<u64> = [s0?, s1?, s2?]
+            .into_iter()
+            .filter(|&d| d > 0)
+            .map(|d| d as u64)
+            .collect();
+        let dt = dt?;
+        let dtype_numpy = ad_datatype_to_numpy(dt).ok_or_else(|| {
+            BsrsError::Backend(format!(
+                "{}DataType_RBV={dt} is not a known NDDataType_t",
+                self.plugin.prefix
+            ))
+        })?;
+        Ok((shape, dtype_numpy.to_string()))
     }
 }
 
@@ -823,6 +895,9 @@ pub trait AdFileIo: Send + Sync {
     async fn num_captured(&self) -> Result<u64>;
     /// Absolute path the IOC resolved for the open file.
     async fn full_file_name(&self) -> Result<String>;
+    /// Incoming frame shape (fastest-varying first, zero dims dropped) and
+    /// numpy dtype string, for the emitted `DataKey`.
+    async fn frame_info(&self) -> Result<(Vec<u64>, String)>;
     /// Watch the frames-written counter, for `complete()` in fly scans.
     fn observe_num_captured(&self) -> watch::Receiver<u64>;
 }
@@ -890,6 +965,9 @@ impl AdFileIo for NdFileIo {
     async fn full_file_name(&self) -> Result<String> {
         self.file.full_file_name().await
     }
+    async fn frame_info(&self) -> Result<(Vec<u64>, String)> {
+        self.file.frame_info().await
+    }
     fn observe_num_captured(&self) -> watch::Receiver<u64> {
         self.index_rx.clone()
     }
@@ -912,11 +990,6 @@ pub struct AdHdfWriter {
     name: String,
     io: Arc<dyn AdFileIo>,
     path_provider: StaticPathProvider,
-    /// Frame shape reported in the emitted `DataKey`. `[]` when unknown —
-    /// discovery from `ArraySizeX/Y_RBV` is a follow-up.
-    shape: Vec<Option<u64>>,
-    /// numpy dtype string for the frames, e.g. `"<u2"` (16-bit unsigned).
-    dtype_numpy: String,
     /// Guards single-`StreamResource` emission and the datum cursor.
     emit: tokio::sync::Mutex<AdEmitState>,
 }
@@ -932,17 +1005,8 @@ impl AdHdfWriter {
             name: name.into(),
             io,
             path_provider,
-            shape: Vec::new(),
-            dtype_numpy: "<u2".into(),
             emit: tokio::sync::Mutex::new(AdEmitState::default()),
         }
-    }
-
-    /// Override the frame shape / numpy dtype reported in the `DataKey`.
-    pub fn with_frame(mut self, shape: Vec<Option<u64>>, dtype_numpy: impl Into<String>) -> Self {
-        self.shape = shape;
-        self.dtype_numpy = dtype_numpy.into();
-        self
     }
 
     /// Connect the underlying file-plugin IO.
@@ -976,14 +1040,18 @@ impl DetectorWriter for AdHdfWriter {
             st.resource_uid = None;
             st.last_emitted = 0;
         }
+        // Discover the frame shape + dtype from the IOC (ArraySize*/DataType
+        // RBVs). Requires a primed detector — the shape is `[]` until the first
+        // frame flows (e.g. after `AreaDetectorCam::warmup`).
+        let (shape, dtype_numpy) = self.io.frame_info().await?;
         let mut out = HashMap::new();
         out.insert(
             self.data_key_name(),
             DataKey {
                 source: format!("ca://{}", self.data_key_name()),
                 dtype: Dtype::Array,
-                shape: self.shape.clone(),
-                dtype_numpy: Some(self.dtype_numpy.clone().into()),
+                shape: shape.into_iter().map(Some).collect(),
+                dtype_numpy: Some(dtype_numpy.into()),
                 external: Some("STREAM:".into()),
                 units: None,
                 precision: None,
@@ -1470,6 +1538,9 @@ mod ad_hdf_tests {
         async fn full_file_name(&self) -> Result<String> {
             Ok(self.full_name.clone())
         }
+        async fn frame_info(&self) -> Result<(Vec<u64>, String)> {
+            Ok((vec![20, 10], "<u2".to_string()))
+        }
         fn observe_num_captured(&self) -> watch::Receiver<u64> {
             self.index_rx.clone()
         }
@@ -1498,6 +1569,25 @@ mod ad_hdf_tests {
         let dk = keys.get("det_image").expect("det_image data key");
         assert_eq!(dk.external.as_deref(), Some("STREAM:"));
         assert_eq!(dk.dtype, Dtype::Array);
+        // Shape + dtype discovered from the IOC (ArraySize*/DataType RBVs).
+        assert_eq!(dk.shape, vec![Some(20), Some(10)]);
+        assert_eq!(
+            dk.dtype_numpy,
+            Some(crate::event_model::DtypeNumpy::Scalar("<u2".to_string()))
+        );
+    }
+
+    #[test]
+    fn ad_datatype_maps_all_known_codes_and_rejects_unknown() {
+        // NDDataType_t 0..=9 → numpy; anything else is None.
+        let want = [
+            "|i1", "|u1", "<i2", "<u2", "<i4", "<u4", "<i8", "<u8", "<f4", "<f8",
+        ];
+        for (code, np) in want.iter().enumerate() {
+            assert_eq!(ad_datatype_to_numpy(code as i64), Some(*np));
+        }
+        assert_eq!(ad_datatype_to_numpy(10), None);
+        assert_eq!(ad_datatype_to_numpy(-1), None);
     }
 
     #[tokio::test]
