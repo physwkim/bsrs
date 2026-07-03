@@ -70,6 +70,12 @@ pub const AD_IMAGE_MODE_MULTIPLE: i64 = 1;
 /// `NDFile.template`: 0=Single, 1=Capture, 2=Stream).
 pub const AD_FILE_WRITE_MODE_STREAM: i64 = 2;
 
+/// `ColorMode_RBV` values (`NDColorMode_t` ordering from `NDArray.h`:
+/// 0=Mono, 1=Bayer, 2=RGB1, 3=RGB2, 4=RGB3, 5=YUV444, 6=YUV422, 7=YUV420).
+pub const AD_COLOR_MODE_MONO: i64 = 0;
+/// See [`AD_COLOR_MODE_MONO`].
+pub const AD_COLOR_MODE_RGB1: i64 = 2;
+
 /// Map an areaDetector `DataType_RBV` (`NDDataType_t` enum ordering) to the
 /// corresponding numpy dtype string (little-endian; single-byte types carry no
 /// byte order). Returns `None` for an unknown code. Matches
@@ -132,6 +138,114 @@ pub struct AreaDetectorCam {
     /// inline XML or a filename on the IOC host. Read at `open()` to discover
     /// NDAttribute datasets for the emitted stream documents.
     pub nd_attributes_file: Arc<EpicsCaBackend<String>>,
+    /// Frame description readbacks (`ArraySizeX/Y/Z_RBV`, `DataType_RBV`,
+    /// `ColorMode_RBV`) — the shape/dtype source for the emitted `DataKey`,
+    /// read from the driver as in ophyd-async's `make_writer_data_logic`.
+    pub frame_info: Arc<CamFrameInfo>,
+}
+
+/// The driver-side NDArray description: `ArraySizeX/Y/Z_RBV`, `DataType_RBV`,
+/// and `ColorMode_RBV`. A cheap `Arc` handle so the detector writer can
+/// discover the frame shape/dtype after the cam has been moved into a
+/// `StandardDetector`. Port of ophyd-async's `NDArrayDescription` and
+/// `get_ndarray_resource_info` (`_data_logic.py:54-91`).
+pub struct CamFrameInfo {
+    /// PV prefix (for error messages).
+    pub prefix: String,
+    /// `ArraySizeX_RBV` (longin).
+    pub size_x: Arc<EpicsCaBackend<i64>>,
+    /// `ArraySizeY_RBV` (longin).
+    pub size_y: Arc<EpicsCaBackend<i64>>,
+    /// `ArraySizeZ_RBV` (longin).
+    pub size_z: Arc<EpicsCaBackend<i64>>,
+    /// `DataType_RBV` (mbbi, `NDDataType_t` ordering).
+    pub data_type: Arc<EpicsCaBackend<i64>>,
+    /// `ColorMode_RBV` (mbbi, `NDColorMode_t` ordering).
+    pub color_mode: Arc<EpicsCaBackend<i64>>,
+}
+
+impl CamFrameInfo {
+    fn new(prefix: &str) -> Self {
+        Self {
+            prefix: prefix.to_string(),
+            size_x: Arc::new(EpicsCaBackend::<i64>::new(join(prefix, "ArraySizeX_RBV"))),
+            size_y: Arc::new(EpicsCaBackend::<i64>::new(join(prefix, "ArraySizeY_RBV"))),
+            size_z: Arc::new(EpicsCaBackend::<i64>::new(join(prefix, "ArraySizeZ_RBV"))),
+            data_type: Arc::new(EpicsCaBackend::<i64>::new(join(prefix, "DataType_RBV"))),
+            color_mode: Arc::new(EpicsCaBackend::<i64>::new(join(prefix, "ColorMode_RBV"))),
+        }
+    }
+
+    async fn connect(&self, timeout: Duration) -> Result<()> {
+        let (a, b, c, d, e) = tokio::join!(
+            SignalBackend::<i64>::connect(self.size_x.as_ref(), timeout),
+            SignalBackend::<i64>::connect(self.size_y.as_ref(), timeout),
+            SignalBackend::<i64>::connect(self.size_z.as_ref(), timeout),
+            SignalBackend::<i64>::connect(self.data_type.as_ref(), timeout),
+            SignalBackend::<i64>::connect(self.color_mode.as_ref(), timeout),
+        );
+        a?;
+        b?;
+        c?;
+        d?;
+        e?;
+        Ok(())
+    }
+}
+
+/// Source of the frame shape + numpy dtype for the emitted `DataKey`. The
+/// detector writer reads it at `open()`; the production impl is the driver's
+/// readbacks ([`CamFrameInfo`]).
+#[async_trait::async_trait]
+pub trait AdFrameInfoSource: Send + Sync {
+    /// Frame shape (slowest-varying first, zero dims dropped, color-mode
+    /// adjusted) and numpy dtype string.
+    async fn frame_info(&self) -> Result<(Vec<u64>, String)>;
+}
+
+/// Compose the frame shape ophyd-async's `get_ndarray_resource_info`
+/// (`_data_logic.py:61-84`) derives from the driver readbacks: dims in
+/// `[Z, Y, X]` order (slowest first, matching the row-major HDF dataset),
+/// zero dims dropped, RGB1 prepending the color dim; any other non-Mono
+/// color mode is unsupported.
+fn compose_frame_shape(sz: i64, sy: i64, sx: i64, color_mode: i64, pv: &str) -> Result<Vec<u64>> {
+    let mut shape: Vec<u64> = [sz, sy, sx]
+        .into_iter()
+        .filter(|&d| d > 0)
+        .map(|d| d as u64)
+        .collect();
+    match color_mode {
+        AD_COLOR_MODE_MONO => {}
+        AD_COLOR_MODE_RGB1 => shape.insert(0, 3),
+        other => {
+            return Err(BsrsError::Backend(format!(
+                "{pv}ColorMode_RBV={other} is not supported (only Mono and RGB1)"
+            )));
+        }
+    }
+    Ok(shape)
+}
+
+#[async_trait::async_trait]
+impl AdFrameInfoSource for CamFrameInfo {
+    async fn frame_info(&self) -> Result<(Vec<u64>, String)> {
+        let (sz, sy, sx, dt, cm) = tokio::join!(
+            SignalBackend::<i64>::get_value(self.size_z.as_ref()),
+            SignalBackend::<i64>::get_value(self.size_y.as_ref()),
+            SignalBackend::<i64>::get_value(self.size_x.as_ref()),
+            SignalBackend::<i64>::get_value(self.data_type.as_ref()),
+            SignalBackend::<i64>::get_value(self.color_mode.as_ref()),
+        );
+        let shape = compose_frame_shape(sz?, sy?, sx?, cm?, &self.prefix)?;
+        let dt = dt?;
+        let dtype_numpy = ad_datatype_to_numpy(dt).ok_or_else(|| {
+            BsrsError::Backend(format!(
+                "{}DataType_RBV={dt} is not a known NDDataType_t",
+                self.prefix
+            ))
+        })?;
+        Ok((shape, dtype_numpy.to_string()))
+    }
 }
 
 impl AreaDetectorCam {
@@ -155,13 +269,14 @@ impl AreaDetectorCam {
                 &prefix,
                 "NDAttributesFile",
             ))),
+            frame_info: Arc::new(CamFrameInfo::new(&prefix)),
             prefix,
         }
     }
 
     /// Connect every channel in parallel.
     pub async fn connect(&self, timeout: Duration) -> Result<()> {
-        let (a, b, c, d, e, f, g) = tokio::join!(
+        let (a, b, c, d, e, f, g, h) = tokio::join!(
             SignalBackend::<i64>::connect(self.image_mode.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.num_images.as_ref(), timeout),
             SignalBackend::<bool>::connect(self.acquire.as_ref(), timeout),
@@ -169,6 +284,7 @@ impl AreaDetectorCam {
             SignalBackend::<i64>::connect(self.array_counter_rbv.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.detector_state_rbv.as_ref(), timeout),
             SignalBackend::<String>::connect(self.nd_attributes_file.as_ref(), timeout),
+            self.frame_info.connect(timeout),
         );
         a?;
         b?;
@@ -177,6 +293,7 @@ impl AreaDetectorCam {
         e?;
         f?;
         g?;
+        h?;
         Ok(())
     }
 
@@ -405,13 +522,6 @@ pub struct NdFile {
     /// The `StreamResource` URI is built from this readback so it points
     /// at the file the IOC actually wrote, not at a re-derived guess.
     pub full_file_name_rbv: Arc<EpicsCaBackend<String>>,
-    /// `ArraySize0_RBV`/`ArraySize1_RBV`/`ArraySize2_RBV` (longin) — the
-    /// dimensions of the incoming NDArray, fastest-varying first. Zero for
-    /// unused dimensions. Read at `open()` to shape the emitted `DataKey`.
-    pub array_size_rbv: [Arc<EpicsCaBackend<i64>>; 3],
-    /// `DataType_RBV` (mbbi) — the NDArray element type (`NDDataType_t`
-    /// ordering), mapped to a numpy dtype string for the `DataKey`.
-    pub data_type_rbv: Arc<EpicsCaBackend<i64>>,
     /// `FlushNow` (bo) — force the plugin to flush buffered frames to the
     /// file. Meaningful in SWMR streaming; the write index only reflects
     /// flushed frames, so we flush before reading `NumCaptured_RBV`.
@@ -446,12 +556,6 @@ impl NdFile {
                 &prefix,
                 "FullFileName_RBV",
             ))),
-            array_size_rbv: [
-                Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "ArraySize0_RBV"))),
-                Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "ArraySize1_RBV"))),
-                Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "ArraySize2_RBV"))),
-            ],
-            data_type_rbv: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "DataType_RBV"))),
             flush_now: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "FlushNow"))),
             plugin,
         }
@@ -482,20 +586,7 @@ impl NdFile {
         h?;
         i?;
         j?;
-        // Frame-info readbacks (shape + dtype), connected in a second batch to
-        // keep the tuple manageable.
-        let (k, l, m, n, o) = tokio::join!(
-            SignalBackend::<i64>::connect(self.array_size_rbv[0].as_ref(), timeout),
-            SignalBackend::<i64>::connect(self.array_size_rbv[1].as_ref(), timeout),
-            SignalBackend::<i64>::connect(self.array_size_rbv[2].as_ref(), timeout),
-            SignalBackend::<i64>::connect(self.data_type_rbv.as_ref(), timeout),
-            SignalBackend::<bool>::connect(self.flush_now.as_ref(), timeout),
-        );
-        k?;
-        l?;
-        m?;
-        n?;
-        o?;
+        SignalBackend::<bool>::connect(self.flush_now.as_ref(), timeout).await?;
         Ok(())
     }
 
@@ -574,33 +665,6 @@ impl NdFile {
     pub async fn full_file_name(&self) -> Result<String> {
         let s = SignalBackend::<String>::get_value(self.full_file_name_rbv.as_ref()).await?;
         Ok(s.trim_end_matches('\0').to_string())
-    }
-
-    /// Discover the incoming frame's shape and numpy dtype from
-    /// `ArraySize{0,1,2}_RBV` + `DataType_RBV`. Zero-sized dimensions are
-    /// dropped (unused / not yet primed), fastest-varying first — matching
-    /// ophyd-async's `get_ndarray_resource_info` (`_data_logic.py`). Errors if
-    /// `DataType_RBV` is not a known `NDDataType_t`.
-    pub async fn frame_info(&self) -> Result<(Vec<u64>, String)> {
-        let (s0, s1, s2, dt) = tokio::join!(
-            SignalBackend::<i64>::get_value(self.array_size_rbv[0].as_ref()),
-            SignalBackend::<i64>::get_value(self.array_size_rbv[1].as_ref()),
-            SignalBackend::<i64>::get_value(self.array_size_rbv[2].as_ref()),
-            SignalBackend::<i64>::get_value(self.data_type_rbv.as_ref()),
-        );
-        let shape: Vec<u64> = [s0?, s1?, s2?]
-            .into_iter()
-            .filter(|&d| d > 0)
-            .map(|d| d as u64)
-            .collect();
-        let dt = dt?;
-        let dtype_numpy = ad_datatype_to_numpy(dt).ok_or_else(|| {
-            BsrsError::Backend(format!(
-                "{}DataType_RBV={dt} is not a known NDDataType_t",
-                self.plugin.prefix
-            ))
-        })?;
-        Ok((shape, dtype_numpy.to_string()))
     }
 
     /// Force a flush (`FlushNow=1`) so `NumCaptured_RBV` reflects frames
@@ -922,9 +986,6 @@ pub trait AdFileIo: Send + Sync {
     async fn num_captured(&self) -> Result<u64>;
     /// Absolute path the IOC resolved for the open file.
     async fn full_file_name(&self) -> Result<String>;
-    /// Incoming frame shape (fastest-varying first, zero dims dropped) and
-    /// numpy dtype string, for the emitted `DataKey`.
-    async fn frame_info(&self) -> Result<(Vec<u64>, String)>;
     /// Force a flush so `num_captured` reflects frames written to the file.
     async fn flush(&self) -> Result<()>;
     /// Watch the frames-written counter, for `complete()` in fly scans.
@@ -993,9 +1054,6 @@ impl AdFileIo for NdFileIo {
     }
     async fn full_file_name(&self) -> Result<String> {
         self.file.full_file_name().await
-    }
-    async fn frame_info(&self) -> Result<(Vec<u64>, String)> {
-        self.file.frame_info().await
     }
     async fn flush(&self) -> Result<()> {
         self.file.flush().await
@@ -1195,6 +1253,9 @@ struct AdEmitState {
 pub struct AdHdfWriter {
     name: String,
     io: Arc<dyn AdFileIo>,
+    /// Driver-side frame description (`ArraySizeZ/Y/X_RBV` etc.), read at
+    /// `open()` for the image `DataKey`'s shape/dtype.
+    frame: Arc<dyn AdFrameInfoSource>,
     path_provider: StaticPathProvider,
     /// `NDAttributesFile` sources (driver + extra plugins) read at `open()` to
     /// discover the per-frame NDAttribute datasets in the IOC's file.
@@ -1209,15 +1270,18 @@ pub struct AdHdfWriter {
 }
 
 impl AdHdfWriter {
-    /// Build a writer over `io`, writing files per `path_provider`.
+    /// Build a writer over `io`, describing frames per `frame`, writing files
+    /// per `path_provider`.
     pub fn new(
         name: impl Into<String>,
         io: Arc<dyn AdFileIo>,
+        frame: Arc<dyn AdFrameInfoSource>,
         path_provider: StaticPathProvider,
     ) -> Self {
         Self {
             name: name.into(),
             io,
+            frame,
             path_provider,
             attr_sources: Vec::new(),
             ndattributes: Vec::new(),
@@ -1300,10 +1364,11 @@ impl DetectorWriter for AdHdfWriter {
             )
             .await?;
         self.io.start_capture().await?;
-        // Discover the frame shape + dtype from the IOC (ArraySize*/DataType
-        // RBVs). Requires a primed detector — the shape is `[]` until the first
-        // frame flows (e.g. after `AreaDetectorCam::warmup`).
-        let (shape, dtype_numpy) = self.io.frame_info().await?;
+        // Discover the frame shape + dtype from the driver's ArraySizeZ/Y/X +
+        // DataType + ColorMode RBVs. Requires a primed detector — the shape is
+        // `[]` until the first frame flows (e.g. after
+        // `AreaDetectorCam::warmup`).
+        let (shape, dtype_numpy) = self.frame.frame_info().await?;
         // Discover the NDAttribute datasets from the NDAttributesFile sources,
         // merged with the declared specs.
         let attrs = self.discover_ndattributes().await?;
@@ -1549,12 +1614,18 @@ pub fn area_detector_hdf(
     let io: Arc<dyn AdFileIo> = Arc::new(NdFileIo::new(Arc::new(NdFile::new(hdf_prefix))));
     // The cam's NDAttributesFile is the discovery source for NDAttribute
     // datasets, as in ophyd-async's `(driver, *plugins)` sweep — extra plugin
-    // sources can be added by composing AdHdfWriter manually.
-    let writer =
-        AdHdfWriter::new(name.clone(), io, path_provider)
-            .with_ndattribute_sources(vec![
-                cam.nd_attributes_file.clone() as Arc<dyn NdAttributeXmlSource>
-            ]);
+    // sources can be added by composing AdHdfWriter manually. The cam's
+    // ArraySize/DataType/ColorMode readbacks are the frame-shape source
+    // (ophyd-async `make_writer_data_logic` shape_signals).
+    let writer = AdHdfWriter::new(
+        name.clone(),
+        io,
+        cam.frame_info.clone() as Arc<dyn AdFrameInfoSource>,
+        path_provider,
+    )
+    .with_ndattribute_sources(vec![
+        cam.nd_attributes_file.clone() as Arc<dyn NdAttributeXmlSource>
+    ]);
     StandardDetector::new(name, cam, writer)
 }
 
@@ -1877,9 +1948,6 @@ mod ad_hdf_tests {
         async fn full_file_name(&self) -> Result<String> {
             Ok(self.full_name.clone())
         }
-        async fn frame_info(&self) -> Result<(Vec<u64>, String)> {
-            Ok((vec![20, 10], "<u2".to_string()))
-        }
         async fn flush(&self) -> Result<()> {
             self.flushes.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -1889,8 +1957,23 @@ mod ad_hdf_tests {
         }
     }
 
+    /// Fixed frame description: a 20x10 (Y, X) `<u2` mono frame.
+    struct FakeFrameInfo;
+
+    #[async_trait::async_trait]
+    impl AdFrameInfoSource for FakeFrameInfo {
+        async fn frame_info(&self) -> Result<(Vec<u64>, String)> {
+            Ok((vec![20, 10], "<u2".to_string()))
+        }
+    }
+
     fn writer_with(io: Arc<FakeAdFileIo>) -> AdHdfWriter {
-        AdHdfWriter::new("det", io, StaticPathProvider::new("/data/scans/", "scan"))
+        AdHdfWriter::new(
+            "det",
+            io,
+            Arc::new(FakeFrameInfo),
+            StaticPathProvider::new("/data/scans/", "scan"),
+        )
     }
 
     /// Fixed-content `NDAttributesFile` source (inline XML or a filename).
@@ -1901,6 +1984,30 @@ mod ad_hdf_tests {
         async fn nd_attributes_xml(&self) -> Result<String> {
             Ok(self.0.clone())
         }
+    }
+
+    #[test]
+    fn compose_frame_shape_orders_zyx_and_handles_color_modes() {
+        // Mono 2-D frame: Z unused (0) → [Y, X].
+        assert_eq!(
+            compose_frame_shape(0, 768, 1024, AD_COLOR_MODE_MONO, "P:").unwrap(),
+            vec![768, 1024]
+        );
+        // 3-D mono: [Z, Y, X], slowest first.
+        assert_eq!(
+            compose_frame_shape(4, 20, 10, AD_COLOR_MODE_MONO, "P:").unwrap(),
+            vec![4, 20, 10]
+        );
+        // RGB1 prepends the color dim (ophyd-async `shape = [3, *shape]`).
+        assert_eq!(
+            compose_frame_shape(0, 768, 1024, AD_COLOR_MODE_RGB1, "P:").unwrap(),
+            vec![3, 768, 1024]
+        );
+        // Any other non-Mono color mode is unsupported.
+        let err = compose_frame_shape(0, 768, 1024, 1, "P:")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ColorMode_RBV=1"), "{err}");
     }
 
     #[test]
@@ -2131,12 +2238,7 @@ mod ad_hdf_tests {
     #[tokio::test]
     async fn ndattributes_emit_extra_resource_and_datum_per_attribute() {
         let io = FakeAdFileIo::new("/data/scans/scan.h5");
-        let w = AdHdfWriter::new(
-            "det",
-            io.clone(),
-            StaticPathProvider::new("/data/scans/", "scan"),
-        )
-        .with_ndattributes(vec![
+        let w = writer_with(io.clone()).with_ndattributes(vec![
             NdAttributeDataset::new("temp", "<f8"),
             NdAttributeDataset::new("counter", "<i4"),
         ]);
