@@ -621,22 +621,34 @@ mod tests {
     }
 
     // -------------------------------------------------------------
-    // Live-IOC smoke tests against `epics-rs/examples/sim-detector`.
+    // Live-IOC smoke tests. Default target is
+    // `epics-rs/examples/sim-detector`; they also run against the
+    // mini-beamline MovingDot detector (`mini:dot:`, asyn port `DOT`).
     // Marked `#[ignore]` so they only run with `--ignored`.
     //
-    // Setup:
+    // Setup (sim-detector):
     //   cd ~/codes/epics-rs/examples/sim-detector
     //   cargo run --bin sim_ioc --features ioc -- ioc/st.cmd
     //
     // Then in another shell:
-    //   cargo test -p bsrs-host --features ca \
+    //   cargo test -p bsrs --features host \
     //       areadetector::tests:: -- --ignored --nocapture
     //
-    // Override the default `SIM1:` prefix with `BSRS_AD_PREFIX=<your:>`.
+    // Retarget with env overrides (defaults are sim-detector `SIM1:` /
+    // `SIM1`); for the mini-beamline:
+    //   BSRS_AD_PREFIX=mini:dot:  BSRS_AD_PORT=DOT
     // -------------------------------------------------------------
 
     fn ad_prefix() -> String {
         std::env::var("BSRS_AD_PREFIX").unwrap_or_else(|_| "SIM1:".to_string())
+    }
+
+    /// The detector's asyn port name — the `NDArrayPort` source that
+    /// `select_save_plugin` routes file plugins to — overridable with
+    /// `BSRS_AD_PORT`. Defaults to sim-detector's `SIM1`; use `DOT` for
+    /// the mini-beamline MovingDot detector.
+    fn ad_port() -> String {
+        std::env::var("BSRS_AD_PORT").unwrap_or_else(|_| "SIM1".to_string())
     }
 
     /// Smoke: `AreaDetectorCam::warmup` must (a) acquire ≥ 1 frame —
@@ -694,12 +706,12 @@ mod tests {
         assert_eq!(restored_num, prev_num, "warmup did not restore NumImages");
     }
 
-    /// Smoke: `select_save_plugin(hdf1, "SIM1", [jpeg1, magick1,
-    /// nexus1])` must (a) set `HDF1:NDArrayPort = "SIM1"`,
-    /// (b) enable `HDF1:EnableCallbacks`, (c) disable
-    /// `EnableCallbacks` on every sibling. Plus long-string
-    /// round-trip on `HDF1:FilePath` to exercise the
-    /// `CaStringKind::Long` get/put path.
+    /// Smoke: `select_save_plugin(hdf1, <port>, [jpeg1, magick1,
+    /// nexus1])` (port from `BSRS_AD_PORT`, default `SIM1`) must
+    /// (a) set `HDF1:NDArrayPort = <port>`, (b) enable
+    /// `HDF1:EnableCallbacks`, (c) disable `EnableCallbacks` on every
+    /// sibling. Plus long-string round-trip on `HDF1:FilePath` to
+    /// exercise the `CaStringKind::Long` get/put path.
     ///
     /// Side effect: leaves HDF1 enabled and JPEG1/Magick1/Nexus1
     /// disabled after the test. Re-enable manually via PYDM/MEDM if
@@ -736,11 +748,13 @@ mod tests {
             "FilePath long-string round-trip mismatch"
         );
 
-        // (2) Route HDF1 to consume from "SIM1" (the cam's asyn
-        // port — see sim-detector's st.cmd PORT=SIM1), and disable
-        // the three sibling file plugins.
+        // (2) Route HDF1 to consume from the cam's asyn port
+        // (`BSRS_AD_PORT`, default `SIM1` per sim-detector's st.cmd
+        // PORT=SIM1; `DOT` for the mini-beamline), and disable the
+        // three sibling file plugins.
+        let port = ad_port();
         let siblings = [&jpeg1, &magick1, &nexus1];
-        select_save_plugin(&hdf1, "SIM1", &siblings)
+        select_save_plugin(&hdf1, &port, &siblings)
             .await
             .expect("select_save_plugin");
 
@@ -767,7 +781,7 @@ mod tests {
         // NDArrayPort comes back via DBR_STRING — short form, NUL-padded
         // to 40 bytes, but our decoder strips at NUL so we just compare
         // directly.
-        assert_eq!(hdf1_port, "SIM1", "HDF1.NDArrayPort not routed to SIM1");
+        assert_eq!(hdf1_port, port, "HDF1.NDArrayPort not routed to {port}");
         assert!(hdf1_en, "HDF1 was not enabled");
         assert!(!jpeg1_en, "JPEG1 still enabled after select_save_plugin");
         assert!(
