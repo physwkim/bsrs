@@ -678,6 +678,81 @@ impl NdFile {
     }
 }
 
+/// `NDFileHDF5` plugin — the generic [`NdFile`] channels plus the
+/// HDF5-specific records (`NumFramesChunks`/`ChunkSizeAuto`). Mirrors
+/// ophyd-async's `NDFileIO` vs `NDFileHDF5IO` split so the JPEG/TIFF file
+/// plugins can share `NdFile` without growing records they don't have.
+pub struct NdFileHdf5 {
+    /// Embedded generic file-plugin handle.
+    pub file: NdFile,
+    /// `NumFramesChunks` (longout) — frames per HDF chunk, written back when
+    /// the readback reports 0 (fresh IOC startup).
+    pub num_frames_chunks: Arc<EpicsCaBackend<i64>>,
+    /// `NumFramesChunks_RBV` (longin).
+    pub num_frames_chunks_rbv: Arc<EpicsCaBackend<i64>>,
+    /// `ChunkSizeAuto` (bo) — let the plugin derive chunking from the frame.
+    pub chunk_size_auto: Arc<EpicsCaBackend<bool>>,
+}
+
+impl NdFileHdf5 {
+    /// Build the handle. Does NOT connect.
+    pub fn new(prefix: impl Into<String>) -> Self {
+        let prefix = prefix.into();
+        Self {
+            num_frames_chunks: Arc::new(EpicsCaBackend::<i64>::new(join(
+                &prefix,
+                "NumFramesChunks",
+            ))),
+            num_frames_chunks_rbv: Arc::new(EpicsCaBackend::<i64>::new(join(
+                &prefix,
+                "NumFramesChunks_RBV",
+            ))),
+            chunk_size_auto: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "ChunkSizeAuto"))),
+            file: NdFile::new(prefix),
+        }
+    }
+
+    /// Connect the embedded file plugin + the HDF5-specific channels.
+    pub async fn connect(&self, timeout: Duration) -> Result<()> {
+        let (a, b, c, d) = tokio::join!(
+            self.file.connect(timeout),
+            SignalBackend::<i64>::connect(self.num_frames_chunks.as_ref(), timeout),
+            SignalBackend::<i64>::connect(self.num_frames_chunks_rbv.as_ref(), timeout),
+            SignalBackend::<bool>::connect(self.chunk_size_auto.as_ref(), timeout),
+        );
+        a?;
+        b?;
+        c?;
+        d?;
+        Ok(())
+    }
+
+    /// Frames per HDF chunk, always `>= 1`. A fresh IOC reports 0 until the
+    /// first capture; ophyd-async writes 1 back to the plugin in that case
+    /// and uses 1 (`prepare_unbounded`, `_data_logic.py:180`).
+    pub async fn frames_per_chunk(&self) -> Result<u64> {
+        let n = SignalBackend::<i64>::get_value(self.num_frames_chunks_rbv.as_ref()).await?;
+        if n <= 0 {
+            await_put(
+                SignalBackend::<i64>::put(self.num_frames_chunks.as_ref(), Some(1)),
+                "NdFileHdf5::frames_per_chunk: NumFramesChunks=1",
+            )
+            .await?;
+            return Ok(1);
+        }
+        Ok(n as u64)
+    }
+
+    /// Set `ChunkSizeAuto`.
+    pub async fn set_chunk_size_auto(&self, on: bool) -> Result<()> {
+        await_put(
+            SignalBackend::<bool>::put(self.chunk_size_auto.as_ref(), Some(on)),
+            "NdFileHdf5::set_chunk_size_auto",
+        )
+        .await
+    }
+}
+
 impl NamedObj for NdFile {
     fn name(&self) -> &str {
         &self.plugin.prefix
@@ -935,6 +1010,10 @@ pub fn num_rois(rois: &[&NdRoi], n: usize) -> Result<()> {
 /// Default HDF5 dataset the NDFileHDF5 plugin writes frames into. Matches
 /// ophyd-async's `parameters={"dataset": "/entry/data/data"}`.
 const AD_HDF_DATASET: &str = "/entry/data/data";
+
+/// `chunk_shape` for the scalar NDAttribute datasets — NDFileHDF5 writes them
+/// in fixed 16384-element chunks (ophyd-async `_data_logic.py:216`).
+const AD_HDF_ATTR_CHUNK: u64 = 16384;
 /// Default `FileTemplate` — `<path><name>.h5`, no auto-increment suffix, so the
 /// IOC-resolved `FullFileName_RBV` is deterministic.
 const AD_HDF_TEMPLATE: &str = "%s%s.h5";
@@ -992,9 +1071,21 @@ pub trait AdFileIo: Send + Sync {
     fn observe_num_captured(&self) -> watch::Receiver<u64>;
 }
 
-/// [`AdFileIo`] backed by a real [`NdFile`] over Channel Access.
+/// The HDF5-specific extension of [`AdFileIo`] the [`AdHdfWriter`] needs on
+/// top of the generic file-plugin operations (mirrors ophyd-async's
+/// `NDFileHDF5IO` over `NDFileIO`).
+#[async_trait::async_trait]
+pub trait AdHdfFileIo: AdFileIo {
+    /// Frames per HDF chunk, always `>= 1` (implementations write 1 back to
+    /// the plugin when it reports 0 — a fresh IOC before its first capture).
+    async fn frames_per_chunk(&self) -> Result<u64>;
+    /// Set `ChunkSizeAuto` — let the plugin derive chunking from the frame.
+    async fn set_chunk_size_auto(&self, on: bool) -> Result<()>;
+}
+
+/// [`AdHdfFileIo`] backed by a real [`NdFileHdf5`] over Channel Access.
 pub struct NdFileIo {
-    file: Arc<NdFile>,
+    file: Arc<NdFileHdf5>,
     index_rx: watch::Receiver<u64>,
     index_tx: Arc<watch::Sender<u64>>,
     /// Kept alive so the `NumCaptured_RBV` monitor feeding `index_rx` is not
@@ -1003,8 +1094,8 @@ pub struct NdFileIo {
 }
 
 impl NdFileIo {
-    /// Wrap an `NdFile`. Call [`connect`](AdFileIo::connect) before use.
-    pub fn new(file: Arc<NdFile>) -> Self {
+    /// Wrap an `NdFileHdf5`. Call [`connect`](AdFileIo::connect) before use.
+    pub fn new(file: Arc<NdFileHdf5>) -> Self {
         let (tx, rx) = watch::channel(0u64);
         Self {
             file,
@@ -1021,7 +1112,7 @@ impl AdFileIo for NdFileIo {
         self.file.connect(timeout).await?;
         let tx = self.index_tx.clone();
         let token = SignalBackend::<i64>::set_callback(
-            self.file.num_captured_rbv.as_ref(),
+            self.file.file.num_captured_rbv.as_ref(),
             Some(Box::new(move |v: &i64, _ts, _alarm| {
                 let _ = tx.send((*v).max(0) as u64);
             })),
@@ -1036,30 +1127,43 @@ impl AdFileIo for NdFileIo {
         template: &str,
         num_capture: i64,
     ) -> Result<()> {
-        self.file.set_path(directory).await?;
-        self.file.set_name(filename).await?;
-        self.file.set_template(template).await?;
-        self.file.set_write_mode(AD_FILE_WRITE_MODE_STREAM).await?;
-        self.file.set_num_capture(num_capture).await?;
+        self.file.file.set_path(directory).await?;
+        self.file.file.set_name(filename).await?;
+        self.file.file.set_template(template).await?;
+        self.file
+            .file
+            .set_write_mode(AD_FILE_WRITE_MODE_STREAM)
+            .await?;
+        self.file.file.set_num_capture(num_capture).await?;
         Ok(())
     }
     async fn start_capture(&self) -> Result<()> {
-        self.file.start_capture().await
+        self.file.file.start_capture().await
     }
     async fn stop_capture(&self) -> Result<()> {
-        self.file.stop_capture().await
+        self.file.file.stop_capture().await
     }
     async fn num_captured(&self) -> Result<u64> {
-        self.file.num_captured().await
+        self.file.file.num_captured().await
     }
     async fn full_file_name(&self) -> Result<String> {
-        self.file.full_file_name().await
+        self.file.file.full_file_name().await
     }
     async fn flush(&self) -> Result<()> {
-        self.file.flush().await
+        self.file.file.flush().await
     }
     fn observe_num_captured(&self) -> watch::Receiver<u64> {
         self.index_rx.clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl AdHdfFileIo for NdFileIo {
+    async fn frames_per_chunk(&self) -> Result<u64> {
+        self.file.frames_per_chunk().await
+    }
+    async fn set_chunk_size_auto(&self, on: bool) -> Result<()> {
+        self.file.set_chunk_size_auto(on).await
     }
 }
 
@@ -1201,11 +1305,26 @@ impl NdAttributeXmlSource for EpicsCaBackend<String> {
 }
 
 /// Compose a `StreamResource` for an HDF dataset in the IOC's file.
-fn ad_stream_resource(uid: String, data_key: String, uri: &str, dataset: &str) -> StreamResource {
+fn ad_stream_resource(
+    uid: String,
+    data_key: String,
+    uri: &str,
+    dataset: &str,
+    chunk_shape: &[u64],
+) -> StreamResource {
     let mut parameters = HashMap::new();
     parameters.insert(
         "dataset".to_string(),
         serde_json::Value::String(dataset.to_string()),
+    );
+    parameters.insert(
+        "chunk_shape".to_string(),
+        serde_json::Value::Array(
+            chunk_shape
+                .iter()
+                .map(|&d| serde_json::Value::from(d))
+                .collect(),
+        ),
     );
     StreamResource {
         uid,
@@ -1246,6 +1365,11 @@ struct AdEmitState {
     /// Frames per index (ophyd-async `collections_per_event`), staged by
     /// `open(multiplier)`. `0` = not yet opened; readers clamp to 1.
     multiplier: u64,
+    /// Frame shape discovered at `open()`, for the main resource's
+    /// `chunk_shape` parameter.
+    frame_shape: Vec<u64>,
+    /// `NumFramesChunks` read at `open()` (always `>= 1`).
+    frames_per_chunk: u64,
 }
 
 /// `DetectorWriter` for an areaDetector NDFileHDF5 plugin. The IOC writes the
@@ -1255,7 +1379,7 @@ struct AdEmitState {
 /// `ADHDFWriter` data-logic (`epics/adcore/_data_logic.py`).
 pub struct AdHdfWriter {
     name: String,
-    io: Arc<dyn AdFileIo>,
+    io: Arc<dyn AdHdfFileIo>,
     /// Driver-side frame description (`ArraySizeZ/Y/X_RBV` etc.), read at
     /// `open()` for the image `DataKey`'s shape/dtype.
     frame: Arc<dyn AdFrameInfoSource>,
@@ -1277,7 +1401,7 @@ impl AdHdfWriter {
     /// per `path_provider`.
     pub fn new(
         name: impl Into<String>,
-        io: Arc<dyn AdFileIo>,
+        io: Arc<dyn AdHdfFileIo>,
         frame: Arc<dyn AdFrameInfoSource>,
         path_provider: StaticPathProvider,
     ) -> Self {
@@ -1378,6 +1502,11 @@ impl DetectorWriter for AdHdfWriter {
             )));
         }
         let multiplier = u64::from(multiplier.max(1));
+        // Frames per HDF chunk — read before the setup puts, then let the
+        // plugin derive the rest of the chunking from the frame
+        // (ophyd-async `prepare_unbounded`, `_data_logic.py:180-186`).
+        let frames_per_chunk = self.io.frames_per_chunk().await?;
+        self.io.set_chunk_size_auto(true).await?;
         // Configure + arm the IOC file plugin. NumCapture=0: capture until
         // close() clears Capture, matching a step scan whose frame count is
         // unknown until the plan ends.
@@ -1407,6 +1536,8 @@ impl DetectorWriter for AdHdfWriter {
             st.attr_resource_uids.clear();
             st.last_emitted = 0;
             st.multiplier = multiplier;
+            st.frame_shape = shape.clone();
+            st.frames_per_chunk = frames_per_chunk;
         }
         // DataKey shapes carry the frames-per-index prefix, `[multiplier,
         // *frame_shape]` for the image and `[multiplier]` for the scalar
@@ -1503,11 +1634,17 @@ impl DetectorWriter for AdHdfWriter {
                 if need_main {
                     let uid = uuid::Uuid::new_v4().to_string();
                     st.main_resource_uid = Some(uid.clone());
+                    // The IOC chunks the image dataset [frames_per_chunk,
+                    // *frame_shape] (ophyd-async `_data_logic.py:88`).
+                    let chunk: Vec<u64> = std::iter::once(st.frames_per_chunk.max(1))
+                        .chain(st.frame_shape.iter().copied())
+                        .collect();
                     docs.push(StreamAsset::Resource(ad_stream_resource(
                         uid,
                         data_key.clone(),
                         &uri,
                         AD_HDF_DATASET,
+                        &chunk,
                     )));
                 }
                 for a in &attrs {
@@ -1520,6 +1657,7 @@ impl DetectorWriter for AdHdfWriter {
                             a.name.clone(),
                             &uri,
                             &dataset,
+                            &[AD_HDF_ATTR_CHUNK],
                         )));
                     }
                 }
@@ -1649,7 +1787,7 @@ pub fn area_detector_hdf(
 ) -> AreaDetectorHdf {
     let name = name.into();
     let cam = AreaDetectorCam::new(cam_prefix);
-    let io: Arc<dyn AdFileIo> = Arc::new(NdFileIo::new(Arc::new(NdFile::new(hdf_prefix))));
+    let io: Arc<dyn AdHdfFileIo> = Arc::new(NdFileIo::new(Arc::new(NdFileHdf5::new(hdf_prefix))));
     // The cam's NDAttributesFile is the discovery source for NDAttribute
     // datasets, as in ophyd-async's `(driver, *plugins)` sweep — extra plugin
     // sources can be added by composing AdHdfWriter manually. The cam's
@@ -1942,6 +2080,8 @@ mod ad_hdf_tests {
         configured: std::sync::Mutex<Option<(String, String, String, i64)>>,
         capturing: AtomicBool,
         flushes: AtomicU64,
+        frames_per_chunk: AtomicU64,
+        chunk_size_auto: AtomicBool,
     }
 
     impl FakeAdFileIo {
@@ -1955,6 +2095,8 @@ mod ad_hdf_tests {
                 configured: std::sync::Mutex::new(None),
                 capturing: AtomicBool::new(false),
                 flushes: AtomicU64::new(0),
+                frames_per_chunk: AtomicU64::new(1),
+                chunk_size_auto: AtomicBool::new(false),
             })
         }
         fn set_captured(&self, n: u64) {
@@ -1992,6 +2134,17 @@ mod ad_hdf_tests {
         }
         fn observe_num_captured(&self) -> watch::Receiver<u64> {
             self.index_rx.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AdHdfFileIo for FakeAdFileIo {
+        async fn frames_per_chunk(&self) -> Result<u64> {
+            Ok(self.frames_per_chunk.load(Ordering::SeqCst).max(1))
+        }
+        async fn set_chunk_size_auto(&self, on: bool) -> Result<()> {
+            self.chunk_size_auto.store(on, Ordering::SeqCst);
+            Ok(())
         }
     }
 
@@ -2236,8 +2389,13 @@ mod ad_hdf_tests {
     #[tokio::test]
     async fn collect_emits_resource_pointing_at_ioc_file_then_datum() {
         let io = FakeAdFileIo::new("/data/scans/scan.h5");
+        io.frames_per_chunk.store(4, Ordering::SeqCst);
         let w = writer_with(io.clone());
         w.open(1).await.unwrap();
+        assert!(
+            io.chunk_size_auto.load(Ordering::SeqCst),
+            "open() sets ChunkSizeAuto"
+        );
         io.set_captured(1);
         let up_to = w.indices_written().await;
         assert_eq!(up_to, 1);
@@ -2251,6 +2409,11 @@ mod ad_hdf_tests {
                 assert_eq!(
                     r.parameters.get("dataset").and_then(|v| v.as_str()),
                     Some("/entry/data/data")
+                );
+                // chunk_shape = [NumFramesChunks, *frame_shape].
+                assert_eq!(
+                    r.parameters.get("chunk_shape"),
+                    Some(&serde_json::json!([4, 20, 10]))
                 );
                 r.uid.clone()
             }
@@ -2333,6 +2496,17 @@ mod ad_hdf_tests {
         assert!(datasets.contains(&"/entry/data/data"));
         assert!(datasets.contains(&"/entry/instrument/NDAttributes/temp"));
         assert!(datasets.contains(&"/entry/instrument/NDAttributes/counter"));
+        // Attribute datasets chunk in fixed 16384-element blocks.
+        for r in &resources {
+            if r.data_key != "det_image" {
+                assert_eq!(
+                    r.parameters.get("chunk_shape"),
+                    Some(&serde_json::json!([16384])),
+                    "attr {} chunk_shape",
+                    r.data_key
+                );
+            }
+        }
         // All datums cover the same frame range + descriptor and each points at
         // a distinct emitted resource.
         let resource_uids: std::collections::HashSet<&str> =
