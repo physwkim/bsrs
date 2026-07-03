@@ -411,6 +411,23 @@ struct MonitorSpec {
     stream: String,
 }
 
+/// Stamp `run_start` on a freshly-drained external-asset doc so every emitted
+/// `StreamResource` carries the run it belongs to. A `DetectorWriter` composes
+/// its `StreamResource` with `run_start: None` because the run UID is
+/// engine/run-scoped, not writer-scoped; the engine — the single owner of the
+/// open run — fills it in at the drain/emit point on both the step (`Save`) and
+/// fly (`Collect`) paths. Ports bluesky `_pack_external_assets` setting
+/// `stream_resource_doc["run_start"]` (bundlers.py:886). Only `StreamResource`
+/// carries `run_start`; `StreamDatum` links to its run via the descriptor.
+/// A non-`None` `run_start` (a writer that already knows it) is left untouched.
+fn stamp_asset_run_start(doc: &mut Document, run_start: &str) {
+    if let Document::StreamResource(r) = doc {
+        if r.run_start.is_none() {
+            r.run_start = Some(run_start.to_string());
+        }
+    }
+}
+
 impl RunEngine {
     /// Construct a fresh RunEngine with the given sinks.
     pub fn new(sinks: Vec<Arc<dyn DocumentSink>>) -> Self {
@@ -1276,17 +1293,26 @@ impl RunEngine {
                 // stream's just-composed EventDescriptor UID — the step-mode
                 // analogue of the Collect path, and a port of bluesky
                 // `_pack_external_assets` on save (bundlers.py:610).
-                let descriptor_uid = {
+                let (descriptor_uid, run_start_uid) = {
                     let state = self.state.lock().await;
-                    match (state.bundler.as_ref(), stream_name.as_ref()) {
+                    let b = state.bundler.as_ref();
+                    let desc = match (b, stream_name.as_ref()) {
                         (Some(b), Some(s)) => b.descriptor_uid(s),
                         _ => None,
-                    }
+                    };
+                    (desc, b.map(|b| b.start_uid.clone()))
                 };
                 let mut assets = Vec::new();
                 if let Some(uid) = &descriptor_uid {
                     for obj in &asset_objs {
                         assets.extend(obj.collect_asset_docs_dyn(uid).await?);
+                    }
+                }
+                // Stamp each StreamResource with the open run's start UID before
+                // it leaves the engine (the writer emitted it with run_start:None).
+                if let Some(rs) = &run_start_uid {
+                    for a in &mut assets {
+                        stamp_asset_run_start(a, rs);
                     }
                 }
                 // Emit order: Descriptor(s) → StreamResource/StreamDatum →
@@ -1498,15 +1524,21 @@ impl RunEngine {
                 // collect stream's just-composed EventDescriptor UID, so stream
                 // data links back to its descriptor (CBEM-13). StandardDetector
                 // collects into a single stream; pass that stream's descriptor.
-                let collect_descriptor = {
+                let (collect_descriptor, run_start_uid) = {
                     let state = self.state.lock().await;
                     let bundler = state.bundler.as_ref().ok_or_else(|| {
                         BsrsError::Plan("Collect lost open run before stream docs".into())
                     })?;
-                    descs.keys().next().and_then(|s| bundler.descriptor_uid(s))
+                    (
+                        descs.keys().next().and_then(|s| bundler.descriptor_uid(s)),
+                        bundler.start_uid.clone(),
+                    )
                 };
                 if let Some(descriptor_uid) = collect_descriptor {
-                    for doc in obj.collect_stream_docs_dyn(&descriptor_uid).await? {
+                    for mut doc in obj.collect_stream_docs_dyn(&descriptor_uid).await? {
+                        // Stamp the run's start UID onto the StreamResource (the
+                        // writer emitted it with run_start:None) before emission.
+                        stamp_asset_run_start(&mut doc, &run_start_uid);
                         self.broadcast(&doc).await?;
                     }
                 }

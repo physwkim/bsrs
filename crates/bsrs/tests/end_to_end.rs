@@ -251,6 +251,27 @@ async fn fly_plan_drives_standard_detector_to_completion() {
         datum_descriptor, descriptor_uid,
         "StreamDatum.descriptor must equal the collect stream's EventDescriptor uid"
     );
+    // The fly/collect path likewise stamps the StreamResource with the run's
+    // start UID (writer emits run_start:None; engine is the single owner).
+    let run_start_uid = docs
+        .iter()
+        .find_map(|d| match d {
+            Start(s) => Some(s.uid.clone()),
+            _ => None,
+        })
+        .expect("expected a RunStart");
+    let sr_run_start = docs
+        .iter()
+        .find_map(|d| match d {
+            StreamResource(sr) => Some(sr.run_start.clone()),
+            _ => None,
+        })
+        .expect("expected a StreamResource from collect");
+    assert_eq!(
+        sr_run_start.as_deref(),
+        Some(run_start_uid.as_str()),
+        "collect StreamResource.run_start must be stamped with the run's start uid"
+    );
 }
 
 #[tokio::test]
@@ -301,9 +322,26 @@ async fn step_scan_save_emits_stream_assets_stamped_with_descriptor() {
             _ => None,
         })
         .expect("expected an EventDescriptor from the step read");
-    assert!(
-        docs.iter().any(|d| matches!(d, StreamResource(_))),
-        "step save must emit a StreamResource (ENG-02); got {docs:?}"
+    let run_start_uid = docs
+        .iter()
+        .find_map(|d| match d {
+            Start(s) => Some(s.uid.clone()),
+            _ => None,
+        })
+        .expect("expected a RunStart");
+    let sr = docs
+        .iter()
+        .find_map(|d| match d {
+            StreamResource(sr) => Some(sr.clone()),
+            _ => None,
+        })
+        .expect("step save must emit a StreamResource (ENG-02)");
+    // The engine stamps the open run's start UID onto the StreamResource, which
+    // the writer emitted with run_start:None.
+    assert_eq!(
+        sr.run_start.as_deref(),
+        Some(run_start_uid.as_str()),
+        "StreamResource.run_start must be stamped with the open run's start uid"
     );
     let sd = docs
         .iter()
