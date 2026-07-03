@@ -1243,6 +1243,9 @@ struct AdEmitState {
     main_resource_uid: Option<String>,
     attr_resource_uids: HashMap<String, String>,
     last_emitted: u64,
+    /// Frames per index (ophyd-async `collections_per_event`), staged by
+    /// `open(multiplier)`. `0` = not yet opened; readers clamp to 1.
+    multiplier: u64,
 }
 
 /// `DetectorWriter` for an areaDetector NDFileHDF5 plugin. The IOC writes the
@@ -1349,9 +1352,32 @@ impl AdHdfWriter {
     }
 }
 
+/// ophyd-async's `StreamResourceDataProvider.make_datakeys` dtype rule:
+/// `"array" if collections_per_event > 1 or len(shape) > 1 else "number"`,
+/// where `shape` is the full DataKey shape including the multiplier prefix.
+fn stream_datakey_dtype(multiplier: u64, shape_len: usize) -> Dtype {
+    if multiplier > 1 || shape_len > 1 {
+        Dtype::Array
+    } else {
+        Dtype::Number
+    }
+}
+
 #[async_trait::async_trait]
 impl DetectorWriter for AdHdfWriter {
-    async fn open(&self, _multiplier: u32) -> Result<HashMap<String, DataKey>> {
+    async fn open(&self, multiplier: u32) -> Result<HashMap<String, DataKey>> {
+        // The frames-per-index multiplier shapes the DataKeys and divides the
+        // frame count into indices. >1 is rejected until the fly-mode index
+        // observation (`observe_indices_written`, raw frame counts) also
+        // scales by it — shipping one path divided and the other raw would
+        // complete a fly scan at the wrong frame count.
+        if multiplier > 1 {
+            return Err(BsrsError::Plan(format!(
+                "AdHdfWriter::open(multiplier={multiplier}): multiplier > 1 is \
+                 not supported yet"
+            )));
+        }
+        let multiplier = u64::from(multiplier.max(1));
         // Configure + arm the IOC file plugin. NumCapture=0: capture until
         // close() clears Capture, matching a step scan whose frame count is
         // unknown until the plan ends.
@@ -1380,14 +1406,21 @@ impl DetectorWriter for AdHdfWriter {
             st.main_resource_uid = None;
             st.attr_resource_uids.clear();
             st.last_emitted = 0;
+            st.multiplier = multiplier;
         }
+        // DataKey shapes carry the frames-per-index prefix, `[multiplier,
+        // *frame_shape]` for the image and `[multiplier]` for the scalar
+        // NDAttributes (ophyd-async `make_datakeys`); the image source is the
+        // file URI the writer resolves to, not a PV.
+        let image_shape: Vec<Option<u64>> =
+            std::iter::once(multiplier).chain(shape).map(Some).collect();
         let mut out = HashMap::new();
         out.insert(
             self.data_key_name(),
             DataKey {
-                source: format!("ca://{}", self.data_key_name()),
-                dtype: Dtype::Array,
-                shape: shape.into_iter().map(Some).collect(),
+                source: self.provider_uri(),
+                dtype: stream_datakey_dtype(multiplier, image_shape.len()),
+                shape: image_shape,
                 dtype_numpy: Some(dtype_numpy.into()),
                 external: Some("STREAM:".into()),
                 units: None,
@@ -1410,8 +1443,8 @@ impl DetectorWriter for AdHdfWriter {
                     } else {
                         a.source.clone()
                     },
-                    dtype: Dtype::Number,
-                    shape: Vec::new(),
+                    dtype: stream_datakey_dtype(multiplier, 1),
+                    shape: vec![Some(multiplier)],
                     dtype_numpy: Some(a.dtype_numpy.clone().into()),
                     external: Some("STREAM:".into()),
                     units: None,
@@ -1426,6 +1459,8 @@ impl DetectorWriter for AdHdfWriter {
         Ok(out)
     }
     fn observe_indices_written(&self) -> watch::Receiver<u64> {
+        // Raw frame counts — equal to indices while `open` rejects
+        // multiplier > 1.
         self.io.observe_num_captured()
     }
     async fn indices_written(&self) -> u64 {
@@ -1434,7 +1469,10 @@ impl DetectorWriter for AdHdfWriter {
         // Best-effort: a plugin without SWMR flush support just yields the
         // unflushed count.
         let _ = self.io.flush().await;
-        self.io.num_captured().await.unwrap_or(0)
+        let frames = self.io.num_captured().await.unwrap_or(0);
+        // Frames -> indices (ophyd-async `collections_written //
+        // collections_per_event`).
+        frames / self.emit.lock().await.multiplier.max(1)
     }
     fn collect_stream_docs(&self, up_to: u64, descriptor: &str) -> BoxStream<'_, StreamAsset> {
         let descriptor = descriptor.to_string();
@@ -2163,12 +2201,23 @@ mod ad_hdf_tests {
         let dk = keys.get("det_image").expect("det_image data key");
         assert_eq!(dk.external.as_deref(), Some("STREAM:"));
         assert_eq!(dk.dtype, Dtype::Array);
-        // Shape + dtype discovered from the IOC (ArraySize*/DataType RBVs).
-        assert_eq!(dk.shape, vec![Some(20), Some(10)]);
+        // Shape = [multiplier, *frame_shape]; frame shape + dtype discovered
+        // from the driver (ArraySizeZ/Y/X / DataType / ColorMode RBVs).
+        assert_eq!(dk.shape, vec![Some(1), Some(20), Some(10)]);
+        // Source is the file URI the path provider resolves to, not a PV.
+        assert_eq!(dk.source, "file:///data/scans/scan.h5");
         assert_eq!(
             dk.dtype_numpy,
             Some(crate::event_model::DtypeNumpy::Scalar("<u2".to_string()))
         );
+    }
+
+    #[tokio::test]
+    async fn open_rejects_multiplier_above_one() {
+        let io = FakeAdFileIo::new("/x.h5");
+        let w = writer_with(io);
+        let err = w.open(2).await.unwrap_err().to_string();
+        assert!(err.contains("multiplier=2"), "{err}");
     }
 
     #[test]
@@ -2251,7 +2300,7 @@ mod ad_hdf_tests {
                 .unwrap_or_else(|| panic!("missing data key {name}"));
             assert_eq!(dk.external.as_deref(), Some("STREAM:"));
             assert_eq!(dk.dtype, Dtype::Number);
-            assert!(dk.shape.is_empty(), "attribute is scalar");
+            assert_eq!(dk.shape, vec![Some(1)], "scalar per index: [multiplier]");
         }
         io.set_captured(1);
         let up_to = w.indices_written().await;
