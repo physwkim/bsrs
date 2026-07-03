@@ -11,7 +11,7 @@ use crate::core::plan::{plan_box, Plan, PlanItem};
 use futures::StreamExt;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Drain a `Plan` stream into a Vec of messages. Useful when a wrapper
 /// needs random access (e.g. `relative_set_wrapper` rewrites Set values).
@@ -618,6 +618,102 @@ pub fn stub_wrapper(inner: Plan) -> Plan {
     })
 }
 
+/// A flyable device paired with its collectable, as consumed by
+/// [`fly_during_wrapper`] and stored in [`SupplementalData`]. bsrs splits the
+/// Flyable and Collectable roles across two traits, so the pair is explicit.
+pub type FlyerPair = (Arc<dyn FlyableObj>, Arc<dyn CollectableObj>);
+
+/// A port of bluesky's `SupplementalData` (`bluesky/preprocessors.py:1274`) —
+/// a mutable set of `baseline` devices, `monitors`, and `flyers`. As a plan
+/// preprocessor it inserts baseline readings around each run, monitors during
+/// it, and flies devices across it, composing [`baseline_wrapper`],
+/// [`monitor_during_wrapper`], and [`fly_during_wrapper`]. Register it on the
+/// RunEngine:
+///
+/// ```ignore
+/// let sd = std::sync::Arc::new(SupplementalData::new());
+/// sd.add_baseline(some_detector);
+/// re.add_preprocessor(sd.as_preprocessor());
+/// ```
+///
+/// The three lists are interior-mutable, so edits made after registration take
+/// effect on the next plan — the preprocessor re-reads them on every call —
+/// mirroring bluesky's interactive `sd.baseline.append(...)`.
+#[derive(Default)]
+pub struct SupplementalData {
+    baseline: Mutex<Vec<Arc<dyn ReadableObj>>>,
+    monitors: Mutex<Vec<Arc<dyn MonitorableObj>>>,
+    flyers: Mutex<Vec<FlyerPair>>,
+}
+
+impl SupplementalData {
+    /// An empty set.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a device to be read into the `baseline` stream at the start and end
+    /// of each run.
+    pub fn add_baseline(&self, device: Arc<dyn ReadableObj>) {
+        self.baseline.lock().unwrap().push(device);
+    }
+
+    /// Add a signal to be monitored (asynchronously) during each run.
+    pub fn add_monitor(&self, signal: Arc<dyn MonitorableObj>) {
+        self.monitors.lock().unwrap().push(signal);
+    }
+
+    /// Add a `(flyer, collectable)` pair to be kicked off at the start of each
+    /// run and completed/collected at the end.
+    pub fn add_flyer(&self, flyer: Arc<dyn FlyableObj>, collectable: Arc<dyn CollectableObj>) {
+        self.flyers.lock().unwrap().push((flyer, collectable));
+    }
+
+    /// Remove all baseline devices, monitors, and flyers.
+    pub fn clear(&self) {
+        self.baseline.lock().unwrap().clear();
+        self.monitors.lock().unwrap().clear();
+        self.flyers.lock().unwrap().clear();
+    }
+
+    /// Apply the supplemental wrappers to `plan`. Composed inside-out
+    /// (fly → monitor → baseline), matching bluesky `SupplementalData.__call__`
+    /// so the run order is: baseline read, start monitors, kick off flyers,
+    /// `plan`, complete/collect flyers, stop monitors, baseline read. Each
+    /// wrapper is skipped when its list is empty (bluesky's `if not devices`
+    /// no-op), so an all-empty `SupplementalData` is a pure passthrough.
+    pub fn apply(&self, plan: Plan) -> Plan {
+        let flyers = self.flyers.lock().unwrap().clone();
+        let monitors = self.monitors.lock().unwrap().clone();
+        let baseline = self.baseline.lock().unwrap().clone();
+
+        let plan = if flyers.is_empty() {
+            plan
+        } else {
+            fly_during_wrapper(plan, flyers)
+        };
+        let plan = if monitors.is_empty() {
+            plan
+        } else {
+            monitor_during_wrapper(plan, monitors)
+        };
+        if baseline.is_empty() {
+            plan
+        } else {
+            baseline_wrapper(plan, baseline, "baseline")
+        }
+    }
+
+    /// A RunEngine preprocessor closure (matching
+    /// [`crate::engine::Preprocessor`]) that applies this `SupplementalData` to
+    /// every plan, re-reading the current baseline/monitors/flyers on each
+    /// call.
+    pub fn as_preprocessor(self: &Arc<Self>) -> Arc<dyn Fn(Plan) -> Plan + Send + Sync + 'static> {
+        let this = self.clone();
+        Arc::new(move |plan| this.apply(plan))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -927,5 +1023,42 @@ mod tests {
         assert!(matches!(&msgs[6], Msg::Read(_)));
         assert!(matches!(&msgs[7], Msg::Save));
         assert!(matches!(&msgs[8], Msg::CloseRun { .. }));
+    }
+
+    #[tokio::test]
+    async fn supplemental_data_empty_is_passthrough() {
+        let sd = Arc::new(SupplementalData::new());
+        let msgs = drain(sd.apply(run_body())).await;
+        // No baseline/monitor/fly insertion: just OpenRun, Null, CloseRun.
+        assert_eq!(msgs.len(), 3, "got {msgs:?}");
+        assert!(matches!(&msgs[0], Msg::OpenRun(_)));
+        assert!(matches!(&msgs[1], Msg::Null));
+        assert!(matches!(&msgs[2], Msg::CloseRun { .. }));
+    }
+
+    #[tokio::test]
+    async fn supplemental_data_inserts_baseline_around_run() {
+        let sd = Arc::new(SupplementalData::new());
+        sd.add_baseline(Arc::new(FakeStage("d".into())) as Arc<dyn ReadableObj>);
+        let msgs = drain(sd.apply(run_body())).await;
+        // OpenRun, Create(baseline), Read, Save, Null, Create(baseline), Read, Save, CloseRun.
+        assert_eq!(msgs.len(), 9, "got {msgs:?}");
+        assert!(matches!(&msgs[1], Msg::Create { stream_name } if stream_name == "baseline"));
+        assert!(matches!(&msgs[2], Msg::Read(_)));
+        assert!(matches!(&msgs[5], Msg::Create { stream_name } if stream_name == "baseline"));
+    }
+
+    #[tokio::test]
+    async fn supplemental_data_as_preprocessor_applies_current_lists() {
+        let sd = Arc::new(SupplementalData::new());
+        // Mutate after construction — the preprocessor must read this on call.
+        sd.add_baseline(Arc::new(FakeStage("d".into())) as Arc<dyn ReadableObj>);
+        let pp = sd.as_preprocessor();
+        let msgs = drain(pp(run_body())).await;
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, Msg::Create { stream_name } if stream_name == "baseline")),
+            "preprocessor did not insert the baseline stream; got {msgs:?}"
+        );
     }
 }
