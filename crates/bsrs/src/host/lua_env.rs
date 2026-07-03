@@ -3558,6 +3558,14 @@ impl UserData for LuaAdFile {
         m.add_method("set_template", |_, this, t: String| {
             ad_block("ad_file:set_template", this.0.set_template(&t))
         });
+        // Apply / revert this plugin's `stage_sigs` (populated by
+        // `select_save_plugin`). Mirrors ophyd staging.
+        m.add_method("stage", |_, this, ()| {
+            ad_block("ad_file:stage", this.0.plugin.stage_sigs.stage())
+        });
+        m.add_method("unstage", |_, this, ()| {
+            ad_block("ad_file:unstage", this.0.plugin.stage_sigs.unstage())
+        });
     }
 }
 
@@ -3604,6 +3612,12 @@ impl UserData for LuaAdStats {
                 SignalBackend::<bool>::put(this.0.compute_histogram.as_ref(), Some(b)),
             )
         });
+        m.add_method("stage", |_, this, ()| {
+            ad_block("ad_stats:stage", this.0.plugin.stage_sigs.stage())
+        });
+        m.add_method("unstage", |_, this, ()| {
+            ad_block("ad_stats:unstage", this.0.plugin.stage_sigs.unstage())
+        });
     }
 }
 
@@ -3639,6 +3653,12 @@ impl UserData for LuaAdRoi {
         );
         m.add_method("set_enabled_xy", |_, this, (x, y): (bool, bool)| {
             ad_block("ad_roi:set_enabled_xy", this.0.set_enabled_xy(x, y))
+        });
+        m.add_method("stage", |_, this, ()| {
+            ad_block("ad_roi:stage", this.0.plugin.stage_sigs.stage())
+        });
+        m.add_method("unstage", |_, this, ()| {
+            ad_block("ad_roi:unstage", this.0.plugin.stage_sigs.unstage())
         });
     }
 }
@@ -3715,15 +3735,16 @@ fn install_areadetector_factories(lua: &Lua) -> mlua::Result<()> {
             }
             let sib_refs: Vec<&crate::host::areadetector::NdFile> =
                 siblings.iter().map(|a| a.as_ref()).collect();
-            ad_block(
-                "select_save_plugin",
-                ad_select_save_plugin_fn(file_arc.as_ref(), &source_port, &sib_refs),
-            )
+            // Records the routing into each plugin's `stage_sigs`; call
+            // `file:stage()` / sibling `:stage()` to apply (and `:unstage()`
+            // to revert).
+            ad_select_save_plugin_fn(file_arc.as_ref(), &source_port, &sib_refs);
+            Ok(())
         },
     )?;
     lua.globals().set("select_save_plugin", f)?;
 
-    // `num_rois({roi1, roi2, …}, n)` — enable first n, disable rest.
+    // `num_rois({roi1, roi2, …}, n)` — stage first n enabled, rest disabled.
     let f = lua.create_function(|_, (rois_tbl, n): (mlua::Table, usize)| {
         let mut rois: Vec<Arc<crate::host::areadetector::NdRoi>> = Vec::new();
         for pair in rois_tbl.pairs::<mlua::Value, mlua::AnyUserData>() {
@@ -3733,7 +3754,9 @@ fn install_areadetector_factories(lua: &Lua) -> mlua::Result<()> {
         }
         let refs: Vec<&crate::host::areadetector::NdRoi> =
             rois.iter().map(|a| a.as_ref()).collect();
-        ad_block("num_rois", ad_num_rois_fn(&refs, n))
+        ad_num_rois_fn(&refs, n)
+            .map_err(|e| mlua::Error::RuntimeError(format!("num_rois: {e}")))?;
+        Ok(())
     })?;
     lua.globals().set("num_rois", f)?;
 

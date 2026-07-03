@@ -36,7 +36,9 @@
 
 use crate::backends::epics_ca::EpicsCaBackend;
 use crate::core::error::{BsrsError, Result};
+use crate::core::msg::{NamedObj, StageableObj};
 use crate::core::status::StatusError;
+use crate::devices::stage_sigs::StageSigs;
 use crate::protocols_async::SignalBackend;
 use std::sync::Arc;
 use std::time::Duration;
@@ -220,6 +222,11 @@ pub struct NdPlugin {
     pub nd_array_port: Arc<EpicsCaBackend<String>>,
     /// `QueueSize` (longout).
     pub queue_size: Arc<EpicsCaBackend<i64>>,
+    /// Staged configuration (ophyd `stage_sigs`): values applied when this
+    /// plugin is staged and reverted on unstage. Populated via
+    /// [`NdPlugin::stage_enabled`] / [`NdPlugin::stage_source_port`] and by
+    /// [`select_save_plugin`] / [`num_rois`].
+    pub stage_sigs: StageSigs,
 }
 
 impl NdPlugin {
@@ -238,8 +245,29 @@ impl NdPlugin {
             // NDArrayPort is a port name (short string) — DBR_STRING is fine.
             nd_array_port: Arc::new(EpicsCaBackend::<String>::new(join(&prefix, "NDArrayPort"))),
             queue_size: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "QueueSize"))),
+            stage_sigs: StageSigs::new(),
             prefix,
         }
+    }
+
+    /// Record `EnableCallbacks = enabled` into this plugin's `stage_sigs`, so
+    /// it is applied on stage and reverted on unstage.
+    pub fn stage_enabled(&self, enabled: bool) {
+        self.stage_sigs.set(
+            self.enable_callbacks.clone() as Arc<dyn SignalBackend<bool>>,
+            enabled,
+            join(&self.prefix, "EnableCallbacks"),
+        );
+    }
+
+    /// Record `NDArrayPort = port` into this plugin's `stage_sigs`, so the
+    /// re-route is applied on stage and reverted on unstage.
+    pub fn stage_source_port(&self, port: impl Into<String>) {
+        self.stage_sigs.set(
+            self.nd_array_port.clone() as Arc<dyn SignalBackend<String>>,
+            port.into(),
+            join(&self.prefix, "NDArrayPort"),
+        );
     }
 
     /// Connect all four channels.
@@ -283,6 +311,22 @@ impl NdPlugin {
             "NdPlugin::set_source_port",
         )
         .await
+    }
+}
+
+impl NamedObj for NdPlugin {
+    fn name(&self) -> &str {
+        &self.prefix
+    }
+}
+
+#[async_trait::async_trait]
+impl StageableObj for NdPlugin {
+    async fn stage_dyn(&self) -> Result<()> {
+        self.stage_sigs.stage().await
+    }
+    async fn unstage_dyn(&self) -> Result<()> {
+        self.stage_sigs.unstage().await
     }
 }
 
@@ -381,6 +425,22 @@ impl NdFile {
     }
 }
 
+impl NamedObj for NdFile {
+    fn name(&self) -> &str {
+        &self.plugin.prefix
+    }
+}
+
+#[async_trait::async_trait]
+impl StageableObj for NdFile {
+    async fn stage_dyn(&self) -> Result<()> {
+        self.plugin.stage_dyn().await
+    }
+    async fn unstage_dyn(&self) -> Result<()> {
+        self.plugin.unstage_dyn().await
+    }
+}
+
 /// `NDStats` plugin — adds `ComputeStatistics`/`ComputeCentroid`/
 /// `ComputeProfiles`/`ComputeHistogram` to the `NdPlugin` base.
 pub struct NdStats {
@@ -449,6 +509,22 @@ impl NdStats {
             "NdStats::force_enable_stats",
         )
         .await
+    }
+}
+
+impl NamedObj for NdStats {
+    fn name(&self) -> &str {
+        &self.plugin.prefix
+    }
+}
+
+#[async_trait::async_trait]
+impl StageableObj for NdStats {
+    async fn stage_dyn(&self) -> Result<()> {
+        self.plugin.stage_dyn().await
+    }
+    async fn unstage_dyn(&self) -> Result<()> {
+        self.plugin.unstage_dyn().await
     }
 }
 
@@ -548,28 +624,47 @@ impl NdRoi {
     }
 }
 
-/// Route `file` to consume frames from `source_port` and enable its
-/// callbacks. Every sibling in `siblings` is disabled (i.e. its
-/// `EnableCallbacks` set to false). Useful when an IOC carries
-/// multiple save plugins (HDF5 / TIFF / JPEG) but only one should be
-/// active per scan.
-pub async fn select_save_plugin(
-    file: &NdFile,
-    source_port: &str,
-    siblings: &[&NdFile],
-) -> Result<()> {
-    file.plugin.set_source_port(source_port).await?;
-    file.plugin.set_enabled(true).await?;
-    for s in siblings {
-        s.plugin.set_enabled(false).await?;
+impl NamedObj for NdRoi {
+    fn name(&self) -> &str {
+        &self.plugin.prefix
     }
-    Ok(())
 }
 
-/// Enable the first `n` ROIs in `rois`, disable the rest. Out-of-range
-/// `n` is clamped to `[0, rois.len()]` and reported as an error so
-/// the caller can react if the index was a typo.
-pub async fn num_rois(rois: &[&NdRoi], n: usize) -> Result<()> {
+#[async_trait::async_trait]
+impl StageableObj for NdRoi {
+    async fn stage_dyn(&self) -> Result<()> {
+        self.plugin.stage_dyn().await
+    }
+    async fn unstage_dyn(&self) -> Result<()> {
+        self.plugin.unstage_dyn().await
+    }
+}
+
+/// Route `file` to consume frames from `source_port` and enable its
+/// callbacks, disabling every sibling in `siblings` (i.e. its
+/// `EnableCallbacks` set to false). Useful when an IOC carries multiple
+/// save plugins (HDF5 / TIFF / JPEG) but only one should be active per
+/// scan.
+///
+/// The changes are recorded into each plugin's [`stage_sigs`](NdPlugin::stage_sigs)
+/// rather than written immediately: they take effect when the plugins are
+/// staged and revert on unstage, mirroring ophyd where plugin routing lives
+/// in `stage_sigs`. Stage `file` **and every sibling** to apply the routing
+/// (e.g. `Msg::Stage` each, or add them to the plan's stage list).
+pub fn select_save_plugin(file: &NdFile, source_port: &str, siblings: &[&NdFile]) {
+    file.plugin.stage_source_port(source_port);
+    file.plugin.stage_enabled(true);
+    for s in siblings {
+        s.plugin.stage_enabled(false);
+    }
+}
+
+/// Record "enable the first `n` ROIs, disable the rest" into each ROI's
+/// [`stage_sigs`](NdPlugin::stage_sigs). Out-of-range `n` (greater than
+/// `rois.len()`) is reported as an error so the caller can react if the index
+/// was a typo. Like [`select_save_plugin`], the enable flags take effect when
+/// the ROIs are staged and revert on unstage; stage every ROI to apply.
+pub fn num_rois(rois: &[&NdRoi], n: usize) -> Result<()> {
     if n > rois.len() {
         return Err(BsrsError::Status(StatusError::Failed(format!(
             "num_rois: requested {n} but only {} ROIs available",
@@ -577,8 +672,7 @@ pub async fn num_rois(rois: &[&NdRoi], n: usize) -> Result<()> {
         ))));
     }
     for (i, roi) in rois.iter().enumerate() {
-        let on = i < n;
-        roi.plugin.set_enabled(on).await?;
+        roi.plugin.stage_enabled(i < n);
     }
     Ok(())
 }
@@ -706,19 +800,31 @@ mod tests {
         assert_eq!(restored_num, prev_num, "warmup did not restore NumImages");
     }
 
-    /// Smoke: `select_save_plugin(hdf1, <port>, [jpeg1, magick1,
-    /// nexus1])` (port from `BSRS_AD_PORT`, default `SIM1`) must
-    /// (a) set `HDF1:NDArrayPort = <port>`, (b) enable
-    /// `HDF1:EnableCallbacks`, (c) disable `EnableCallbacks` on every
-    /// sibling. Plus long-string round-trip on `HDF1:FilePath` to
-    /// exercise the `CaStringKind::Long` get/put path.
+    /// `stage_sigs` lifecycle smoke: `select_save_plugin(hdf1, <port>, [jpeg1,
+    /// magick1, nexus1])` (port from `BSRS_AD_PORT`, default `SIM1`) records the
+    /// routing into each plugin's `stage_sigs` **without touching the IOC**;
+    /// staging then applies it — (a) `HDF1:NDArrayPort = <port>`,
+    /// (b) `HDF1:EnableCallbacks` enabled, (c) siblings' `EnableCallbacks`
+    /// disabled — and unstaging restores every signal to its pre-stage value.
+    /// Also exercises the long-string `HDF1:FilePath` `CaStringKind::Long`
+    /// get/put path.
     ///
-    /// Side effect: leaves HDF1 enabled and JPEG1/Magick1/Nexus1
-    /// disabled after the test. Re-enable manually via PYDM/MEDM if
-    /// you need them on for another run.
+    /// Non-destructive: FilePath, every plugin enable, and HDF1's port are
+    /// captured and restored, so the IOC is left as it was found.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     async fn ad_select_save_plugin_against_sim_detector() {
+        async fn en(f: &NdFile) -> bool {
+            SignalBackend::<bool>::get_value(f.plugin.enable_callbacks.as_ref())
+                .await
+                .expect("read EnableCallbacks")
+        }
+        async fn port_of(f: &NdFile) -> String {
+            SignalBackend::<String>::get_value(f.plugin.nd_array_port.as_ref())
+                .await
+                .expect("read NDArrayPort")
+        }
+
         let prefix = ad_prefix();
         let hdf1 = NdFile::new(format!("{prefix}HDF1:"));
         let jpeg1 = NdFile::new(format!("{prefix}JPEG1:"));
@@ -734,8 +840,11 @@ mod tests {
         )
         .expect("connect file plugins");
 
-        // (1) Long-string round-trip on FilePath. Use a path that
-        // exists on every Unix box so the IOC accepts it.
+        // (1) Long-string round-trip on FilePath (CaStringKind::Long),
+        // capturing and restoring the original so the IOC is untouched.
+        let orig_path = SignalBackend::<String>::get_value(hdf1.file_path.as_ref())
+            .await
+            .expect("read HDF1.FilePath orig");
         let path = "/tmp/bsrs_smoke/";
         hdf1.set_path(path).await.expect("HDF1.set_path");
         let read_back = SignalBackend::<String>::get_value(hdf1.file_path.as_ref())
@@ -747,47 +856,75 @@ mod tests {
             path,
             "FilePath long-string round-trip mismatch"
         );
+        hdf1.set_path(orig_path.trim_end_matches('\0'))
+            .await
+            .expect("restore HDF1.FilePath");
 
-        // (2) Route HDF1 to consume from the cam's asyn port
-        // (`BSRS_AD_PORT`, default `SIM1` per sim-detector's st.cmd
-        // PORT=SIM1; `DOT` for the mini-beamline), and disable the
-        // three sibling file plugins.
+        // (2) Capture the pre-stage state of every signal the routing touches.
         let port = ad_port();
+        let pre_hdf1_en = en(&hdf1).await;
+        let pre_jpeg1_en = en(&jpeg1).await;
+        let pre_magick1_en = en(&magick1).await;
+        let pre_nexus1_en = en(&nexus1).await;
+        let pre_hdf1_port = port_of(&hdf1).await;
+
+        // Record the routing into stage_sigs — this must NOT write to the IOC.
         let siblings = [&jpeg1, &magick1, &nexus1];
-        select_save_plugin(&hdf1, &port, &siblings)
-            .await
-            .expect("select_save_plugin");
+        select_save_plugin(&hdf1, &port, &siblings);
+        assert_eq!(
+            en(&hdf1).await,
+            pre_hdf1_en,
+            "select_save_plugin wrote to the IOC before staging"
+        );
 
-        let hdf1_port = SignalBackend::<String>::get_value(hdf1.plugin.nd_array_port.as_ref())
-            .await
-            .expect("read HDF1.NDArrayPort");
-        let hdf1_en = SignalBackend::<bool>::get_value(hdf1.plugin.enable_callbacks.as_ref())
-            .await
-            .expect("read HDF1.EnableCallbacks");
-        let jpeg1_en = SignalBackend::<bool>::get_value(jpeg1.plugin.enable_callbacks.as_ref())
-            .await
-            .expect("read JPEG1.EnableCallbacks");
-        let magick1_en = SignalBackend::<bool>::get_value(magick1.plugin.enable_callbacks.as_ref())
-            .await
-            .expect("read Magick1.EnableCallbacks");
-        let nexus1_en = SignalBackend::<bool>::get_value(nexus1.plugin.enable_callbacks.as_ref())
-            .await
-            .expect("read Nexus1.EnableCallbacks");
+        // Stage: apply the recorded routing to hdf1 and every sibling.
+        hdf1.stage_dyn().await.expect("stage HDF1");
+        for s in &siblings {
+            s.stage_dyn().await.expect("stage sibling");
+        }
 
+        let hdf1_port = port_of(&hdf1).await;
+        let hdf1_en = en(&hdf1).await;
+        let jpeg1_en = en(&jpeg1).await;
+        let magick1_en = en(&magick1).await;
+        let nexus1_en = en(&nexus1).await;
         eprintln!(
-            "select_save_plugin: HDF1.port={hdf1_port:?}, \
+            "staged: HDF1.port={hdf1_port:?}, \
              enables HDF1={hdf1_en} JPEG1={jpeg1_en} Magick1={magick1_en} Nexus1={nexus1_en}"
         );
-        // NDArrayPort comes back via DBR_STRING — short form, NUL-padded
-        // to 40 bytes, but our decoder strips at NUL so we just compare
-        // directly.
         assert_eq!(hdf1_port, port, "HDF1.NDArrayPort not routed to {port}");
-        assert!(hdf1_en, "HDF1 was not enabled");
-        assert!(!jpeg1_en, "JPEG1 still enabled after select_save_plugin");
-        assert!(
-            !magick1_en,
-            "Magick1 still enabled after select_save_plugin"
+        assert!(hdf1_en, "HDF1 was not enabled by staging");
+        assert!(!jpeg1_en, "JPEG1 not disabled by staging");
+        assert!(!magick1_en, "Magick1 not disabled by staging");
+        assert!(!nexus1_en, "Nexus1 not disabled by staging");
+
+        // Unstage (reverse order): restore every signal to its pre-stage value.
+        for s in siblings.iter().rev() {
+            s.unstage_dyn().await.expect("unstage sibling");
+        }
+        hdf1.unstage_dyn().await.expect("unstage HDF1");
+
+        assert_eq!(
+            en(&hdf1).await,
+            pre_hdf1_en,
+            "HDF1 enable not restored on unstage"
         );
-        assert!(!nexus1_en, "Nexus1 still enabled after select_save_plugin");
+        assert_eq!(en(&jpeg1).await, pre_jpeg1_en, "JPEG1 enable not restored");
+        assert_eq!(
+            en(&magick1).await,
+            pre_magick1_en,
+            "Magick1 enable not restored"
+        );
+        assert_eq!(
+            en(&nexus1).await,
+            pre_nexus1_en,
+            "Nexus1 enable not restored"
+        );
+        assert_eq!(
+            port_of(&hdf1).await,
+            pre_hdf1_port,
+            "HDF1 NDArrayPort not restored on unstage"
+        );
+        eprintln!("unstage restored HDF1 enable={pre_hdf1_en}, port={pre_hdf1_port:?}");
     }
 }

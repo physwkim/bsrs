@@ -8,6 +8,7 @@ pub mod device;
 pub mod observe;
 pub mod signal;
 pub mod signal_cache;
+pub mod stage_sigs;
 pub mod standard_readable;
 
 pub use detector::{DetectorTrigger, StandardDetector, TriggerInfo};
@@ -18,6 +19,7 @@ pub use signal::{
     SignalRW, SignalW, SignalX, Writable, Write,
 };
 pub use signal_cache::SignalCache;
+pub use stage_sigs::{StageSetting, StageSigs};
 pub use standard_readable::{StandardReadable, StandardReadableFormat};
 
 /// Re-export of the `#[derive(Device)]` proc-macro. (The like-named [`Device`]
