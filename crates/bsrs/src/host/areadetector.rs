@@ -995,11 +995,67 @@ impl AdFileIo for NdFileIo {
     }
 }
 
-/// Emit state for [`AdHdfWriter`]: the once-emitted `StreamResource` UID and the
-/// frame cursor (`StreamDatum`s cover `[last_emitted, up_to)`).
+/// One per-frame NDAttribute the IOC's NDFileHDF5 plugin writes into the same
+/// `.h5` alongside the main image, at `/entry/instrument/NDAttributes/<name>`.
+/// Declared explicitly (bsrs has no NDAttributes-config discovery); the writer
+/// then emits a `StreamResource`/`StreamDatum` for it just like ophyd-async's
+/// `ndattribute_datasets` (`_data_logic.py`).
+#[derive(Clone, Debug)]
+pub struct NdAttributeDataset {
+    /// Attribute name — used as both the `DataKey` and the HDF dataset leaf.
+    pub name: String,
+    /// numpy dtype string of the attribute values, e.g. `"<f8"`.
+    pub dtype_numpy: String,
+}
+
+impl NdAttributeDataset {
+    /// Build a spec for attribute `name` with numpy dtype `dtype_numpy`.
+    pub fn new(name: impl Into<String>, dtype_numpy: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            dtype_numpy: dtype_numpy.into(),
+        }
+    }
+}
+
+/// Compose a `StreamResource` for an HDF dataset in the IOC's file.
+fn ad_stream_resource(uid: String, data_key: String, uri: &str, dataset: &str) -> StreamResource {
+    let mut parameters = HashMap::new();
+    parameters.insert(
+        "dataset".to_string(),
+        serde_json::Value::String(dataset.to_string()),
+    );
+    StreamResource {
+        uid,
+        data_key,
+        mimetype: "application/x-hdf5".to_string(),
+        uri: uri.to_string(),
+        parameters,
+        run_start: None,
+    }
+}
+
+/// Compose a `StreamDatum` covering frames `[start, stop)` for a resource.
+fn ad_stream_datum(resource_uid: String, descriptor: &str, start: u64, stop: u64) -> StreamDatum {
+    StreamDatum {
+        uid: uuid::Uuid::new_v4().to_string(),
+        stream_resource: resource_uid,
+        descriptor: descriptor.to_string(),
+        indices: StreamRange { start, stop },
+        seq_nums: StreamRange {
+            start: start + 1,
+            stop: stop + 1,
+        },
+    }
+}
+
+/// Emit state for [`AdHdfWriter`]: the once-emitted `StreamResource` UIDs (main
+/// image + one per NDAttribute) and the frame cursor (`StreamDatum`s cover
+/// `[last_emitted, up_to)`).
 #[derive(Default)]
 struct AdEmitState {
-    resource_uid: Option<String>,
+    main_resource_uid: Option<String>,
+    attr_resource_uids: HashMap<String, String>,
     last_emitted: u64,
 }
 
@@ -1012,6 +1068,9 @@ pub struct AdHdfWriter {
     name: String,
     io: Arc<dyn AdFileIo>,
     path_provider: StaticPathProvider,
+    /// Per-frame NDAttribute datasets the IOC also writes into the file; each
+    /// gets its own `StreamResource`/`StreamDatum`. Empty = main image only.
+    ndattributes: Vec<NdAttributeDataset>,
     /// Guards single-`StreamResource` emission and the datum cursor.
     emit: tokio::sync::Mutex<AdEmitState>,
 }
@@ -1027,8 +1086,17 @@ impl AdHdfWriter {
             name: name.into(),
             io,
             path_provider,
+            ndattributes: Vec::new(),
             emit: tokio::sync::Mutex::new(AdEmitState::default()),
         }
+    }
+
+    /// Declare the per-frame NDAttribute datasets the IOC writes into the file,
+    /// so the writer emits a `StreamResource`/`StreamDatum` for each in addition
+    /// to the main image.
+    pub fn with_ndattributes(mut self, attrs: Vec<NdAttributeDataset>) -> Self {
+        self.ndattributes = attrs;
+        self
     }
 
     /// Connect the underlying file-plugin IO.
@@ -1059,7 +1127,8 @@ impl DetectorWriter for AdHdfWriter {
         // Reset emit state for this staging.
         {
             let mut st = self.emit.lock().await;
-            st.resource_uid = None;
+            st.main_resource_uid = None;
+            st.attr_resource_uids.clear();
             st.last_emitted = 0;
         }
         // Discover the frame shape + dtype from the IOC (ArraySize*/DataType
@@ -1083,6 +1152,25 @@ impl DetectorWriter for AdHdfWriter {
                 choices: None,
             },
         );
+        // One scalar external data key per declared NDAttribute dataset.
+        for a in &self.ndattributes {
+            out.insert(
+                a.name.clone(),
+                DataKey {
+                    source: format!("ca://{}", a.name),
+                    dtype: Dtype::Number,
+                    shape: Vec::new(),
+                    dtype_numpy: Some(a.dtype_numpy.clone().into()),
+                    external: Some("STREAM:".into()),
+                    units: None,
+                    precision: None,
+                    object_name: Some(self.name.clone()),
+                    dims: None,
+                    limits: None,
+                    choices: None,
+                },
+            );
+        }
         Ok(out)
     }
     fn observe_indices_written(&self) -> watch::Receiver<u64> {
@@ -1105,47 +1193,74 @@ impl DetectorWriter for AdHdfWriter {
         let fut = async move {
             let mut docs: Vec<StreamAsset> = Vec::new();
             let mut st = self.emit.lock().await;
-            // StreamResource once — URI from the IOC's resolved FullFileName_RBV.
-            if st.resource_uid.is_none() {
+            // Emit each StreamResource once. The main image and every
+            // NDAttribute live in the same .h5, so they share one URI resolved
+            // from FullFileName_RBV — read it only when a resource still needs
+            // emitting.
+            let need_main = st.main_resource_uid.is_none();
+            let need_attr = self
+                .ndattributes
+                .iter()
+                .any(|a| !st.attr_resource_uids.contains_key(&a.name));
+            if need_main || need_attr {
                 let path = self.io.full_file_name().await.unwrap_or_default();
                 let uri = if path.is_empty() {
                     String::new()
                 } else {
                     format!("file://{path}")
                 };
-                let uid = uuid::Uuid::new_v4().to_string();
-                st.resource_uid = Some(uid.clone());
-                let mut parameters = HashMap::new();
-                parameters.insert(
-                    "dataset".to_string(),
-                    serde_json::Value::String(AD_HDF_DATASET.to_string()),
-                );
-                docs.push(StreamAsset::Resource(StreamResource {
-                    uid,
-                    data_key: data_key.clone(),
-                    mimetype: "application/x-hdf5".to_string(),
-                    uri,
-                    parameters,
-                    run_start: None,
-                }));
+                if need_main {
+                    let uid = uuid::Uuid::new_v4().to_string();
+                    st.main_resource_uid = Some(uid.clone());
+                    docs.push(StreamAsset::Resource(ad_stream_resource(
+                        uid,
+                        data_key.clone(),
+                        &uri,
+                        AD_HDF_DATASET,
+                    )));
+                }
+                for a in &self.ndattributes {
+                    if !st.attr_resource_uids.contains_key(&a.name) {
+                        let uid = uuid::Uuid::new_v4().to_string();
+                        st.attr_resource_uids.insert(a.name.clone(), uid.clone());
+                        let dataset = format!("/entry/instrument/NDAttributes/{}", a.name);
+                        docs.push(StreamAsset::Resource(ad_stream_resource(
+                            uid,
+                            a.name.clone(),
+                            &uri,
+                            &dataset,
+                        )));
+                    }
+                }
             }
-            let resource_uid = st
-                .resource_uid
-                .clone()
-                .expect("resource_uid set above on first emission");
+            // One StreamDatum per dataset (main + each attribute) for the new
+            // frames, all covering the same index range in the same event.
             if up_to > st.last_emitted {
                 let start = st.last_emitted;
                 st.last_emitted = up_to;
-                docs.push(StreamAsset::Datum(StreamDatum {
-                    uid: uuid::Uuid::new_v4().to_string(),
-                    stream_resource: resource_uid,
-                    descriptor,
-                    indices: StreamRange { start, stop: up_to },
-                    seq_nums: StreamRange {
-                        start: start + 1,
-                        stop: up_to + 1,
-                    },
-                }));
+                let main_uid = st
+                    .main_resource_uid
+                    .clone()
+                    .expect("main resource uid set above on first emission");
+                docs.push(StreamAsset::Datum(ad_stream_datum(
+                    main_uid,
+                    &descriptor,
+                    start,
+                    up_to,
+                )));
+                for a in &self.ndattributes {
+                    let auid = st
+                        .attr_resource_uids
+                        .get(&a.name)
+                        .cloned()
+                        .expect("attr resource uid set above");
+                    docs.push(StreamAsset::Datum(ad_stream_datum(
+                        auid,
+                        &descriptor,
+                        start,
+                        up_to,
+                    )));
+                }
             }
             docs
         };
@@ -1672,6 +1787,97 @@ mod ad_hdf_tests {
             }
             _ => panic!("must be StreamDatum"),
         }
+    }
+
+    #[tokio::test]
+    async fn ndattributes_emit_extra_resource_and_datum_per_attribute() {
+        let io = FakeAdFileIo::new("/data/scans/scan.h5");
+        let w = AdHdfWriter::new(
+            "det",
+            io.clone(),
+            StaticPathProvider::new("/data/scans/", "scan"),
+        )
+        .with_ndattributes(vec![
+            NdAttributeDataset::new("temp", "<f8"),
+            NdAttributeDataset::new("counter", "<i4"),
+        ]);
+        // open() reports a scalar external data key per attribute + the image.
+        let keys = w.open(1).await.unwrap();
+        assert!(keys.contains_key("det_image"));
+        for name in ["temp", "counter"] {
+            let dk = keys
+                .get(name)
+                .unwrap_or_else(|| panic!("missing data key {name}"));
+            assert_eq!(dk.external.as_deref(), Some("STREAM:"));
+            assert_eq!(dk.dtype, Dtype::Number);
+            assert!(dk.shape.is_empty(), "attribute is scalar");
+        }
+        io.set_captured(1);
+        let up_to = w.indices_written().await;
+        let docs: Vec<StreamAsset> = w.collect_stream_docs(up_to, "descN").collect().await;
+        let resources: Vec<&StreamResource> = docs
+            .iter()
+            .filter_map(|a| match a {
+                StreamAsset::Resource(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        let datums: Vec<&StreamDatum> = docs
+            .iter()
+            .filter_map(|a| match a {
+                StreamAsset::Datum(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(resources.len(), 3, "main + 2 attribute resources");
+        assert_eq!(datums.len(), 3, "main + 2 attribute datums");
+        let datasets: Vec<&str> = resources
+            .iter()
+            .map(|r| {
+                r.parameters
+                    .get("dataset")
+                    .and_then(|v| v.as_str())
+                    .unwrap()
+            })
+            .collect();
+        assert!(datasets.contains(&"/entry/data/data"));
+        assert!(datasets.contains(&"/entry/instrument/NDAttributes/temp"));
+        assert!(datasets.contains(&"/entry/instrument/NDAttributes/counter"));
+        // All datums cover the same frame range + descriptor and each points at
+        // a distinct emitted resource.
+        let resource_uids: std::collections::HashSet<&str> =
+            resources.iter().map(|r| r.uid.as_str()).collect();
+        for d in &datums {
+            assert_eq!(d.indices.start, 0);
+            assert_eq!(d.indices.stop, 1);
+            assert_eq!(d.descriptor, "descN");
+            assert!(
+                resource_uids.contains(d.stream_resource.as_str()),
+                "datum must reference an emitted resource"
+            );
+        }
+        // A second collect emits no new resources, one datum per dataset.
+        io.set_captured(2);
+        let docs2: Vec<StreamAsset> = w
+            .collect_stream_docs(w.indices_written().await, "descN")
+            .collect()
+            .await;
+        assert_eq!(
+            docs2
+                .iter()
+                .filter(|a| matches!(a, StreamAsset::Resource(_)))
+                .count(),
+            0,
+            "resources emitted once"
+        );
+        assert_eq!(
+            docs2
+                .iter()
+                .filter(|a| matches!(a, StreamAsset::Datum(_)))
+                .count(),
+            3,
+            "one datum per dataset on the increment"
+        );
     }
 
     #[tokio::test]
