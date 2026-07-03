@@ -112,7 +112,7 @@ impl DetectorWriter for BinaryFrameSink {
         out.insert(
             format!("{}_image", self.name),
             DataKey {
-                source: format!("file://{}", self.path.display()),
+                source: crate::event_model::file_uri(&self.path.display().to_string()),
                 dtype: Dtype::Number,
                 shape: if self.payload_size > 0 {
                     vec![Some(self.payload_size)]
@@ -150,7 +150,7 @@ impl DetectorWriter for BinaryFrameSink {
                     uid: new_uid.clone(),
                     data_key: format!("{}_image", self.name),
                     mimetype: "application/x-cirbin1".into(),
-                    uri: format!("file://{}", self.path.display()),
+                    uri: crate::event_model::file_uri(&self.path.display().to_string()),
                     parameters: Default::default(),
                     run_start: None,
                 }));

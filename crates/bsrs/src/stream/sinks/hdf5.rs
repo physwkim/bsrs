@@ -197,7 +197,7 @@ impl DetectorWriter for Hdf5FrameSink {
         out.insert(
             format!("{}_image", self.name),
             DataKey {
-                source: format!("file://{}", self.path.display()),
+                source: crate::event_model::file_uri(&self.path.display().to_string()),
                 dtype: Dtype::Number,
                 shape: if self.payload_size > 0 {
                     vec![Some(self.payload_size)]
@@ -247,7 +247,7 @@ impl DetectorWriter for Hdf5FrameSink {
                     uid: new_uid.clone(),
                     data_key: format!("{}_image", self.name),
                     mimetype: "application/x-hdf5".into(),
-                    uri: format!("file://{}", self.path.display()),
+                    uri: crate::event_model::file_uri(&self.path.display().to_string()),
                     parameters: params,
                     run_start: None,
                 }));

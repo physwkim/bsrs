@@ -1322,10 +1322,10 @@ impl AdHdfWriter {
     /// `DataKey.source` fallback for attributes with no PV source, mirroring
     /// ophyd-async composing the uri from `path_info` (`_data_logic.py:224`).
     fn provider_uri(&self) -> String {
-        format!(
-            "file://{}{}.h5",
+        crate::event_model::file_uri(&format!(
+            "{}{}.h5",
             self.path_provider.directory, self.path_provider.filename
-        )
+        ))
     }
 
     /// Effective NDAttribute set for this staging: every source's inline XML,
@@ -1498,7 +1498,7 @@ impl DetectorWriter for AdHdfWriter {
                 let uri = if path.is_empty() {
                     String::new()
                 } else {
-                    format!("file://{path}")
+                    crate::event_model::file_uri(&path)
                 };
                 if need_main {
                     let uid = uuid::Uuid::new_v4().to_string();
@@ -2118,7 +2118,7 @@ mod ad_hdf_tests {
             keys["temp"].dtype_numpy,
             Some(crate::event_model::DtypeNumpy::Scalar("<f8".to_string()))
         );
-        assert_eq!(keys["id"].source, "file:///data/scans/scan.h5");
+        assert_eq!(keys["id"].source, "file://localhost/data/scans/scan.h5");
         // Discovered attrs are emitted like declared ones.
         io.set_captured(1);
         let docs: Vec<StreamAsset> = w.collect_stream_docs(1, "d").collect().await;
@@ -2205,7 +2205,7 @@ mod ad_hdf_tests {
         // from the driver (ArraySizeZ/Y/X / DataType / ColorMode RBVs).
         assert_eq!(dk.shape, vec![Some(1), Some(20), Some(10)]);
         // Source is the file URI the path provider resolves to, not a PV.
-        assert_eq!(dk.source, "file:///data/scans/scan.h5");
+        assert_eq!(dk.source, "file://localhost/data/scans/scan.h5");
         assert_eq!(
             dk.dtype_numpy,
             Some(crate::event_model::DtypeNumpy::Scalar("<u2".to_string()))
@@ -2245,7 +2245,7 @@ mod ad_hdf_tests {
         assert_eq!(docs.len(), 2, "resource + datum");
         let resource_uid = match &docs[0] {
             StreamAsset::Resource(r) => {
-                assert_eq!(r.uri, "file:///data/scans/scan.h5");
+                assert_eq!(r.uri, "file://localhost/data/scans/scan.h5");
                 assert_eq!(r.mimetype, "application/x-hdf5");
                 assert_eq!(r.data_key, "det_image");
                 assert_eq!(
