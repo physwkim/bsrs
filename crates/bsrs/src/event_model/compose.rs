@@ -187,6 +187,28 @@ impl RunBundle {
         }
     }
 
+    /// The stream descriptor's external (`STREAM:`-prefixed) data keys — the
+    /// keys whose data arrives via `StreamResource`/`StreamDatum` rather than
+    /// inline in events. The engine validates drained asset documents against
+    /// this set (bluesky `get_external_data_keys` /
+    /// `_pack_external_assets`). Returns `None` for an undeclared stream.
+    pub fn external_data_keys(&self, stream_name: &str) -> Option<Vec<String>> {
+        let streams = self.streams.lock().unwrap();
+        let st = streams.get(stream_name)?;
+        Some(
+            st.descriptor
+                .data_keys
+                .iter()
+                .filter(|(_, dk)| {
+                    dk.external
+                        .as_deref()
+                        .is_some_and(|e| e.starts_with("STREAM:"))
+                })
+                .map(|(k, _)| k.clone())
+                .collect(),
+        )
+    }
+
     /// Snapshot every stream's current sequence counter. Paired with
     /// [`RunBundle::restore_seq_nums`] to implement checkpoint/rewind: the
     /// engine snapshots at each checkpoint and restores on a rewind so a

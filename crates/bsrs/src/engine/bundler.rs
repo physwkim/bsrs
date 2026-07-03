@@ -55,6 +55,13 @@ pub struct RunBundler {
     /// `seq_num`. `None` when no checkpoint region is active. bluesky
     /// `RunBundler._sequence_counters_copy` (bundlers.py:167).
     seq_snapshot: Option<HashMap<String, u64>>,
+    /// Every `StreamResource` uid emitted this run → its `data_key`. The
+    /// engine's asset-drain validation records resources here and requires
+    /// each later `StreamDatum` to reference a known uid. Run-scoped and
+    /// never rewound — a datum after a rewind still legitimately references
+    /// the resource emitted before it. bluesky
+    /// `RunBundler._stream_resource_data_keys`.
+    stream_resource_data_keys: HashMap<String, String>,
 }
 
 impl RunBundler {
@@ -67,7 +74,14 @@ impl RunBundler {
             open: None,
             pending_config: HashMap::new(),
             seq_snapshot: None,
+            stream_resource_data_keys: HashMap::new(),
         }
+    }
+
+    /// The run's `StreamResource` uid → `data_key` registry, for the engine's
+    /// asset-drain validation (see the field doc).
+    pub fn stream_resource_data_keys_mut(&mut self) -> &mut HashMap<String, String> {
+        &mut self.stream_resource_data_keys
     }
 
     /// Snapshot the current per-stream sequence counters as the rewind target.

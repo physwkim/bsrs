@@ -411,64 +411,106 @@ struct MonitorSpec {
     stream: String,
 }
 
-/// Stamp `run_start` on a freshly-drained external-asset doc so every emitted
-/// `StreamResource` carries the run it belongs to. A `DetectorWriter` composes
-/// its `StreamResource` with `run_start: None` because the run UID is
-/// engine/run-scoped, not writer-scoped; the engine — the single owner of the
-/// open run — fills it in at the drain/emit point on both the step (`Save`) and
-/// fly (`Collect`) paths. Ports bluesky `_pack_external_assets` setting
-/// `stream_resource_doc["run_start"]` (bundlers.py:886). Only `StreamResource`
-/// carries `run_start`; `StreamDatum` links to its run via the descriptor.
-/// A non-`None` `run_start` (a writer that already knows it) is left untouched.
-fn stamp_asset_run_start(doc: &mut Document, run_start: &str) {
-    if let Document::StreamResource(r) = doc {
-        if r.run_start.is_none() {
-            r.run_start = Some(run_start.to_string());
-        }
-    }
-}
-
-/// Stamp the run's sequence numbers into drained `StreamDatum`s: each datum
-/// gets `seq_nums = [next_seq, next_seq + width)` where `width` is its own
-/// indices span. Writers must leave `seq_nums` at `{0, 0}` — the sequence
-/// counter belongs to the run (the engine), never the writer — and every
-/// datum in one drain must span the same width, since all detectors in a
-/// stream advance together. Returns the shared width (0 when the drain holds
-/// no datums). Port of bluesky `_pack_seq_nums_into_stream_datum`
-/// (bundlers.py:830-860).
-fn pack_seq_nums_into_stream_datums(
+/// Validate + stamp one drain of external-asset documents, the engine-owned
+/// half of every `StreamResource`/`StreamDatum` emission. Port of bluesky
+/// `_pack_external_assets` + `_pack_seq_nums_into_stream_datum`
+/// (bundlers.py:830-940):
+///
+/// - `StreamResource`: run_start stamped (single owner: the engine); a uid
+///   emitted twice in one run is an error; its `data_key` must be one of the
+///   descriptor's external (`STREAM:`) keys and is recorded in the run's
+///   `resource_data_keys` registry.
+/// - `StreamDatum`: must reference a registered resource uid; must arrive
+///   with `seq_nums {0, 0}` (the sequence counter belongs to the run, never
+///   the writer); every datum in one drain must span the same indices width
+///   (detectors in a stream advance together); `seq_nums` is filled with
+///   `[next_seq, next_seq + width)`.
+/// - After the drain: if any datum arrived, every external data key of the
+///   descriptor must have received one — a writer silently dropping one of
+///   its datasets desyncs the stream.
+///
+/// Returns the shared indices width (0 when the drain holds no datums).
+fn pack_external_assets(
     docs: &mut [Document],
+    run_start: &str,
     next_seq: u64,
+    external_data_keys: &[String],
+    resource_data_keys: &mut HashMap<String, String>,
 ) -> Result<u64, BsrsError> {
     let mut width: Option<u64> = None;
+    let mut data_keys_received: std::collections::HashSet<String> = Default::default();
     for doc in docs.iter_mut() {
-        if let Document::StreamDatum(d) = doc {
-            if d.seq_nums.start != 0 || d.seq_nums.stop != 0 {
-                return Err(BsrsError::Plan(format!(
-                    "StreamDatum {} arrived with pre-filled seq_nums \
-                     [{}, {}); the run engine owns the sequence counter and \
-                     writers must emit seq_nums {{0, 0}}",
-                    d.uid, d.seq_nums.start, d.seq_nums.stop
-                )));
-            }
-            let w = d.indices.stop.saturating_sub(d.indices.start);
-            match width {
-                None => width = Some(w),
-                Some(prev) if prev != w => {
+        match doc {
+            Document::StreamResource(r) => {
+                if r.run_start.is_none() {
+                    r.run_start = Some(run_start.to_string());
+                }
+                if resource_data_keys.contains_key(&r.uid) {
                     return Err(BsrsError::Plan(format!(
-                        "StreamDatum {} spans {w} indices but another datum \
-                         in the same drain spans {prev}; every detector in a \
-                         stream must advance by the same number of indices",
-                        d.uid
+                        "Received `stream_resource` with uid {} twice",
+                        r.uid
                     )));
                 }
-                Some(_) => {}
+                if !external_data_keys.contains(&r.data_key) {
+                    return Err(BsrsError::Plan(format!(
+                        "Received a `stream_resource` with data_key {} that is \
+                         not in the descriptor 'STREAM:' data_keys \
+                         {external_data_keys:?}",
+                        r.data_key
+                    )));
+                }
+                resource_data_keys.insert(r.uid.clone(), r.data_key.clone());
             }
-            d.seq_nums = crate::event_model::StreamRange {
-                start: next_seq,
-                stop: next_seq + w,
-            };
+            Document::StreamDatum(d) => {
+                if d.seq_nums.start != 0 || d.seq_nums.stop != 0 {
+                    return Err(BsrsError::Plan(format!(
+                        "StreamDatum {} arrived with pre-filled seq_nums \
+                         [{}, {}); the run engine owns the sequence counter and \
+                         writers must emit seq_nums {{0, 0}}",
+                        d.uid, d.seq_nums.start, d.seq_nums.stop
+                    )));
+                }
+                let Some(data_key) = resource_data_keys.get(&d.stream_resource) else {
+                    return Err(BsrsError::Plan(format!(
+                        "Received a `stream_datum` referring to an unknown \
+                         stream resource {}",
+                        d.stream_resource
+                    )));
+                };
+                data_keys_received.insert(data_key.clone());
+                let w = d.indices.stop.saturating_sub(d.indices.start);
+                match width {
+                    None => width = Some(w),
+                    Some(prev) if prev != w => {
+                        return Err(BsrsError::Plan(format!(
+                            "StreamDatum {} spans {w} indices but another datum \
+                             in the same drain spans {prev}; every detector in a \
+                             stream must advance by the same number of indices",
+                            d.uid
+                        )));
+                    }
+                    Some(_) => {}
+                }
+                d.seq_nums = crate::event_model::StreamRange {
+                    start: next_seq,
+                    stop: next_seq + w,
+                };
+            }
+            _ => {}
         }
+    }
+    if !data_keys_received.is_empty()
+        && (external_data_keys.len() != data_keys_received.len()
+            || !external_data_keys
+                .iter()
+                .all(|k| data_keys_received.contains(k)))
+    {
+        return Err(BsrsError::Plan(format!(
+            "Received `stream_datum` for the data keys {data_keys_received:?}, \
+             but the descriptor's 'STREAM:' data keys are \
+             {external_data_keys:?}; every external data key must receive a \
+             `stream_datum` in the same drain"
+        )));
     }
     Ok(width.unwrap_or(0))
 }
@@ -1338,14 +1380,13 @@ impl RunEngine {
                 // stream's just-composed EventDescriptor UID — the step-mode
                 // analogue of the Collect path, and a port of bluesky
                 // `_pack_external_assets` on save (bundlers.py:610).
-                let (descriptor_uid, run_start_uid) = {
+                let descriptor_uid = {
                     let state = self.state.lock().await;
                     let b = state.bundler.as_ref();
-                    let desc = match (b, stream_name.as_ref()) {
+                    match (b, stream_name.as_ref()) {
                         (Some(b), Some(s)) => b.descriptor_uid(s),
                         _ => None,
-                    };
-                    (desc, b.map(|b| b.start_uid.clone()))
+                    }
                 };
                 let mut assets = Vec::new();
                 if let Some(uid) = &descriptor_uid {
@@ -1353,35 +1394,43 @@ impl RunEngine {
                         assets.extend(obj.collect_asset_docs_dyn(uid).await?);
                     }
                 }
-                // Stamp each StreamResource with the open run's start UID before
-                // it leaves the engine (the writer emitted it with run_start:None).
-                if let Some(rs) = &run_start_uid {
-                    for a in &mut assets {
-                        stamp_asset_run_start(a, rs);
+                if !assets.is_empty() {
+                    // Validate + stamp the drain (run_start, resource/datum
+                    // cross-checks) and fill the datums' seq_nums from the
+                    // Event this save just composed: the datums accompany
+                    // that event, so they cover [event_seq, event_seq +
+                    // width) — bluesky packs with the stream counter at the
+                    // same point (bundlers.py:830). The event itself advanced
+                    // the counter; no extra advance here.
+                    let event_seq = docs.iter().find_map(|d| match d {
+                        Document::Event(ev) => Some(ev.seq_num),
+                        _ => None,
+                    });
+                    if event_seq.is_none()
+                        && assets.iter().any(|a| matches!(a, Document::StreamDatum(_)))
+                    {
+                        return Err(BsrsError::Plan(
+                            "Save drained StreamDatum documents but composed no \
+                             Event to anchor their seq_nums"
+                                .into(),
+                        ));
                     }
-                }
-                // Fill the datums' seq_nums from the Event this save just
-                // composed: the datums accompany that event, so they cover
-                // [event_seq, event_seq + width) — bluesky packs with the
-                // stream counter at the same point (bundlers.py:830). The
-                // event itself advanced the counter; no extra advance here.
-                let event_seq = docs.iter().find_map(|d| match d {
-                    Document::Event(ev) => Some(ev.seq_num),
-                    _ => None,
-                });
-                match event_seq {
-                    Some(seq) => {
-                        pack_seq_nums_into_stream_datums(&mut assets, seq)?;
-                    }
-                    None => {
-                        if assets.iter().any(|a| matches!(a, Document::StreamDatum(_))) {
-                            return Err(BsrsError::Plan(
-                                "Save drained StreamDatum documents but composed no \
-                                 Event to anchor their seq_nums"
-                                    .into(),
-                            ));
-                        }
-                    }
+                    let mut state = self.state.lock().await;
+                    let bundler = state.bundler.as_mut().ok_or_else(|| {
+                        BsrsError::Plan("Save lost open run before stream docs".into())
+                    })?;
+                    let external_keys = stream_name
+                        .as_deref()
+                        .and_then(|s| bundler.compose().external_data_keys(s))
+                        .unwrap_or_default();
+                    let run_start = bundler.start_uid.clone();
+                    pack_external_assets(
+                        &mut assets,
+                        &run_start,
+                        event_seq.unwrap_or(0),
+                        &external_keys,
+                        bundler.stream_resource_data_keys_mut(),
+                    )?;
                 }
                 // Emit order: Descriptor(s) → StreamResource/StreamDatum →
                 // Event(s), so a consumer sees the descriptor before the stream
@@ -1592,7 +1641,7 @@ impl RunEngine {
                 // collect stream's just-composed EventDescriptor UID, so stream
                 // data links back to its descriptor (CBEM-13). StandardDetector
                 // collects into a single stream; pass that stream's descriptor.
-                let (collect_stream, collect_descriptor, run_start_uid, bundle) = {
+                let (collect_stream, collect_descriptor) = {
                     let state = self.state.lock().await;
                     let bundler = state.bundler.as_ref().ok_or_else(|| {
                         BsrsError::Plan("Collect lost open run before stream docs".into())
@@ -1601,36 +1650,51 @@ impl RunEngine {
                     (
                         stream.clone(),
                         stream.and_then(|s| bundler.descriptor_uid(&s)),
-                        bundler.start_uid.clone(),
-                        bundler.bundle(),
                     )
                 };
                 if let Some(descriptor_uid) = collect_descriptor {
                     let mut asset_docs = obj.collect_stream_docs_dyn(&descriptor_uid).await?;
-                    // Fill the datums' seq_nums from the stream's counter and
-                    // advance it by the indices width: no per-frame Event
-                    // exists on this path to advance it ("we do it
-                    // ourselves", bluesky bundlers.py:1180). The summary
-                    // index event composed below then lands after the datum
-                    // span, keeping one monotonic sequence axis.
-                    let stream = collect_stream
-                        .as_deref()
-                        .expect("descriptor_uid implies a collect stream name");
-                    let next_seq = bundle.peek_next_seq(stream).ok_or_else(|| {
-                        BsrsError::Plan(format!(
-                            "Collect stream `{stream}` has a descriptor but no \
-                             sequence counter"
-                        ))
-                    })?;
-                    let width = pack_seq_nums_into_stream_datums(&mut asset_docs, next_seq)?;
-                    if width > 0 {
-                        bundle.advance_seq(stream, width);
-                    }
-                    for mut doc in asset_docs {
-                        // Stamp the run's start UID onto the StreamResource (the
-                        // writer emitted it with run_start:None) before emission.
-                        stamp_asset_run_start(&mut doc, &run_start_uid);
-                        self.broadcast(&doc).await?;
+                    if !asset_docs.is_empty() {
+                        // Validate + stamp the drain, fill the datums'
+                        // seq_nums from the stream's counter, and advance it
+                        // by the indices width: no per-frame Event exists on
+                        // this path to advance it ("we do it ourselves",
+                        // bluesky bundlers.py:1180). The summary index event
+                        // composed below then lands after the datum span,
+                        // keeping one monotonic sequence axis.
+                        let stream = collect_stream
+                            .as_deref()
+                            .expect("descriptor_uid implies a collect stream name");
+                        let mut state = self.state.lock().await;
+                        let bundler = state.bundler.as_mut().ok_or_else(|| {
+                            BsrsError::Plan("Collect lost open run before stream docs".into())
+                        })?;
+                        let next_seq =
+                            bundler.compose().peek_next_seq(stream).ok_or_else(|| {
+                                BsrsError::Plan(format!(
+                                    "Collect stream `{stream}` has a descriptor but \
+                                     no sequence counter"
+                                ))
+                            })?;
+                        let external_keys = bundler
+                            .compose()
+                            .external_data_keys(stream)
+                            .unwrap_or_default();
+                        let run_start = bundler.start_uid.clone();
+                        let width = pack_external_assets(
+                            &mut asset_docs,
+                            &run_start,
+                            next_seq,
+                            &external_keys,
+                            bundler.stream_resource_data_keys_mut(),
+                        )?;
+                        if width > 0 {
+                            bundler.compose().advance_seq(stream, width);
+                        }
+                        drop(state);
+                        for doc in asset_docs {
+                            self.broadcast(&doc).await?;
+                        }
                     }
                 }
                 let events = obj.collect_dyn().await?;
@@ -2410,10 +2474,10 @@ impl Default for RunEngine {
 mod tests {
     use super::*;
 
-    fn datum(uid: &str, indices: (u64, u64), seq_nums: (u64, u64)) -> Document {
+    fn datum_for(uid: &str, resource: &str, indices: (u64, u64), seq_nums: (u64, u64)) -> Document {
         Document::StreamDatum(crate::event_model::StreamDatum {
             uid: uid.into(),
-            stream_resource: "res".into(),
+            stream_resource: resource.into(),
             descriptor: "desc".into(),
             indices: crate::event_model::StreamRange {
                 start: indices.0,
@@ -2426,11 +2490,41 @@ mod tests {
         })
     }
 
+    fn datum(uid: &str, indices: (u64, u64), seq_nums: (u64, u64)) -> Document {
+        datum_for(uid, "res", indices, seq_nums)
+    }
+
+    fn resource(uid: &str, data_key: &str) -> Document {
+        Document::StreamResource(crate::event_model::StreamResource {
+            uid: uid.into(),
+            data_key: data_key.into(),
+            mimetype: "application/x-hdf5".into(),
+            uri: "file://localhost/data/f.h5".into(),
+            parameters: Default::default(),
+            run_start: None,
+        })
+    }
+
+    /// One registered resource for the datum-only tests: `res` → `img`, the
+    /// descriptor's sole external key.
+    fn seeded_registry() -> HashMap<String, String> {
+        HashMap::from([("res".to_string(), "img".to_string())])
+    }
+
+    const EXTERNAL: [&str; 1] = ["img"];
+
+    fn external() -> Vec<String> {
+        EXTERNAL.iter().map(|s| s.to_string()).collect()
+    }
+
     /// The engine fills `[next_seq, next_seq + width)` into every datum of a
-    /// drain, each from its own indices span, and reports the shared width.
+    /// drain, each from its own indices span, reports the shared width, and
+    /// stamps `run_start` on resources (writers emit `None`).
     #[test]
-    fn pack_seq_nums_fills_from_next_seq_and_indices_width() {
+    fn pack_assets_fills_seq_nums_and_stamps_run_start() {
+        let mut registry = HashMap::new();
         let mut docs = vec![
+            resource("res", "img"),
             datum("a", (10, 13), (0, 0)),
             datum("b", (5, 8), (0, 0)),
             Document::Event(crate::event_model::Event {
@@ -2443,9 +2537,15 @@ mod tests {
                 filled: Default::default(),
             }),
         ];
-        let width = pack_seq_nums_into_stream_datums(&mut docs, 7).unwrap();
+        let width =
+            pack_external_assets(&mut docs, "run-1", 7, &external(), &mut registry).unwrap();
         assert_eq!(width, 3);
-        for d in &docs[..2] {
+        let Document::StreamResource(r) = &docs[0] else {
+            panic!("expected resource")
+        };
+        assert_eq!(r.run_start.as_deref(), Some("run-1"));
+        assert_eq!(registry.get("res").map(String::as_str), Some("img"));
+        for d in &docs[1..3] {
             let Document::StreamDatum(d) = d else {
                 panic!("expected datum")
             };
@@ -2457,9 +2557,10 @@ mod tests {
     /// the sequence counter and is rejected, mirroring bluesky's
     /// `_pack_seq_nums_into_stream_datum` assertion (bundlers.py:830).
     #[test]
-    fn pack_seq_nums_rejects_prefilled_datum() {
+    fn pack_assets_rejects_prefilled_datum() {
         let mut docs = vec![datum("a", (0, 1), (1, 2))];
-        let err = pack_seq_nums_into_stream_datums(&mut docs, 1).unwrap_err();
+        let err = pack_external_assets(&mut docs, "run-1", 1, &external(), &mut seeded_registry())
+            .unwrap_err();
         assert!(err.to_string().contains("pre-filled"), "got: {err}");
     }
 
@@ -2467,9 +2568,10 @@ mod tests {
     /// indices per drain; a mismatch means their frames no longer line up
     /// with a common event sequence.
     #[test]
-    fn pack_seq_nums_rejects_mismatched_indices_width() {
+    fn pack_assets_rejects_mismatched_indices_width() {
         let mut docs = vec![datum("a", (0, 2), (0, 0)), datum("b", (0, 3), (0, 0))];
-        let err = pack_seq_nums_into_stream_datums(&mut docs, 1).unwrap_err();
+        let err = pack_external_assets(&mut docs, "run-1", 1, &external(), &mut seeded_registry())
+            .unwrap_err();
         assert!(
             err.to_string().contains("same number of indices"),
             "got: {err}"
@@ -2479,9 +2581,60 @@ mod tests {
     /// A drain with no datums (resources only, or empty) is a no-op with
     /// width 0 — the Collect path must not advance the stream counter.
     #[test]
-    fn pack_seq_nums_empty_drain_reports_zero_width() {
+    fn pack_assets_empty_drain_reports_zero_width() {
         let mut docs: Vec<Document> = Vec::new();
-        assert_eq!(pack_seq_nums_into_stream_datums(&mut docs, 5).unwrap(), 0);
+        assert_eq!(
+            pack_external_assets(&mut docs, "run-1", 5, &external(), &mut HashMap::new()).unwrap(),
+            0
+        );
+    }
+
+    /// The same `StreamResource` uid emitted twice in one run is a writer
+    /// bug (bsrs writers emit each resource exactly once, on first drain).
+    #[test]
+    fn pack_assets_rejects_duplicate_resource_uid() {
+        let mut registry = seeded_registry();
+        let mut docs = vec![resource("res", "img")];
+        let err =
+            pack_external_assets(&mut docs, "run-1", 1, &external(), &mut registry).unwrap_err();
+        assert!(err.to_string().contains("twice"), "got: {err}");
+    }
+
+    /// A resource whose data_key is not among the descriptor's `STREAM:`
+    /// keys points at data no event will ever reference.
+    #[test]
+    fn pack_assets_rejects_resource_for_unknown_data_key() {
+        let mut docs = vec![resource("res2", "not_in_descriptor")];
+        let err = pack_external_assets(&mut docs, "run-1", 1, &external(), &mut HashMap::new())
+            .unwrap_err();
+        assert!(err.to_string().contains("STREAM:"), "got: {err}");
+    }
+
+    /// A datum referencing a resource uid never emitted this run cannot be
+    /// linked to any dataset.
+    #[test]
+    fn pack_assets_rejects_datum_with_unknown_resource() {
+        let mut docs = vec![datum_for("a", "ghost", (0, 1), (0, 0))];
+        let err = pack_external_assets(&mut docs, "run-1", 1, &external(), &mut HashMap::new())
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown"), "got: {err}");
+    }
+
+    /// If any datum arrived, every external key of the descriptor must have
+    /// received one in the same drain — a writer silently dropping one of
+    /// its datasets (e.g. an NDAttribute) desyncs the stream.
+    #[test]
+    fn pack_assets_rejects_incomplete_data_key_coverage() {
+        let mut registry = seeded_registry();
+        registry.insert("res_attr".to_string(), "temp".to_string());
+        let ext = vec!["img".to_string(), "temp".to_string()];
+        // Only `img` gets a datum; `temp` is missing.
+        let mut docs = vec![datum("a", (0, 1), (0, 0))];
+        let err = pack_external_assets(&mut docs, "run-1", 1, &ext, &mut registry).unwrap_err();
+        assert!(
+            err.to_string().contains("every external data key"),
+            "got: {err}"
+        );
     }
 
     /// K1 regression: `install_signal_handler` must capture `Weak<Self>`,
