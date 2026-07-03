@@ -563,10 +563,6 @@ pub struct NdFile {
     /// The `StreamResource` URI is built from this readback so it points
     /// at the file the IOC actually wrote, not at a re-derived guess.
     pub full_file_name_rbv: Arc<EpicsCaBackend<String>>,
-    /// `FlushNow` (bo) — force the plugin to flush buffered frames to the
-    /// file. Meaningful in SWMR streaming; the write index only reflects
-    /// flushed frames, so we flush before reading `NumCaptured_RBV`.
-    pub flush_now: Arc<EpicsCaBackend<bool>>,
     /// `FileNumber` (longout) — next file's sequence number, substituted
     /// into `FileTemplate`.
     pub file_number: Arc<EpicsCaBackend<i64>>,
@@ -607,7 +603,6 @@ impl NdFile {
                 &prefix,
                 "FullFileName_RBV",
             ))),
-            flush_now: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "FlushNow"))),
             file_number: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "FileNumber"))),
             file_path_exists_rbv: Arc::new(EpicsCaBackend::<bool>::new(join(
                 &prefix,
@@ -646,8 +641,7 @@ impl NdFile {
         h?;
         i?;
         j?;
-        let (k, l, m, n, o) = tokio::join!(
-            SignalBackend::<bool>::connect(self.flush_now.as_ref(), timeout),
+        let (k, l, m, n) = tokio::join!(
             SignalBackend::<i64>::connect(self.file_number.as_ref(), timeout),
             SignalBackend::<bool>::connect(self.file_path_exists_rbv.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.create_directory.as_ref(), timeout),
@@ -657,7 +651,6 @@ impl NdFile {
         l?;
         m?;
         n?;
-        o?;
         Ok(())
     }
 
@@ -785,16 +778,6 @@ impl NdFile {
         let s = SignalBackend::<String>::get_value(self.full_file_name_rbv.as_ref()).await?;
         Ok(s.trim_end_matches('\0').to_string())
     }
-
-    /// Force a flush (`FlushNow=1`) so `NumCaptured_RBV` reflects frames
-    /// actually written to the file. A no-op on plugins without SWMR support.
-    pub async fn flush(&self) -> Result<()> {
-        await_put(
-            SignalBackend::<bool>::put(self.flush_now.as_ref(), Some(true)),
-            "NdFile::flush",
-        )
-        .await
-    }
 }
 
 /// `NDFileHDF5` plugin — the generic [`NdFile`] channels plus the
@@ -822,6 +805,11 @@ pub struct NdFileHdf5 {
     /// `XMLFileName` (CHAR waveform) — custom HDF5 layout XML; cleared so
     /// the default `/entry/data/data` layout applies.
     pub xml_file_name: Arc<EpicsCaBackend<String>>,
+    /// `FlushNow` (bo) — force the plugin to flush buffered frames to the
+    /// file. An `NDFileHDF5`-only record (SWMR streaming; the write index
+    /// only reflects flushed frames, so we flush before reading
+    /// `NumCaptured_RBV`) — the JPEG/TIFF plugins do not have it.
+    pub flush_now: Arc<EpicsCaBackend<bool>>,
 }
 
 impl NdFileHdf5 {
@@ -845,13 +833,14 @@ impl NdFileHdf5 {
                 &prefix,
                 "XMLFileName",
             ))),
+            flush_now: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "FlushNow"))),
             file: NdFile::new(prefix),
         }
     }
 
     /// Connect the embedded file plugin + the HDF5-specific channels.
     pub async fn connect(&self, timeout: Duration) -> Result<()> {
-        let (a, b, c, d, e, f, g, h) = tokio::join!(
+        let (a, b, c, d, e, f, g, h, i) = tokio::join!(
             self.file.connect(timeout),
             SignalBackend::<i64>::connect(self.num_frames_chunks.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.num_frames_chunks_rbv.as_ref(), timeout),
@@ -860,6 +849,7 @@ impl NdFileHdf5 {
             SignalBackend::<bool>::connect(self.swmr_mode.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.num_extra_dims.as_ref(), timeout),
             SignalBackend::<String>::connect(self.xml_file_name.as_ref(), timeout),
+            SignalBackend::<bool>::connect(self.flush_now.as_ref(), timeout),
         );
         a?;
         b?;
@@ -869,6 +859,7 @@ impl NdFileHdf5 {
         f?;
         g?;
         h?;
+        i?;
         Ok(())
     }
 
@@ -923,6 +914,16 @@ impl NdFileHdf5 {
         await_put(
             SignalBackend::<bool>::put(self.chunk_size_auto.as_ref(), Some(on)),
             "NdFileHdf5::set_chunk_size_auto",
+        )
+        .await
+    }
+
+    /// Force a flush (`FlushNow=1`) so `NumCaptured_RBV` reflects frames
+    /// actually written to the file.
+    pub async fn flush(&self) -> Result<()> {
+        await_put(
+            SignalBackend::<bool>::put(self.flush_now.as_ref(), Some(true)),
+            "NdFileHdf5::flush",
         )
         .await
     }
@@ -1269,8 +1270,6 @@ pub trait AdFileIo: Send + Sync {
     async fn num_captured(&self) -> Result<u64>;
     /// Absolute path the IOC resolved for the open file.
     async fn full_file_name(&self) -> Result<String>;
-    /// Force a flush so `num_captured` reflects frames written to the file.
-    async fn flush(&self) -> Result<()>;
     /// Watch the frames-written counter, for `complete()` in fly scans.
     fn observe_num_captured(&self) -> watch::Receiver<u64>;
 }
@@ -1288,6 +1287,10 @@ pub trait AdHdfFileIo: AdFileIo {
     /// The HDF5-specific arming puts: `NumExtraDims=0`, `LazyOpen=1`,
     /// `SWMRMode=1`, `XMLFileName=""` (ophyd-async `prepare_unbounded`).
     async fn setup_hdf_writer(&self) -> Result<()>;
+    /// Force a flush (`FlushNow=1`) so `num_captured` reflects frames written
+    /// to the file. HDF5-only: `FlushNow` exists on `NDFileHDF5` (SWMR), not
+    /// on the JPEG/TIFF file plugins.
+    async fn flush(&self) -> Result<()>;
 }
 
 /// [`AdHdfFileIo`] backed by a real [`NdFileHdf5`] over Channel Access.
@@ -1370,9 +1373,6 @@ impl AdFileIo for NdFileIo {
     async fn full_file_name(&self) -> Result<String> {
         self.file.file.full_file_name().await
     }
-    async fn flush(&self) -> Result<()> {
-        self.file.file.flush().await
-    }
     fn observe_num_captured(&self) -> watch::Receiver<u64> {
         self.index_rx.clone()
     }
@@ -1388,6 +1388,9 @@ impl AdHdfFileIo for NdFileIo {
     }
     async fn setup_hdf_writer(&self) -> Result<()> {
         self.file.setup_hdf_writer().await
+    }
+    async fn flush(&self) -> Result<()> {
+        self.file.flush().await
     }
 }
 
@@ -2393,10 +2396,6 @@ mod ad_hdf_tests {
         async fn full_file_name(&self) -> Result<String> {
             Ok(self.full_name.clone())
         }
-        async fn flush(&self) -> Result<()> {
-            self.flushes.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
         fn observe_num_captured(&self) -> watch::Receiver<u64> {
             self.index_rx.clone()
         }
@@ -2413,6 +2412,10 @@ mod ad_hdf_tests {
         }
         async fn setup_hdf_writer(&self) -> Result<()> {
             self.hdf_setup.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn flush(&self) -> Result<()> {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
