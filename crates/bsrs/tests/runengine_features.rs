@@ -959,15 +959,26 @@ async fn monitor_emits_descriptor_then_events() {
     re.run_async(plan).await.unwrap();
 
     let docs = sink.snapshot().await;
-    let descriptors = docs
+    let descriptors: Vec<_> = docs
         .iter()
-        .filter(|d| matches!(d, Document::Descriptor(_)))
-        .count();
+        .filter_map(|d| match d {
+            Document::Descriptor(d) => Some(d),
+            _ => None,
+        })
+        .collect();
     let events = docs
         .iter()
         .filter(|d| matches!(d, Document::Event(_)))
         .count();
-    assert!(descriptors >= 1, "expected at least one descriptor");
+    assert!(!descriptors.is_empty(), "expected at least one descriptor");
+    // The monitor descriptor carries the monitored object's configuration
+    // entry (bluesky `_monitor` runs ensure_cached + _prepare_stream,
+    // bundlers.py:473-475); TestMonitor is not configurable, so it is empty.
+    assert!(
+        descriptors[0].configuration.contains_key("mon1"),
+        "monitor descriptor has the object's configuration entry; got keys {:?}",
+        descriptors[0].configuration.keys().collect::<Vec<_>>()
+    );
     assert!(
         events >= 1,
         "expected at least one Event from the monitor pump"

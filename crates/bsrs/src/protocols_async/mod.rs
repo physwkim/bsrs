@@ -231,6 +231,20 @@ pub trait DetectorControl: Send + Sync {
     async fn wait_for_idle(&self) -> Result<()>;
     /// Disarm.
     async fn disarm(&self) -> Result<()>;
+    /// Configuration readings for the owning detector's descriptor, keyed
+    /// `{name}_...` where `name` is the detector's name. Default none;
+    /// drivers with slow-changing acquisition parameters override it —
+    /// ophyd-async's `AreaDetector` registers `driver.acquire_time` /
+    /// `driver.acquire_period` as CONFIG_SIGNALs on itself.
+    async fn read_configuration(&self, name: &str) -> Result<HashMap<String, ReadingValue>> {
+        let _ = name;
+        Ok(HashMap::new())
+    }
+    /// `DataKey`s for [`DetectorControl::read_configuration`]'s fields.
+    async fn describe_configuration(&self, name: &str) -> Result<HashMap<String, DataKey>> {
+        let _ = name;
+        Ok(HashMap::new())
+    }
 }
 
 /// Mechanism for triggering a detector to take exposures. Direct port of

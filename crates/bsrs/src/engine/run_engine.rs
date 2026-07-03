@@ -411,6 +411,31 @@ struct MonitorSpec {
     stream: String,
 }
 
+/// Read one object's configuration into the descriptor's per-object
+/// [`Configuration`] shape — values/timestamps from `read_configuration`,
+/// keys from `describe_configuration`. bluesky `_StreamCache.cache_read_config`
+/// + `_cache_describe_config` (bundlers.py:109-130).
+async fn read_object_configuration(
+    obj: &dyn crate::core::msg::ConfigurableObj,
+) -> Result<crate::event_model::Configuration, BsrsError> {
+    let (readings, data_keys) = tokio::join!(
+        obj.read_configuration_dyn(),
+        obj.describe_configuration_dyn()
+    );
+    let (readings, data_keys) = (readings?, data_keys?);
+    let mut data = HashMap::new();
+    let mut timestamps = HashMap::new();
+    for (k, r) in readings {
+        data.insert(k.clone(), r.value);
+        timestamps.insert(k, r.timestamp);
+    }
+    Ok(crate::event_model::Configuration {
+        data,
+        data_keys,
+        timestamps,
+    })
+}
+
 /// Validate + stamp one drain of external-asset documents, the engine-owned
 /// half of every `StreamResource`/`StreamDatum` emission. Port of bluesky
 /// `_pack_external_assets` + `_pack_seq_nums_into_stream_datum`
@@ -1464,13 +1489,18 @@ impl RunEngine {
                 stream_name,
                 data_keys,
             } => {
+                // `Msg::DeclareStream` carries raw data keys, not objects
+                // (deviation from bluesky, whose declare_stream takes the
+                // collect objects), so there is nothing to read configuration
+                // from — the descriptor's configuration stays empty here. The
+                // object-driven paths (Read/save, Collect, Monitor) fill it.
                 let descriptor = {
                     let mut state = self.state.lock().await;
                     state
                         .bundler
                         .as_mut()
                         .ok_or_else(|| BsrsError::Plan("DeclareStream with no open run".into()))?
-                        .declare_stream(stream_name, data_keys)?
+                        .declare_stream(stream_name, data_keys, HashMap::new())?
                 };
                 self.broadcast(&Document::Descriptor(descriptor)).await?;
             }
@@ -1492,12 +1522,19 @@ impl RunEngine {
                     // describe() only matters for the bundle's descriptor, so
                     // compute it (awaiting before re-locking) only when bundling.
                     let data_keys = obj.describe_dyn().await?;
+                    // The object's configuration goes into the same descriptor,
+                    // keyed by object name — empty for non-configurables
+                    // (bluesky `_prepare_stream`, bundlers.py:286-290).
+                    let config = self
+                        .ensure_object_configuration(obj.name(), obj.as_configurable())
+                        .await?;
                     let object_name = Some(obj.name().to_string());
                     let hint_fields = obj.hint_fields();
                     let tracks_assets = obj.writes_external_assets();
                     let mut state = self.state.lock().await;
                     if let Some(bundler) = state.bundler.as_mut() {
                         bundler.add_readings(readings, data_keys, object_name, hint_fields)?;
+                        bundler.add_configuration(obj.name().to_string(), config)?;
                     }
                     // Track asset-writing readables so the paired `Save` drains
                     // their `StreamResource`/`StreamDatum`, stamped with the
@@ -1620,6 +1657,13 @@ impl RunEngine {
                     }
                 }
                 let descs = obj.describe_collect_dyn().await?;
+                // The collect object's configuration, for any descriptor
+                // declared below — bluesky's collect path runs
+                // `ensure_cached(obj)` + `_prepare_stream`, which folds the
+                // object's config into the descriptor (bundlers.py:814-819).
+                let config = self
+                    .ensure_object_configuration(obj.name(), obj.as_configurable())
+                    .await?;
                 let new_descriptors: Vec<crate::event_model::EventDescriptor> = {
                     let mut state = self.state.lock().await;
                     let bundler = state
@@ -1629,7 +1673,13 @@ impl RunEngine {
                     let mut out = Vec::new();
                     for (name, dks) in &descs {
                         if bundler.descriptor_uid(name).is_none() {
-                            out.push(bundler.declare_stream(name.clone(), dks.clone())?);
+                            let configuration =
+                                HashMap::from([(obj.name().to_string(), config.clone())]);
+                            out.push(bundler.declare_stream(
+                                name.clone(),
+                                dks.clone(),
+                                configuration,
+                            )?);
                         }
                     }
                     out
@@ -1940,6 +1990,23 @@ impl RunEngine {
                     }
                 }
                 obj.configure_dyn(args).await?;
+                // Refresh the run's cached configuration so descriptors of
+                // streams declared after this point carry the new values
+                // (bluesky re-runs cache_read_config, bundlers.py:1209).
+                // Not ported: bluesky also invalidates and re-emits the
+                // descriptors of already-declared streams containing this
+                // object (bundlers.py:1213-1218); bsrs's one-descriptor-per-
+                // stream model (CBEM-21) fixes a stream's descriptor at first
+                // declaration, so a configure between events of an existing
+                // stream does not re-describe it.
+                let run_open = { self.state.lock().await.bundler.is_some() };
+                if run_open {
+                    let config = read_object_configuration(obj.as_ref()).await?;
+                    let mut state = self.state.lock().await;
+                    if let Some(b) = state.bundler.as_mut() {
+                        b.cache_configuration(obj.name().to_string(), config);
+                    }
+                }
             }
             Msg::Prepare { obj, value, group } => {
                 let status = obj.prepare_dyn(value).await;
@@ -2004,14 +2071,51 @@ impl RunEngine {
         Ok(None)
     }
 
+    /// The run-cached configuration for object `name`, reading it through
+    /// `configurable` on first use (empty when the object is not
+    /// configurable). Cache lives on the `RunBundler` (run-scoped); the
+    /// bluesky analogue is `ensure_cached` filling the config caches once
+    /// per object (bundlers.py:93-102). Returns the configuration even if
+    /// the run closed mid-read (it just isn't cached then).
+    async fn ensure_object_configuration(
+        &self,
+        name: &str,
+        configurable: Option<&dyn crate::core::msg::ConfigurableObj>,
+    ) -> Result<crate::event_model::Configuration> {
+        let cached = {
+            let state = self.state.lock().await;
+            state
+                .bundler
+                .as_ref()
+                .and_then(|b| b.cached_configuration(name))
+        };
+        if let Some(c) = cached {
+            return Ok(c);
+        }
+        let config = match configurable {
+            Some(c) => read_object_configuration(c).await?,
+            None => crate::event_model::Configuration::default(),
+        };
+        let mut state = self.state.lock().await;
+        if let Some(b) = state.bundler.as_mut() {
+            b.cache_configuration(name.to_string(), config.clone());
+        }
+        Ok(config)
+    }
+
     async fn start_monitor(
         &self,
         stream: String,
         obj: Arc<dyn crate::core::msg::MonitorableObj>,
     ) -> Result<()> {
         // Step 1: declare the descriptor for this stream from the device's
-        // own describe_dyn (MonitorableObj : ReadableObj).
+        // own describe_dyn (MonitorableObj : ReadableObj), with the device's
+        // configuration — bluesky `_monitor` runs `ensure_cached(obj)` +
+        // `_prepare_stream(name, {obj: ...})` (bundlers.py:473-475).
         let data_keys = obj.describe_dyn().await?;
+        let config = self
+            .ensure_object_configuration(obj.name(), obj.as_configurable())
+            .await?;
         let (descriptor, bundle) = {
             let mut state = self.state.lock().await;
             let bundler = state
@@ -2021,7 +2125,8 @@ impl RunEngine {
             let descriptor = if bundler.descriptor_uid(&stream).is_some() {
                 None
             } else {
-                Some(bundler.declare_stream(stream.clone(), data_keys.clone())?)
+                let configuration = HashMap::from([(obj.name().to_string(), config)]);
+                Some(bundler.declare_stream(stream.clone(), data_keys.clone(), configuration)?)
             };
             (descriptor, bundler.bundle())
         };
@@ -2279,7 +2384,9 @@ impl RunEngine {
                         choices: None,
                     },
                 );
-                Some(bundler.declare_stream("interruptions".into(), keys)?)
+                // No configuration: bluesky's interruptions descriptor is
+                // composed from a bare data key, no objects (bundlers.py).
+                Some(bundler.declare_stream("interruptions".into(), keys, HashMap::new())?)
             } else {
                 None
             };

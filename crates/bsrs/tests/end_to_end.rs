@@ -229,13 +229,21 @@ async fn fly_plan_drives_standard_detector_to_completion() {
     // it must carry the EventDescriptor UID the engine composed for the collect
     // stream — not an empty string. This is the owner-path check: the descriptor
     // is stamped by the engine (single owner), not invented by the sink.
-    let descriptor_uid = docs
+    let (descriptor_uid, descriptor_configuration) = docs
         .iter()
         .find_map(|d| match d {
-            Descriptor(desc) => Some(desc.uid.clone()),
+            Descriptor(desc) => Some((desc.uid.clone(), desc.configuration.clone())),
             _ => None,
         })
         .expect("expected an EventDescriptor from describe_collect");
+    // The collect-declared descriptor carries the detector's configuration
+    // entry (bluesky's collect path runs ensure_cached + _prepare_stream);
+    // the soft control has no config parameters, so the entry is empty.
+    assert!(
+        descriptor_configuration.contains_key("flydet"),
+        "collect descriptor has the detector's configuration entry; got keys {:?}",
+        descriptor_configuration.keys().collect::<Vec<_>>()
+    );
     let datum_descriptor = docs
         .iter()
         .find_map(|d| match d {
@@ -643,6 +651,226 @@ async fn configure_inside_open_bundle_is_rejected() {
         result.exit_status, "fail",
         "configure between create and save must be rejected (pre-fix: ran to \"success\")"
     );
+}
+
+/// Readable + Configurable device for descriptor-configuration tests: one
+/// read field `{name}_x`, one config field `{name}_gain`, a counter on
+/// config reads (to prove the run-level cache), and a `configure_dyn` that
+/// bumps the gain.
+struct ConfigReadable {
+    name: String,
+    gain: std::sync::Mutex<f64>,
+    config_reads: std::sync::atomic::AtomicU64,
+}
+
+impl ConfigReadable {
+    fn new(name: &str, gain: f64) -> Arc<Self> {
+        Arc::new(Self {
+            name: name.into(),
+            gain: std::sync::Mutex::new(gain),
+            config_reads: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+    fn number_key() -> bsrs::event_model::DataKey {
+        bsrs::event_model::DataKey {
+            source: "soft://test".into(),
+            dtype: bsrs::event_model::Dtype::Number,
+            shape: vec![],
+            dtype_numpy: None,
+            external: None,
+            units: None,
+            precision: None,
+            object_name: None,
+            dims: None,
+            limits: None,
+            choices: None,
+        }
+    }
+}
+
+impl bsrs::core::msg::NamedObj for ConfigReadable {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[async_trait::async_trait]
+impl bsrs::core::msg::ReadableObj for ConfigReadable {
+    async fn read_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, bsrs::core::reading::ReadingValue>,
+        bsrs::core::error::BsrsError,
+    > {
+        Ok(std::collections::HashMap::from([(
+            format!("{}_x", self.name),
+            bsrs::core::reading::ReadingValue {
+                value: serde_json::Value::from(1.0),
+                timestamp: 0.0,
+                alarm_severity: None,
+                message: None,
+            },
+        )]))
+    }
+    async fn describe_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, bsrs::event_model::DataKey>,
+        bsrs::core::error::BsrsError,
+    > {
+        Ok(std::collections::HashMap::from([(
+            format!("{}_x", self.name),
+            Self::number_key(),
+        )]))
+    }
+    fn as_configurable(&self) -> Option<&dyn bsrs::core::msg::ConfigurableObj> {
+        Some(self)
+    }
+}
+
+#[async_trait::async_trait]
+impl bsrs::core::msg::ConfigurableObj for ConfigReadable {
+    async fn read_configuration_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, bsrs::core::reading::ReadingValue>,
+        bsrs::core::error::BsrsError,
+    > {
+        self.config_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(std::collections::HashMap::from([(
+            format!("{}_gain", self.name),
+            bsrs::core::reading::ReadingValue {
+                value: serde_json::Value::from(*self.gain.lock().unwrap()),
+                timestamp: 42.0,
+                alarm_severity: None,
+                message: None,
+            },
+        )]))
+    }
+    async fn describe_configuration_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, bsrs::event_model::DataKey>,
+        bsrs::core::error::BsrsError,
+    > {
+        Ok(std::collections::HashMap::from([(
+            format!("{}_gain", self.name),
+            Self::number_key(),
+        )]))
+    }
+    async fn configure_dyn(
+        &self,
+        _args: bsrs::core::ConfigureArgs,
+    ) -> Result<(), bsrs::core::error::BsrsError> {
+        *self.gain.lock().unwrap() = 5.0;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn descriptor_configuration_carries_object_config_and_caches_reads() {
+    // bluesky `_prepare_stream` folds every read object's configuration into
+    // the descriptor — configurables get data/timestamps/data_keys from
+    // read/describe_configuration, non-configurables get an empty entry
+    // (bundlers.py:286-290) — and `ensure_cached` reads each object's
+    // configuration once per run (bundlers.py:93-102).
+    let cfg = ConfigReadable::new("cfgr", 2.5);
+    let plain: Arc<dyn bsrs::core::msg::ReadableObj> = Arc::new(CollidingReadable {
+        name: "plainr".into(),
+    });
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let cfg_read: Arc<dyn bsrs::core::msg::ReadableObj> = cfg.clone();
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        // Two bundles: the second proves the config cache (one read total).
+        for _ in 0..2 {
+            yield bsrs::core::Msg::Create { stream_name: "primary".into() };
+            yield bsrs::core::Msg::Read(cfg_read.clone());
+            yield bsrs::core::Msg::Read(plain.clone());
+            yield bsrs::core::Msg::Save;
+        }
+        yield bsrs::core::Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let result = re.run_async(plan).await.expect("plan failed");
+    assert_eq!(result.exit_status, "success");
+
+    let docs = sink.snapshot().await;
+    let desc = docs
+        .iter()
+        .find_map(|d| match d {
+            Document::Descriptor(d) => Some(d.clone()),
+            _ => None,
+        })
+        .expect("a descriptor was emitted");
+    let cfg_entry = desc
+        .configuration
+        .get("cfgr")
+        .expect("configurable object has a configuration entry");
+    assert_eq!(
+        cfg_entry.data.get("cfgr_gain"),
+        Some(&serde_json::Value::from(2.5))
+    );
+    assert_eq!(cfg_entry.timestamps.get("cfgr_gain"), Some(&42.0));
+    assert!(cfg_entry.data_keys.contains_key("cfgr_gain"));
+    let plain_entry = desc
+        .configuration
+        .get("plainr")
+        .expect("non-configurable object still gets a configuration entry");
+    assert!(plain_entry.data.is_empty());
+    assert!(plain_entry.data_keys.is_empty());
+    // Read twice in the run, configuration read once (run-level cache).
+    assert_eq!(
+        cfg.config_reads.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+}
+
+#[tokio::test]
+async fn configure_refreshes_configuration_for_later_descriptors() {
+    // bluesky re-runs cache_read_config on configure (bundlers.py:1209): a
+    // stream declared after the configure carries the new values, while the
+    // earlier stream's descriptor keeps the values read before it.
+    let cfg = ConfigReadable::new("cfgr", 2.5);
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let cfg_read: Arc<dyn bsrs::core::msg::ReadableObj> = cfg.clone();
+    let cfg_conf: Arc<dyn bsrs::core::msg::ConfigurableObj> = cfg.clone();
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        yield bsrs::core::Msg::Create { stream_name: "first".into() };
+        yield bsrs::core::Msg::Read(cfg_read.clone());
+        yield bsrs::core::Msg::Save;
+        // configure_dyn sets gain 2.5 → 5.0 and the engine re-caches.
+        yield bsrs::core::Msg::Configure { obj: cfg_conf.clone(), args: Default::default() };
+        yield bsrs::core::Msg::Create { stream_name: "second".into() };
+        yield bsrs::core::Msg::Read(cfg_read.clone());
+        yield bsrs::core::Msg::Save;
+        yield bsrs::core::Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let result = re.run_async(plan).await.expect("plan failed");
+    assert_eq!(result.exit_status, "success");
+
+    let docs = sink.snapshot().await;
+    let gain_of = |stream: &str| -> serde_json::Value {
+        docs.iter()
+            .find_map(|d| match d {
+                Document::Descriptor(d) if d.name.as_deref() == Some(stream) => Some(
+                    d.configuration
+                        .get("cfgr")
+                        .expect("configuration entry")
+                        .data
+                        .get("cfgr_gain")
+                        .expect("gain field")
+                        .clone(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("descriptor for stream `{stream}`"))
+    };
+    assert_eq!(gain_of("first"), serde_json::Value::from(2.5));
+    assert_eq!(gain_of("second"), serde_json::Value::from(5.0));
 }
 
 struct CollidingReadable {

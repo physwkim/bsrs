@@ -2,7 +2,8 @@
 
 use crate::core::error::{BsrsError, Result};
 use crate::core::msg::{
-    CollectableObj, FlyableObj, NamedObj, ReadableObj, StageableObj, TriggerableObj,
+    CollectableObj, ConfigurableObj, FlyableObj, NamedObj, ReadableObj, StageableObj,
+    TriggerableObj,
 };
 use crate::core::reading::ReadingValue;
 use crate::core::status::Status;
@@ -366,6 +367,9 @@ where
     ) -> Result<Vec<crate::event_model::Document>> {
         self.drain_asset_documents(descriptor).await
     }
+    fn as_configurable(&self) -> Option<&dyn ConfigurableObj> {
+        Some(self)
+    }
 }
 
 #[async_trait]
@@ -403,6 +407,35 @@ where
         descriptor: &str,
     ) -> Result<Vec<crate::event_model::Document>> {
         self.drain_asset_documents(descriptor).await
+    }
+    fn as_configurable(&self) -> Option<&dyn ConfigurableObj> {
+        Some(self)
+    }
+}
+
+/// Configuration = the control half's slow-changing acquisition parameters
+/// (ophyd-async `AreaDetector` adds `driver.acquire_time`/`acquire_period`
+/// as CONFIG_SIGNALs; controls without config parameters contribute none).
+#[async_trait]
+impl<C, W> ConfigurableObj for StandardDetector<C, W>
+where
+    C: DetectorControl + Send + Sync + 'static,
+    W: DetectorWriter + Send + Sync + 'static,
+{
+    async fn read_configuration_dyn(&self) -> Result<HashMap<String, ReadingValue>> {
+        self.control.read_configuration(&self.name).await
+    }
+    async fn describe_configuration_dyn(&self) -> Result<HashMap<String, DataKey>> {
+        self.control.describe_configuration(&self.name).await
+    }
+    async fn configure_dyn(&self, _args: crate::core::ConfigureArgs) -> Result<()> {
+        // Acquisition parameters are set through `prepare(TriggerInfo)`, not
+        // a generic configure — same as ophyd-async, whose detectors expose
+        // config signals read-only on the descriptor path.
+        Err(BsrsError::State(format!(
+            "{}: StandardDetector is configured via prepare(TriggerInfo), not configure()",
+            self.name
+        )))
     }
 }
 

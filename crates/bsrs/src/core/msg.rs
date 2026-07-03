@@ -616,6 +616,16 @@ pub trait ReadableObj: NamedObj {
     ) -> Result<Vec<crate::event_model::Document>, crate::core::error::BsrsError> {
         Ok(Vec::new())
     }
+    /// This object's configuration view, if it has one. The engine reads
+    /// `read_configuration`/`describe_configuration` through it to fill the
+    /// descriptor's per-object `configuration` — bluesky's
+    /// `isinstance(obj, Configurable)` gate in `_StreamCache.ensure_cached`
+    /// (bundlers.py:93-130). Default `None`: the object still gets a
+    /// `configuration` entry in the descriptor, with empty data/keys, exactly
+    /// as bluesky gives non-Configurable objects empty cache dicts.
+    fn as_configurable(&self) -> Option<&dyn ConfigurableObj> {
+        None
+    }
 }
 
 /// Anything that can be moved (set to a value).
@@ -739,6 +749,13 @@ pub trait CollectableObj: NamedObj {
         _descriptor: &str,
     ) -> Result<Vec<crate::event_model::Document>, crate::core::error::BsrsError> {
         Ok(Vec::new())
+    }
+    /// This object's configuration view, if it has one — the collect-path
+    /// twin of [`ReadableObj::as_configurable`], read when the engine
+    /// declares this object's collect stream(s) (bluesky `describe_collect`
+    /// runs `ensure_cached` + `_prepare_stream`, bundlers.py:814-819).
+    fn as_configurable(&self) -> Option<&dyn ConfigurableObj> {
+        None
     }
 }
 

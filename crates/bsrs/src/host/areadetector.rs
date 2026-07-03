@@ -37,6 +37,7 @@
 use crate::backends::epics_ca::EpicsCaBackend;
 use crate::core::error::{BsrsError, Result};
 use crate::core::msg::{NamedObj, StageableObj};
+use crate::core::reading::ReadingValue;
 use crate::core::status::{Status, StatusError, SubToken};
 use crate::devices::stage_sigs::StageSigs;
 use crate::devices::StandardDetector;
@@ -2398,6 +2399,31 @@ impl DetectorControl for AreaDetectorCam {
             "disarm: Acquire_RBV",
         )
         .await
+    }
+    // Slow-changing acquisition parameters for the owning detector's
+    // descriptor `configuration` — ophyd-async `AreaDetector` registers
+    // `driver.acquire_time` / `driver.acquire_period` as CONFIG_SIGNALs.
+    async fn read_configuration(&self, name: &str) -> Result<HashMap<String, ReadingValue>> {
+        let (time, period) = tokio::join!(
+            SignalBackend::<f64>::get_reading(self.acquire_time.as_ref()),
+            SignalBackend::<f64>::get_reading(self.acquire_period.as_ref()),
+        );
+        Ok(HashMap::from([
+            (format!("{name}_acquire_time"), time?),
+            (format!("{name}_acquire_period"), period?),
+        ]))
+    }
+    async fn describe_configuration(&self, name: &str) -> Result<HashMap<String, DataKey>> {
+        let time_source = SignalBackend::<f64>::source(self.acquire_time.as_ref(), name, true);
+        let period_source = SignalBackend::<f64>::source(self.acquire_period.as_ref(), name, true);
+        let (time, period) = tokio::join!(
+            SignalBackend::<f64>::get_datakey(self.acquire_time.as_ref(), &time_source),
+            SignalBackend::<f64>::get_datakey(self.acquire_period.as_ref(), &period_source),
+        );
+        Ok(HashMap::from([
+            (format!("{name}_acquire_time"), time?),
+            (format!("{name}_acquire_period"), period?),
+        ]))
     }
 }
 

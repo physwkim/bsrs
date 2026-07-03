@@ -209,6 +209,9 @@ impl ReadableObj for StandardReadable {
             Some(self.hints.clone())
         }
     }
+    fn as_configurable(&self) -> Option<&dyn ConfigurableObj> {
+        Some(self)
+    }
 }
 
 #[async_trait]
