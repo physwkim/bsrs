@@ -207,6 +207,13 @@ impl RunBundler {
         self.open.is_some()
     }
 
+    /// Stream name of the currently open event bundle, if any. Lets the engine
+    /// look up the stream's descriptor UID to stamp the bundle's external-asset
+    /// docs at `save` — captured *before* `save` consumes the open bundle.
+    pub fn open_stream_name(&self) -> Option<String> {
+        self.open.as_ref().map(|b| b.stream_name.clone())
+    }
+
     /// Discard the open bundle.
     pub fn drop_bundle(&mut self) -> Result<()> {
         if self.open.take().is_none() {

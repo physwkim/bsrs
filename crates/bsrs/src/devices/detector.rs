@@ -88,6 +88,31 @@ where
             ))
         })
     }
+
+    /// Drain the writer's buffered `StreamResource`/`StreamDatum` for frames up
+    /// to the current write index, mapped to `Document`s and each `StreamDatum`
+    /// stamped with `descriptor`. Shared by the fly path
+    /// ([`CollectableObj::collect_stream_docs_dyn`]) and the step path
+    /// ([`ReadableObj::collect_asset_docs_dyn`]); a given scan drives exactly
+    /// one of them, so the writer's `last_emitted` cursor is never
+    /// double-consumed.
+    ///
+    /// [`CollectableObj::collect_stream_docs_dyn`]: crate::core::msg::CollectableObj::collect_stream_docs_dyn
+    /// [`ReadableObj::collect_asset_docs_dyn`]: crate::core::msg::ReadableObj::collect_asset_docs_dyn
+    async fn drain_asset_documents(
+        &self,
+        descriptor: &str,
+    ) -> Result<Vec<crate::event_model::Document>> {
+        let up_to = WritesStreamAssets::get_index(self).await?;
+        let docs = WritesStreamAssets::collect_asset_docs(self, up_to, descriptor)
+            .map(|asset| match asset {
+                StreamAsset::Resource(r) => crate::event_model::Document::StreamResource(r),
+                StreamAsset::Datum(d) => crate::event_model::Document::StreamDatum(d),
+            })
+            .collect::<Vec<_>>()
+            .await;
+        Ok(docs)
+    }
 }
 
 #[async_trait]
@@ -339,15 +364,7 @@ where
         &self,
         descriptor: &str,
     ) -> Result<Vec<crate::event_model::Document>> {
-        let up_to = WritesStreamAssets::get_index(self).await?;
-        let docs = WritesStreamAssets::collect_asset_docs(self, up_to, descriptor)
-            .map(|asset| match asset {
-                StreamAsset::Resource(r) => crate::event_model::Document::StreamResource(r),
-                StreamAsset::Datum(d) => crate::event_model::Document::StreamDatum(d),
-            })
-            .collect::<Vec<_>>()
-            .await;
-        Ok(docs)
+        self.drain_asset_documents(descriptor).await
     }
 }
 
@@ -377,6 +394,15 @@ where
     }
     fn hint_fields(&self) -> Option<Vec<String>> {
         Some(vec![format!("{}_index", self.name)])
+    }
+    fn writes_external_assets(&self) -> bool {
+        true
+    }
+    async fn collect_asset_docs_dyn(
+        &self,
+        descriptor: &str,
+    ) -> Result<Vec<crate::event_model::Document>> {
+        self.drain_asset_documents(descriptor).await
     }
 }
 

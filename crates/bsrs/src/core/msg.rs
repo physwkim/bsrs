@@ -589,6 +589,33 @@ pub trait ReadableObj: NamedObj {
     fn hint_fields(&self) -> Option<Vec<String>> {
         None
     }
+    /// Whether this readable also writes external assets, i.e. it emits
+    /// `StreamResource` / `StreamDatum` documents alongside its Event. Default
+    /// `false`; only asset-writing readables (e.g. `StandardDetector` in step
+    /// mode) return `true`. The engine tracks a bundle's read objects that
+    /// return `true` and drains their [`collect_asset_docs_dyn`] at `save`,
+    /// mirroring bluesky's `check_supports(obj, WritesStreamAssets)` gate in
+    /// `maybe_collect_asset_docs` (bundlers.py:444).
+    ///
+    /// [`collect_asset_docs_dyn`]: ReadableObj::collect_asset_docs_dyn
+    fn writes_external_assets(&self) -> bool {
+        false
+    }
+    /// Drain external-asset documents (`StreamResource` / `StreamDatum`) for
+    /// frames written since the last call, each `StreamDatum` stamped with
+    /// `descriptor` — the EventDescriptor UID the engine composed for the event
+    /// bundle this read landed in. The engine broadcasts them right before the
+    /// Event on `Msg::Save`, so a consumer can link the step scan's frame data
+    /// back to the event's descriptor. This is the step-mode analogue of
+    /// [`CollectableObj::collect_stream_docs_dyn`] and a port of bluesky's
+    /// `_pack_external_assets` on `save` (bundlers.py:610). Default yields none;
+    /// only readables that also write external assets override it.
+    async fn collect_asset_docs_dyn(
+        &self,
+        _descriptor: &str,
+    ) -> Result<Vec<crate::event_model::Document>, crate::core::error::BsrsError> {
+        Ok(Vec::new())
+    }
 }
 
 /// Anything that can be moved (set to a value).

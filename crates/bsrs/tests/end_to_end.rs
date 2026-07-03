@@ -253,6 +253,86 @@ async fn fly_plan_drives_standard_detector_to_completion() {
     );
 }
 
+#[tokio::test]
+async fn step_scan_save_emits_stream_assets_stamped_with_descriptor() {
+    // ENG-02 (step half): a step scan that triggers + reads a StandardDetector
+    // which writes external assets must emit that detector's StreamResource +
+    // StreamDatum on `save`, each StreamDatum stamped with the event's
+    // EventDescriptor UID — so a separate consumer (e.g. a Tiled-writing
+    // process) can link the frame data to the event. Before the fix, `save`
+    // emitted only the bundler's inline Descriptor + Event and dropped the
+    // external-asset docs entirely (only the fly/collect path emitted them).
+    use bsrs::core::msg::{ReadableObj, StageableObj, TriggerableObj};
+
+    let det = Arc::new(bsrs::backends::soft::detector::soft_detector("stepdet"));
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+
+    let det_c = det.clone();
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        // Stage opens the writer + caches the data keys (required before read
+        // describes the stream).
+        yield bsrs::core::Msg::Stage(det_c.clone() as Arc<dyn StageableObj>);
+        yield bsrs::core::Msg::Create { stream_name: "primary".into() };
+        // Trigger writes one frame → the writer's index advances to 1.
+        yield bsrs::core::Msg::Trigger {
+            obj: det_c.clone() as Arc<dyn TriggerableObj>,
+            group: None,
+        };
+        yield bsrs::core::Msg::Read(det_c.clone() as Arc<dyn ReadableObj>);
+        yield bsrs::core::Msg::Save;
+        yield bsrs::core::Msg::Unstage(det_c.clone() as Arc<dyn StageableObj>);
+        yield bsrs::core::Msg::CloseRun {
+            exit_status: "success".into(),
+            reason: None,
+        };
+    });
+    let result = re.run_async(plan).await.expect("step plan failed");
+    assert_eq!(result.exit_status, "success");
+
+    let docs = sink.snapshot().await;
+    use bsrs::core::Document::*;
+
+    let descriptor_uid = docs
+        .iter()
+        .find_map(|d| match d {
+            Descriptor(desc) => Some(desc.uid.clone()),
+            _ => None,
+        })
+        .expect("expected an EventDescriptor from the step read");
+    assert!(
+        docs.iter().any(|d| matches!(d, StreamResource(_))),
+        "step save must emit a StreamResource (ENG-02); got {docs:?}"
+    );
+    let sd = docs
+        .iter()
+        .find_map(|d| match d {
+            StreamDatum(sd) => Some(sd.clone()),
+            _ => None,
+        })
+        .expect("step save must emit a StreamDatum (ENG-02)");
+    assert_eq!(
+        sd.descriptor, descriptor_uid,
+        "StreamDatum.descriptor must equal the step stream's EventDescriptor uid"
+    );
+    assert_eq!(sd.indices.start, 0, "one triggered frame → indices [0, 1)");
+    assert_eq!(sd.indices.stop, 1, "one triggered frame → indices [0, 1)");
+
+    // Emit order: Descriptor → StreamResource → StreamDatum → Event.
+    let pos = |want: fn(&bsrs::core::Document) -> bool| {
+        docs.iter().position(want).expect("document missing")
+    };
+    let d_desc = pos(|d| matches!(d, Descriptor(_)));
+    let d_res = pos(|d| matches!(d, StreamResource(_)));
+    let d_datum = pos(|d| matches!(d, StreamDatum(_)));
+    let d_event = pos(|d| matches!(d, Event(_)));
+    assert!(
+        d_desc < d_res && d_res < d_datum && d_datum < d_event,
+        "emit order must be Descriptor→StreamResource→StreamDatum→Event; got {docs:?}"
+    );
+}
+
 // -- M4 -----------------------------------------------------------------
 
 #[tokio::test]

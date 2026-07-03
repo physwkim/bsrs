@@ -342,6 +342,16 @@ pub struct RunEngine {
 #[derive(Default)]
 struct EngineState {
     bundler: Option<RunBundler>,
+    /// Read objects in the current event bundle that also write external assets
+    /// ([`ReadableObj::writes_external_assets`]). Populated on `Msg::Read` while
+    /// bundling; drained on `Msg::Save` (their `collect_asset_docs_dyn` emits
+    /// `StreamResource`/`StreamDatum` stamped with the bundle's descriptor);
+    /// cleared when the bundle ends (`Save`/`Drop`/`rewind`) or a new one begins
+    /// (`Create`). The bsrs mirror of bluesky's per-bundle `_asset_docs_cache`
+    /// (bundlers.py:158), reset on `create`.
+    ///
+    /// [`ReadableObj::writes_external_assets`]: crate::core::msg::ReadableObj::writes_external_assets
+    bundle_asset_objs: Vec<Arc<dyn crate::core::msg::ReadableObj>>,
     groups: HashMap<String, WaitGroup>,
     staged: Vec<Arc<dyn crate::core::msg::StageableObj>>,
     /// Live monitor pumps, keyed by the monitored object's name (`obj.name()`)
@@ -1152,6 +1162,10 @@ impl RunEngine {
                 if let Some(b) = state.bundler.as_mut() {
                     b.rewind();
                 }
+                // The cancelled bundle's external-asset reads are replayed from
+                // the checkpoint (which precedes the bundle's `Create`), so drop
+                // the stale tracking here to match the bundler rewind.
+                state.bundle_asset_objs.clear();
             }
             state.replay_queue.extend(cache);
             state.pausables.values().cloned().collect()
@@ -1229,35 +1243,79 @@ impl RunEngine {
                 };
             }
             Msg::Create { stream_name } => {
-                self.state
-                    .lock()
-                    .await
+                let mut state = self.state.lock().await;
+                state
                     .bundler
                     .as_mut()
                     .ok_or_else(|| BsrsError::Plan("Create with no open run".into()))?
                     .create(stream_name)?;
+                // A fresh bundle starts with no external-asset reads (bluesky
+                // resets `_asset_docs_cache` on create, bundlers.py:388).
+                state.bundle_asset_objs.clear();
             }
             Msg::Save => {
-                let docs = {
+                // Compose the bundle's Descriptor (first event only) + Event,
+                // and capture the stream name + the asset-writing read objects
+                // to drain — all before `save` consumes the open bundle.
+                let (docs, stream_name, asset_objs) = {
                     let mut state = self.state.lock().await;
-                    state
-                        .bundler
-                        .as_mut()
-                        .ok_or_else(|| BsrsError::Plan("Save with no open run".into()))?
-                        .save()?
+                    let (docs, stream_name) = {
+                        let bundler = state
+                            .bundler
+                            .as_mut()
+                            .ok_or_else(|| BsrsError::Plan("Save with no open run".into()))?;
+                        let stream_name = bundler.open_stream_name();
+                        let docs = bundler.save()?;
+                        (docs, stream_name)
+                    };
+                    let asset_objs = std::mem::take(&mut state.bundle_asset_objs);
+                    (docs, stream_name, asset_objs)
                 };
-                for d in docs {
-                    self.broadcast(&d).await?;
+                // Drain external-asset docs (`StreamResource`/`StreamDatum`)
+                // from the read objects that write them, stamped with this
+                // stream's just-composed EventDescriptor UID — the step-mode
+                // analogue of the Collect path, and a port of bluesky
+                // `_pack_external_assets` on save (bundlers.py:610).
+                let descriptor_uid = {
+                    let state = self.state.lock().await;
+                    match (state.bundler.as_ref(), stream_name.as_ref()) {
+                        (Some(b), Some(s)) => b.descriptor_uid(s),
+                        _ => None,
+                    }
+                };
+                let mut assets = Vec::new();
+                if let Some(uid) = &descriptor_uid {
+                    for obj in &asset_objs {
+                        assets.extend(obj.collect_asset_docs_dyn(uid).await?);
+                    }
+                }
+                // Emit order: Descriptor(s) → StreamResource/StreamDatum →
+                // Event(s), so a consumer sees the descriptor before the stream
+                // docs that reference it, and the stream docs before the event
+                // they accompany.
+                for d in &docs {
+                    if matches!(d, Document::Descriptor(_)) {
+                        self.broadcast(d).await?;
+                    }
+                }
+                for a in &assets {
+                    self.broadcast(a).await?;
+                }
+                for d in &docs {
+                    if !matches!(d, Document::Descriptor(_)) {
+                        self.broadcast(d).await?;
+                    }
                 }
             }
             Msg::Drop => {
-                self.state
-                    .lock()
-                    .await
+                let mut state = self.state.lock().await;
+                state
                     .bundler
                     .as_mut()
                     .ok_or_else(|| BsrsError::Plan("Drop with no open run".into()))?
                     .drop_bundle()?;
+                // The discarded bundle's external-asset reads go with it.
+                state.bundle_asset_objs.clear();
             }
             Msg::DeclareStream {
                 stream_name,
@@ -1293,9 +1351,17 @@ impl RunEngine {
                     let data_keys = obj.describe_dyn().await?;
                     let object_name = Some(obj.name().to_string());
                     let hint_fields = obj.hint_fields();
+                    let tracks_assets = obj.writes_external_assets();
                     let mut state = self.state.lock().await;
                     if let Some(bundler) = state.bundler.as_mut() {
                         bundler.add_readings(readings, data_keys, object_name, hint_fields)?;
+                    }
+                    // Track asset-writing readables so the paired `Save` drains
+                    // their `StreamResource`/`StreamDatum`, stamped with the
+                    // bundle's descriptor (bluesky `maybe_collect_asset_docs`,
+                    // bundlers.py:444).
+                    if tracks_assets {
+                        state.bundle_asset_objs.push(obj.clone());
                     }
                 }
                 // Surface the reading even when there's no open run; the
