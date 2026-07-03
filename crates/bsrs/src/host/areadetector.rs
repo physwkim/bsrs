@@ -526,6 +526,15 @@ pub struct NdFile {
     /// file. Meaningful in SWMR streaming; the write index only reflects
     /// flushed frames, so we flush before reading `NumCaptured_RBV`.
     pub flush_now: Arc<EpicsCaBackend<bool>>,
+    /// `FileNumber` (longout) — next file's sequence number, substituted
+    /// into `FileTemplate`.
+    pub file_number: Arc<EpicsCaBackend<i64>>,
+    /// `FilePathExists_RBV` (bi) — whether the IOC can see (and write)
+    /// `FilePath`. Checked after configuring the paths.
+    pub file_path_exists_rbv: Arc<EpicsCaBackend<bool>>,
+    /// `CreateDirectory` (longout) — how many missing trailing path levels
+    /// the IOC may create when `FilePath` is processed (`0` = none).
+    pub create_directory: Arc<EpicsCaBackend<i64>>,
 }
 
 impl NdFile {
@@ -557,6 +566,15 @@ impl NdFile {
                 "FullFileName_RBV",
             ))),
             flush_now: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "FlushNow"))),
+            file_number: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "FileNumber"))),
+            file_path_exists_rbv: Arc::new(EpicsCaBackend::<bool>::new(join(
+                &prefix,
+                "FilePathExists_RBV",
+            ))),
+            create_directory: Arc::new(EpicsCaBackend::<i64>::new(join(
+                &prefix,
+                "CreateDirectory",
+            ))),
             plugin,
         }
     }
@@ -586,7 +604,16 @@ impl NdFile {
         h?;
         i?;
         j?;
-        SignalBackend::<bool>::connect(self.flush_now.as_ref(), timeout).await?;
+        let (k, l, m, n) = tokio::join!(
+            SignalBackend::<bool>::connect(self.flush_now.as_ref(), timeout),
+            SignalBackend::<i64>::connect(self.file_number.as_ref(), timeout),
+            SignalBackend::<bool>::connect(self.file_path_exists_rbv.as_ref(), timeout),
+            SignalBackend::<i64>::connect(self.create_directory.as_ref(), timeout),
+        );
+        k?;
+        l?;
+        m?;
+        n?;
         Ok(())
     }
 
@@ -633,6 +660,42 @@ impl NdFile {
             "NdFile::set_num_capture",
         )
         .await
+    }
+
+    /// Set `AutoIncrement` — bump `FileNumber` after each file.
+    pub async fn set_auto_increment(&self, on: bool) -> Result<()> {
+        await_put(
+            SignalBackend::<bool>::put(self.auto_increment.as_ref(), Some(on)),
+            "NdFile::set_auto_increment",
+        )
+        .await
+    }
+
+    /// Set `FileNumber` — the next file's sequence number.
+    pub async fn set_file_number(&self, n: i64) -> Result<()> {
+        await_put(
+            SignalBackend::<i64>::put(self.file_number.as_ref(), Some(n)),
+            "NdFile::set_file_number",
+        )
+        .await
+    }
+
+    /// Set `CreateDirectory` — missing trailing path levels the IOC may
+    /// create. Must be set BEFORE `FilePath`: the directory-creation callback
+    /// fires when the path PV is processed (ophyd-async
+    /// `prepare_file_paths`, `_data_logic.py:127`).
+    pub async fn set_create_directory(&self, depth: i64) -> Result<()> {
+        await_put(
+            SignalBackend::<i64>::put(self.create_directory.as_ref(), Some(depth)),
+            "NdFile::set_create_directory",
+        )
+        .await
+    }
+
+    /// Read `FilePathExists_RBV` — whether the IOC can see the configured
+    /// `FilePath`.
+    pub async fn file_path_exists(&self) -> Result<bool> {
+        SignalBackend::<bool>::get_value(self.file_path_exists_rbv.as_ref()).await
     }
 
     /// Start capture (`Capture=1`). In Stream mode the file opens on this
@@ -692,6 +755,17 @@ pub struct NdFileHdf5 {
     pub num_frames_chunks_rbv: Arc<EpicsCaBackend<i64>>,
     /// `ChunkSizeAuto` (bo) — let the plugin derive chunking from the frame.
     pub chunk_size_auto: Arc<EpicsCaBackend<bool>>,
+    /// `LazyOpen` (bo) — open the file on the first frame instead of on
+    /// `Capture=1`, so no warmup frame is needed to size the dataset.
+    pub lazy_open: Arc<EpicsCaBackend<bool>>,
+    /// `SWMRMode` (bo) — single-writer/multiple-reader, so consumers can
+    /// read the file while the IOC is still writing it.
+    pub swmr_mode: Arc<EpicsCaBackend<bool>>,
+    /// `NumExtraDims` (longout) — extra virtual dimensions (unused here).
+    pub num_extra_dims: Arc<EpicsCaBackend<i64>>,
+    /// `XMLFileName` (CHAR waveform) — custom HDF5 layout XML; cleared so
+    /// the default `/entry/data/data` layout applies.
+    pub xml_file_name: Arc<EpicsCaBackend<String>>,
 }
 
 impl NdFileHdf5 {
@@ -708,17 +782,62 @@ impl NdFileHdf5 {
                 "NumFramesChunks_RBV",
             ))),
             chunk_size_auto: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "ChunkSizeAuto"))),
+            lazy_open: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "LazyOpen"))),
+            swmr_mode: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "SWMRMode"))),
+            num_extra_dims: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "NumExtraDims"))),
+            xml_file_name: Arc::new(EpicsCaBackend::<String>::new_long_string(join(
+                &prefix,
+                "XMLFileName",
+            ))),
             file: NdFile::new(prefix),
         }
     }
 
     /// Connect the embedded file plugin + the HDF5-specific channels.
     pub async fn connect(&self, timeout: Duration) -> Result<()> {
-        let (a, b, c, d) = tokio::join!(
+        let (a, b, c, d, e, f, g, h) = tokio::join!(
             self.file.connect(timeout),
             SignalBackend::<i64>::connect(self.num_frames_chunks.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.num_frames_chunks_rbv.as_ref(), timeout),
             SignalBackend::<bool>::connect(self.chunk_size_auto.as_ref(), timeout),
+            SignalBackend::<bool>::connect(self.lazy_open.as_ref(), timeout),
+            SignalBackend::<bool>::connect(self.swmr_mode.as_ref(), timeout),
+            SignalBackend::<i64>::connect(self.num_extra_dims.as_ref(), timeout),
+            SignalBackend::<String>::connect(self.xml_file_name.as_ref(), timeout),
+        );
+        a?;
+        b?;
+        c?;
+        d?;
+        e?;
+        f?;
+        g?;
+        h?;
+        Ok(())
+    }
+
+    /// The HDF5-specific arming puts of ophyd-async's `prepare_unbounded`
+    /// (`_data_logic.py:185-191`): no extra virtual dims, lazy open (no
+    /// warmup frame needed to size the dataset), SWMR on (readable while
+    /// growing), custom layout XML cleared.
+    pub async fn setup_hdf_writer(&self) -> Result<()> {
+        let (a, b, c, d) = tokio::join!(
+            await_put(
+                SignalBackend::<i64>::put(self.num_extra_dims.as_ref(), Some(0)),
+                "NdFileHdf5::setup: NumExtraDims=0",
+            ),
+            await_put(
+                SignalBackend::<bool>::put(self.lazy_open.as_ref(), Some(true)),
+                "NdFileHdf5::setup: LazyOpen=1",
+            ),
+            await_put(
+                SignalBackend::<bool>::put(self.swmr_mode.as_ref(), Some(true)),
+                "NdFileHdf5::setup: SWMRMode=1",
+            ),
+            await_put(
+                SignalBackend::<String>::put(self.xml_file_name.as_ref(), Some(String::new())),
+                "NdFileHdf5::setup: XMLFileName=\"\"",
+            ),
         );
         a?;
         b?;
@@ -1025,18 +1144,39 @@ const AD_HDF_TEMPLATE: &str = "%s%s.h5";
 #[derive(Clone, Debug)]
 pub struct StaticPathProvider {
     /// Directory the IOC writes into (must be visible on the IOC host).
+    /// Always stored with a trailing `/`, fixed at construction — left to the
+    /// IOC, areaDetector appends the separator itself and the `FilePath`
+    /// readback never matches the put (ophyd-async `prepare_file_paths`,
+    /// `_data_logic.py:130`). POSIX IOC hosts only; ophyd's
+    /// `PureWindowsPath` + `\` variant is not ported.
     pub directory: String,
     /// File basename (pre-template), e.g. `"scan"`.
     pub filename: String,
+    /// `CreateDirectory` depth — how many missing trailing path levels the
+    /// IOC may create (`0` = create nothing). Set via
+    /// [`with_create_dir_depth`](Self::with_create_dir_depth).
+    pub create_dir_depth: i64,
 }
 
 impl StaticPathProvider {
     /// Build a provider that always returns the same directory + basename.
     pub fn new(directory: impl Into<String>, filename: impl Into<String>) -> Self {
-        Self {
-            directory: directory.into(),
-            filename: filename.into(),
+        let mut directory = directory.into();
+        if !directory.ends_with('/') {
+            directory.push('/');
         }
+        Self {
+            directory,
+            filename: filename.into(),
+            create_dir_depth: 0,
+        }
+    }
+
+    /// Let the IOC create up to `depth` missing trailing path levels
+    /// (`CreateDirectory` PV; ophyd-async `PathInfo.create_dir_depth`).
+    pub fn with_create_dir_depth(mut self, depth: i64) -> Self {
+        self.create_dir_depth = depth;
+        self
     }
 }
 
@@ -1048,15 +1188,23 @@ impl StaticPathProvider {
 pub trait AdFileIo: Send + Sync {
     /// Connect the underlying transport and install the frames-written monitor.
     async fn connect(&self, timeout: Duration) -> Result<()>;
-    /// Point the plugin at `directory`/`filename` with `template`, switch it to
-    /// Stream mode, and set `NumCapture` (`0` = until `stop_capture`).
+    /// Point the plugin at `directory`/`filename` with `template`, switch it
+    /// to Stream mode with `AutoIncrement` on and `FileNumber` reset, and set
+    /// `NumCapture` (`0` = until `stop_capture`). `create_dir_depth` missing
+    /// trailing path levels may be created by the IOC; errors if the IOC then
+    /// still cannot see the directory (`FilePathExists_RBV`). Port of
+    /// ophyd-async's `prepare_file_paths` (`_data_logic.py:124`).
     async fn configure(
         &self,
         directory: &str,
         filename: &str,
         template: &str,
         num_capture: i64,
+        create_dir_depth: i64,
     ) -> Result<()>;
+    /// Enable the plugin's callbacks (`EnableCallbacks=1`) so it consumes
+    /// frames from its NDArray port.
+    async fn enable_callbacks(&self) -> Result<()>;
     /// Start capture — the plugin opens the file and accepts frames.
     async fn start_capture(&self) -> Result<()>;
     /// Stop capture — flush and close the file.
@@ -1081,6 +1229,9 @@ pub trait AdHdfFileIo: AdFileIo {
     async fn frames_per_chunk(&self) -> Result<u64>;
     /// Set `ChunkSizeAuto` — let the plugin derive chunking from the frame.
     async fn set_chunk_size_auto(&self, on: bool) -> Result<()>;
+    /// The HDF5-specific arming puts: `NumExtraDims=0`, `LazyOpen=1`,
+    /// `SWMRMode=1`, `XMLFileName=""` (ophyd-async `prepare_unbounded`).
+    async fn setup_hdf_writer(&self) -> Result<()>;
 }
 
 /// [`AdHdfFileIo`] backed by a real [`NdFileHdf5`] over Channel Access.
@@ -1126,16 +1277,30 @@ impl AdFileIo for NdFileIo {
         filename: &str,
         template: &str,
         num_capture: i64,
+        create_dir_depth: i64,
     ) -> Result<()> {
-        self.file.file.set_path(directory).await?;
-        self.file.file.set_name(filename).await?;
-        self.file.file.set_template(template).await?;
-        self.file
-            .file
-            .set_write_mode(AD_FILE_WRITE_MODE_STREAM)
-            .await?;
-        self.file.file.set_num_capture(num_capture).await?;
+        let f = &self.file.file;
+        // Depth first: the directory-creation callback fires when FilePath
+        // is processed.
+        f.set_create_directory(create_dir_depth).await?;
+        f.set_path(directory).await?;
+        f.set_name(filename).await?;
+        f.set_template(template).await?;
+        f.set_auto_increment(true).await?;
+        f.set_file_number(0).await?;
+        f.set_write_mode(AD_FILE_WRITE_MODE_STREAM).await?;
+        if !f.file_path_exists().await? {
+            return Err(BsrsError::Backend(format!(
+                "{}FilePath {directory} doesn't exist on the IOC host or is \
+                 not writable",
+                f.plugin.prefix
+            )));
+        }
+        f.set_num_capture(num_capture).await?;
         Ok(())
+    }
+    async fn enable_callbacks(&self) -> Result<()> {
+        self.file.file.plugin.set_enabled(true).await
     }
     async fn start_capture(&self) -> Result<()> {
         self.file.file.start_capture().await
@@ -1164,6 +1329,9 @@ impl AdHdfFileIo for NdFileIo {
     }
     async fn set_chunk_size_auto(&self, on: bool) -> Result<()> {
         self.file.set_chunk_size_auto(on).await
+    }
+    async fn setup_hdf_writer(&self) -> Result<()> {
+        self.file.setup_hdf_writer().await
     }
 }
 
@@ -1507,6 +1675,11 @@ impl DetectorWriter for AdHdfWriter {
         // (ophyd-async `prepare_unbounded`, `_data_logic.py:180-186`).
         let frames_per_chunk = self.io.frames_per_chunk().await?;
         self.io.set_chunk_size_auto(true).await?;
+        // HDF-specific arming (lazy open, SWMR, no extra dims, default
+        // layout) and plugin callbacks, then the file paths — the
+        // `prepare_unbounded` setup gather (`_data_logic.py:185-195`).
+        self.io.setup_hdf_writer().await?;
+        self.io.enable_callbacks().await?;
         // Configure + arm the IOC file plugin. NumCapture=0: capture until
         // close() clears Capture, matching a step scan whose frame count is
         // unknown until the plan ends.
@@ -1516,6 +1689,7 @@ impl DetectorWriter for AdHdfWriter {
                 &self.path_provider.filename,
                 AD_HDF_TEMPLATE,
                 0,
+                self.path_provider.create_dir_depth,
             )
             .await?;
         self.io.start_capture().await?;
@@ -2070,6 +2244,10 @@ mod ad_hdf_tests {
     use crate::protocols_async::{Stageable, WritesStreamAssets};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+    /// What [`AdFileIo::configure`] received: `(directory, filename,
+    /// template, num_capture, create_dir_depth)`.
+    type ConfigureArgs = (String, String, String, i64, i64);
+
     /// In-memory `AdFileIo` so the document-composition logic is testable with
     /// no live IOC (mirrors ophyd-async's IO-vs-writer split).
     struct FakeAdFileIo {
@@ -2077,11 +2255,14 @@ mod ad_hdf_tests {
         full_name: String,
         index_tx: Arc<watch::Sender<u64>>,
         index_rx: watch::Receiver<u64>,
-        configured: std::sync::Mutex<Option<(String, String, String, i64)>>,
+        configured: std::sync::Mutex<Option<ConfigureArgs>>,
         capturing: AtomicBool,
         flushes: AtomicU64,
         frames_per_chunk: AtomicU64,
         chunk_size_auto: AtomicBool,
+        hdf_setup: AtomicBool,
+        callbacks_enabled: AtomicBool,
+        path_exists: AtomicBool,
     }
 
     impl FakeAdFileIo {
@@ -2097,6 +2278,9 @@ mod ad_hdf_tests {
                 flushes: AtomicU64::new(0),
                 frames_per_chunk: AtomicU64::new(1),
                 chunk_size_auto: AtomicBool::new(false),
+                hdf_setup: AtomicBool::new(false),
+                callbacks_enabled: AtomicBool::new(false),
+                path_exists: AtomicBool::new(true),
             })
         }
         fn set_captured(&self, n: u64) {
@@ -2110,8 +2294,17 @@ mod ad_hdf_tests {
         async fn connect(&self, _t: Duration) -> Result<()> {
             Ok(())
         }
-        async fn configure(&self, d: &str, f: &str, t: &str, n: i64) -> Result<()> {
-            *self.configured.lock().unwrap() = Some((d.into(), f.into(), t.into(), n));
+        async fn configure(&self, d: &str, f: &str, t: &str, n: i64, depth: i64) -> Result<()> {
+            if !self.path_exists.load(Ordering::SeqCst) {
+                return Err(BsrsError::Backend(format!(
+                    "FilePath {d} doesn't exist on the IOC host or is not writable"
+                )));
+            }
+            *self.configured.lock().unwrap() = Some((d.into(), f.into(), t.into(), n, depth));
+            Ok(())
+        }
+        async fn enable_callbacks(&self) -> Result<()> {
+            self.callbacks_enabled.store(true, Ordering::SeqCst);
             Ok(())
         }
         async fn start_capture(&self) -> Result<()> {
@@ -2144,6 +2337,10 @@ mod ad_hdf_tests {
         }
         async fn set_chunk_size_auto(&self, on: bool) -> Result<()> {
             self.chunk_size_auto.store(on, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn setup_hdf_writer(&self) -> Result<()> {
+            self.hdf_setup.store(true, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -2350,7 +2547,16 @@ mod ad_hdf_tests {
         assert_eq!(cfg.1, "scan");
         assert_eq!(cfg.2, AD_HDF_TEMPLATE);
         assert_eq!(cfg.3, 0, "NumCapture=0 (capture until stopped)");
+        assert_eq!(cfg.4, 0, "CreateDirectory depth defaults to 0");
         assert!(io.capturing.load(Ordering::SeqCst), "capture started");
+        assert!(
+            io.hdf_setup.load(Ordering::SeqCst),
+            "HDF arming puts (LazyOpen/SWMR/NumExtraDims/XMLFileName) applied"
+        );
+        assert!(
+            io.callbacks_enabled.load(Ordering::SeqCst),
+            "plugin callbacks enabled"
+        );
         let dk = keys.get("det_image").expect("det_image data key");
         assert_eq!(dk.external.as_deref(), Some("STREAM:"));
         assert_eq!(dk.dtype, Dtype::Array);
@@ -2363,6 +2569,29 @@ mod ad_hdf_tests {
             dk.dtype_numpy,
             Some(crate::event_model::DtypeNumpy::Scalar("<u2".to_string()))
         );
+    }
+
+    #[tokio::test]
+    async fn open_fails_when_file_path_does_not_exist_on_ioc() {
+        let io = FakeAdFileIo::new("/x.h5");
+        io.path_exists.store(false, Ordering::SeqCst);
+        let w = writer_with(io.clone());
+        let err = w.open(1).await.unwrap_err().to_string();
+        assert!(err.contains("doesn't exist"), "{err}");
+        assert!(
+            !io.capturing.load(Ordering::SeqCst),
+            "capture must not start when the path check fails"
+        );
+    }
+
+    #[test]
+    fn static_path_provider_normalizes_trailing_slash_and_depth() {
+        let p = StaticPathProvider::new("/data/scans", "scan");
+        assert_eq!(p.directory, "/data/scans/");
+        assert_eq!(p.create_dir_depth, 0);
+        let p = StaticPathProvider::new("/data/scans/", "scan").with_create_dir_depth(2);
+        assert_eq!(p.directory, "/data/scans/", "no double slash");
+        assert_eq!(p.create_dir_depth, 2);
     }
 
     #[tokio::test]
