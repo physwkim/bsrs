@@ -272,6 +272,37 @@ async fn fly_plan_drives_standard_detector_to_completion() {
         Some(run_start_uid.as_str()),
         "collect StreamResource.run_start must be stamped with the run's start uid"
     );
+    // The engine owns the sequence counter: the writer emits seq_nums {0,0},
+    // the Collect drain fills [1, 1 + width) from the stream counter and
+    // advances it by the indices width ("we do it ourselves", bluesky
+    // bundlers.py:1180); the summary index event then lands right after the
+    // datum span on the same monotonic axis.
+    let sd = docs
+        .iter()
+        .find_map(|d| match d {
+            StreamDatum(sd) => Some(sd.clone()),
+            _ => None,
+        })
+        .expect("expected a StreamDatum from collect");
+    let width = sd.indices.stop - sd.indices.start;
+    assert!(width > 0, "collect datum must cover at least one frame");
+    assert_eq!(
+        (sd.seq_nums.start, sd.seq_nums.stop),
+        (1, 1 + width),
+        "Collect drain must fill seq_nums from the stream counter"
+    );
+    let ev_seq = docs
+        .iter()
+        .find_map(|d| match d {
+            Event(ev) => Some(ev.seq_num),
+            _ => None,
+        })
+        .expect("expected the collect summary event");
+    assert_eq!(
+        ev_seq,
+        1 + width,
+        "summary event must continue the sequence axis after the datum span"
+    );
 }
 
 #[tokio::test]
@@ -356,6 +387,22 @@ async fn step_scan_save_emits_stream_assets_stamped_with_descriptor() {
     );
     assert_eq!(sd.indices.start, 0, "one triggered frame → indices [0, 1)");
     assert_eq!(sd.indices.stop, 1, "one triggered frame → indices [0, 1)");
+    // The engine owns the sequence counter: the writer emits seq_nums {0,0}
+    // and the Save drain fills [event_seq, event_seq + width) — here the
+    // first event of the stream, one index wide.
+    let ev_seq = docs
+        .iter()
+        .find_map(|d| match d {
+            Event(ev) => Some(ev.seq_num),
+            _ => None,
+        })
+        .expect("step save must emit an Event");
+    assert_eq!(ev_seq, 1, "first event of the stream");
+    assert_eq!(
+        (sd.seq_nums.start, sd.seq_nums.stop),
+        (ev_seq, ev_seq + 1),
+        "Save drain must anchor the datum's seq_nums to the composed event"
+    );
 
     // Emit order: Descriptor → StreamResource → StreamDatum → Event.
     let pos = |want: fn(&bsrs::core::Document) -> bool| {

@@ -1561,16 +1561,16 @@ fn ad_stream_resource(
 }
 
 /// Compose a `StreamDatum` covering frames `[start, stop)` for a resource.
+/// `seq_nums` is left at `{0, 0}`: the run engine owns the sequence counter
+/// and fills it at the Save/Collect drain (bluesky
+/// `_pack_seq_nums_into_stream_datum`, bundlers.py:830).
 fn ad_stream_datum(resource_uid: String, descriptor: &str, start: u64, stop: u64) -> StreamDatum {
     StreamDatum {
         uid: uuid::Uuid::new_v4().to_string(),
         stream_resource: resource_uid,
         descriptor: descriptor.to_string(),
         indices: StreamRange { start, stop },
-        seq_nums: StreamRange {
-            start: start + 1,
-            stop: stop + 1,
-        },
+        seq_nums: StreamRange { start: 0, stop: 0 },
     }
 }
 
@@ -2726,8 +2726,10 @@ mod ad_hdf_tests {
                 assert_eq!(d.stream_resource, resource_uid);
                 assert_eq!(d.indices.start, 0);
                 assert_eq!(d.indices.stop, 1);
-                assert_eq!(d.seq_nums.start, 1);
-                assert_eq!(d.seq_nums.stop, 2);
+                // Writers leave seq_nums unset; the engine fills them at
+                // the Save/Collect drain.
+                assert_eq!(d.seq_nums.start, 0);
+                assert_eq!(d.seq_nums.stop, 0);
             }
             _ => panic!("second doc must be StreamDatum"),
         }

@@ -264,10 +264,10 @@ impl DetectorWriter for Hdf5FrameSink {
                     start: prev,
                     stop: up_to,
                 },
-                seq_nums: StreamRange {
-                    start: prev + 1,
-                    stop: up_to + 1,
-                },
+                // The run engine owns the sequence counter and fills
+                // seq_nums at the drain; in the run-less frame-source
+                // pipeline {0, 0} stays, meaning "not anchored to events".
+                seq_nums: StreamRange { start: 0, stop: 0 },
             }));
         }
         stream::iter(docs).boxed()

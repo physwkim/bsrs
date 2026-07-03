@@ -428,6 +428,51 @@ fn stamp_asset_run_start(doc: &mut Document, run_start: &str) {
     }
 }
 
+/// Stamp the run's sequence numbers into drained `StreamDatum`s: each datum
+/// gets `seq_nums = [next_seq, next_seq + width)` where `width` is its own
+/// indices span. Writers must leave `seq_nums` at `{0, 0}` — the sequence
+/// counter belongs to the run (the engine), never the writer — and every
+/// datum in one drain must span the same width, since all detectors in a
+/// stream advance together. Returns the shared width (0 when the drain holds
+/// no datums). Port of bluesky `_pack_seq_nums_into_stream_datum`
+/// (bundlers.py:830-860).
+fn pack_seq_nums_into_stream_datums(
+    docs: &mut [Document],
+    next_seq: u64,
+) -> Result<u64, BsrsError> {
+    let mut width: Option<u64> = None;
+    for doc in docs.iter_mut() {
+        if let Document::StreamDatum(d) = doc {
+            if d.seq_nums.start != 0 || d.seq_nums.stop != 0 {
+                return Err(BsrsError::Plan(format!(
+                    "StreamDatum {} arrived with pre-filled seq_nums \
+                     [{}, {}); the run engine owns the sequence counter and \
+                     writers must emit seq_nums {{0, 0}}",
+                    d.uid, d.seq_nums.start, d.seq_nums.stop
+                )));
+            }
+            let w = d.indices.stop.saturating_sub(d.indices.start);
+            match width {
+                None => width = Some(w),
+                Some(prev) if prev != w => {
+                    return Err(BsrsError::Plan(format!(
+                        "StreamDatum {} spans {w} indices but another datum \
+                         in the same drain spans {prev}; every detector in a \
+                         stream must advance by the same number of indices",
+                        d.uid
+                    )));
+                }
+                Some(_) => {}
+            }
+            d.seq_nums = crate::event_model::StreamRange {
+                start: next_seq,
+                stop: next_seq + w,
+            };
+        }
+    }
+    Ok(width.unwrap_or(0))
+}
+
 impl RunEngine {
     /// Construct a fresh RunEngine with the given sinks.
     pub fn new(sinks: Vec<Arc<dyn DocumentSink>>) -> Self {
@@ -1315,6 +1360,29 @@ impl RunEngine {
                         stamp_asset_run_start(a, rs);
                     }
                 }
+                // Fill the datums' seq_nums from the Event this save just
+                // composed: the datums accompany that event, so they cover
+                // [event_seq, event_seq + width) — bluesky packs with the
+                // stream counter at the same point (bundlers.py:830). The
+                // event itself advanced the counter; no extra advance here.
+                let event_seq = docs.iter().find_map(|d| match d {
+                    Document::Event(ev) => Some(ev.seq_num),
+                    _ => None,
+                });
+                match event_seq {
+                    Some(seq) => {
+                        pack_seq_nums_into_stream_datums(&mut assets, seq)?;
+                    }
+                    None => {
+                        if assets.iter().any(|a| matches!(a, Document::StreamDatum(_))) {
+                            return Err(BsrsError::Plan(
+                                "Save drained StreamDatum documents but composed no \
+                                 Event to anchor their seq_nums"
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
                 // Emit order: Descriptor(s) → StreamResource/StreamDatum →
                 // Event(s), so a consumer sees the descriptor before the stream
                 // docs that reference it, and the stream docs before the event
@@ -1524,18 +1592,41 @@ impl RunEngine {
                 // collect stream's just-composed EventDescriptor UID, so stream
                 // data links back to its descriptor (CBEM-13). StandardDetector
                 // collects into a single stream; pass that stream's descriptor.
-                let (collect_descriptor, run_start_uid) = {
+                let (collect_stream, collect_descriptor, run_start_uid, bundle) = {
                     let state = self.state.lock().await;
                     let bundler = state.bundler.as_ref().ok_or_else(|| {
                         BsrsError::Plan("Collect lost open run before stream docs".into())
                     })?;
+                    let stream = descs.keys().next().cloned();
                     (
-                        descs.keys().next().and_then(|s| bundler.descriptor_uid(s)),
+                        stream.clone(),
+                        stream.and_then(|s| bundler.descriptor_uid(&s)),
                         bundler.start_uid.clone(),
+                        bundler.bundle(),
                     )
                 };
                 if let Some(descriptor_uid) = collect_descriptor {
-                    for mut doc in obj.collect_stream_docs_dyn(&descriptor_uid).await? {
+                    let mut asset_docs = obj.collect_stream_docs_dyn(&descriptor_uid).await?;
+                    // Fill the datums' seq_nums from the stream's counter and
+                    // advance it by the indices width: no per-frame Event
+                    // exists on this path to advance it ("we do it
+                    // ourselves", bluesky bundlers.py:1180). The summary
+                    // index event composed below then lands after the datum
+                    // span, keeping one monotonic sequence axis.
+                    let stream = collect_stream
+                        .as_deref()
+                        .expect("descriptor_uid implies a collect stream name");
+                    let next_seq = bundle.peek_next_seq(stream).ok_or_else(|| {
+                        BsrsError::Plan(format!(
+                            "Collect stream `{stream}` has a descriptor but no \
+                             sequence counter"
+                        ))
+                    })?;
+                    let width = pack_seq_nums_into_stream_datums(&mut asset_docs, next_seq)?;
+                    if width > 0 {
+                        bundle.advance_seq(stream, width);
+                    }
+                    for mut doc in asset_docs {
                         // Stamp the run's start UID onto the StreamResource (the
                         // writer emitted it with run_start:None) before emission.
                         stamp_asset_run_start(&mut doc, &run_start_uid);
@@ -2318,6 +2409,80 @@ impl Default for RunEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn datum(uid: &str, indices: (u64, u64), seq_nums: (u64, u64)) -> Document {
+        Document::StreamDatum(crate::event_model::StreamDatum {
+            uid: uid.into(),
+            stream_resource: "res".into(),
+            descriptor: "desc".into(),
+            indices: crate::event_model::StreamRange {
+                start: indices.0,
+                stop: indices.1,
+            },
+            seq_nums: crate::event_model::StreamRange {
+                start: seq_nums.0,
+                stop: seq_nums.1,
+            },
+        })
+    }
+
+    /// The engine fills `[next_seq, next_seq + width)` into every datum of a
+    /// drain, each from its own indices span, and reports the shared width.
+    #[test]
+    fn pack_seq_nums_fills_from_next_seq_and_indices_width() {
+        let mut docs = vec![
+            datum("a", (10, 13), (0, 0)),
+            datum("b", (5, 8), (0, 0)),
+            Document::Event(crate::event_model::Event {
+                uid: "ev".into(),
+                descriptor: "desc".into(),
+                time: 0.0,
+                seq_num: 7,
+                data: Default::default(),
+                timestamps: Default::default(),
+                filled: Default::default(),
+            }),
+        ];
+        let width = pack_seq_nums_into_stream_datums(&mut docs, 7).unwrap();
+        assert_eq!(width, 3);
+        for d in &docs[..2] {
+            let Document::StreamDatum(d) = d else {
+                panic!("expected datum")
+            };
+            assert_eq!((d.seq_nums.start, d.seq_nums.stop), (7, 10));
+        }
+    }
+
+    /// A writer that pre-fills seq_nums violates the engine's ownership of
+    /// the sequence counter and is rejected, mirroring bluesky's
+    /// `_pack_seq_nums_into_stream_datum` assertion (bundlers.py:830).
+    #[test]
+    fn pack_seq_nums_rejects_prefilled_datum() {
+        let mut docs = vec![datum("a", (0, 1), (1, 2))];
+        let err = pack_seq_nums_into_stream_datums(&mut docs, 1).unwrap_err();
+        assert!(err.to_string().contains("pre-filled"), "got: {err}");
+    }
+
+    /// Two detectors in one stream must advance by the same number of
+    /// indices per drain; a mismatch means their frames no longer line up
+    /// with a common event sequence.
+    #[test]
+    fn pack_seq_nums_rejects_mismatched_indices_width() {
+        let mut docs = vec![datum("a", (0, 2), (0, 0)), datum("b", (0, 3), (0, 0))];
+        let err = pack_seq_nums_into_stream_datums(&mut docs, 1).unwrap_err();
+        assert!(
+            err.to_string().contains("same number of indices"),
+            "got: {err}"
+        );
+    }
+
+    /// A drain with no datums (resources only, or empty) is a no-op with
+    /// width 0 — the Collect path must not advance the stream counter.
+    #[test]
+    fn pack_seq_nums_empty_drain_reports_zero_width() {
+        let mut docs: Vec<Document> = Vec::new();
+        assert_eq!(pack_seq_nums_into_stream_datums(&mut docs, 5).unwrap(), 0);
+    }
 
     /// K1 regression: `install_signal_handler` must capture `Weak<Self>`,
     /// not `Arc<Self>`. Otherwise the watcher pins the engine forever and

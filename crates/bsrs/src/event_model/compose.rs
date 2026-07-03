@@ -158,6 +158,35 @@ impl RunBundle {
         })
     }
 
+    /// The `seq_num` the stream's next `Event` would receive (last used + 1),
+    /// without advancing the counter. The engine reads this to stamp
+    /// `StreamDatum.seq_nums` at the Collect drain — the sequence counter is
+    /// the run's, never the writer's (bluesky
+    /// `_pack_seq_nums_into_stream_datum`, bundlers.py:830). Returns `None`
+    /// for an undeclared stream.
+    pub fn peek_next_seq(&self, stream_name: &str) -> Option<u64> {
+        let streams = self.streams.lock().unwrap();
+        streams
+            .get(stream_name)
+            .map(|st| st.seq_num.load(Ordering::SeqCst) + 1)
+    }
+
+    /// Advance the stream's sequence counter by `n` without composing events.
+    /// The Collect drain applies the indices width this way because no Event
+    /// per frame exists to advance it ("Since there are no events or
+    /// event_pages incrementing the sequence counter, we do it ourselves",
+    /// bluesky bundlers.py:1180). Returns `false` for an undeclared stream.
+    pub fn advance_seq(&self, stream_name: &str, n: u64) -> bool {
+        let streams = self.streams.lock().unwrap();
+        match streams.get(stream_name) {
+            Some(st) => {
+                st.seq_num.fetch_add(n, Ordering::SeqCst);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Snapshot every stream's current sequence counter. Paired with
     /// [`RunBundle::restore_seq_nums`] to implement checkpoint/rewind: the
     /// engine snapshots at each checkpoint and restores on a rewind so a
@@ -437,6 +466,36 @@ mod tests {
             .event("primary", HashMap::new(), HashMap::new())
             .expect("stream declared");
         assert_eq!(ev.seq_num, 3, "re-compose must not reset the seq_num");
+    }
+
+    /// `peek_next_seq` reads without advancing; `advance_seq` moves the same
+    /// counter `event()` uses, so datums filled by the Collect drain and the
+    /// summary event that follows share one monotonic sequence axis.
+    #[test]
+    fn peek_and_advance_share_the_event_seq_counter() {
+        let start = RunBundle::start(Some(1), None);
+        let bundle = RunBundle::open(&start);
+        assert_eq!(bundle.peek_next_seq("primary"), None, "undeclared stream");
+        assert!(!bundle.advance_seq("primary", 3), "undeclared stream");
+        bundle.descriptor(
+            "primary",
+            HashMap::new(),
+            HashMap::new(),
+            None,
+            HashMap::new(),
+        );
+        assert_eq!(bundle.peek_next_seq("primary"), Some(1));
+        assert_eq!(
+            bundle.peek_next_seq("primary"),
+            Some(1),
+            "peek must not advance"
+        );
+        assert!(bundle.advance_seq("primary", 3));
+        assert_eq!(bundle.peek_next_seq("primary"), Some(4));
+        let ev = bundle
+            .event("primary", HashMap::new(), HashMap::new())
+            .expect("stream declared");
+        assert_eq!(ev.seq_num, 4, "event continues after the advanced span");
     }
 
     #[test]
