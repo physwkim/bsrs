@@ -37,11 +37,18 @@
 use crate::backends::epics_ca::EpicsCaBackend;
 use crate::core::error::{BsrsError, Result};
 use crate::core::msg::{NamedObj, StageableObj};
-use crate::core::status::StatusError;
+use crate::core::status::{Status, StatusError, SubToken};
 use crate::devices::stage_sigs::StageSigs;
-use crate::protocols_async::SignalBackend;
+use crate::devices::StandardDetector;
+use crate::event_model::{DataKey, Dtype, StreamDatum, StreamRange, StreamResource};
+use crate::protocols_async::{
+    DetectorControl, DetectorTrigger, DetectorWriter, SignalBackend, StreamAsset, TriggerInfo,
+};
+use futures::stream::{BoxStream, StreamExt};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::watch;
 
 const PUT_TIMEOUT: Duration = Duration::from_secs(10);
 const WARMUP_IDLE_POLL: Duration = Duration::from_millis(100);
@@ -55,6 +62,13 @@ pub const AD_STATE_IDLE: i64 = 0;
 /// `ImageMode` value for single-frame acquisition (mbbo ordering from
 /// `ADBase.template`: 0=Single, 1=Multiple, 2=Continuous).
 pub const AD_IMAGE_MODE_SINGLE: i64 = 0;
+
+/// `ImageMode` value for a bounded burst of `NumImages` frames.
+pub const AD_IMAGE_MODE_MULTIPLE: i64 = 1;
+
+/// `FileWriteMode` value for streaming capture (mbbo ordering from
+/// `NDFile.template`: 0=Single, 1=Capture, 2=Stream).
+pub const AD_FILE_WRITE_MODE_STREAM: i64 = 2;
 
 fn join(prefix: &str, suffix: &str) -> String {
     format!("{prefix}{suffix}")
@@ -350,6 +364,17 @@ pub struct NdFile {
     pub file_write_mode: Arc<EpicsCaBackend<i64>>,
     /// `Capture` (bo) — start/stop capture in Capture/Stream mode.
     pub capture: Arc<EpicsCaBackend<bool>>,
+    /// `NumCapture` (longout) — number of frames to capture in
+    /// Capture/Stream mode (`0` = capture until `Capture` is cleared).
+    pub num_capture: Arc<EpicsCaBackend<i64>>,
+    /// `NumCaptured_RBV` (longin) — frames written to the file so far.
+    /// This is the per-frame write index the `DetectorWriter` reports.
+    pub num_captured_rbv: Arc<EpicsCaBackend<i64>>,
+    /// `FullFileName_RBV` (CHAR waveform) — absolute path the IOC
+    /// resolved from `FilePath`/`FileName`/`FileTemplate`/`FileNumber`.
+    /// The `StreamResource` URI is built from this readback so it points
+    /// at the file the IOC actually wrote, not at a re-derived guess.
+    pub full_file_name_rbv: Arc<EpicsCaBackend<String>>,
 }
 
 impl NdFile {
@@ -371,6 +396,15 @@ impl NdFile {
             auto_increment: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "AutoIncrement"))),
             file_write_mode: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "FileWriteMode"))),
             capture: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "Capture"))),
+            num_capture: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "NumCapture"))),
+            num_captured_rbv: Arc::new(EpicsCaBackend::<i64>::new(join(
+                &prefix,
+                "NumCaptured_RBV",
+            ))),
+            full_file_name_rbv: Arc::new(EpicsCaBackend::<String>::new_long_string(join(
+                &prefix,
+                "FullFileName_RBV",
+            ))),
             plugin,
         }
     }
@@ -378,7 +412,7 @@ impl NdFile {
     /// Connect plugin base + every file-specific channel.
     pub async fn connect(&self, timeout: Duration) -> Result<()> {
         let p = self.plugin.connect(timeout);
-        let (a, b, c, d, e, f, g) = tokio::join!(
+        let (a, b, c, d, e, f, g, h, i, j) = tokio::join!(
             p,
             SignalBackend::<String>::connect(self.file_path.as_ref(), timeout),
             SignalBackend::<String>::connect(self.file_name.as_ref(), timeout),
@@ -386,6 +420,9 @@ impl NdFile {
             SignalBackend::<bool>::connect(self.auto_increment.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.file_write_mode.as_ref(), timeout),
             SignalBackend::<bool>::connect(self.capture.as_ref(), timeout),
+            SignalBackend::<i64>::connect(self.num_capture.as_ref(), timeout),
+            SignalBackend::<i64>::connect(self.num_captured_rbv.as_ref(), timeout),
+            SignalBackend::<String>::connect(self.full_file_name_rbv.as_ref(), timeout),
         );
         a?;
         b?;
@@ -394,6 +431,9 @@ impl NdFile {
         e?;
         f?;
         g?;
+        h?;
+        i?;
+        j?;
         Ok(())
     }
 
@@ -422,6 +462,56 @@ impl NdFile {
             "NdFile::set_template",
         )
         .await
+    }
+
+    /// Set `FileWriteMode` (0=Single, 1=Capture, 2=Stream).
+    pub async fn set_write_mode(&self, mode: i64) -> Result<()> {
+        await_put(
+            SignalBackend::<i64>::put(self.file_write_mode.as_ref(), Some(mode)),
+            "NdFile::set_write_mode",
+        )
+        .await
+    }
+
+    /// Set `NumCapture` — frames to capture (`0` = until `Capture` cleared).
+    pub async fn set_num_capture(&self, n: i64) -> Result<()> {
+        await_put(
+            SignalBackend::<i64>::put(self.num_capture.as_ref(), Some(n)),
+            "NdFile::set_num_capture",
+        )
+        .await
+    }
+
+    /// Start capture (`Capture=1`). In Stream mode the file opens on this
+    /// transition (or on the first frame when `LazyOpen` is set).
+    pub async fn start_capture(&self) -> Result<()> {
+        await_put(
+            SignalBackend::<bool>::put(self.capture.as_ref(), Some(true)),
+            "NdFile::start_capture",
+        )
+        .await
+    }
+
+    /// Stop capture (`Capture=0`) — flushes and closes the file.
+    pub async fn stop_capture(&self) -> Result<()> {
+        await_put(
+            SignalBackend::<bool>::put(self.capture.as_ref(), Some(false)),
+            "NdFile::stop_capture",
+        )
+        .await
+    }
+
+    /// Read `NumCaptured_RBV` — frames written so far (clamped to `>= 0`).
+    pub async fn num_captured(&self) -> Result<u64> {
+        let n = SignalBackend::<i64>::get_value(self.num_captured_rbv.as_ref()).await?;
+        Ok(n.max(0) as u64)
+    }
+
+    /// Read `FullFileName_RBV` — the absolute path the IOC resolved, with any
+    /// trailing NUL padding from the CHAR waveform stripped.
+    pub async fn full_file_name(&self) -> Result<String> {
+        let s = SignalBackend::<String>::get_value(self.full_file_name_rbv.as_ref()).await?;
+        Ok(s.trim_end_matches('\0').to_string())
     }
 }
 
@@ -677,6 +767,399 @@ pub fn num_rois(rois: &[&NdRoi], n: usize) -> Result<()> {
     Ok(())
 }
 
+// -- IOC-backed HDF file writer ----------------------------------------------
+
+/// Default HDF5 dataset the NDFileHDF5 plugin writes frames into. Matches
+/// ophyd-async's `parameters={"dataset": "/entry/data/data"}`.
+const AD_HDF_DATASET: &str = "/entry/data/data";
+/// Default `FileTemplate` — `<path><name>.h5`, no auto-increment suffix, so the
+/// IOC-resolved `FullFileName_RBV` is deterministic.
+const AD_HDF_TEMPLATE: &str = "%s%s.h5";
+
+/// Where the areaDetector file plugin should write and under what basename.
+/// Mirrors ophyd-async's `PathProvider`/`PathInfo`: the writer sets the IOC's
+/// `FilePath`/`FileName` from this, then builds the `StreamResource` URI from
+/// the IOC's `FullFileName_RBV` readback (so it points at what the IOC wrote).
+#[derive(Clone, Debug)]
+pub struct StaticPathProvider {
+    /// Directory the IOC writes into (must be visible on the IOC host).
+    pub directory: String,
+    /// File basename (pre-template), e.g. `"scan"`.
+    pub filename: String,
+}
+
+impl StaticPathProvider {
+    /// Build a provider that always returns the same directory + basename.
+    pub fn new(directory: impl Into<String>, filename: impl Into<String>) -> Self {
+        Self {
+            directory: directory.into(),
+            filename: filename.into(),
+        }
+    }
+}
+
+/// The subset of an areaDetector file plugin the [`AdHdfWriter`] drives.
+/// Splitting this out (mirroring ophyd-async's `NDFileHDF5IO` vs `ADHDFWriter`)
+/// keeps the document-composition logic unit-testable against an in-memory fake
+/// with no live IOC.
+#[async_trait::async_trait]
+pub trait AdFileIo: Send + Sync {
+    /// Connect the underlying transport and install the frames-written monitor.
+    async fn connect(&self, timeout: Duration) -> Result<()>;
+    /// Point the plugin at `directory`/`filename` with `template`, switch it to
+    /// Stream mode, and set `NumCapture` (`0` = until `stop_capture`).
+    async fn configure(
+        &self,
+        directory: &str,
+        filename: &str,
+        template: &str,
+        num_capture: i64,
+    ) -> Result<()>;
+    /// Start capture — the plugin opens the file and accepts frames.
+    async fn start_capture(&self) -> Result<()>;
+    /// Stop capture — flush and close the file.
+    async fn stop_capture(&self) -> Result<()>;
+    /// Frames written so far (the per-frame write index).
+    async fn num_captured(&self) -> Result<u64>;
+    /// Absolute path the IOC resolved for the open file.
+    async fn full_file_name(&self) -> Result<String>;
+    /// Watch the frames-written counter, for `complete()` in fly scans.
+    fn observe_num_captured(&self) -> watch::Receiver<u64>;
+}
+
+/// [`AdFileIo`] backed by a real [`NdFile`] over Channel Access.
+pub struct NdFileIo {
+    file: Arc<NdFile>,
+    index_rx: watch::Receiver<u64>,
+    index_tx: Arc<watch::Sender<u64>>,
+    /// Kept alive so the `NumCaptured_RBV` monitor feeding `index_rx` is not
+    /// torn down. Installed by [`connect`](AdFileIo::connect).
+    token: std::sync::Mutex<Option<SubToken>>,
+}
+
+impl NdFileIo {
+    /// Wrap an `NdFile`. Call [`connect`](AdFileIo::connect) before use.
+    pub fn new(file: Arc<NdFile>) -> Self {
+        let (tx, rx) = watch::channel(0u64);
+        Self {
+            file,
+            index_rx: rx,
+            index_tx: Arc::new(tx),
+            token: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AdFileIo for NdFileIo {
+    async fn connect(&self, timeout: Duration) -> Result<()> {
+        self.file.connect(timeout).await?;
+        let tx = self.index_tx.clone();
+        let token = SignalBackend::<i64>::set_callback(
+            self.file.num_captured_rbv.as_ref(),
+            Some(Box::new(move |v: &i64, _ts, _alarm| {
+                let _ = tx.send((*v).max(0) as u64);
+            })),
+        );
+        *self.token.lock().unwrap() = Some(token);
+        Ok(())
+    }
+    async fn configure(
+        &self,
+        directory: &str,
+        filename: &str,
+        template: &str,
+        num_capture: i64,
+    ) -> Result<()> {
+        self.file.set_path(directory).await?;
+        self.file.set_name(filename).await?;
+        self.file.set_template(template).await?;
+        self.file.set_write_mode(AD_FILE_WRITE_MODE_STREAM).await?;
+        self.file.set_num_capture(num_capture).await?;
+        Ok(())
+    }
+    async fn start_capture(&self) -> Result<()> {
+        self.file.start_capture().await
+    }
+    async fn stop_capture(&self) -> Result<()> {
+        self.file.stop_capture().await
+    }
+    async fn num_captured(&self) -> Result<u64> {
+        self.file.num_captured().await
+    }
+    async fn full_file_name(&self) -> Result<String> {
+        self.file.full_file_name().await
+    }
+    fn observe_num_captured(&self) -> watch::Receiver<u64> {
+        self.index_rx.clone()
+    }
+}
+
+/// Emit state for [`AdHdfWriter`]: the once-emitted `StreamResource` UID and the
+/// frame cursor (`StreamDatum`s cover `[last_emitted, up_to)`).
+#[derive(Default)]
+struct AdEmitState {
+    resource_uid: Option<String>,
+    last_emitted: u64,
+}
+
+/// `DetectorWriter` for an areaDetector NDFileHDF5 plugin. The IOC writes the
+/// actual `.h5`; this writer only arms the plugin and emits the
+/// `StreamResource`/`StreamDatum` documents that point a downstream consumer
+/// (e.g. a Tiled-writing process) at the IOC's file. Port of ophyd-async's
+/// `ADHDFWriter` data-logic (`epics/adcore/_data_logic.py`).
+pub struct AdHdfWriter {
+    name: String,
+    io: Arc<dyn AdFileIo>,
+    path_provider: StaticPathProvider,
+    /// Frame shape reported in the emitted `DataKey`. `[]` when unknown —
+    /// discovery from `ArraySizeX/Y_RBV` is a follow-up.
+    shape: Vec<Option<u64>>,
+    /// numpy dtype string for the frames, e.g. `"<u2"` (16-bit unsigned).
+    dtype_numpy: String,
+    /// Guards single-`StreamResource` emission and the datum cursor.
+    emit: tokio::sync::Mutex<AdEmitState>,
+}
+
+impl AdHdfWriter {
+    /// Build a writer over `io`, writing files per `path_provider`.
+    pub fn new(
+        name: impl Into<String>,
+        io: Arc<dyn AdFileIo>,
+        path_provider: StaticPathProvider,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            io,
+            path_provider,
+            shape: Vec::new(),
+            dtype_numpy: "<u2".into(),
+            emit: tokio::sync::Mutex::new(AdEmitState::default()),
+        }
+    }
+
+    /// Override the frame shape / numpy dtype reported in the `DataKey`.
+    pub fn with_frame(mut self, shape: Vec<Option<u64>>, dtype_numpy: impl Into<String>) -> Self {
+        self.shape = shape;
+        self.dtype_numpy = dtype_numpy.into();
+        self
+    }
+
+    /// Connect the underlying file-plugin IO.
+    pub async fn connect(&self, timeout: Duration) -> Result<()> {
+        self.io.connect(timeout).await
+    }
+
+    fn data_key_name(&self) -> String {
+        format!("{}_image", self.name)
+    }
+}
+
+#[async_trait::async_trait]
+impl DetectorWriter for AdHdfWriter {
+    async fn open(&self, _multiplier: u32) -> Result<HashMap<String, DataKey>> {
+        // Configure + arm the IOC file plugin. NumCapture=0: capture until
+        // close() clears Capture, matching a step scan whose frame count is
+        // unknown until the plan ends.
+        self.io
+            .configure(
+                &self.path_provider.directory,
+                &self.path_provider.filename,
+                AD_HDF_TEMPLATE,
+                0,
+            )
+            .await?;
+        self.io.start_capture().await?;
+        // Reset emit state for this staging.
+        {
+            let mut st = self.emit.lock().await;
+            st.resource_uid = None;
+            st.last_emitted = 0;
+        }
+        let mut out = HashMap::new();
+        out.insert(
+            self.data_key_name(),
+            DataKey {
+                source: format!("ca://{}", self.data_key_name()),
+                dtype: Dtype::Array,
+                shape: self.shape.clone(),
+                dtype_numpy: Some(self.dtype_numpy.clone().into()),
+                external: Some("STREAM:".into()),
+                units: None,
+                precision: None,
+                object_name: Some(self.name.clone()),
+                dims: None,
+                limits: None,
+                choices: None,
+            },
+        );
+        Ok(out)
+    }
+    fn observe_indices_written(&self) -> watch::Receiver<u64> {
+        self.io.observe_num_captured()
+    }
+    async fn indices_written(&self) -> u64 {
+        self.io.num_captured().await.unwrap_or(0)
+    }
+    fn collect_stream_docs(&self, up_to: u64, descriptor: &str) -> BoxStream<'_, StreamAsset> {
+        let descriptor = descriptor.to_string();
+        let data_key = self.data_key_name();
+        // Build the docs in one future (the FullFileName_RBV read is async), then
+        // flatten to a stream. `stream::once(..).flat_map(stream::iter)` gives a
+        // `BoxStream` without pulling in a generator macro.
+        let fut = async move {
+            let mut docs: Vec<StreamAsset> = Vec::new();
+            let mut st = self.emit.lock().await;
+            // StreamResource once — URI from the IOC's resolved FullFileName_RBV.
+            if st.resource_uid.is_none() {
+                let path = self.io.full_file_name().await.unwrap_or_default();
+                let uri = if path.is_empty() {
+                    String::new()
+                } else {
+                    format!("file://{path}")
+                };
+                let uid = uuid::Uuid::new_v4().to_string();
+                st.resource_uid = Some(uid.clone());
+                let mut parameters = HashMap::new();
+                parameters.insert(
+                    "dataset".to_string(),
+                    serde_json::Value::String(AD_HDF_DATASET.to_string()),
+                );
+                docs.push(StreamAsset::Resource(StreamResource {
+                    uid,
+                    data_key: data_key.clone(),
+                    mimetype: "application/x-hdf5".to_string(),
+                    uri,
+                    parameters,
+                    run_start: None,
+                }));
+            }
+            let resource_uid = st
+                .resource_uid
+                .clone()
+                .expect("resource_uid set above on first emission");
+            if up_to > st.last_emitted {
+                let start = st.last_emitted;
+                st.last_emitted = up_to;
+                docs.push(StreamAsset::Datum(StreamDatum {
+                    uid: uuid::Uuid::new_v4().to_string(),
+                    stream_resource: resource_uid,
+                    descriptor,
+                    indices: StreamRange { start, stop: up_to },
+                    seq_nums: StreamRange {
+                        start: start + 1,
+                        stop: up_to + 1,
+                    },
+                }));
+            }
+            docs
+        };
+        futures::stream::once(fut)
+            .flat_map(futures::stream::iter)
+            .boxed()
+    }
+    async fn close(&self) -> Result<()> {
+        self.io.stop_capture().await
+    }
+}
+
+#[async_trait::async_trait]
+impl DetectorControl for AreaDetectorCam {
+    fn deadtime(&self, _exposure: Option<Duration>) -> Duration {
+        // The generic areaDetector minimum dead-time is driver-specific; expose
+        // zero here. Callers that need a real dead-time pass it via TriggerInfo.
+        Duration::ZERO
+    }
+    async fn prepare(&self, info: TriggerInfo) -> Result<()> {
+        if info.trigger != DetectorTrigger::Internal {
+            return Err(BsrsError::Backend(format!(
+                "AreaDetectorCam supports only DetectorTrigger::Internal, got {:?}",
+                info.trigger
+            )));
+        }
+        await_put(
+            SignalBackend::<i64>::put(self.image_mode.as_ref(), Some(AD_IMAGE_MODE_MULTIPLE)),
+            "prepare: ImageMode=Multiple",
+        )
+        .await?;
+        await_put(
+            SignalBackend::<i64>::put(
+                self.num_images.as_ref(),
+                Some(info.number_of_exposures() as i64),
+            ),
+            "prepare: NumImages",
+        )
+        .await?;
+        if let Some(lt) = info.livetime {
+            await_put(
+                SignalBackend::<f64>::put(self.acquire_time.as_ref(), Some(lt.as_secs_f64())),
+                "prepare: AcquireTime",
+            )
+            .await?;
+        }
+        Ok(())
+    }
+    async fn arm(&self) -> Status {
+        // Start acquisition in the background and resolve the Status when the
+        // Acquire put-callback fires (acquisition complete). Returning promptly
+        // lets a fly scan's complete() watch the write index concurrently.
+        let (status, setter) = Status::new();
+        let acquire = self.acquire.clone();
+        let prefix = self.prefix.clone();
+        tokio::spawn(async move {
+            match await_put(
+                SignalBackend::<bool>::put(acquire.as_ref(), Some(true)),
+                "arm: Acquire",
+            )
+            .await
+            {
+                Ok(()) => setter.success(),
+                Err(e) => setter.fail(StatusError::Failed(format!("{prefix}arm: {e}"))),
+            }
+        });
+        status
+    }
+    async fn wait_for_idle(&self) -> Result<()> {
+        // Inherent `wait_for_idle(timeout)` takes priority in method resolution.
+        self.wait_for_idle(WARMUP_IDLE_TIMEOUT).await
+    }
+    async fn disarm(&self) -> Result<()> {
+        await_put(
+            SignalBackend::<bool>::put(self.acquire.as_ref(), Some(false)),
+            "disarm: Acquire=0",
+        )
+        .await
+    }
+}
+
+/// A `StandardDetector` composed of an areaDetector camera driver and an
+/// NDFileHDF5 plugin: the cam arms/acquires, the HDF plugin (inside the IOC)
+/// writes the `.h5`, and bsrs emits the pointing `StreamResource`/`StreamDatum`.
+pub type AreaDetectorHdf = StandardDetector<AreaDetectorCam, AdHdfWriter>;
+
+/// Build an [`AreaDetectorHdf`] from a cam prefix and an HDF-plugin prefix,
+/// writing files per `path_provider`. Call
+/// [`connect_area_detector_hdf`] before running a plan.
+pub fn area_detector_hdf(
+    name: impl Into<String>,
+    cam_prefix: impl Into<String>,
+    hdf_prefix: impl Into<String>,
+    path_provider: StaticPathProvider,
+) -> AreaDetectorHdf {
+    let name = name.into();
+    let cam = AreaDetectorCam::new(cam_prefix);
+    let io: Arc<dyn AdFileIo> = Arc::new(NdFileIo::new(Arc::new(NdFile::new(hdf_prefix))));
+    let writer = AdHdfWriter::new(name.clone(), io, path_provider);
+    StandardDetector::new(name, cam, writer)
+}
+
+/// Connect both halves of an [`AreaDetectorHdf`] (cam driver + HDF plugin IO).
+pub async fn connect_area_detector_hdf(det: &AreaDetectorHdf, timeout: Duration) -> Result<()> {
+    det.control().connect(timeout).await?;
+    det.writer().connect(timeout).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -926,5 +1409,265 @@ mod tests {
             "HDF1 NDArrayPort not restored on unstage"
         );
         eprintln!("unstage restored HDF1 enable={pre_hdf1_en}, port={pre_hdf1_port:?}");
+    }
+}
+
+#[cfg(test)]
+mod ad_hdf_tests {
+    use super::*;
+    use crate::protocols_async::{Stageable, WritesStreamAssets};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    /// In-memory `AdFileIo` so the document-composition logic is testable with
+    /// no live IOC (mirrors ophyd-async's IO-vs-writer split).
+    struct FakeAdFileIo {
+        captured: AtomicU64,
+        full_name: String,
+        index_tx: Arc<watch::Sender<u64>>,
+        index_rx: watch::Receiver<u64>,
+        configured: std::sync::Mutex<Option<(String, String, String, i64)>>,
+        capturing: AtomicBool,
+    }
+
+    impl FakeAdFileIo {
+        fn new(full_name: &str) -> Arc<Self> {
+            let (tx, rx) = watch::channel(0u64);
+            Arc::new(Self {
+                captured: AtomicU64::new(0),
+                full_name: full_name.to_string(),
+                index_tx: Arc::new(tx),
+                index_rx: rx,
+                configured: std::sync::Mutex::new(None),
+                capturing: AtomicBool::new(false),
+            })
+        }
+        fn set_captured(&self, n: u64) {
+            self.captured.store(n, Ordering::SeqCst);
+            let _ = self.index_tx.send(n);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AdFileIo for FakeAdFileIo {
+        async fn connect(&self, _t: Duration) -> Result<()> {
+            Ok(())
+        }
+        async fn configure(&self, d: &str, f: &str, t: &str, n: i64) -> Result<()> {
+            *self.configured.lock().unwrap() = Some((d.into(), f.into(), t.into(), n));
+            Ok(())
+        }
+        async fn start_capture(&self) -> Result<()> {
+            self.capturing.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn stop_capture(&self) -> Result<()> {
+            self.capturing.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn num_captured(&self) -> Result<u64> {
+            Ok(self.captured.load(Ordering::SeqCst))
+        }
+        async fn full_file_name(&self) -> Result<String> {
+            Ok(self.full_name.clone())
+        }
+        fn observe_num_captured(&self) -> watch::Receiver<u64> {
+            self.index_rx.clone()
+        }
+    }
+
+    fn writer_with(io: Arc<FakeAdFileIo>) -> AdHdfWriter {
+        AdHdfWriter::new("det", io, StaticPathProvider::new("/data/scans/", "scan"))
+    }
+
+    #[tokio::test]
+    async fn open_configures_stream_capture_and_reports_external_datakey() {
+        let io = FakeAdFileIo::new("/data/scans/scan.h5");
+        let w = writer_with(io.clone());
+        let keys = w.open(1).await.unwrap();
+        let cfg = io
+            .configured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("configure called");
+        assert_eq!(cfg.0, "/data/scans/");
+        assert_eq!(cfg.1, "scan");
+        assert_eq!(cfg.2, AD_HDF_TEMPLATE);
+        assert_eq!(cfg.3, 0, "NumCapture=0 (capture until stopped)");
+        assert!(io.capturing.load(Ordering::SeqCst), "capture started");
+        let dk = keys.get("det_image").expect("det_image data key");
+        assert_eq!(dk.external.as_deref(), Some("STREAM:"));
+        assert_eq!(dk.dtype, Dtype::Array);
+    }
+
+    #[tokio::test]
+    async fn collect_emits_resource_pointing_at_ioc_file_then_datum() {
+        let io = FakeAdFileIo::new("/data/scans/scan.h5");
+        let w = writer_with(io.clone());
+        w.open(1).await.unwrap();
+        io.set_captured(1);
+        let up_to = w.indices_written().await;
+        assert_eq!(up_to, 1);
+        let docs: Vec<StreamAsset> = w.collect_stream_docs(up_to, "desc-uid-1").collect().await;
+        assert_eq!(docs.len(), 2, "resource + datum");
+        let resource_uid = match &docs[0] {
+            StreamAsset::Resource(r) => {
+                assert_eq!(r.uri, "file:///data/scans/scan.h5");
+                assert_eq!(r.mimetype, "application/x-hdf5");
+                assert_eq!(r.data_key, "det_image");
+                assert_eq!(
+                    r.parameters.get("dataset").and_then(|v| v.as_str()),
+                    Some("/entry/data/data")
+                );
+                r.uid.clone()
+            }
+            _ => panic!("first doc must be StreamResource"),
+        };
+        match &docs[1] {
+            StreamAsset::Datum(d) => {
+                assert_eq!(d.descriptor, "desc-uid-1");
+                assert_eq!(d.stream_resource, resource_uid);
+                assert_eq!(d.indices.start, 0);
+                assert_eq!(d.indices.stop, 1);
+                assert_eq!(d.seq_nums.start, 1);
+                assert_eq!(d.seq_nums.stop, 2);
+            }
+            _ => panic!("second doc must be StreamDatum"),
+        }
+        // A second collect emits only the incremental datum, no new resource.
+        io.set_captured(3);
+        let docs2: Vec<StreamAsset> = w
+            .collect_stream_docs(w.indices_written().await, "desc-uid-1")
+            .collect()
+            .await;
+        assert_eq!(docs2.len(), 1, "only the incremental datum");
+        match &docs2[0] {
+            StreamAsset::Datum(d) => {
+                assert_eq!(d.indices.start, 1);
+                assert_eq!(d.indices.stop, 3);
+                assert_eq!(d.stream_resource, resource_uid, "same resource uid reused");
+            }
+            _ => panic!("must be StreamDatum"),
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_full_file_name_yields_empty_uri() {
+        let io = FakeAdFileIo::new("");
+        let w = writer_with(io.clone());
+        w.open(1).await.unwrap();
+        io.set_captured(1);
+        let docs: Vec<StreamAsset> = w.collect_stream_docs(1, "d").collect().await;
+        match &docs[0] {
+            StreamAsset::Resource(r) => assert_eq!(r.uri, "", "no readback → empty URI"),
+            _ => panic!("first doc must be StreamResource"),
+        }
+    }
+
+    #[tokio::test]
+    async fn observe_reflects_num_captured_updates() {
+        let io = FakeAdFileIo::new("/x.h5");
+        let w = writer_with(io.clone());
+        let mut rx = w.observe_indices_written();
+        assert_eq!(*rx.borrow_and_update(), 0);
+        io.set_captured(5);
+        rx.changed().await.unwrap();
+        assert_eq!(*rx.borrow_and_update(), 5);
+    }
+
+    #[tokio::test]
+    async fn close_stops_capture() {
+        let io = FakeAdFileIo::new("/x.h5");
+        let w = writer_with(io.clone());
+        w.open(1).await.unwrap();
+        assert!(io.capturing.load(Ordering::SeqCst));
+        w.close().await.unwrap();
+        assert!(!io.capturing.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn composite_writes_stream_assets_drains_ad_writer() {
+        // The composite StandardDetector<AreaDetectorCam, AdHdfWriter> builds,
+        // and its WritesStreamAssets seam — the exact one the engine's step/fly
+        // save path drains — yields the AD writer's resource + datum.
+        let io = FakeAdFileIo::new("/data/scan.h5");
+        let writer = writer_with(io.clone());
+        let cam = AreaDetectorCam::new("13SIM1:cam1:");
+        let det = StandardDetector::new("det", cam, writer);
+        det.writer().open(1).await.unwrap();
+        io.set_captured(2);
+        let up_to = WritesStreamAssets::get_index(&det).await.unwrap();
+        assert_eq!(up_to, 2);
+        let docs: Vec<StreamAsset> = det.collect_asset_docs(up_to, "descZ").collect().await;
+        assert_eq!(docs.len(), 2);
+        assert!(matches!(docs[0], StreamAsset::Resource(_)));
+        match &docs[1] {
+            StreamAsset::Datum(d) => assert_eq!(d.descriptor, "descZ"),
+            _ => panic!("second doc must be StreamDatum"),
+        }
+    }
+
+    #[test]
+    fn path_provider_stores_directory_and_filename() {
+        let p = StaticPathProvider::new("/gpfs/data/", "img");
+        assert_eq!(p.directory, "/gpfs/data/");
+        assert_eq!(p.filename, "img");
+    }
+
+    // Live-IOC smoke test — drives a real areaDetector cam + NDFileHDF5 plugin
+    // end to end and asserts the emitted StreamResource points at the file the
+    // IOC actually wrote. `#[ignore]`; run with `--ignored` against an IOC.
+    //   BSRS_AD_PREFIX  cam prefix   (default 13SIM1:cam1:)
+    //   BSRS_AD_HDF     HDF1 prefix  (default 13SIM1:HDF1:)
+    //   BSRS_AD_DIR     write dir    (default /tmp/), must be IOC-visible
+    #[tokio::test]
+    #[ignore]
+    async fn area_detector_hdf_live_emits_real_file_stream_resource() {
+        let cam_prefix =
+            std::env::var("BSRS_AD_PREFIX").unwrap_or_else(|_| "13SIM1:cam1:".to_string());
+        let hdf_prefix =
+            std::env::var("BSRS_AD_HDF").unwrap_or_else(|_| "13SIM1:HDF1:".to_string());
+        let dir = std::env::var("BSRS_AD_DIR").unwrap_or_else(|_| "/tmp/".to_string());
+        let det = area_detector_hdf(
+            "addet",
+            cam_prefix,
+            hdf_prefix,
+            StaticPathProvider::new(dir, "bsrs_ad_live"),
+        );
+        connect_area_detector_hdf(&det, Duration::from_secs(5))
+            .await
+            .expect("connect");
+        // Prime array dims so the HDF plugin can open the file.
+        det.control().warmup().await.expect("warmup");
+        // Stage opens (configures + starts capture) the writer.
+        Stageable::stage(&det).await.expect("stage");
+        // One internal-trigger acquisition.
+        det.control().arm().await.await.expect("acquire");
+        // Fully-qualified: the inherent `wait_for_idle(timeout)` shadows the
+        // zero-arg trait method by name.
+        DetectorControl::wait_for_idle(det.control())
+            .await
+            .expect("idle");
+        let up_to = WritesStreamAssets::get_index(&det).await.expect("index");
+        assert!(up_to >= 1, "expected >=1 frame written, got {up_to}");
+        let docs: Vec<StreamAsset> = det.collect_asset_docs(up_to, "live-desc").collect().await;
+        let resource = docs
+            .iter()
+            .find_map(|a| match a {
+                StreamAsset::Resource(r) => Some(r),
+                _ => None,
+            })
+            .expect("a StreamResource was emitted");
+        assert!(
+            resource.uri.starts_with("file://"),
+            "uri should be a file URI, got {}",
+            resource.uri
+        );
+        assert!(
+            resource.uri.ends_with(".h5"),
+            "uri should point at the .h5, got {}",
+            resource.uri
+        );
+        Stageable::unstage(&det).await.expect("unstage");
     }
 }
