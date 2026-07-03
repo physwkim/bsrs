@@ -71,6 +71,9 @@ pub const AD_IMAGE_MODE_SINGLE: i64 = 0;
 /// `ImageMode` value for a bounded burst of `NumImages` frames.
 pub const AD_IMAGE_MODE_MULTIPLE: i64 = 1;
 
+/// `ImageMode` value for unbounded acquisition until `Acquire` is cleared.
+pub const AD_IMAGE_MODE_CONTINUOUS: i64 = 2;
+
 /// `FileWriteMode` value for streaming capture (mbbo ordering from
 /// `NDFile.template`: 0=Single, 1=Capture, 2=Stream).
 pub const AD_FILE_WRITE_MODE_STREAM: i64 = 2;
@@ -163,6 +166,9 @@ pub struct AreaDetectorCam {
     pub acquire_rbv: Arc<EpicsCaBackend<bool>>,
     /// `AcquireTime` (ao) — exposure time, seconds.
     pub acquire_time: Arc<EpicsCaBackend<f64>>,
+    /// `AcquirePeriod` (ao) — seconds from one exposure start to the next
+    /// (exposure + dead time).
+    pub acquire_period: Arc<EpicsCaBackend<f64>>,
     /// `ArrayCounter_RBV` (longin) — total frames produced.
     pub array_counter_rbv: Arc<EpicsCaBackend<i64>>,
     /// `DetectorState_RBV` (mbbi).
@@ -291,6 +297,7 @@ impl AreaDetectorCam {
             acquire: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "Acquire"))),
             acquire_rbv: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "Acquire_RBV"))),
             acquire_time: Arc::new(EpicsCaBackend::<f64>::new(join(&prefix, "AcquireTime"))),
+            acquire_period: Arc::new(EpicsCaBackend::<f64>::new(join(&prefix, "AcquirePeriod"))),
             array_counter_rbv: Arc::new(EpicsCaBackend::<i64>::new(join(
                 &prefix,
                 "ArrayCounter_RBV",
@@ -310,12 +317,13 @@ impl AreaDetectorCam {
 
     /// Connect every channel in parallel.
     pub async fn connect(&self, timeout: Duration) -> Result<()> {
-        let (a, b, c, d, e, f, g, h, i) = tokio::join!(
+        let (a, b, c, d, e, f, g, h, i, j) = tokio::join!(
             SignalBackend::<i64>::connect(self.image_mode.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.num_images.as_ref(), timeout),
             SignalBackend::<bool>::connect(self.acquire.as_ref(), timeout),
             SignalBackend::<bool>::connect(self.acquire_rbv.as_ref(), timeout),
             SignalBackend::<f64>::connect(self.acquire_time.as_ref(), timeout),
+            SignalBackend::<f64>::connect(self.acquire_period.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.array_counter_rbv.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.detector_state_rbv.as_ref(), timeout),
             SignalBackend::<String>::connect(self.nd_attributes_file.as_ref(), timeout),
@@ -330,6 +338,7 @@ impl AreaDetectorCam {
         g?;
         h?;
         i?;
+        j?;
         Ok(())
     }
 
@@ -2300,9 +2309,18 @@ impl DetectorControl for AreaDetectorCam {
                 info.trigger
             )));
         }
+        // number_of_events == 0 means "acquire until told to stop"
+        // (ophyd-async ADImageMode.CONTINUOUS when num == 0,
+        // _trigger_logic.py `prepare_exposures`); NumImages is set either
+        // way — the driver ignores it in Continuous mode.
+        let image_mode = if info.number_of_exposures() == 0 {
+            AD_IMAGE_MODE_CONTINUOUS
+        } else {
+            AD_IMAGE_MODE_MULTIPLE
+        };
         await_put(
-            SignalBackend::<i64>::put(self.image_mode.as_ref(), Some(AD_IMAGE_MODE_MULTIPLE)),
-            "prepare: ImageMode=Multiple",
+            SignalBackend::<i64>::put(self.image_mode.as_ref(), Some(image_mode)),
+            "prepare: ImageMode",
         )
         .await?;
         await_put(
@@ -2319,6 +2337,18 @@ impl DetectorControl for AreaDetectorCam {
                 "prepare: AcquireTime",
             )
             .await?;
+            // AcquirePeriod = exposure + dead time, only when both are known
+            // (ophyd-async sets it only under `if livetime and deadtime`).
+            if let Some(dt) = info.deadtime {
+                await_put(
+                    SignalBackend::<f64>::put(
+                        self.acquire_period.as_ref(),
+                        Some((lt + dt).as_secs_f64()),
+                    ),
+                    "prepare: AcquirePeriod",
+                )
+                .await?;
+            }
         }
         Ok(())
     }
@@ -2521,6 +2551,8 @@ mod tests {
         // ADBase.template:388-389.
         assert_eq!(AD_STATE_IDLE, 0);
         assert_eq!(AD_IMAGE_MODE_SINGLE, 0);
+        assert_eq!(AD_IMAGE_MODE_MULTIPLE, 1);
+        assert_eq!(AD_IMAGE_MODE_CONTINUOUS, 2);
     }
 
     // -------------------------------------------------------------
