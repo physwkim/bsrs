@@ -1,0 +1,22 @@
+# Local-runner config: development runs use `cargo nextest run`; CI runs
+# `cargo test`, and leak detection is a nextest-only concept, so this file
+# affects local runs only.
+
+[profile.default]
+# Nextest marks a passing test "leaky" when its stdout/stderr pipes are still
+# open past this window after the test process exits — i.e. a spawned child
+# inherited them and is still alive. No test in this workspace can leave such
+# a child: the only process-spawning tests (cli_round_trip, repl_script,
+# bsrs-py python_smoke) kill+wait their children before returning, and the
+# deps' one spawn path (epics-ca-rs spawn_repeater) nulls all stdio and only
+# fires when a ca-repeater-rs binary sits next to the test executable, which
+# cargo never builds for a dependency. A leak report is therefore either a
+# real regression or the pipe-close/exit-observation race on a loaded machine
+# (observed once, first run after a full rebuild; not reproduced in 28
+# re-runs). 500ms — 5x the 100ms default — puts that race outside plausible
+# scheduling delay, while a genuinely leaked child (which holds the pipes
+# indefinitely) still trips it.
+leak-timeout = "500ms"
+# Re-list leaky tests next to the final summary so the culprit's name
+# survives scrolled or truncated output instead of only appearing mid-stream.
+final-status-level = "leak"
