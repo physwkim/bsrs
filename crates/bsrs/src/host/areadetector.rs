@@ -128,6 +128,10 @@ pub struct AreaDetectorCam {
     pub array_counter_rbv: Arc<EpicsCaBackend<i64>>,
     /// `DetectorState_RBV` (mbbi).
     pub detector_state_rbv: Arc<EpicsCaBackend<i64>>,
+    /// `NDAttributesFile` (waveform) — per-frame attribute config, either
+    /// inline XML or a filename on the IOC host. Read at `open()` to discover
+    /// NDAttribute datasets for the emitted stream documents.
+    pub nd_attributes_file: Arc<EpicsCaBackend<String>>,
 }
 
 impl AreaDetectorCam {
@@ -147,19 +151,24 @@ impl AreaDetectorCam {
                 &prefix,
                 "DetectorState_RBV",
             ))),
+            nd_attributes_file: Arc::new(EpicsCaBackend::<String>::new_long_string(join(
+                &prefix,
+                "NDAttributesFile",
+            ))),
             prefix,
         }
     }
 
     /// Connect every channel in parallel.
     pub async fn connect(&self, timeout: Duration) -> Result<()> {
-        let (a, b, c, d, e, f) = tokio::join!(
+        let (a, b, c, d, e, f, g) = tokio::join!(
             SignalBackend::<i64>::connect(self.image_mode.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.num_images.as_ref(), timeout),
             SignalBackend::<bool>::connect(self.acquire.as_ref(), timeout),
             SignalBackend::<f64>::connect(self.acquire_time.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.array_counter_rbv.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.detector_state_rbv.as_ref(), timeout),
+            SignalBackend::<String>::connect(self.nd_attributes_file.as_ref(), timeout),
         );
         a?;
         b?;
@@ -167,6 +176,7 @@ impl AreaDetectorCam {
         d?;
         e?;
         f?;
+        g?;
         Ok(())
     }
 
@@ -997,24 +1007,138 @@ impl AdFileIo for NdFileIo {
 
 /// One per-frame NDAttribute the IOC's NDFileHDF5 plugin writes into the same
 /// `.h5` alongside the main image, at `/entry/instrument/NDAttributes/<name>`.
-/// Declared explicitly (bsrs has no NDAttributes-config discovery); the writer
-/// then emits a `StreamResource`/`StreamDatum` for it just like ophyd-async's
+/// Discovered from the IOC's `NDAttributesFile` XML at `open()` (see
+/// [`NdAttributeXmlSource`]) or declared explicitly via
+/// [`AdHdfWriter::with_ndattributes`]; the writer then emits a
+/// `StreamResource`/`StreamDatum` for it just like ophyd-async's
 /// `ndattribute_datasets` (`_data_logic.py`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NdAttributeDataset {
     /// Attribute name — used as both the `DataKey` and the HDF dataset leaf.
     pub name: String,
     /// numpy dtype string of the attribute values, e.g. `"<f8"`.
     pub dtype_numpy: String,
+    /// `DataKey.source` for the attribute — `ca://<pv>` for `EPICS_PV`
+    /// attributes; empty means "fall back to the file URI" (ophyd-async
+    /// `resource.source or self.uri`, `_data_providers.py:127`).
+    pub source: String,
 }
 
 impl NdAttributeDataset {
-    /// Build a spec for attribute `name` with numpy dtype `dtype_numpy`.
+    /// Build a spec for attribute `name` with numpy dtype `dtype_numpy` and no
+    /// source (the `DataKey.source` falls back to the file URI).
     pub fn new(name: impl Into<String>, dtype_numpy: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             dtype_numpy: dtype_numpy.into(),
+            source: String::new(),
         }
+    }
+}
+
+/// Map an NDAttribute `dbrtype` (an `EPICS_PV`-type attribute in the
+/// `NDAttributesFile` XML) to a numpy dtype string. Port of ophyd-async's
+/// `NDAttributePvDbrType` (`_ndattribute.py`). `DBR_NATIVE` is unsupported
+/// there and here — returns `None`, as for unknown strings.
+pub fn ndattr_dbrtype_to_numpy(dbrtype: &str) -> Option<&'static str> {
+    Some(match dbrtype {
+        "DBR_SHORT" | "DBR_ENUM" => "<i2",
+        "DBR_INT" | "DBR_LONG" => "<i4",
+        "DBR_FLOAT" => "<f4",
+        "DBR_DOUBLE" => "<f8",
+        "DBR_STRING" => "S40",
+        "DBR_CHAR" => "|i1",
+        _ => return None,
+    })
+}
+
+/// Map an NDAttribute `datatype` (a `PARAM`-type attribute in the
+/// `NDAttributesFile` XML) to a numpy dtype string. Port of ophyd-async's
+/// `NDAttributeDataType` (`_ndattribute.py`).
+pub fn ndattr_datatype_to_numpy(datatype: &str) -> Option<&'static str> {
+    Some(match datatype {
+        "INT" => "<i4",
+        "INT64" => "<i8",
+        "DOUBLE" => "<f8",
+        "STRING" => "S40",
+        _ => return None,
+    })
+}
+
+/// Parse ADCore `NDAttributesFile` XML (`<Attributes><Attribute .../></Attributes>`)
+/// into dataset specs, in document order. Port of ophyd-async's
+/// `get_ndattribute_dtype_source` (`_data_logic.py:94`): `type` defaults to
+/// `EPICS_PV`; an `EPICS_PV` attribute maps `dbrtype` (default `DBR_NATIVE`,
+/// which is rejected) and sources from `ca://<source>`; any other type maps
+/// `datatype` (default `INT`) with an empty source. Same-name duplicates are
+/// resolved by the caller's merge, not here.
+pub fn parse_ndattributes_xml(xml: &str) -> Result<Vec<NdAttributeDataset>> {
+    let doc = roxmltree::Document::parse(xml)
+        .map_err(|e| BsrsError::Backend(format!("NDAttributesFile XML parse error: {e}")))?;
+    let mut out = Vec::new();
+    for child in doc.root_element().children().filter(|n| n.is_element()) {
+        let name = child.attribute("name").ok_or_else(|| {
+            BsrsError::Backend("NDAttributesFile XML: <Attribute> without a name".to_string())
+        })?;
+        let (dtype_numpy, source) = if child.attribute("type").unwrap_or("EPICS_PV") == "EPICS_PV" {
+            let dbrtype = child.attribute("dbrtype").unwrap_or("DBR_NATIVE");
+            let dtype = ndattr_dbrtype_to_numpy(dbrtype).ok_or_else(|| {
+                BsrsError::Backend(format!(
+                    "NDAttribute {name} has dbrtype {dbrtype}, which is not supported"
+                ))
+            })?;
+            let pv = child.attribute("source").ok_or_else(|| {
+                BsrsError::Backend(format!("NDAttribute {name} (EPICS_PV) has no source"))
+            })?;
+            (dtype, format!("ca://{pv}"))
+        } else {
+            let datatype = child.attribute("datatype").unwrap_or("INT");
+            let dtype = ndattr_datatype_to_numpy(datatype).ok_or_else(|| {
+                BsrsError::Backend(format!(
+                    "NDAttribute {name} has datatype {datatype}, which is not supported"
+                ))
+            })?;
+            (dtype, String::new())
+        };
+        out.push(NdAttributeDataset {
+            name: name.to_string(),
+            dtype_numpy: dtype_numpy.to_string(),
+            source,
+        });
+    }
+    Ok(out)
+}
+
+/// Merge `new` specs into `acc` by attribute name: a later entry replaces an
+/// earlier one in place, keeping first-seen order — the dict semantics of
+/// ophyd-async's `get_ndattribute_dtype_source` accumulating across sources.
+fn merge_ndattributes(acc: &mut Vec<NdAttributeDataset>, new: Vec<NdAttributeDataset>) {
+    for a in new {
+        if let Some(slot) = acc.iter_mut().find(|x| x.name == a.name) {
+            *slot = a;
+        } else {
+            acc.push(a);
+        }
+    }
+}
+
+/// A source of ADCore `NDAttributesFile` content — the driver's or a plugin's
+/// `NDAttributesFile` PV. `open()` reads each source and, when the content is
+/// inline XML (contains `<Attributes>`, ADCore's own check), parses it into
+/// per-frame attribute datasets; a filename is skipped, since the file lives on
+/// the IOC host. Mirrors ophyd-async reading `(driver, *plugins)`
+/// (`_data_logic.py:207`).
+#[async_trait::async_trait]
+pub trait NdAttributeXmlSource: Send + Sync {
+    /// Current `NDAttributesFile` content: inline XML or a filename.
+    async fn nd_attributes_xml(&self) -> Result<String>;
+}
+
+#[async_trait::async_trait]
+impl NdAttributeXmlSource for EpicsCaBackend<String> {
+    async fn nd_attributes_xml(&self) -> Result<String> {
+        let v = SignalBackend::<String>::get_value(self).await?;
+        Ok(v.trim_end_matches('\0').to_string())
     }
 }
 
@@ -1049,11 +1173,15 @@ fn ad_stream_datum(resource_uid: String, descriptor: &str, start: u64, stop: u64
     }
 }
 
-/// Emit state for [`AdHdfWriter`]: the once-emitted `StreamResource` UIDs (main
-/// image + one per NDAttribute) and the frame cursor (`StreamDatum`s cover
-/// `[last_emitted, up_to)`).
+/// Emit state for [`AdHdfWriter`]: the attribute set staged by the last
+/// `open()` (discovered from the XML sources, merged with the declared specs),
+/// the once-emitted `StreamResource` UIDs (main image + one per NDAttribute),
+/// and the frame cursor (`StreamDatum`s cover `[last_emitted, up_to)`).
+/// `open()` is the only writer of `attrs`; `collect_stream_docs` only reads it,
+/// so the emitted datasets always match the data keys reported at `open()`.
 #[derive(Default)]
 struct AdEmitState {
+    attrs: Vec<NdAttributeDataset>,
     main_resource_uid: Option<String>,
     attr_resource_uids: HashMap<String, String>,
     last_emitted: u64,
@@ -1068,8 +1196,13 @@ pub struct AdHdfWriter {
     name: String,
     io: Arc<dyn AdFileIo>,
     path_provider: StaticPathProvider,
-    /// Per-frame NDAttribute datasets the IOC also writes into the file; each
-    /// gets its own `StreamResource`/`StreamDatum`. Empty = main image only.
+    /// `NDAttributesFile` sources (driver + extra plugins) read at `open()` to
+    /// discover the per-frame NDAttribute datasets in the IOC's file.
+    attr_sources: Vec<Arc<dyn NdAttributeXmlSource>>,
+    /// Explicitly declared NDAttribute datasets, merged over the discovered set
+    /// at `open()` (declared wins on a name collision). Covers the case where
+    /// `NDAttributesFile` holds a filename on the IOC host that discovery
+    /// cannot read.
     ndattributes: Vec<NdAttributeDataset>,
     /// Guards single-`StreamResource` emission and the datum cursor.
     emit: tokio::sync::Mutex<AdEmitState>,
@@ -1086,14 +1219,24 @@ impl AdHdfWriter {
             name: name.into(),
             io,
             path_provider,
+            attr_sources: Vec::new(),
             ndattributes: Vec::new(),
             emit: tokio::sync::Mutex::new(AdEmitState::default()),
         }
     }
 
-    /// Declare the per-frame NDAttribute datasets the IOC writes into the file,
-    /// so the writer emits a `StreamResource`/`StreamDatum` for each in addition
-    /// to the main image.
+    /// Set the `NDAttributesFile` sources (driver + extra plugins) whose inline
+    /// XML is parsed at `open()` to discover NDAttribute datasets — the
+    /// ophyd-async `(driver, *plugins)` sweep (`_data_logic.py:207`).
+    pub fn with_ndattribute_sources(mut self, sources: Vec<Arc<dyn NdAttributeXmlSource>>) -> Self {
+        self.attr_sources = sources;
+        self
+    }
+
+    /// Declare per-frame NDAttribute datasets explicitly, merged over the
+    /// discovered set at `open()` (declared wins on a name collision), so the
+    /// writer emits a `StreamResource`/`StreamDatum` for each in addition to
+    /// the main image.
     pub fn with_ndattributes(mut self, attrs: Vec<NdAttributeDataset>) -> Self {
         self.ndattributes = attrs;
         self
@@ -1106,6 +1249,39 @@ impl AdHdfWriter {
 
     fn data_key_name(&self) -> String {
         format!("{}_image", self.name)
+    }
+
+    /// The file URI the path provider + `%s%s.h5` template resolve to — the
+    /// `DataKey.source` fallback for attributes with no PV source, mirroring
+    /// ophyd-async composing the uri from `path_info` (`_data_logic.py:224`).
+    fn provider_uri(&self) -> String {
+        format!(
+            "file://{}{}.h5",
+            self.path_provider.directory, self.path_provider.filename
+        )
+    }
+
+    /// Effective NDAttribute set for this staging: every source's inline XML,
+    /// merged in order, then the declared specs on top. A source whose content
+    /// has no `<Attributes>` is a filename on the IOC host (ADCore's own
+    /// check, `_data_logic.py:104`) — unreadable here, so it is skipped.
+    async fn discover_ndattributes(&self) -> Result<Vec<NdAttributeDataset>> {
+        let mut attrs = Vec::new();
+        for src in &self.attr_sources {
+            let text = src.nd_attributes_xml().await?;
+            if text.contains("<Attributes>") {
+                merge_ndattributes(&mut attrs, parse_ndattributes_xml(&text)?);
+            } else if !text.trim().is_empty() {
+                tracing::warn!(
+                    ndattributes_file = %text,
+                    "NDAttributesFile is a filename on the IOC host; cannot \
+                     discover NDAttribute datasets from it — declare them via \
+                     AdHdfWriter::with_ndattributes if they should be emitted"
+                );
+            }
+        }
+        merge_ndattributes(&mut attrs, self.ndattributes.clone());
+        Ok(attrs)
     }
 }
 
@@ -1124,17 +1300,22 @@ impl DetectorWriter for AdHdfWriter {
             )
             .await?;
         self.io.start_capture().await?;
-        // Reset emit state for this staging.
-        {
-            let mut st = self.emit.lock().await;
-            st.main_resource_uid = None;
-            st.attr_resource_uids.clear();
-            st.last_emitted = 0;
-        }
         // Discover the frame shape + dtype from the IOC (ArraySize*/DataType
         // RBVs). Requires a primed detector — the shape is `[]` until the first
         // frame flows (e.g. after `AreaDetectorCam::warmup`).
         let (shape, dtype_numpy) = self.io.frame_info().await?;
+        // Discover the NDAttribute datasets from the NDAttributesFile sources,
+        // merged with the declared specs.
+        let attrs = self.discover_ndattributes().await?;
+        // Reset emit state for this staging; the staged attribute set is what
+        // collect_stream_docs will emit resources/datums for.
+        {
+            let mut st = self.emit.lock().await;
+            st.attrs = attrs.clone();
+            st.main_resource_uid = None;
+            st.attr_resource_uids.clear();
+            st.last_emitted = 0;
+        }
         let mut out = HashMap::new();
         out.insert(
             self.data_key_name(),
@@ -1152,12 +1333,18 @@ impl DetectorWriter for AdHdfWriter {
                 choices: None,
             },
         );
-        // One scalar external data key per declared NDAttribute dataset.
-        for a in &self.ndattributes {
+        // One scalar external data key per staged NDAttribute dataset. Source
+        // is the attribute's PV source, or the file URI when it has none
+        // (ophyd-async `resource.source or self.uri`).
+        for a in &attrs {
             out.insert(
                 a.name.clone(),
                 DataKey {
-                    source: format!("ca://{}", a.name),
+                    source: if a.source.is_empty() {
+                        self.provider_uri()
+                    } else {
+                        a.source.clone()
+                    },
                     dtype: Dtype::Number,
                     shape: Vec::new(),
                     dtype_numpy: Some(a.dtype_numpy.clone().into()),
@@ -1193,13 +1380,14 @@ impl DetectorWriter for AdHdfWriter {
         let fut = async move {
             let mut docs: Vec<StreamAsset> = Vec::new();
             let mut st = self.emit.lock().await;
+            // The attribute set staged by the last open().
+            let attrs = st.attrs.clone();
             // Emit each StreamResource once. The main image and every
             // NDAttribute live in the same .h5, so they share one URI resolved
             // from FullFileName_RBV — read it only when a resource still needs
             // emitting.
             let need_main = st.main_resource_uid.is_none();
-            let need_attr = self
-                .ndattributes
+            let need_attr = attrs
                 .iter()
                 .any(|a| !st.attr_resource_uids.contains_key(&a.name));
             if need_main || need_attr {
@@ -1219,7 +1407,7 @@ impl DetectorWriter for AdHdfWriter {
                         AD_HDF_DATASET,
                     )));
                 }
-                for a in &self.ndattributes {
+                for a in &attrs {
                     if !st.attr_resource_uids.contains_key(&a.name) {
                         let uid = uuid::Uuid::new_v4().to_string();
                         st.attr_resource_uids.insert(a.name.clone(), uid.clone());
@@ -1248,7 +1436,7 @@ impl DetectorWriter for AdHdfWriter {
                     start,
                     up_to,
                 )));
-                for a in &self.ndattributes {
+                for a in &attrs {
                     let auid = st
                         .attr_resource_uids
                         .get(&a.name)
@@ -1359,7 +1547,14 @@ pub fn area_detector_hdf(
     let name = name.into();
     let cam = AreaDetectorCam::new(cam_prefix);
     let io: Arc<dyn AdFileIo> = Arc::new(NdFileIo::new(Arc::new(NdFile::new(hdf_prefix))));
-    let writer = AdHdfWriter::new(name.clone(), io, path_provider);
+    // The cam's NDAttributesFile is the discovery source for NDAttribute
+    // datasets, as in ophyd-async's `(driver, *plugins)` sweep — extra plugin
+    // sources can be added by composing AdHdfWriter manually.
+    let writer =
+        AdHdfWriter::new(name.clone(), io, path_provider)
+            .with_ndattribute_sources(vec![
+                cam.nd_attributes_file.clone() as Arc<dyn NdAttributeXmlSource>
+            ]);
     StandardDetector::new(name, cam, writer)
 }
 
@@ -1696,6 +1891,150 @@ mod ad_hdf_tests {
 
     fn writer_with(io: Arc<FakeAdFileIo>) -> AdHdfWriter {
         AdHdfWriter::new("det", io, StaticPathProvider::new("/data/scans/", "scan"))
+    }
+
+    /// Fixed-content `NDAttributesFile` source (inline XML or a filename).
+    struct FakeXmlSource(String);
+
+    #[async_trait::async_trait]
+    impl NdAttributeXmlSource for FakeXmlSource {
+        async fn nd_attributes_xml(&self) -> Result<String> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn parse_ndattributes_xml_maps_epics_pv_and_param() {
+        let xml = r#"<?xml version="1.0"?>
+            <Attributes>
+                <!-- an EPICS_PV attribute with an explicit dbrtype -->
+                <Attribute name="temp" type="EPICS_PV" source="SIM:TEMP" dbrtype="DBR_DOUBLE"/>
+                <Attribute name="ring" source="SR:CURRENT" dbrtype="DBR_FLOAT"/>
+                <Attribute name="id" type="PARAM" source="UNIQUE_ID" datatype="INT64"/>
+                <Attribute name="color" type="PARAM" source="COLOR_MODE"/>
+            </Attributes>"#;
+        let attrs = parse_ndattributes_xml(xml).unwrap();
+        assert_eq!(
+            attrs,
+            vec![
+                NdAttributeDataset {
+                    name: "temp".into(),
+                    dtype_numpy: "<f8".into(),
+                    source: "ca://SIM:TEMP".into(),
+                },
+                // `type` defaults to EPICS_PV
+                NdAttributeDataset {
+                    name: "ring".into(),
+                    dtype_numpy: "<f4".into(),
+                    source: "ca://SR:CURRENT".into(),
+                },
+                NdAttributeDataset {
+                    name: "id".into(),
+                    dtype_numpy: "<i8".into(),
+                    source: String::new(),
+                },
+                // PARAM `datatype` defaults to INT
+                NdAttributeDataset {
+                    name: "color".into(),
+                    dtype_numpy: "<i4".into(),
+                    source: String::new(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_ndattributes_xml_rejects_native_dbrtype_and_missing_name() {
+        // dbrtype defaults to DBR_NATIVE, which ophyd-async rejects.
+        let native = r#"<Attributes><Attribute name="t" source="SIM:T"/></Attributes>"#;
+        let err = parse_ndattributes_xml(native).unwrap_err().to_string();
+        assert!(err.contains("DBR_NATIVE"), "{err}");
+        let unnamed = r#"<Attributes><Attribute type="PARAM" source="X"/></Attributes>"#;
+        assert!(parse_ndattributes_xml(unnamed).is_err());
+        let no_source = r#"<Attributes><Attribute name="t" dbrtype="DBR_INT"/></Attributes>"#;
+        assert!(parse_ndattributes_xml(no_source).is_err());
+        assert!(parse_ndattributes_xml("not xml at all").is_err());
+    }
+
+    #[tokio::test]
+    async fn open_discovers_ndattributes_from_xml_sources() {
+        let io = FakeAdFileIo::new("/data/scans/scan.h5");
+        let xml = r#"<Attributes>
+            <Attribute name="temp" type="EPICS_PV" source="SIM:TEMP" dbrtype="DBR_DOUBLE"/>
+            <Attribute name="id" type="PARAM" source="UNIQUE_ID" datatype="INT64"/>
+        </Attributes>"#;
+        let w = writer_with(io.clone())
+            .with_ndattribute_sources(vec![Arc::new(FakeXmlSource(xml.into()))]);
+        let keys = w.open(1).await.unwrap();
+        // EPICS_PV attribute sources from its PV; PARAM falls back to the
+        // path-provider file URI (ophyd `resource.source or self.uri`).
+        assert_eq!(keys["temp"].source, "ca://SIM:TEMP");
+        assert_eq!(
+            keys["temp"].dtype_numpy,
+            Some(crate::event_model::DtypeNumpy::Scalar("<f8".to_string()))
+        );
+        assert_eq!(keys["id"].source, "file:///data/scans/scan.h5");
+        // Discovered attrs are emitted like declared ones.
+        io.set_captured(1);
+        let docs: Vec<StreamAsset> = w.collect_stream_docs(1, "d").collect().await;
+        let datasets: Vec<String> = docs
+            .iter()
+            .filter_map(|a| match a {
+                StreamAsset::Resource(r) => Some(
+                    r.parameters
+                        .get("dataset")
+                        .and_then(|v| v.as_str())
+                        .unwrap()
+                        .to_string(),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert!(datasets.contains(&"/entry/instrument/NDAttributes/temp".to_string()));
+        assert!(datasets.contains(&"/entry/instrument/NDAttributes/id".to_string()));
+        assert_eq!(
+            docs.iter()
+                .filter(|a| matches!(a, StreamAsset::Datum(_)))
+                .count(),
+            3,
+            "main + 2 discovered attribute datums"
+        );
+    }
+
+    #[tokio::test]
+    async fn declared_ndattributes_override_discovered_by_name() {
+        let io = FakeAdFileIo::new("/x.h5");
+        let xml = r#"<Attributes>
+            <Attribute name="temp" type="EPICS_PV" source="SIM:TEMP" dbrtype="DBR_DOUBLE"/>
+        </Attributes>"#;
+        let w = writer_with(io.clone())
+            .with_ndattribute_sources(vec![Arc::new(FakeXmlSource(xml.into()))])
+            .with_ndattributes(vec![
+                NdAttributeDataset::new("temp", "<i4"),
+                NdAttributeDataset::new("extra", "<f8"),
+            ]);
+        let keys = w.open(1).await.unwrap();
+        // Declared "temp" replaces the discovered one (dtype <i4, no source).
+        assert_eq!(
+            keys["temp"].dtype_numpy,
+            Some(crate::event_model::DtypeNumpy::Scalar("<i4".to_string()))
+        );
+        assert!(keys.contains_key("extra"));
+        // det_image + temp + extra, no duplicate for the collision.
+        assert_eq!(keys.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn filename_ndattributes_source_is_skipped() {
+        let io = FakeAdFileIo::new("/x.h5");
+        // ADCore treats content without "<Attributes>" as a filename on the
+        // IOC host; discovery cannot read it, so it contributes nothing.
+        let w = writer_with(io.clone()).with_ndattribute_sources(vec![Arc::new(FakeXmlSource(
+            "/epics/attributes.xml".into(),
+        ))]);
+        let keys = w.open(1).await.unwrap();
+        assert_eq!(keys.len(), 1, "main image only");
+        assert!(keys.contains_key("det_image"));
     }
 
     #[tokio::test]
