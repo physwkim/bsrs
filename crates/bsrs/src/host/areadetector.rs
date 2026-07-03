@@ -56,8 +56,13 @@ const WARMUP_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// `DetectorState_RBV` value for the idle state. mbbi ordering from
 /// `ADBase.template`: 0=Idle, 1=Acquire, 2=Readout, 3=Correct, 4=Saving,
-/// 5=Aborting, 6=Error.
+/// 5=Aborting, 6=Error, 7=Waiting, 8=Initializing, 9=Disconnected,
+/// 10=Aborted.
 pub const AD_STATE_IDLE: i64 = 0;
+
+/// `DetectorState_RBV` value for an aborted acquisition — a "good" terminal
+/// state alongside Idle (ophyd-async waits for `{IDLE, ABORTED}`).
+pub const AD_STATE_ABORTED: i64 = 10;
 
 /// `ImageMode` value for single-frame acquisition (mbbo ordering from
 /// `ADBase.template`: 0=Single, 1=Multiple, 2=Continuous).
@@ -116,6 +121,30 @@ where
     }
 }
 
+/// Poll a bool readback until it equals `want`, bounded by `timeout`. The
+/// wait half of ophyd-async's `set_and_wait_for_value(...,
+/// wait_for_set_completion=False)` / `stop_busy_record` for busy records,
+/// whose put-callback tracks the *operation*, not the value change.
+async fn wait_for_bool(
+    ch: &EpicsCaBackend<bool>,
+    want: bool,
+    timeout: Duration,
+    what: &str,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if SignalBackend::<bool>::get_value(ch).await? == want {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(BsrsError::Backend(format!(
+                "{what}: readback did not reach {want} within {timeout:?}"
+            )));
+        }
+        tokio::time::sleep(WARMUP_IDLE_POLL).await;
+    }
+}
+
 /// Cam-side handle: `ImageMode`/`NumImages`/`Acquire`/`AcquireTime`
 /// setters plus `ArrayCounter_RBV` / `DetectorState_RBV` readbacks.
 pub struct AreaDetectorCam {
@@ -126,8 +155,12 @@ pub struct AreaDetectorCam {
     /// `NumImages` (longout) — how many frames to acquire in
     /// `Multiple` mode.
     pub num_images: Arc<EpicsCaBackend<i64>>,
-    /// `Acquire` (bo) — true to start, false to stop.
+    /// `Acquire` (busy) — true to start, false to stop. A put-callback for
+    /// `1` completes when the whole acquisition ends, so arming watches
+    /// [`acquire_rbv`](Self::acquire_rbv) instead of the callback.
     pub acquire: Arc<EpicsCaBackend<bool>>,
+    /// `Acquire_RBV` (bi) — whether the driver is acquiring.
+    pub acquire_rbv: Arc<EpicsCaBackend<bool>>,
     /// `AcquireTime` (ao) — exposure time, seconds.
     pub acquire_time: Arc<EpicsCaBackend<f64>>,
     /// `ArrayCounter_RBV` (longin) — total frames produced.
@@ -256,6 +289,7 @@ impl AreaDetectorCam {
             image_mode: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "ImageMode"))),
             num_images: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "NumImages"))),
             acquire: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "Acquire"))),
+            acquire_rbv: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "Acquire_RBV"))),
             acquire_time: Arc::new(EpicsCaBackend::<f64>::new(join(&prefix, "AcquireTime"))),
             array_counter_rbv: Arc::new(EpicsCaBackend::<i64>::new(join(
                 &prefix,
@@ -276,10 +310,11 @@ impl AreaDetectorCam {
 
     /// Connect every channel in parallel.
     pub async fn connect(&self, timeout: Duration) -> Result<()> {
-        let (a, b, c, d, e, f, g, h) = tokio::join!(
+        let (a, b, c, d, e, f, g, h, i) = tokio::join!(
             SignalBackend::<i64>::connect(self.image_mode.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.num_images.as_ref(), timeout),
             SignalBackend::<bool>::connect(self.acquire.as_ref(), timeout),
+            SignalBackend::<bool>::connect(self.acquire_rbv.as_ref(), timeout),
             SignalBackend::<f64>::connect(self.acquire_time.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.array_counter_rbv.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.detector_state_rbv.as_ref(), timeout),
@@ -294,21 +329,23 @@ impl AreaDetectorCam {
         f?;
         g?;
         h?;
+        i?;
         Ok(())
     }
 
-    /// Poll `DetectorState_RBV` until it reports idle, or `timeout`
-    /// elapses.
+    /// Poll `DetectorState_RBV` until it reports a good terminal state —
+    /// Idle or Aborted (ophyd-async `wait_for_good_state({IDLE, ABORTED})`)
+    /// — or `timeout` elapses.
     pub async fn wait_for_idle(&self, timeout: Duration) -> Result<()> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             let state = SignalBackend::<i64>::get_value(self.detector_state_rbv.as_ref()).await?;
-            if state == AD_STATE_IDLE {
+            if state == AD_STATE_IDLE || state == AD_STATE_ABORTED {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
                 return Err(BsrsError::Backend(format!(
-                    "{}DetectorState_RBV did not reach Idle within {:?} (last={state})",
+                    "{}DetectorState_RBV did not reach Idle/Aborted within {:?} (last={state})",
                     self.prefix, timeout
                 )));
             }
@@ -509,8 +546,12 @@ pub struct NdFile {
     pub auto_increment: Arc<EpicsCaBackend<bool>>,
     /// `FileWriteMode` (mbbo: 0=Single, 1=Capture, 2=Stream).
     pub file_write_mode: Arc<EpicsCaBackend<i64>>,
-    /// `Capture` (bo) — start/stop capture in Capture/Stream mode.
+    /// `Capture` (busy) — start/stop capture in Capture/Stream mode. A
+    /// put-callback for `1` completes only when capture ENDS, so
+    /// start/stop watch [`capture_rbv`](Self::capture_rbv) instead.
     pub capture: Arc<EpicsCaBackend<bool>>,
+    /// `Capture_RBV` (bi) — whether the plugin is capturing.
+    pub capture_rbv: Arc<EpicsCaBackend<bool>>,
     /// `NumCapture` (longout) — number of frames to capture in
     /// Capture/Stream mode (`0` = capture until `Capture` is cleared).
     pub num_capture: Arc<EpicsCaBackend<i64>>,
@@ -556,6 +597,7 @@ impl NdFile {
             auto_increment: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "AutoIncrement"))),
             file_write_mode: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "FileWriteMode"))),
             capture: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "Capture"))),
+            capture_rbv: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "Capture_RBV"))),
             num_capture: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "NumCapture"))),
             num_captured_rbv: Arc::new(EpicsCaBackend::<i64>::new(join(
                 &prefix,
@@ -604,16 +646,18 @@ impl NdFile {
         h?;
         i?;
         j?;
-        let (k, l, m, n) = tokio::join!(
+        let (k, l, m, n, o) = tokio::join!(
             SignalBackend::<bool>::connect(self.flush_now.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.file_number.as_ref(), timeout),
             SignalBackend::<bool>::connect(self.file_path_exists_rbv.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.create_directory.as_ref(), timeout),
+            SignalBackend::<bool>::connect(self.capture_rbv.as_ref(), timeout),
         );
         k?;
         l?;
         m?;
         n?;
+        o?;
         Ok(())
     }
 
@@ -699,20 +743,32 @@ impl NdFile {
     }
 
     /// Start capture (`Capture=1`). In Stream mode the file opens on this
-    /// transition (or on the first frame when `LazyOpen` is set).
+    /// transition (or on the first frame when `LazyOpen` is set). `Capture`
+    /// is a busy record — its put-callback would complete only when capture
+    /// ENDS — so the put is fire-and-forget and completion is
+    /// `Capture_RBV=1` (ophyd-async `set_and_wait_for_value(capture, True,
+    /// wait_for_set_completion=False)`).
     pub async fn start_capture(&self) -> Result<()> {
-        await_put(
-            SignalBackend::<bool>::put(self.capture.as_ref(), Some(true)),
-            "NdFile::start_capture",
+        self.capture.put_nowait(true).await?;
+        wait_for_bool(
+            self.capture_rbv.as_ref(),
+            true,
+            PUT_TIMEOUT,
+            "NdFile::start_capture: Capture_RBV",
         )
         .await
     }
 
-    /// Stop capture (`Capture=0`) — flushes and closes the file.
+    /// Stop capture (`Capture=0`) — flushes and closes the file. Same busy
+    /// record: fire-and-forget the put, wait for `Capture_RBV=0`
+    /// (ophyd-async `stop_busy_record`).
     pub async fn stop_capture(&self) -> Result<()> {
-        await_put(
-            SignalBackend::<bool>::put(self.capture.as_ref(), Some(false)),
-            "NdFile::stop_capture",
+        self.capture.put_nowait(false).await?;
+        wait_for_bool(
+            self.capture_rbv.as_ref(),
+            false,
+            PUT_TIMEOUT,
+            "NdFile::stop_capture: Capture_RBV",
         )
         .await
     }
@@ -1913,23 +1969,34 @@ impl DetectorControl for AreaDetectorCam {
         Ok(())
     }
     async fn arm(&self) -> Status {
-        // Start acquisition in the background and resolve the Status when the
-        // Acquire put-callback fires (acquisition complete). Returning promptly
-        // lets a fly scan's complete() watch the write index concurrently.
+        // Acquire is a busy record: its put-callback completes when the whole
+        // acquisition ends, so it becomes the returned Status — deliberately
+        // unbounded, an N-frame acquisition takes as long as it takes. Before
+        // returning, wait until Acquire_RBV confirms the driver is actually
+        // acquiring (ophyd-async `set_and_wait_for_value(acquire, True,
+        // wait_for_set_completion=False)`), so a fly scan's kickoff doesn't
+        // complete with the detector still idle.
         let (status, setter) = Status::new();
         let acquire = self.acquire.clone();
         let prefix = self.prefix.clone();
         tokio::spawn(async move {
-            match await_put(
-                SignalBackend::<bool>::put(acquire.as_ref(), Some(true)),
-                "arm: Acquire",
-            )
-            .await
-            {
+            match SignalBackend::<bool>::put(acquire.as_ref(), Some(true)).await {
                 Ok(()) => setter.success(),
-                Err(e) => setter.fail(StatusError::Failed(format!("{prefix}arm: {e}"))),
+                Err(e) => setter.fail(StatusError::Failed(format!("{prefix}arm: Acquire: {e}"))),
             }
         });
+        if let Err(e) = wait_for_bool(
+            self.acquire_rbv.as_ref(),
+            true,
+            PUT_TIMEOUT,
+            "arm: Acquire_RBV",
+        )
+        .await
+        {
+            let (failed, setter) = Status::new();
+            setter.fail(StatusError::Failed(format!("{}{e}", self.prefix)));
+            return failed;
+        }
         status
     }
     async fn wait_for_idle(&self) -> Result<()> {
@@ -1937,9 +2004,14 @@ impl DetectorControl for AreaDetectorCam {
         self.wait_for_idle(WARMUP_IDLE_TIMEOUT).await
     }
     async fn disarm(&self) -> Result<()> {
-        await_put(
-            SignalBackend::<bool>::put(self.acquire.as_ref(), Some(false)),
-            "disarm: Acquire=0",
+        // stop_busy_record: a put-callback for Acquire=0 can deadlock on a
+        // busy record, so fire-and-forget then wait for the readback.
+        self.acquire.put_nowait(false).await?;
+        wait_for_bool(
+            self.acquire_rbv.as_ref(),
+            false,
+            PUT_TIMEOUT,
+            "disarm: Acquire_RBV",
         )
         .await
     }
