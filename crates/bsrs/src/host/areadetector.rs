@@ -402,6 +402,10 @@ pub struct NdFile {
     /// `DataType_RBV` (mbbi) — the NDArray element type (`NDDataType_t`
     /// ordering), mapped to a numpy dtype string for the `DataKey`.
     pub data_type_rbv: Arc<EpicsCaBackend<i64>>,
+    /// `FlushNow` (bo) — force the plugin to flush buffered frames to the
+    /// file. Meaningful in SWMR streaming; the write index only reflects
+    /// flushed frames, so we flush before reading `NumCaptured_RBV`.
+    pub flush_now: Arc<EpicsCaBackend<bool>>,
 }
 
 impl NdFile {
@@ -438,6 +442,7 @@ impl NdFile {
                 Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "ArraySize2_RBV"))),
             ],
             data_type_rbv: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "DataType_RBV"))),
+            flush_now: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "FlushNow"))),
             plugin,
         }
     }
@@ -469,16 +474,18 @@ impl NdFile {
         j?;
         // Frame-info readbacks (shape + dtype), connected in a second batch to
         // keep the tuple manageable.
-        let (k, l, m, n) = tokio::join!(
+        let (k, l, m, n, o) = tokio::join!(
             SignalBackend::<i64>::connect(self.array_size_rbv[0].as_ref(), timeout),
             SignalBackend::<i64>::connect(self.array_size_rbv[1].as_ref(), timeout),
             SignalBackend::<i64>::connect(self.array_size_rbv[2].as_ref(), timeout),
             SignalBackend::<i64>::connect(self.data_type_rbv.as_ref(), timeout),
+            SignalBackend::<bool>::connect(self.flush_now.as_ref(), timeout),
         );
         k?;
         l?;
         m?;
         n?;
+        o?;
         Ok(())
     }
 
@@ -584,6 +591,16 @@ impl NdFile {
             ))
         })?;
         Ok((shape, dtype_numpy.to_string()))
+    }
+
+    /// Force a flush (`FlushNow=1`) so `NumCaptured_RBV` reflects frames
+    /// actually written to the file. A no-op on plugins without SWMR support.
+    pub async fn flush(&self) -> Result<()> {
+        await_put(
+            SignalBackend::<bool>::put(self.flush_now.as_ref(), Some(true)),
+            "NdFile::flush",
+        )
+        .await
     }
 }
 
@@ -898,6 +915,8 @@ pub trait AdFileIo: Send + Sync {
     /// Incoming frame shape (fastest-varying first, zero dims dropped) and
     /// numpy dtype string, for the emitted `DataKey`.
     async fn frame_info(&self) -> Result<(Vec<u64>, String)>;
+    /// Force a flush so `num_captured` reflects frames written to the file.
+    async fn flush(&self) -> Result<()>;
     /// Watch the frames-written counter, for `complete()` in fly scans.
     fn observe_num_captured(&self) -> watch::Receiver<u64>;
 }
@@ -967,6 +986,9 @@ impl AdFileIo for NdFileIo {
     }
     async fn frame_info(&self) -> Result<(Vec<u64>, String)> {
         self.file.frame_info().await
+    }
+    async fn flush(&self) -> Result<()> {
+        self.file.flush().await
     }
     fn observe_num_captured(&self) -> watch::Receiver<u64> {
         self.index_rx.clone()
@@ -1067,6 +1089,11 @@ impl DetectorWriter for AdHdfWriter {
         self.io.observe_num_captured()
     }
     async fn indices_written(&self) -> u64 {
+        // Flush first so the count reflects frames actually on disk (SWMR),
+        // mirroring ophyd-async setting flush_signal before reading the count.
+        // Best-effort: a plugin without SWMR flush support just yields the
+        // unflushed count.
+        let _ = self.io.flush().await;
         self.io.num_captured().await.unwrap_or(0)
     }
     fn collect_stream_docs(&self, up_to: u64, descriptor: &str) -> BoxStream<'_, StreamAsset> {
@@ -1495,6 +1522,7 @@ mod ad_hdf_tests {
         index_rx: watch::Receiver<u64>,
         configured: std::sync::Mutex<Option<(String, String, String, i64)>>,
         capturing: AtomicBool,
+        flushes: AtomicU64,
     }
 
     impl FakeAdFileIo {
@@ -1507,6 +1535,7 @@ mod ad_hdf_tests {
                 index_rx: rx,
                 configured: std::sync::Mutex::new(None),
                 capturing: AtomicBool::new(false),
+                flushes: AtomicU64::new(0),
             })
         }
         fn set_captured(&self, n: u64) {
@@ -1540,6 +1569,10 @@ mod ad_hdf_tests {
         }
         async fn frame_info(&self) -> Result<(Vec<u64>, String)> {
             Ok((vec![20, 10], "<u2".to_string()))
+        }
+        async fn flush(&self) -> Result<()> {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
         fn observe_num_captured(&self) -> watch::Receiver<u64> {
             self.index_rx.clone()
@@ -1652,6 +1685,22 @@ mod ad_hdf_tests {
             StreamAsset::Resource(r) => assert_eq!(r.uri, "", "no readback → empty URI"),
             _ => panic!("first doc must be StreamResource"),
         }
+    }
+
+    #[tokio::test]
+    async fn indices_written_flushes_before_reading_count() {
+        // Parity with ophyd-async make_stream_docs: flush before reading the
+        // frame count so it reflects frames actually on disk (SWMR).
+        let io = FakeAdFileIo::new("/x.h5");
+        let w = writer_with(io.clone());
+        io.set_captured(4);
+        let n = w.indices_written().await;
+        assert_eq!(n, 4);
+        assert_eq!(
+            io.flushes.load(Ordering::SeqCst),
+            1,
+            "indices_written must flush exactly once before reading the count"
+        );
     }
 
     #[tokio::test]
