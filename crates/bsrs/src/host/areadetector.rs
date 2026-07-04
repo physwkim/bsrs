@@ -2296,6 +2296,53 @@ impl DetectorWriter for AdMultipartWriter {
     }
 }
 
+/// The record values `prepare` derives from a [`TriggerInfo`], split out
+/// from the CA I/O so the exposure policy (ophyd-async `prepare_exposures`,
+/// `_trigger_logic.py`) is unit-testable without an IOC. `acquire_time` /
+/// `acquire_period` are `None` when the trigger info does not pin them, in
+/// which case `prepare` leaves the corresponding record untouched.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ExposurePlan {
+    image_mode: i64,
+    num_images: i64,
+    acquire_time: Option<f64>,
+    acquire_period: Option<f64>,
+}
+
+impl ExposurePlan {
+    fn from_trigger_info(info: &TriggerInfo) -> Result<Self> {
+        if info.trigger != DetectorTrigger::Internal {
+            return Err(BsrsError::Backend(format!(
+                "AreaDetectorCam supports only DetectorTrigger::Internal, got {:?}",
+                info.trigger
+            )));
+        }
+        // number_of_events == 0 means "acquire until told to stop"
+        // (ophyd-async ADImageMode.CONTINUOUS when num == 0); NumImages is set
+        // either way — the driver ignores it in Continuous mode.
+        let num = info.number_of_exposures();
+        let image_mode = if num == 0 {
+            AD_IMAGE_MODE_CONTINUOUS
+        } else {
+            AD_IMAGE_MODE_MULTIPLE
+        };
+        let acquire_time = info.livetime.map(|lt| lt.as_secs_f64());
+        // AcquirePeriod = exposure + dead time, set only when both are known
+        // (ophyd-async's `if livetime and deadtime`). A bare deadtime with no
+        // livetime leaves the period record as-is, matching ophyd-async.
+        let acquire_period = match (info.livetime, info.deadtime) {
+            (Some(lt), Some(dt)) => Some((lt + dt).as_secs_f64()),
+            _ => None,
+        };
+        Ok(Self {
+            image_mode,
+            num_images: num as i64,
+            acquire_time,
+            acquire_period,
+        })
+    }
+}
+
 #[async_trait::async_trait]
 impl DetectorControl for AreaDetectorCam {
     fn deadtime(&self, _exposure: Option<Duration>) -> Duration {
@@ -2304,52 +2351,34 @@ impl DetectorControl for AreaDetectorCam {
         Duration::ZERO
     }
     async fn prepare(&self, info: TriggerInfo) -> Result<()> {
-        if info.trigger != DetectorTrigger::Internal {
-            return Err(BsrsError::Backend(format!(
-                "AreaDetectorCam supports only DetectorTrigger::Internal, got {:?}",
-                info.trigger
-            )));
-        }
-        // number_of_events == 0 means "acquire until told to stop"
-        // (ophyd-async ADImageMode.CONTINUOUS when num == 0,
-        // _trigger_logic.py `prepare_exposures`); NumImages is set either
-        // way — the driver ignores it in Continuous mode.
-        let image_mode = if info.number_of_exposures() == 0 {
-            AD_IMAGE_MODE_CONTINUOUS
-        } else {
-            AD_IMAGE_MODE_MULTIPLE
-        };
+        // All exposure policy lives in ExposurePlan (pure, IOC-free
+        // testable); prepare only issues the derived CA puts. A field left
+        // `None` in the plan means "leave the record as-is" and its put is
+        // skipped, mirroring ophyd-async's conditional sets.
+        let plan = ExposurePlan::from_trigger_info(&info)?;
         await_put(
-            SignalBackend::<i64>::put(self.image_mode.as_ref(), Some(image_mode)),
+            SignalBackend::<i64>::put(self.image_mode.as_ref(), Some(plan.image_mode)),
             "prepare: ImageMode",
         )
         .await?;
         await_put(
-            SignalBackend::<i64>::put(
-                self.num_images.as_ref(),
-                Some(info.number_of_exposures() as i64),
-            ),
+            SignalBackend::<i64>::put(self.num_images.as_ref(), Some(plan.num_images)),
             "prepare: NumImages",
         )
         .await?;
-        if let Some(lt) = info.livetime {
+        if let Some(t) = plan.acquire_time {
             await_put(
-                SignalBackend::<f64>::put(self.acquire_time.as_ref(), Some(lt.as_secs_f64())),
+                SignalBackend::<f64>::put(self.acquire_time.as_ref(), Some(t)),
                 "prepare: AcquireTime",
             )
             .await?;
-            // AcquirePeriod = exposure + dead time, only when both are known
-            // (ophyd-async sets it only under `if livetime and deadtime`).
-            if let Some(dt) = info.deadtime {
-                await_put(
-                    SignalBackend::<f64>::put(
-                        self.acquire_period.as_ref(),
-                        Some((lt + dt).as_secs_f64()),
-                    ),
-                    "prepare: AcquirePeriod",
-                )
-                .await?;
-            }
+        }
+        if let Some(p) = plan.acquire_period {
+            await_put(
+                SignalBackend::<f64>::put(self.acquire_period.as_ref(), Some(p)),
+                "prepare: AcquirePeriod",
+            )
+            .await?;
         }
         Ok(())
     }
@@ -2579,6 +2608,90 @@ mod tests {
         assert_eq!(AD_IMAGE_MODE_SINGLE, 0);
         assert_eq!(AD_IMAGE_MODE_MULTIPLE, 1);
         assert_eq!(AD_IMAGE_MODE_CONTINUOUS, 2);
+    }
+
+    // ExposurePlan boundary tests — the IOC-free half of prepare().
+    // TriggerInfo::number_of_exposures() = number_of_events *
+    // collections_per_event * exposures_per_collection.
+
+    /// A bounded burst (number_of_events > 0) arms MULTIPLE; NumImages counts
+    /// every exposure across collections/averaging.
+    #[test]
+    fn exposure_plan_bounded_burst_is_multiple() {
+        let info = TriggerInfo {
+            number_of_events: 3,
+            collections_per_event: 2,
+            exposures_per_collection: 4,
+            ..Default::default()
+        };
+        let plan = ExposurePlan::from_trigger_info(&info).unwrap();
+        assert_eq!(plan.image_mode, AD_IMAGE_MODE_MULTIPLE);
+        assert_eq!(plan.num_images, 24);
+    }
+
+    /// number_of_events == 0 ("acquire until stopped") arms CONTINUOUS;
+    /// NumImages is 0 but the driver ignores it in that mode.
+    #[test]
+    fn exposure_plan_zero_events_is_continuous() {
+        let info = TriggerInfo {
+            number_of_events: 0,
+            ..Default::default()
+        };
+        let plan = ExposurePlan::from_trigger_info(&info).unwrap();
+        assert_eq!(plan.image_mode, AD_IMAGE_MODE_CONTINUOUS);
+        assert_eq!(plan.num_images, 0);
+    }
+
+    /// No livetime → neither AcquireTime nor AcquirePeriod is pinned (both
+    /// records left as-is).
+    #[test]
+    fn exposure_plan_no_livetime_pins_no_times() {
+        let info = TriggerInfo {
+            livetime: None,
+            deadtime: Some(Duration::from_millis(1)),
+            ..Default::default()
+        };
+        let plan = ExposurePlan::from_trigger_info(&info).unwrap();
+        assert_eq!(plan.acquire_time, None);
+        assert_eq!(plan.acquire_period, None);
+    }
+
+    /// Livetime alone pins AcquireTime; AcquirePeriod needs deadtime too.
+    #[test]
+    fn exposure_plan_livetime_only_pins_time_not_period() {
+        let info = TriggerInfo {
+            livetime: Some(Duration::from_millis(100)),
+            deadtime: None,
+            ..Default::default()
+        };
+        let plan = ExposurePlan::from_trigger_info(&info).unwrap();
+        assert_eq!(plan.acquire_time, Some(0.1));
+        assert_eq!(plan.acquire_period, None);
+    }
+
+    /// Livetime + deadtime pins AcquirePeriod = livetime + deadtime.
+    #[test]
+    fn exposure_plan_livetime_and_deadtime_pins_period() {
+        let info = TriggerInfo {
+            livetime: Some(Duration::from_millis(100)),
+            deadtime: Some(Duration::from_millis(5)),
+            ..Default::default()
+        };
+        let plan = ExposurePlan::from_trigger_info(&info).unwrap();
+        assert_eq!(plan.acquire_time, Some(0.1));
+        assert_eq!(plan.acquire_period, Some(0.105));
+    }
+
+    /// AreaDetectorCam is internal-trigger only; any external trigger is
+    /// rejected before any put is derived.
+    #[test]
+    fn exposure_plan_rejects_external_trigger() {
+        let info = TriggerInfo {
+            trigger: DetectorTrigger::ExternalEdge,
+            ..Default::default()
+        };
+        let err = ExposurePlan::from_trigger_info(&info).unwrap_err();
+        assert!(err.to_string().contains("Internal"), "got: {err}");
     }
 
     // -------------------------------------------------------------
