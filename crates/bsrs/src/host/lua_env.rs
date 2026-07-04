@@ -2611,16 +2611,29 @@ fn register_bp(lua: &Lua) -> mlua::Result<()> {
     // axis is {motor=, start=, stop=, num=}.
     bp.set(
         "grid_scan",
-        lua.create_function(|_, (dt, axes_t): (mlua::Table, mlua::Table)| {
-            let dets = dets_table_to_readables(&dt)?;
-            let (a1, a2) = pair_grid_axes(&axes_t)?;
-            Ok(wrap_prebuilt(
-                "grid_scan",
-                crate::plans::grid_scan(
-                    dets, a1.0, a1.1, a1.2, a1.3, a1.4, a2.0, a2.1, a2.2, a2.3, a2.4,
-                ),
-            ))
-        })?,
+        lua.create_function(
+            |_, (dt, axes_t, snake): (mlua::Table, mlua::Table, Option<bool>)| {
+                let dets = dets_table_to_readables(&dt)?;
+                let (a1, a2) = pair_grid_axes(&axes_t)?;
+                Ok(wrap_prebuilt(
+                    "grid_scan",
+                    crate::plans::grid_scan_snake(
+                        dets,
+                        a1.0,
+                        a1.1,
+                        a1.2,
+                        a1.3,
+                        a1.4,
+                        a2.0,
+                        a2.1,
+                        a2.2,
+                        a2.3,
+                        a2.4,
+                        snake.unwrap_or(false),
+                    ),
+                ))
+            },
+        )?,
     )?;
     bp.set(
         "rel_grid_scan",
@@ -2637,14 +2650,17 @@ fn register_bp(lua: &Lua) -> mlua::Result<()> {
     )?;
     bp.set(
         "list_grid_scan",
-        lua.create_function(|_, (dt, axes_t): (mlua::Table, mlua::Table)| {
-            let dets = dets_table_to_readables(&dt)?;
-            let axes = axes_table_to_list_grid_axes(&axes_t)?;
-            Ok(wrap_prebuilt(
-                "list_grid_scan",
-                crate::plans::list_grid_scan(dets, axes),
-            ))
-        })?,
+        lua.create_function(
+            |_, (dt, axes_t, snake): (mlua::Table, mlua::Table, mlua::Value)| {
+                let dets = dets_table_to_readables(&dt)?;
+                let axes = axes_table_to_list_grid_axes(&axes_t)?;
+                let snake_axes = parse_snake_axes(snake)?;
+                Ok(wrap_prebuilt(
+                    "list_grid_scan",
+                    crate::plans::list_grid_scan_snake(dets, axes, snake_axes),
+                ))
+            },
+        )?,
     )?;
     bp.set(
         "inner_product_scan",
@@ -2874,6 +2890,39 @@ fn axes_table_to_list_grid_axes(t: &mlua::Table) -> mlua::Result<Vec<crate::plan
         out.push((mv, rd, vec_f64(&pts_t)?));
     }
     Ok(out)
+}
+
+/// Parse a Lua `snake_axes` argument into [`crate::plans::SnakeAxes`]:
+/// `nil` / `false` → `None`, `true` → `All` (snake every axis but the
+/// slowest), a table of 1-based axis positions → `Axes` (converted to the
+/// 0-based indices the plan layer uses). Mirrors bluesky's `bool | list`
+/// `snake_axes` argument.
+fn parse_snake_axes(v: mlua::Value) -> mlua::Result<crate::plans::SnakeAxes> {
+    match v {
+        mlua::Value::Nil => Ok(crate::plans::SnakeAxes::None),
+        mlua::Value::Boolean(b) => Ok(if b {
+            crate::plans::SnakeAxes::All
+        } else {
+            crate::plans::SnakeAxes::None
+        }),
+        mlua::Value::Table(t) => {
+            let mut idxs = Vec::new();
+            for pos in t.sequence_values::<i64>() {
+                let pos = pos?;
+                if pos < 1 {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "snake_axes entries are 1-based axis positions, got {pos}"
+                    )));
+                }
+                idxs.push((pos - 1) as usize);
+            }
+            Ok(crate::plans::SnakeAxes::Axes(idxs))
+        }
+        other => Err(mlua::Error::RuntimeError(format!(
+            "snake_axes must be nil, a boolean, or a table of axis positions, got {}",
+            other.type_name()
+        ))),
+    }
 }
 
 type InnerProductAxis = (Arc<dyn MovableObj>, Arc<dyn ReadableObj>, f64, f64);

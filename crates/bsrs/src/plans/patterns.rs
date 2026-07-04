@@ -30,32 +30,72 @@ pub fn inner_product(num: usize, axes: &[(f64, f64)]) -> Vec<Vec<f64>> {
     out
 }
 
+/// Per-axis suffix products: `num_repeats[i] = prod(lengths[i+1..])`, the
+/// number of consecutive rows an axis holds one value before advancing. Mirrors
+/// `num_repeats` in bluesky's `snake_cyclers` (utils/__init__.py:688).
+fn suffix_repeats(lengths: &[usize]) -> Vec<usize> {
+    let mut num_repeats = vec![1usize; lengths.len()];
+    for i in (0..lengths.len()).rev() {
+        num_repeats[i] = if i + 1 < lengths.len() {
+            num_repeats[i + 1] * lengths[i + 1]
+        } else {
+            1
+        };
+    }
+    num_repeats
+}
+
+/// Map row `k` to axis `i`'s position index within `0..lengths[i]`, applying
+/// snake (boustrophedon) folding when `snaked`. Without snake the index is the
+/// plain mixed-radix digit `(k / num_repeats) % L`. With snake the period
+/// doubles to `2L` and the second half counts back down (`2L-1-m`), so every
+/// other pass of the axis runs in reverse — the exact effect of
+/// `np.concatenate([v, v[::-1]])` in bluesky's `snake_cyclers`.
+fn axis_index(k: usize, num_repeats: usize, l: usize, snaked: bool) -> usize {
+    let snaked = snaked && l > 1;
+    let period = if snaked { 2 * l } else { l };
+    let m = (k / num_repeats) % period;
+    if !snaked || m < l {
+        m
+    } else {
+        2 * l - 1 - m
+    }
+}
+
 /// `outer_product([(start1, stop1, num1), ...])` — N-D rectilinear grid.
-/// Slowest axis varies first. Returns `prod(num_i)` rows.
-///
-/// Per-axis `snake` in this Rust port is **not** implemented; the order
-/// is always natural (no zig-zag). bluesky callers that rely on snake
-/// must do their own reordering.
+/// Slowest axis varies first. Returns `prod(num_i)` rows, in natural
+/// (non-snaked) order. The one-argument form of [`outer_product_snake`].
 pub fn outer_product(axes: &[(f64, f64, usize)]) -> Vec<Vec<f64>> {
+    outer_product_snake(axes, &[])
+}
+
+/// `outer_product_snake(axes, snaking)` — N-D rectilinear grid with per-axis
+/// snake (boustrophedon) traversal. `snaking[i] == true` reverses axis `i` on
+/// alternating passes to minimise dead travel; a missing / `false` entry keeps
+/// the axis's natural left-to-right order. Ports bluesky's
+/// `outer_product` + `snake_cyclers` (plan_patterns.py, utils/__init__.py:656).
+/// Snaking the slowest axis (index 0) has no effect — it is traversed once.
+pub fn outer_product_snake(axes: &[(f64, f64, usize)], snaking: &[bool]) -> Vec<Vec<f64>> {
     if axes.is_empty() || axes.iter().any(|(_, _, n)| *n == 0) {
         return Vec::new();
     }
-    let total: usize = axes.iter().map(|(_, _, n)| *n).product();
+    let lengths: Vec<usize> = axes.iter().map(|(_, _, n)| *n).collect();
+    let total: usize = lengths.iter().product();
+    let num_repeats = suffix_repeats(&lengths);
     let mut out = Vec::with_capacity(total);
     for k in 0..total {
         let mut row = Vec::with_capacity(axes.len());
-        let mut idx = k;
-        for (s, e, n) in axes.iter().rev() {
-            let i = idx % n;
-            idx /= n;
-            let t = if *n > 1 {
-                i as f64 / (*n as f64 - 1.0)
+        for i in 0..axes.len() {
+            let (s, e, n) = axes[i];
+            let snaked = snaking.get(i).copied().unwrap_or(false);
+            let vi = axis_index(k, num_repeats[i], n, snaked);
+            let t = if n > 1 {
+                vi as f64 / (n as f64 - 1.0)
             } else {
                 0.0
             };
             row.push(s + (e - s) * t);
         }
-        row.reverse();
         out.push(row);
     }
     out
@@ -73,22 +113,32 @@ pub fn inner_list_product(axes: &[Vec<f64>]) -> Vec<Vec<f64>> {
         .collect()
 }
 
-/// Outer-list product — N-D grid from per-axis lists.
+/// Outer-list product — N-D grid from per-axis lists, in natural (non-snaked)
+/// order. The one-argument form of [`outer_list_product_snake`].
 pub fn outer_list_product(axes: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    outer_list_product_snake(axes, &[])
+}
+
+/// `outer_list_product_snake(axes, snaking)` — N-D grid from per-axis position
+/// lists with per-axis snake traversal, the list analog of
+/// [`outer_product_snake`] (bluesky `outer_list_product` +`snake_cyclers`).
+/// `snaking[i]` reverses axis `i` on alternating passes.
+pub fn outer_list_product_snake(axes: &[Vec<f64>], snaking: &[bool]) -> Vec<Vec<f64>> {
     if axes.is_empty() || axes.iter().any(|v| v.is_empty()) {
         return Vec::new();
     }
-    let mut out = vec![Vec::with_capacity(axes.len())];
-    for axis in axes {
-        let mut next = Vec::with_capacity(out.len() * axis.len());
-        for prefix in &out {
-            for v in axis {
-                let mut row = prefix.clone();
-                row.push(*v);
-                next.push(row);
-            }
+    let lengths: Vec<usize> = axes.iter().map(|v| v.len()).collect();
+    let total: usize = lengths.iter().product();
+    let num_repeats = suffix_repeats(&lengths);
+    let mut out = Vec::with_capacity(total);
+    for k in 0..total {
+        let mut row = Vec::with_capacity(axes.len());
+        for i in 0..axes.len() {
+            let snaked = snaking.get(i).copied().unwrap_or(false);
+            let vi = axis_index(k, num_repeats[i], lengths[i], snaked);
+            row.push(axes[i][vi]);
         }
-        out = next;
+        out.push(row);
     }
     out
 }
@@ -276,6 +326,93 @@ mod tests {
     fn outer_list_product_size() {
         let v = outer_list_product(&[vec![1.0, 2.0], vec![10.0, 20.0, 30.0]]);
         assert_eq!(v.len(), 6);
+    }
+
+    #[test]
+    fn snake_reverses_fast_axis_on_odd_rows() {
+        // 3x3 grid, values equal to indices. Fast axis (index 1) snaked:
+        // row 0 forward, row 1 reversed, row 2 forward.
+        let v = outer_product_snake(&[(0.0, 2.0, 3), (0.0, 2.0, 3)], &[false, true]);
+        assert_eq!(
+            v,
+            vec![
+                vec![0.0, 0.0],
+                vec![0.0, 1.0],
+                vec![0.0, 2.0],
+                vec![1.0, 2.0],
+                vec![1.0, 1.0],
+                vec![1.0, 0.0],
+                vec![2.0, 0.0],
+                vec![2.0, 1.0],
+                vec![2.0, 2.0],
+            ]
+        );
+    }
+
+    #[test]
+    fn snake_empty_flags_equals_plain_product() {
+        // Delegation invariant: outer_product == outer_product_snake(.., &[]).
+        let axes = [(0.0, 1.0, 3), (10.0, 11.0, 2), (0.0, 4.0, 2)];
+        assert_eq!(outer_product(&axes), outer_product_snake(&axes, &[]));
+    }
+
+    #[test]
+    fn snake_on_slowest_axis_is_a_noop() {
+        // The slowest axis is traversed once, so snaking it changes nothing.
+        let axes = [(0.0, 1.0, 3), (10.0, 11.0, 2)];
+        assert_eq!(
+            outer_product_snake(&axes, &[true, false]),
+            outer_product(&axes)
+        );
+    }
+
+    #[test]
+    fn snake_list_product_reverses_fast_axis() {
+        let v = outer_list_product_snake(&[vec![1.0, 2.0], vec![10.0, 20.0, 30.0]], &[false, true]);
+        assert_eq!(
+            v,
+            vec![
+                vec![1.0, 10.0],
+                vec![1.0, 20.0],
+                vec![1.0, 30.0],
+                vec![2.0, 30.0],
+                vec![2.0, 20.0],
+                vec![2.0, 10.0],
+            ]
+        );
+    }
+
+    #[test]
+    fn snake_3d_is_a_continuous_walk() {
+        // 2x2x2 cube, snake the two faster axes (bluesky snake_axes=True). The
+        // resulting path must visit every cell exactly once and change exactly
+        // one coordinate by one step between consecutive points (no fly-back).
+        let v = outer_product_snake(
+            &[(0.0, 1.0, 2), (0.0, 1.0, 2), (0.0, 1.0, 2)],
+            &[false, true, true],
+        );
+        assert_eq!(
+            v,
+            vec![
+                vec![0.0, 0.0, 0.0],
+                vec![0.0, 0.0, 1.0],
+                vec![0.0, 1.0, 1.0],
+                vec![0.0, 1.0, 0.0],
+                vec![1.0, 1.0, 0.0],
+                vec![1.0, 1.0, 1.0],
+                vec![1.0, 0.0, 1.0],
+                vec![1.0, 0.0, 0.0],
+            ]
+        );
+        // Independent check: adjacent points differ in exactly one axis by 1.0.
+        for w in v.windows(2) {
+            let diffs: usize = w[0]
+                .iter()
+                .zip(&w[1])
+                .filter(|(a, b)| (*a - *b).abs() > 1e-9)
+                .count();
+            assert_eq!(diffs, 1, "snake walk must move one axis at a time");
+        }
     }
 
     #[test]

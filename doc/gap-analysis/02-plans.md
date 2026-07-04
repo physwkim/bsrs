@@ -21,8 +21,9 @@ The primary gaps are:
 - **`scan` is 1D only**; bluesky's is N-D (P0, PLAN-03).
 - **`mv`/`mvr` are single-motor only**; bluesky accepts parallel multi-motor pairs (P1,
   PLAN-10).
-- **Snake traversal absent** from all N-D grid scans and pattern generators (P1,
-  PLAN-19).
+- ~~**Snake traversal absent** from all N-D grid scans and pattern generators (P1,
+  PLAN-19).~~ **DONE** — `outer_product_snake` / `list_grid_scan_snake` /
+  `grid_scan_snake` + `SnakeAxes`.
 - **No `md` parameter** on any plan — downstream tools cannot identify scan types or
   motors (P1, PLAN-25).
 - `plan_mutator` lacks the (head, tail) insertion pair that bluesky uses in
@@ -285,7 +286,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-19 — Snake (boustrophedon) traversal absent from all N-D scans and patterns
+### PLAN-19 — Snake (boustrophedon) traversal absent from all N-D scans and patterns — **DONE**
 
 - **bsrs:** `patterns.rs:39–94` (`outer_product`, `outer_list_product` — no snake);
   `lib.rs:484–644` (`grid_scan`, `list_grid_scan` — no snake)
@@ -299,6 +300,21 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
   snaked rows, reverse every other fast-axis pass.  Propagate `snake_axes: bool |
   Vec<usize>` to `grid_scan` and `list_grid_scan`.
 - **Effort:** M
+- **Resolution:** Ported bluesky's `snake_cyclers` index math directly.
+  `patterns.rs` gains `outer_product_snake(axes, snaking: &[bool])` and
+  `outer_list_product_snake(axes, snaking)`; the original one-arg functions
+  delegate with an empty (all-natural) flag slice, so existing callers are
+  unchanged.  Axis `i`'s value index becomes `(k / num_repeats[i]) % period`
+  with `period = 2L` (fold back down on the second half) when snaked — the
+  exact effect of `np.concatenate([v, v[::-1]])`.  `grid_scan_snake(…, snake:
+  bool)` reverses the fast axis on odd slow-axis rows; `list_grid_scan_snake(…,
+  snake_axes: SnakeAxes)` resolves the bluesky `bool | list` spec via
+  `SnakeAxes::{None, All, Axes(Vec<usize>)}`.  Lua `bp.grid_scan` /
+  `bp.list_grid_scan` accept an optional trailing snake arg (backward
+  compatible).  Tests: per-axis snake on 2-D and a 3-D continuous-walk
+  invariant (one axis changes per step), delegation equivalence, slowest-axis
+  no-op, `SnakeAxes::to_flags` boundaries, a `grid_scan_snake` position-order
+  integration test, and Lua smoke coverage.
 
 ---
 

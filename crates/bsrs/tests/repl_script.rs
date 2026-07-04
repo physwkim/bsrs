@@ -345,6 +345,19 @@ assert(string.find(
   RE:run(bp.grid_scan({d1},
     {{motor=m1, start=0, stop=0.2, num=2}, {motor=m2, start=0, stop=0.3, num=2}})),
   "exit_status=success"))
+-- PLAN-19: snake (boustrophedon) traversal via the optional trailing arg.
+assert(string.find(
+  RE:run(bp.grid_scan({d1},
+    {{motor=m1, start=0, stop=0.2, num=2}, {motor=m2, start=0, stop=0.3, num=3}}, true)),
+  "exit_status=success"))
+assert(string.find(
+  RE:run(bp.list_grid_scan({d1},
+    {{motor=m1, points={0, 0.1}}, {motor=m2, points={0, 0.1, 0.2}}}, true)),
+  "exit_status=success"))
+assert(string.find(
+  RE:run(bp.list_grid_scan({d1},
+    {{motor=m1, points={0, 0.1}}, {motor=m2, points={0, 0.1, 0.2}}}, {2})),
+  "exit_status=success"))
 assert(string.find(
   RE:run(bp.inner_product_scan({d1}, 3,
     {{motor=m1, start=0, stop=1}, {motor=m2, start=0, stop=2}})),

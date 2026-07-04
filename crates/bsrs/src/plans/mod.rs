@@ -905,7 +905,8 @@ pub fn rel_scan(
 
 /// `grid_scan(dets, m1, s1, e1, n1, m2, s2, e2, n2)` — 2-D rectilinear scan.
 /// `m1` is the slow axis (outer loop), `m2` is the fast axis (inner loop).
-/// Every grid point the detectors are read once into `primary`.
+/// Every grid point the detectors are read once into `primary`. Natural
+/// (non-snaked) order; the non-snaked form of [`grid_scan_snake`].
 #[allow(clippy::too_many_arguments)]
 pub fn grid_scan(
     detectors: Vec<Arc<dyn ReadableObj>>,
@@ -919,6 +920,44 @@ pub fn grid_scan(
     s2: f64,
     e2: f64,
     n2: usize,
+) -> Plan {
+    grid_scan_snake(
+        detectors,
+        motor1,
+        motor1_reader,
+        s1,
+        e1,
+        n1,
+        motor2,
+        motor2_reader,
+        s2,
+        e2,
+        n2,
+        false,
+    )
+}
+
+/// `grid_scan_snake(..., snake)` — 2-D scan where `snake = true` traverses the
+/// fast axis (`m2`) in boustrophedon order: forward on even slow-axis rows,
+/// reversed on odd ones, so the stage never flies back across the row. Mirrors
+/// bluesky `grid_scan(..., snake_axes=True)`, which snakes the fast axis and
+/// never the slowest (plans.py:1294). The slow axis and every emitted document
+/// are otherwise identical to [`grid_scan`]; only the fast-axis position order
+/// within alternate rows changes.
+#[allow(clippy::too_many_arguments)]
+pub fn grid_scan_snake(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    motor1: Arc<dyn MovableObj>,
+    motor1_reader: Arc<dyn ReadableObj>,
+    s1: f64,
+    e1: f64,
+    n1: usize,
+    motor2: Arc<dyn MovableObj>,
+    motor2_reader: Arc<dyn ReadableObj>,
+    s2: f64,
+    e2: f64,
+    n2: usize,
+    snake: bool,
 ) -> Plan {
     let step1 = if n1 > 1 {
         (e1 - s1) / (n1 as f64 - 1.0)
@@ -959,7 +998,11 @@ pub fn grid_scan(
                 // already settled at p1 above). Mirrors one Checkpoint per
                 // grid point (bluesky move_per_step, plan_stubs.py:1695).
                 yield Msg::Checkpoint;
-                let p2 = s2 + step2 * (j as f64);
+                // Snake: reverse the fast axis on odd slow-axis rows so the
+                // stage winds back and forth instead of flying back each row
+                // (bluesky snake_cyclers, utils/__init__.py:656).
+                let jj = if snake && i % 2 == 1 { n2 - 1 - j } else { j };
+                let p2 = s2 + step2 * (jj as f64);
                 yield Msg::Set {
                     obj: motor2.clone(),
                     value: p2,
@@ -1163,11 +1206,52 @@ fn scan_nd_with_md(
     })
 }
 
+/// Which axes of an N-D grid scan follow a snake (boustrophedon) trajectory.
+/// Ports bluesky's `snake_axes` argument (`bool | list`, plans.py:1294):
+/// `None` snakes nothing, `All` snakes every axis except the slowest (which is
+/// traversed once, so snaking it is a no-op), and `Axes(idxs)` snakes exactly
+/// the listed axis indices (0 = slowest).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SnakeAxes {
+    /// Do not snake any axis — plain outer-product order.
+    #[default]
+    None,
+    /// Snake all axes except the slowest (bluesky `snake_axes=True`).
+    All,
+    /// Snake exactly these axis indices (bluesky `snake_axes=[m2, m3, …]`).
+    Axes(Vec<usize>),
+}
+
+impl SnakeAxes {
+    /// Expand to a per-axis flag vector of length `n` (index 0 = slowest).
+    fn to_flags(&self, n: usize) -> Vec<bool> {
+        match self {
+            SnakeAxes::None => vec![false; n],
+            // The slowest axis (index 0) never snakes: it is traversed once.
+            SnakeAxes::All => (0..n).map(|i| i > 0).collect(),
+            SnakeAxes::Axes(idxs) => (0..n).map(|i| idxs.contains(&i)).collect(),
+        }
+    }
+}
+
 /// `list_grid_scan(dets, [(motor, [points...]), ...])` — N-D grid where
-/// each axis traces a user-supplied list of positions.
+/// each axis traces a user-supplied list of positions. Natural (non-snaked)
+/// order; the non-snaked form of [`list_grid_scan_snake`].
 pub fn list_grid_scan(detectors: Vec<Arc<dyn ReadableObj>>, axes: Vec<ListGridAxis>) -> Plan {
+    list_grid_scan_snake(detectors, axes, SnakeAxes::None)
+}
+
+/// `list_grid_scan_snake(dets, axes, snake_axes)` — N-D list grid with per-axis
+/// snake traversal (bluesky `list_grid_scan(..., snake_axes=…)`). The axes
+/// selected by `snake_axes` reverse on alternating passes; all emitted
+/// documents are otherwise identical to [`list_grid_scan`].
+pub fn list_grid_scan_snake(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    axes: Vec<ListGridAxis>,
+    snake_axes: SnakeAxes,
+) -> Plan {
     let lists: Vec<Vec<f64>> = axes.iter().map(|(_, _, l)| l.clone()).collect();
-    let pts = patterns::outer_list_product(&lists);
+    let pts = patterns::outer_list_product_snake(&lists, &snake_axes.to_flags(lists.len()));
     let motors: Vec<(Arc<dyn MovableObj>, Arc<dyn ReadableObj>)> =
         axes.into_iter().map(|(m, r, _)| (m, r)).collect();
     // A grid: each motor is its own axis in the `dimensions` hint (bluesky's
@@ -2654,6 +2738,56 @@ mod tests {
             6,
             "grid_scan: one Checkpoint per row (2) + one per point (4)"
         );
+    }
+
+    #[test]
+    fn snake_axes_to_flags_resolves_bluesky_spec() {
+        // None snakes nothing; All snakes every axis but the slowest (index 0);
+        // Axes(list) snakes exactly the listed 0-based indices.
+        assert_eq!(SnakeAxes::None.to_flags(3), vec![false, false, false]);
+        assert_eq!(SnakeAxes::All.to_flags(3), vec![false, true, true]);
+        assert_eq!(
+            SnakeAxes::Axes(vec![0, 2]).to_flags(3),
+            vec![true, false, true]
+        );
+    }
+
+    #[tokio::test]
+    async fn grid_scan_snake_reverses_fast_axis_positions() {
+        // 2 slow rows x 3 fast points. With snake, the fast axis (m2) runs
+        // forward on row 0 and reversed on row 1, so its Set values are
+        // [0,1,2, 2,1,0] — a continuous boustrophedon, no fly-back.
+        let m1 = Arc::new(FakeMotor {
+            name: "m1".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let m2 = Arc::new(FakeMotor {
+            name: "m2".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let msgs = drain(grid_scan_snake(
+            vec![],
+            m1,
+            rdr("m1r"),
+            0.0,
+            1.0,
+            2,
+            m2,
+            rdr("m2r"),
+            0.0,
+            2.0,
+            3,
+            true,
+        ))
+        .await;
+        let m2_targets: Vec<f64> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                Msg::Set { obj, value, .. } if obj.name() == "m2" => Some(*value),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(m2_targets, vec![0.0, 1.0, 2.0, 2.0, 1.0, 0.0]);
     }
 
     #[tokio::test]
