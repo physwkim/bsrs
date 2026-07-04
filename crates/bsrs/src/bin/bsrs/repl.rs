@@ -515,7 +515,7 @@ bluesky-style namespaces (full surface):
   bp.*    compound plans  (count, scan, list_scan, rel_scan,
                             rel_list_scan, grid_scan, rel_grid_scan,
                             inner_product_scan, scan_nd, spiral,
-                            spiral_square, spiral_fermat, ramp_plan,
+                            spiral_square, spiral_fermat,
                             log_scan, count_with_trigger)
   bps.*   1-Msg / small stubs (open_run, close_run, create, save, drop,
                                 read, null, abs_set, mv, mvr, trigger,

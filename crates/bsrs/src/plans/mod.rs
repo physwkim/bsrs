@@ -1387,39 +1387,104 @@ pub fn spiral(
     })
 }
 
-/// `ramp_plan(go_plan, monitor_signal, take_pre_data_count, period)` —
-/// kicks off `go_plan` (a *sub-plan* that initiates a monotonic ramp,
-/// e.g. `mv(temperature, 300)`), then samples `detectors` every `period`
-/// while waiting for the ramp to land. Simplified vs bluesky's full
-/// version — no wait_for_motor_done branch; caller must interrupt.
+/// Builds a fresh inner plan for one ramp sample — bluesky's `inner_plan_func`.
+/// Called once per data point (pre, each poll, and post), typically a
+/// `trigger_and_read` of the detectors.
+pub type RampInnerFn = Arc<dyn Fn() -> Plan + Send + Sync>;
+
+/// Ramp-completion predicate — the bsrs stand-in for bluesky's `status.done`.
+/// Polled between samples; returns `true` once the ramp has landed. bsrs plans
+/// receive no Status back from the engine, so the caller supplies this (e.g.
+/// "motor readback within tolerance of the target").
+pub type RampDoneFn = Arc<dyn Fn() -> futures::future::BoxFuture<'static, bool> + Send + Sync>;
+
+/// `ramp_plan(go_plan, monitor_sig, inner, is_complete, take_pre_data, timeout,
+/// period)` — take data while ramping a positioner. Ports bluesky's `ramp_plan`
+/// (plans.py:2214): an optional pre-sample, start the ramp via `go_plan`, then
+/// repeatedly sample with `inner` until `is_complete` reports the ramp landed,
+/// then a final post-sample. `monitor_sig` is monitored across the whole run
+/// (bluesky's `monitor_during_decorator`).
+///
+/// bluesky captures a Status from `go_plan` and loops `while not status.done`.
+/// bsrs plans get no value back from the engine, so completion is the
+/// caller-supplied `is_complete` predicate, polled before each sample. `timeout`
+/// bounds the total ramp — exceeding it fails the run (bluesky's `RampFail`).
+/// `period` rate-limits sampling to at most one point per `period`; if a sample
+/// already took longer, the next runs with no added delay.
+#[allow(clippy::too_many_arguments)]
 pub fn ramp_plan(
     go_plan: Plan,
-    detectors: Vec<Arc<dyn ReadableObj>>,
-    period: std::time::Duration,
-    samples: usize,
+    monitor_sig: Arc<dyn MonitorableObj>,
+    inner: RampInnerFn,
+    is_complete: RampDoneFn,
+    take_pre_data: bool,
+    timeout: Option<Duration>,
+    period: Option<Duration>,
 ) -> Plan {
-    plan_box(async_stream::stream! {
+    let body = plan_box(async_stream::stream! {
+        use futures::StreamExt;
         yield Msg::OpenRun(RunMetadata {
             plan_name: Some("ramp_plan".into()),
             ..Default::default()
         });
-        // Kick off the ramp (do not wait — go_plan should issue Set
-        // without a Wait if it wants asynchronous progress).
+        // Watch the clock only if a timeout was given (bluesky `fail_time`).
+        let fail_time = timeout.map(|t| std::time::Instant::now() + t);
+        // Pre-sample, before the ramp starts.
+        if take_pre_data {
+            let mut pre = inner();
+            while let Some(item) = pre.next().await {
+                let crate::core::plan::PlanItem::Bare(m) = item;
+                yield m;
+            }
+        }
+        // Start the ramp (go_plan issues its Set(s) without waiting).
         let mut go = go_plan;
-        while let Some(item) = futures::StreamExt::next(&mut go).await {
+        while let Some(item) = go.next().await {
             let crate::core::plan::PlanItem::Bare(m) = item;
             yield m;
         }
-        for _ in 0..samples {
-            yield Msg::Sleep(period);
-            yield Msg::Create { stream_name: "primary".into() };
-            for d in &detectors {
-                yield Msg::Read(d.clone());
+        // Sample until the ramp lands (bluesky `while not status.done`).
+        let mut timed_out = false;
+        loop {
+            if is_complete().await {
+                break;
             }
-            yield Msg::Save;
+            let start = std::time::Instant::now();
+            let mut p = inner();
+            while let Some(item) = p.next().await {
+                let crate::core::plan::PlanItem::Bare(m) = item;
+                yield m;
+            }
+            if let Some(ft) = fail_time {
+                if std::time::Instant::now() > ft {
+                    timed_out = true;
+                    break;
+                }
+            }
+            // Rate-limit: sleep out the remainder of this sample's period.
+            if let Some(min_period) = period {
+                let remaining =
+                    (start + min_period).saturating_duration_since(std::time::Instant::now());
+                if !remaining.is_zero() {
+                    yield Msg::Sleep(remaining);
+                }
+            }
+        }
+        if timed_out {
+            // bluesky raises utils.RampFail(); bsrs fails the run.
+            yield Msg::Fail("ramp_plan: ramp did not complete within timeout".into());
+            return;
+        }
+        // Post-sample, after completion.
+        let mut post = inner();
+        while let Some(item) = post.next().await {
+            let crate::core::plan::PlanItem::Bare(m) = item;
+            yield m;
         }
         yield Msg::CloseRun { exit_status: "success".into(), reason: None };
-    })
+    });
+    // Monitor `monitor_sig` for the duration of the run.
+    preprocessors::monitor_during_wrapper(body, vec![monitor_sig])
 }
 
 /// `rel_list_scan` — relative variant of `list_scan`. Reads each motor's
@@ -2444,6 +2509,144 @@ mod tests {
         assert!(
             (targets.last().copied().unwrap() - 1.75).abs() < 1e-9,
             "final move to the signal-weighted centroid 1.75: {targets:?}"
+        );
+    }
+
+    /// Monitorable used only inside `Msg::Monitor`; `subscribe_dyn` is never
+    /// reached by `drain` (which just collects yielded messages).
+    struct FakeMonitor(String);
+
+    impl NamedObj for FakeMonitor {
+        fn name(&self) -> &str {
+            &self.0
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ReadableObj for FakeMonitor {
+        async fn read_dyn(
+            &self,
+        ) -> Result<HashMap<String, ReadingValue>, crate::core::error::BsrsError> {
+            Ok(HashMap::new())
+        }
+        async fn describe_dyn(
+            &self,
+        ) -> Result<HashMap<String, crate::event_model::DataKey>, crate::core::error::BsrsError>
+        {
+            Ok(HashMap::new())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MonitorableObj for FakeMonitor {
+        async fn subscribe_dyn(
+            &self,
+        ) -> Result<crate::core::subscription::Subscription, crate::core::error::BsrsError>
+        {
+            Err(crate::core::error::BsrsError::Other(
+                "FakeMonitor::subscribe_dyn is never called by drain".into(),
+            ))
+        }
+    }
+
+    /// A ramp-completion predicate that reports "not done" for its first `n`
+    /// polls, then "done" — so a ramp plan takes exactly `n` in-loop samples.
+    fn done_after(n: usize) -> RampDoneFn {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        Arc::new(move || -> futures::future::BoxFuture<'static, bool> {
+            let calls = calls.clone();
+            Box::pin(async move { calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= n })
+        })
+    }
+
+    /// A ramp inner-sample plan: one `Create`/`Save` event.
+    fn one_event_inner() -> RampInnerFn {
+        Arc::new(|| {
+            plan_box(async_stream::stream! {
+                yield Msg::Create { stream_name: "primary".into() };
+                yield Msg::Save;
+            })
+        })
+    }
+
+    fn no_op_go() -> Plan {
+        plan_box(async_stream::stream! {
+            yield Msg::Null;
+        })
+    }
+
+    #[tokio::test]
+    async fn ramp_plan_samples_until_complete_with_pre_and_post() {
+        // is_complete is false for two polls then true: one pre-sample, two
+        // in-loop samples, one post-sample = four events. The monitor brackets
+        // the run.
+        let mon = Arc::new(FakeMonitor("mon".into())) as Arc<dyn MonitorableObj>;
+        let msgs = drain(ramp_plan(
+            no_op_go(),
+            mon,
+            one_event_inner(),
+            done_after(2),
+            true, // take_pre_data
+            None, // timeout
+            None, // period
+        ))
+        .await;
+        assert_eq!(create_count(&msgs), 4, "pre + 2 in-loop + post");
+        assert!(matches!(msgs.first(), Some(Msg::OpenRun(_))));
+        assert!(
+            msgs.iter().any(|m| matches!(m, Msg::Monitor { .. })),
+            "monitor installed after open"
+        );
+        assert!(
+            msgs.iter().any(|m| matches!(m, Msg::Unmonitor(_))),
+            "monitor removed before close"
+        );
+        assert!(matches!(
+            msgs.last(),
+            Some(Msg::CloseRun { exit_status, .. }) if exit_status == "success"
+        ));
+    }
+
+    #[tokio::test]
+    async fn ramp_plan_without_pre_data_skips_leading_sample() {
+        let mon = Arc::new(FakeMonitor("mon".into())) as Arc<dyn MonitorableObj>;
+        let msgs = drain(ramp_plan(
+            no_op_go(),
+            mon,
+            one_event_inner(),
+            done_after(2),
+            false, // take_pre_data
+            None,
+            None,
+        ))
+        .await;
+        assert_eq!(create_count(&msgs), 3, "2 in-loop + post, no pre-sample");
+    }
+
+    #[tokio::test]
+    async fn ramp_plan_times_out_and_fails() {
+        // A zero timeout trips after the first in-loop sample; the ramp never
+        // completes, so the run fails (bluesky RampFail) with no clean close.
+        let mon = Arc::new(FakeMonitor("mon".into())) as Arc<dyn MonitorableObj>;
+        let msgs = drain(ramp_plan(
+            no_op_go(),
+            mon,
+            one_event_inner(),
+            done_after(usize::MAX), // never completes
+            false,
+            Some(std::time::Duration::ZERO),
+            None,
+        ))
+        .await;
+        assert!(
+            msgs.iter().any(|m| matches!(m, Msg::Fail(_))),
+            "timeout fails the run: {msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(
+                |m| matches!(m, Msg::CloseRun { exit_status, .. } if exit_status == "success")
+            ),
+            "a timed-out ramp does not close successfully"
         );
     }
 

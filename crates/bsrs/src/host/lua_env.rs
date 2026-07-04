@@ -2796,23 +2796,10 @@ fn register_bp(lua: &Lua) -> mlua::Result<()> {
             },
         )?,
     )?;
-    bp.set(
-        "ramp_plan",
-        lua.create_function(
-            |_, (go_plan, dt, period_secs, samples): (mlua::AnyUserData, mlua::Table, f64, usize)| {
-                let go = take_inner_plan(&go_plan)?;
-                Ok(wrap_prebuilt(
-                    format!("ramp_plan(n={samples})"),
-                    crate::plans::ramp_plan(
-                        go,
-                        dets(&dt)?,
-                        std::time::Duration::from_secs_f64(period_secs),
-                        samples,
-                    ),
-                ))
-            },
-        )?,
-    )?;
+    // NOTE: `bp.ramp_plan` is intentionally not bound. The status-driven
+    // `plans::ramp_plan` takes Rust closures (an `is_complete` predicate and an
+    // inner-plan factory) that have no faithful Lua representation; a Lua
+    // completion condition is a separate design (see gap-analysis PLAN-04).
     bp.set(
         "log_scan",
         lua.create_function(

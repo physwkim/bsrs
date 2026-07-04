@@ -16,10 +16,11 @@ The primary gaps are:
 - **No `per_step`/`per_shot` hooks** in any plan — the inner loop is hardcoded and
   cannot be customized (P0, PLAN-01).
 - **No staging** inside any compound plan — devices are never armed (P0, PLAN-09).
-- **Three core plans have divergent algorithms** from bluesky: `ramp_plan`,
-  `tune_centroid`, `adaptive_scan` (P0, PLAN-04/05/06). `adaptive_scan` **DONE**
-  (slope-normalised + threshold + smoothing); `tune_centroid` **DONE** (multi-pass
-  refinement); `ramp_plan` open (needs a Status-completion mechanism).
+- ~~**Three core plans have divergent algorithms** from bluesky: `ramp_plan`,
+  `tune_centroid`, `adaptive_scan` (P0, PLAN-04/05/06).~~ **ALL DONE**:
+  `adaptive_scan` (slope-normalised + threshold + smoothing), `tune_centroid`
+  (multi-pass refinement), `ramp_plan` (completion-predicate polling +
+  monitor/timeout/period; Lua binding removed pending a Lua completion design).
 - **`scan` is 1D only**; bluesky's is N-D (P0, PLAN-03).
 - **`mv`/`mvr` are single-motor only**; bluesky accepts parallel multi-motor pairs (P1,
   PLAN-10).
@@ -91,7 +92,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-04 — `ramp_plan` algorithm divergence — status-driven vs fixed-sample-count
+### PLAN-04 — `ramp_plan` algorithm divergence — status-driven vs fixed-sample-count — **DONE**
 
 - **bsrs:** `lib.rs:729–757` — runs `go_plan` then loops `samples` times, sleeping
   `period` each iteration
@@ -104,6 +105,21 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
   stops before completion.
 - **Fix sketch:** Return a `StatusHandle` from `go_plan`; loop on `Msg::Wait(timeout=period, error_on_timeout=false)` until status completes; add `take_pre_data: bool`, `timeout: Option<Duration>`, `period: Option<Duration>`.  Wrap body with `monitor_during_wrapper([monitor_sig])`.
 - **Effort:** L
+- **Resolution:** `ramp_plan` rewritten to bluesky's `polling_plan`. Because bsrs
+  plans receive no Status back from the engine (no Msg→result channel), the
+  completion query is a caller-supplied predicate — chosen design: `is_complete:
+  Arc<dyn Fn() -> BoxFuture<bool>>`, polled between samples (the bsrs stand-in
+  for `status.done`). The per-sample body is a caller-supplied inner-plan factory
+  `inner: Arc<dyn Fn() -> Plan>` (bluesky's `inner_plan_func`, typically
+  `trigger_and_read`). Flow: optional pre-sample → forward `go_plan` (start the
+  ramp) → poll/sample loop → post-sample; `timeout` fails the run with a
+  RampFail-style `Msg::Fail`, `period` rate-limits via `Msg::Sleep`. The body is
+  wrapped with `monitor_during_wrapper([monitor_sig])`. Tests: completion
+  predicate controls the in-loop sample count (pre + N + post), the
+  `take_pre_data` toggle, and a zero-timeout RampFail.
+- **Follow-up:** the Lua `bp.ramp_plan` binding was **removed** (per user decision)
+  — the Rust closures have no faithful Lua representation. A Lua completion
+  condition (e.g. readback-within-tolerance) is a separate small design.
 
 ---
 
