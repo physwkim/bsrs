@@ -1990,21 +1990,30 @@ impl RunEngine {
                     }
                 }
                 obj.configure_dyn(args).await?;
-                // Refresh the run's cached configuration so descriptors of
-                // streams declared after this point carry the new values
-                // (bluesky re-runs cache_read_config, bundlers.py:1209).
-                // Not ported: bluesky also invalidates and re-emits the
-                // descriptors of already-declared streams containing this
-                // object (bundlers.py:1213-1218); bsrs's one-descriptor-per-
-                // stream model (CBEM-21) fixes a stream's descriptor at first
-                // declaration, so a configure between events of an existing
-                // stream does not re-describe it.
+                // Refresh the run's cached configuration (so streams declared
+                // after this point carry the new values, bluesky
+                // cache_read_config, bundlers.py:1209) AND re-emit the
+                // descriptors of already-declared streams that include this
+                // object, each a new generation carrying the fresh config with
+                // the sequence counter unbroken — bluesky's configure-time
+                // invalidation (bundlers.py:1213-1218). Without the re-emit,
+                // events after the configure would keep referencing the old
+                // descriptor and its stale configuration.
                 let run_open = { self.state.lock().await.bundler.is_some() };
                 if run_open {
                     let config = read_object_configuration(obj.as_ref()).await?;
-                    let mut state = self.state.lock().await;
-                    if let Some(b) = state.bundler.as_mut() {
-                        b.cache_configuration(obj.name().to_string(), config);
+                    let new_descriptors = {
+                        let mut state = self.state.lock().await;
+                        match state.bundler.as_mut() {
+                            Some(b) => {
+                                b.cache_configuration(obj.name().to_string(), config.clone());
+                                b.reconfigure_streams(obj.name(), config)
+                            }
+                            None => Vec::new(),
+                        }
+                    };
+                    for d in new_descriptors {
+                        self.broadcast(&Document::Descriptor(d)).await?;
                     }
                 }
             }

@@ -34,10 +34,16 @@ pub struct RunBundle {
 
 #[derive(Debug)]
 struct StreamState {
-    /// The one descriptor for this stream. Minted on the first
-    /// [`RunBundle::descriptor`] call for the stream name and returned unchanged
-    /// on every later call, so the uid that `event()`/`stop()` stamp always
-    /// matches the descriptor that was emitted (CBEM-21).
+    /// The stream's *current* descriptor. Minted on the first
+    /// [`RunBundle::descriptor`] call for the stream name and returned
+    /// unchanged on every later `descriptor()` call, so the uid that
+    /// `event()`/`stop()` stamp always matches the descriptor that was
+    /// emitted (CBEM-21). It is replaced — a new generation, new uid, same
+    /// `seq_num` — only by [`RunBundle::redescribe`] on a configuration
+    /// change (bluesky re-emits a stream's descriptor when a member object is
+    /// reconfigured). Within one generation the uid is still immutable; the
+    /// invariant is "one *current* descriptor per stream", not "one descriptor
+    /// per stream for the whole run".
     descriptor: EventDescriptor,
     seq_num: AtomicU64,
 }
@@ -69,10 +75,12 @@ impl RunBundle {
     /// uid that `event()` stamps on the stream's events and that
     /// `descriptor_uid_for()`/`stop()` report.
     ///
-    /// A stream's descriptor is fixed at first declaration: re-composing with a
+    /// A stream's *schema* is fixed at first declaration: re-composing with a
     /// different `data_keys` shape returns the original descriptor (first
-    /// definition wins), matching bluesky's one-descriptor-per-stream model. A
-    /// caller that needs a different schema must use a different stream name.
+    /// definition wins). Only the `configuration` sub-document changes over a
+    /// stream's life, and only through [`RunBundle::redescribe`] — a caller
+    /// that needs a different `data_keys` schema must use a different stream
+    /// name.
     pub fn descriptor(
         &self,
         name: &str,
@@ -103,6 +111,42 @@ impl RunBundle {
             },
         );
         (descriptor, true)
+    }
+
+    /// Replace a stream's current descriptor with a new generation carrying
+    /// fresh `configuration` for `object_name`, keeping every other field
+    /// (`data_keys`, `hints`, `object_keys`, `name`) and — crucially — the
+    /// stream's `seq_num`, so events before and after the change share one
+    /// monotonic sequence axis. Mints a new uid; every later `event()` stamps
+    /// it. Returns the new descriptor to emit, or `None` when the stream is
+    /// undeclared or its current descriptor does not include `object_name`
+    /// (nothing to reconfigure — a raw-`data_keys` stream with no objects, or
+    /// a stream this object never joined).
+    ///
+    /// This is the one sanctioned mutation of a live descriptor. Ports
+    /// bluesky's configure-time invalidation: `del self._descriptors[name]`
+    /// then `_prepare_stream(name, obj_set)`, whose sequence counter is left
+    /// intact because `desc_key` is already in `_sequence_counters`
+    /// (bundlers.py:1213-1218, 308-310).
+    pub fn redescribe(
+        &self,
+        stream_name: &str,
+        object_name: &str,
+        configuration: Configuration,
+    ) -> Option<EventDescriptor> {
+        let mut streams = self.streams.lock().unwrap();
+        let st = streams.get_mut(stream_name)?;
+        if !st.descriptor.configuration.contains_key(object_name) {
+            return None;
+        }
+        let mut new_desc = st.descriptor.clone();
+        new_desc.uid = new_uid();
+        new_desc.time = now();
+        new_desc
+            .configuration
+            .insert(object_name.to_string(), configuration);
+        st.descriptor = new_desc.clone();
+        Some(new_desc)
     }
 
     /// Compose an `Event` document for a stream that already has a descriptor.
@@ -542,6 +586,73 @@ mod tests {
         assert_ne!(
             p.uid, b.uid,
             "different stream names get different descriptors"
+        );
+    }
+
+    #[test]
+    fn redescribe_swaps_config_new_uid_same_seq_num() {
+        let start = RunBundle::start(Some(1), None);
+        let bundle = RunBundle::open(&start);
+        // A stream whose descriptor has a configuration entry for "cam".
+        let mut config = HashMap::new();
+        config.insert(
+            "cam".to_string(),
+            Configuration {
+                data: HashMap::from([("cam_gain".to_string(), serde_json::Value::from(2.5))]),
+                ..Default::default()
+            },
+        );
+        let (v1, _) = bundle.descriptor("primary", HashMap::new(), config, None, HashMap::new());
+        // Advance the counter, then reconfigure: seq must survive.
+        bundle.advance_seq("primary", 4);
+        let fresh = Configuration {
+            data: HashMap::from([("cam_gain".to_string(), serde_json::Value::from(5.0))]),
+            ..Default::default()
+        };
+        let v2 = bundle
+            .redescribe("primary", "cam", fresh)
+            .expect("stream includes cam");
+        assert_ne!(v1.uid, v2.uid, "redescribe mints a new uid");
+        assert_eq!(
+            v2.configuration.get("cam").unwrap().data.get("cam_gain"),
+            Some(&serde_json::Value::from(5.0)),
+            "new generation carries the fresh config"
+        );
+        // The counter is preserved: the next event follows the advanced span,
+        // and it references the new descriptor uid.
+        assert_eq!(bundle.peek_next_seq("primary"), Some(5));
+        let ev = bundle
+            .event("primary", HashMap::new(), HashMap::new())
+            .unwrap();
+        assert_eq!(ev.seq_num, 5, "seq continues across redescribe");
+        assert_eq!(ev.descriptor, v2.uid, "events reference the new generation");
+        assert_eq!(
+            bundle.descriptor_uid_for("primary").as_deref(),
+            Some(v2.uid.as_str())
+        );
+    }
+
+    #[test]
+    fn redescribe_returns_none_when_object_absent_or_stream_undeclared() {
+        let start = RunBundle::start(Some(1), None);
+        let bundle = RunBundle::open(&start);
+        // Undeclared stream.
+        assert!(bundle
+            .redescribe("primary", "cam", Configuration::default())
+            .is_none());
+        // Declared, but the object is not in this stream's configuration.
+        bundle.descriptor(
+            "primary",
+            HashMap::new(),
+            HashMap::new(),
+            None,
+            HashMap::new(),
+        );
+        assert!(
+            bundle
+                .redescribe("primary", "cam", Configuration::default())
+                .is_none(),
+            "an object not in the stream does not reconfigure it"
         );
     }
 

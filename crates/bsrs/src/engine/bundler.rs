@@ -111,6 +111,40 @@ impl RunBundler {
         self.config_cache.insert(object_name, config);
     }
 
+    /// Re-emit the descriptor of every declared stream whose current
+    /// descriptor includes `object_name`, carrying `configuration` freshly
+    /// read after a `configure`. Each stream's current descriptor is replaced
+    /// in place (new uid, same `seq_num`) and the local uid cache is updated
+    /// in lockstep — the single point that keeps the two descriptor caches
+    /// (`RunBundle::streams` and `self.descriptors`) in sync, so no later
+    /// `descriptor_uid` lookup can return a stale generation. Returns the new
+    /// descriptors for the engine to broadcast, in no particular order (each
+    /// names its own stream). Ports bluesky `RunBundler.configure`'s
+    /// invalidation loop (bundlers.py:1213-1218).
+    pub fn reconfigure_streams(
+        &mut self,
+        object_name: &str,
+        configuration: Configuration,
+    ) -> Vec<EventDescriptor> {
+        let stream_names: Vec<String> = self.descriptors.keys().cloned().collect();
+        let mut out = Vec::new();
+        for name in stream_names {
+            if let Some(desc) = self
+                .bundle
+                .redescribe(&name, object_name, configuration.clone())
+            {
+                self.descriptors.insert(
+                    name,
+                    DescriptorState {
+                        uid: desc.uid.clone(),
+                    },
+                );
+                out.push(desc);
+            }
+        }
+        out
+    }
+
     /// Snapshot the current per-stream sequence counters as the rewind target.
     /// Called at every checkpoint reset (the `Checkpoint` message plus the
     /// stage/unstage/monitor/subscribe lifecycle handlers), mirroring bluesky's

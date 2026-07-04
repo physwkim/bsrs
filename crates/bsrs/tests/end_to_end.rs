@@ -873,6 +873,106 @@ async fn configure_refreshes_configuration_for_later_descriptors() {
     assert_eq!(gain_of("second"), serde_json::Value::from(5.0));
 }
 
+#[tokio::test]
+async fn configure_reemits_same_stream_descriptor_with_fresh_config() {
+    // Item 1 / CBEM-21 amendment: a configure between two batches of the SAME
+    // stream re-emits the stream's descriptor as a new generation carrying the
+    // fresh config, with the sequence counter unbroken — bluesky's
+    // configure-time invalidation (bundlers.py:1213-1218). Pre-fix, the second
+    // batch's events kept referencing the first descriptor and its stale
+    // configuration.
+    let cfg = ConfigReadable::new("cfgr", 2.5);
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let cfg_read: Arc<dyn bsrs::core::msg::ReadableObj> = cfg.clone();
+    let cfg_conf: Arc<dyn bsrs::core::msg::ConfigurableObj> = cfg.clone();
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        yield bsrs::core::Msg::Create { stream_name: "primary".into() };
+        yield bsrs::core::Msg::Read(cfg_read.clone());
+        yield bsrs::core::Msg::Save;
+        yield bsrs::core::Msg::Configure { obj: cfg_conf.clone(), args: Default::default() };
+        yield bsrs::core::Msg::Create { stream_name: "primary".into() };
+        yield bsrs::core::Msg::Read(cfg_read.clone());
+        yield bsrs::core::Msg::Save;
+        yield bsrs::core::Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let result = re.run_async(plan).await.expect("plan failed");
+    assert_eq!(result.exit_status, "success");
+
+    let docs = sink.snapshot().await;
+    // uid → this generation's cfgr_gain.
+    let gain_by_uid: std::collections::HashMap<String, serde_json::Value> = docs
+        .iter()
+        .filter_map(|d| match d {
+            Document::Descriptor(d) => Some((
+                d.uid.clone(),
+                d.configuration
+                    .get("cfgr")
+                    .expect("cfgr config entry")
+                    .data
+                    .get("cfgr_gain")
+                    .expect("gain field")
+                    .clone(),
+            )),
+            _ => None,
+        })
+        .collect();
+    // Two generations of the primary descriptor, old then new gain.
+    let primary_descs: Vec<&bsrs::event_model::EventDescriptor> = docs
+        .iter()
+        .filter_map(|d| match d {
+            Document::Descriptor(d) if d.name.as_deref() == Some("primary") => Some(d),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        primary_descs.len(),
+        2,
+        "configure re-emits the primary descriptor as a new generation"
+    );
+    assert_eq!(
+        gain_by_uid[&primary_descs[0].uid],
+        serde_json::Value::from(2.5)
+    );
+    assert_eq!(
+        gain_by_uid[&primary_descs[1].uid],
+        serde_json::Value::from(5.0)
+    );
+
+    // Each event references the generation current when it was composed, and
+    // the sequence counter runs 1, 2 across the descriptor change.
+    let events: Vec<&bsrs::event_model::Event> = docs
+        .iter()
+        .filter_map(|d| match d {
+            Document::Event(e) => Some(e),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(events.len(), 2);
+    assert_eq!((events[0].seq_num, events[1].seq_num), (1, 2));
+    assert_eq!(
+        gain_by_uid[&events[0].descriptor],
+        serde_json::Value::from(2.5),
+        "first event references the pre-configure generation"
+    );
+    assert_eq!(
+        gain_by_uid[&events[1].descriptor],
+        serde_json::Value::from(5.0),
+        "second event references the post-configure generation"
+    );
+
+    // Emission order: the new descriptor precedes the event that references it.
+    let pos = |pred: &dyn Fn(&Document) -> bool| docs.iter().position(pred).unwrap();
+    let new_desc_at =
+        pos(&|d| matches!(d, Document::Descriptor(x) if x.uid == primary_descs[1].uid));
+    let second_event_at = pos(&|d| matches!(d, Document::Event(e) if e.seq_num == 2));
+    assert!(
+        new_desc_at < second_event_at,
+        "the re-emitted descriptor must precede the event that references it"
+    );
+}
+
 struct CollidingReadable {
     name: String,
 }
