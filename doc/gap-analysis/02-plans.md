@@ -13,8 +13,10 @@ bsrs-plans covers roughly 60% of the bluesky surface area.  The core compound pl
 `spiral_*`, `fly`, `ramp_plan`) are present.  All preprocessor wrappers are present.
 The primary gaps are:
 
-- **No `per_step`/`per_shot` hooks** in any plan — the inner loop is hardcoded and
-  cannot be customized (P0, PLAN-01).
+- ~~**No `per_step`/`per_shot` hooks** in any plan — the inner loop is hardcoded and
+  cannot be customized (P0, PLAN-01).~~ **DONE** — `PerStep`/`PerShot`/`StepMotor`
+  + `count_per_shot`/`scan_per_step`/`list_scan_per_step`/`inner_product_scan_per_step`/`scan_nd_per_step`
+  (grid family deferred pending a settle-semantics decision).
 - **No staging** inside any compound plan — devices are never armed (P0, PLAN-09).
 - ~~**Three core plans have divergent algorithms** from bluesky: `ramp_plan`,
   `tune_centroid`, `adaptive_scan` (P0, PLAN-04/05/06).~~ **ALL DONE**:
@@ -38,7 +40,28 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ## P0 — Correctness / Protocol Divergence / Commonly-Used Feature Entirely Missing
 
-### PLAN-01 — No `per_step`/`per_shot` hooks; no `Checkpoint` in scan inner loops
+### PLAN-01 — No `per_step`/`per_shot` hooks; no `Checkpoint` in scan inner loops — **DONE (grid-family deferred)**
+
+- **Resolution:** Added the `PerStep` / `PerShot` hook types and a `StepMotor`
+  (`(Movable, Readable, Option<f64>)`, `None` = at-position/skip) in
+  `plans/mod.rs`, plus stubs `move_per_step`, `one_nd_step` (default `PerStep`),
+  and `read_shot` (default read-only `PerShot`; the existing `one_shot` stays the
+  trigger-and-read variant). The public plans keep their signatures and delegate
+  to new hook-taking forms — `count`→`count_per_shot`, `scan`→`scan_per_step`,
+  `list_scan`→`list_scan_per_step`, `inner_product_scan`→`inner_product_scan_per_step`,
+  `scan_nd`→`scan_nd_per_step` (convenience-delegator, so no caller churned). The
+  `None` path reproduces each plan's previous per-step/per-shot Msg sequence
+  byte-for-byte (all 78 plans unit tests unchanged and green), including
+  `scan_nd`'s `pos_cache` skip, which now surfaces as `StepMotor::None` at the
+  hook. The step-boundary `Checkpoint` gap noted below (b) was already closed in
+  bsrs; this change moves that Checkpoint into the default stub. **Deferred:**
+  `grid_scan` / `grid_scan_snake` (and `list_grid_scan`, which shares
+  `scan_nd_with_md`) route through the default only — the grid family settles the
+  slow axis in a separate `"set1"` group per row, which does not match
+  `one_nd_step`'s single-group move; unifying it is a settle-semantics change that
+  needs sign-off (tracked here). Tests: `count_per_shot_uses_custom_hook_verbatim`,
+  `scan_per_step_uses_custom_hook_and_threads_targets`,
+  `scan_nd_per_step_marks_unchanged_motor_none`.
 
 - **bsrs:** `lib.rs:322–1155` — all plans hardcode `Create → Read* → Save` per step
 - **ref:** `plans.py:66,130,484,1026` — every plan accepts `per_step: PerStep | None`

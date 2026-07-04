@@ -695,26 +695,119 @@ pub mod stubs {
             }
         })
     }
-}
 
-// ===========================================================================
-//  plans (compound; mirrors bluesky.plans)
-// ===========================================================================
+    /// `move_per_step(motors)` — the move half of one step: a `Checkpoint`, a
+    /// `Set` for each motor that carries a target (`Some`), then a single `Wait`
+    /// on the shared `"set"` group. A motor with a `None` target is already at
+    /// position and is not re-commanded (bluesky `move_per_step`'s
+    /// skip-unchanged, plan_stubs.py:1678). The `Wait` is emitted
+    /// unconditionally, matching bluesky — a wait on an empty group is a no-op.
+    /// A building block for custom [`PerStep`](super::PerStep) hooks.
+    pub fn move_per_step(motors: Vec<super::StepMotor>) -> Plan {
+        plan_box(async_stream::stream! {
+            yield Msg::Checkpoint;
+            for (m, _, target) in &motors {
+                if let Some(pos) = target {
+                    yield Msg::Set { obj: m.clone(), value: *pos, group: Some("set".into()) };
+                }
+            }
+            yield Msg::Wait { group: "set".into(), error_on_timeout: true, timeout: None };
+        })
+    }
 
-/// `count(detectors, num)` — read each detector `num` times.
-pub fn count(detectors: Vec<Arc<dyn ReadableObj>>, num: usize) -> Plan {
-    plan_box(async_stream::stream! {
-        yield Msg::OpenRun(scan_run_md("count", &detectors, &[], Some(num), AxisGrouping::Time));
-        for _ in 0..num {
-            // Per-shot rewind boundary (bluesky count == repeat(one_shot),
-            // both of which emit a Checkpoint per shot: plan_stubs.py:1808,
-            // :1622). Without it a pause/resume rewinds the whole run.
+    /// `one_nd_step(detectors, motors)` — the default [`PerStep`](super::PerStep):
+    /// [`move_per_step`] then read the motor readers and detectors into
+    /// `"primary"` as a `Create → Read* → Save` bundle. bsrs's port of bluesky's
+    /// `one_nd_step` (plan_stubs.py:1707); reads without triggering (bsrs step
+    /// scans take plain `Readable` detectors, not `Triggerable`).
+    pub fn one_nd_step(
+        detectors: Vec<Arc<dyn ReadableObj>>,
+        motors: Vec<super::StepMotor>,
+    ) -> Plan {
+        plan_box(async_stream::stream! {
+            let mut mv = move_per_step(motors.clone());
+            while let Some(item) = futures::StreamExt::next(&mut mv).await {
+                let crate::core::plan::PlanItem::Bare(m) = item;
+                yield m;
+            }
+            yield Msg::Create { stream_name: "primary".into() };
+            for (_, reader, _) in &motors {
+                yield Msg::Read(reader.clone());
+            }
+            for d in &detectors {
+                yield Msg::Read(d.clone());
+            }
+            yield Msg::Save;
+        })
+    }
+
+    /// `read_shot(detectors)` — the default read-only [`PerShot`](super::PerShot)
+    /// for [`count`](super::count): a `Checkpoint` then read the detectors into
+    /// `"primary"` as a `Create → Read* → Save` bundle, without triggering. This
+    /// is the plain-read analogue of [`one_shot`], which triggers via
+    /// `trigger_and_read`; `count` takes plain `Readable` detectors, so its
+    /// default does not trigger.
+    pub fn read_shot(detectors: Vec<Arc<dyn ReadableObj>>) -> Plan {
+        plan_box(async_stream::stream! {
             yield Msg::Checkpoint;
             yield Msg::Create { stream_name: "primary".into() };
             for d in &detectors {
                 yield Msg::Read(d.clone());
             }
             yield Msg::Save;
+        })
+    }
+}
+
+// ===========================================================================
+//  plans (compound; mirrors bluesky.plans)
+// ===========================================================================
+
+/// One motor's role in a scan step: its handle, its reader, and — if it should
+/// be commanded this step — the target position. A `None` target means the motor
+/// is already at position and must not be re-commanded (bluesky `move_per_step`'s
+/// skip-unchanged); the step still reads it. Used by [`PerStep`] hooks.
+pub type StepMotor = (Arc<dyn MovableObj>, Arc<dyn ReadableObj>, Option<f64>);
+
+/// Per-step hook for step scans: given the detectors and this step's motors,
+/// yield the Msgs for one inner-loop step (move + read). bsrs's analogue of
+/// bluesky's `per_step`; the default is [`stubs::one_nd_step`]. A custom hook
+/// replaces the entire move-and-read step, so it owns its own `Checkpoint`,
+/// moves, and reads.
+pub type PerStep = Arc<dyn Fn(Vec<Arc<dyn ReadableObj>>, Vec<StepMotor>) -> Plan + Send + Sync>;
+
+/// Per-shot hook for `count`: given the detectors, yield the Msgs for one shot.
+/// bsrs's analogue of bluesky's `per_shot`; the default is [`stubs::read_shot`].
+pub type PerShot = Arc<dyn Fn(Vec<Arc<dyn ReadableObj>>) -> Plan + Send + Sync>;
+
+/// `count(detectors, num)` — read each detector `num` times. Convenience form of
+/// [`count_per_shot`] with the default per-shot action ([`stubs::one_shot`]).
+pub fn count(detectors: Vec<Arc<dyn ReadableObj>>, num: usize) -> Plan {
+    count_per_shot(detectors, num, None)
+}
+
+/// `count_per_shot(detectors, num, per_shot)` — read the detectors `num` times,
+/// delegating each shot to `per_shot`. `None` uses [`stubs::read_shot`]
+/// (`Checkpoint → Create → Read* → Save`), byte-for-byte the previous `count`
+/// body. Ports bluesky's `count` `per_shot` hook (plans.py:66): a custom hook can
+/// trigger before reading, read into a different stream, or repeat a shot.
+pub fn count_per_shot(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    num: usize,
+    per_shot: Option<PerShot>,
+) -> Plan {
+    // The default carries the per-shot Checkpoint (bluesky count == repeat(one_shot),
+    // both emitting a Checkpoint per shot: plan_stubs.py:1808, :1622), so a
+    // pause/resume rewinds only the current shot, not the whole run.
+    let per_shot = per_shot.unwrap_or_else(|| Arc::new(stubs::read_shot) as PerShot);
+    plan_box(async_stream::stream! {
+        yield Msg::OpenRun(scan_run_md("count", &detectors, &[], Some(num), AxisGrouping::Time));
+        for _ in 0..num {
+            let mut shot = per_shot(detectors.clone());
+            while let Some(item) = futures::StreamExt::next(&mut shot).await {
+                let crate::core::plan::PlanItem::Bare(m) = item;
+                yield m;
+            }
         }
         yield Msg::CloseRun {
             exit_status: "success".into(),
@@ -769,6 +862,8 @@ pub fn count_with_trigger(
 }
 
 /// 1-D step `scan` from `start` to `stop` (inclusive) in `num` steps.
+/// Convenience form of [`scan_per_step`] with the default per-step action
+/// ([`stubs::one_nd_step`]).
 pub fn scan(
     detectors: Vec<Arc<dyn ReadableObj>>,
     motor: Arc<dyn MovableObj>,
@@ -777,11 +872,29 @@ pub fn scan(
     stop: f64,
     num: usize,
 ) -> Plan {
+    scan_per_step(detectors, motor, motor_reader, start, stop, num, None)
+}
+
+/// 1-D step `scan` delegating each step to `per_step`. `None` uses
+/// [`stubs::one_nd_step`] (`Checkpoint → Set → Wait → Create → Read* → Save`),
+/// byte-for-byte the previous `scan` body. Ports bluesky's `scan` `per_step`
+/// hook (plans.py:1096): a custom hook owns the whole move-and-read step, so it
+/// can trigger detectors, read into extra streams, or settle differently.
+pub fn scan_per_step(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    motor: Arc<dyn MovableObj>,
+    motor_reader: Arc<dyn ReadableObj>,
+    start: f64,
+    stop: f64,
+    num: usize,
+    per_step: Option<PerStep>,
+) -> Plan {
     let step = if num > 1 {
         (stop - start) / (num as f64 - 1.0)
     } else {
         0.0
     };
+    let per_step = per_step.unwrap_or_else(|| Arc::new(stubs::one_nd_step) as PerStep);
     plan_box(async_stream::stream! {
         yield Msg::OpenRun(scan_run_md(
             "scan",
@@ -791,27 +904,13 @@ pub fn scan(
             AxisGrouping::Coupled,
         ));
         for i in 0..num {
-            // Per-step rewind boundary (bluesky one_1d_step.move(): a
-            // Checkpoint before the set, plan_stubs.py:1669). Without it a
-            // pause/resume rewinds the whole run instead of the current step.
-            yield Msg::Checkpoint;
             let pos = start + step * (i as f64);
-            yield Msg::Set {
-                obj: motor.clone(),
-                value: pos,
-                group: Some("set".into()),
-            };
-            yield Msg::Wait {
-                group: "set".into(),
-                error_on_timeout: true,
-                timeout: None,
-            };
-            yield Msg::Create { stream_name: "primary".into() };
-            yield Msg::Read(motor_reader.clone());
-            for d in &detectors {
-                yield Msg::Read(d.clone());
+            let motors: Vec<StepMotor> = vec![(motor.clone(), motor_reader.clone(), Some(pos))];
+            let mut sub = per_step(detectors.clone(), motors);
+            while let Some(item) = futures::StreamExt::next(&mut sub).await {
+                let crate::core::plan::PlanItem::Bare(m) = item;
+                yield m;
             }
-            yield Msg::Save;
         }
         yield Msg::CloseRun {
             exit_status: "success".into(),
@@ -828,6 +927,21 @@ pub fn list_scan(
     motor_reader: Arc<dyn ReadableObj>,
     points: Vec<f64>,
 ) -> Plan {
+    list_scan_per_step(detectors, motor, motor_reader, points, None)
+}
+
+/// 1-D `list_scan` over explicit `points`, delegating each step to `per_step`.
+/// `None` uses [`stubs::one_nd_step`] (`Checkpoint → Set → Wait → Create →
+/// Read* → Save`), byte-for-byte the previous `list_scan` body. Ports bluesky's
+/// `list_scan` `per_step` hook (plans.py:576).
+pub fn list_scan_per_step(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    motor: Arc<dyn MovableObj>,
+    motor_reader: Arc<dyn ReadableObj>,
+    points: Vec<f64>,
+    per_step: Option<PerStep>,
+) -> Plan {
+    let per_step = per_step.unwrap_or_else(|| Arc::new(stubs::one_nd_step) as PerStep);
     plan_box(async_stream::stream! {
         yield Msg::OpenRun(scan_run_md(
             "list_scan",
@@ -837,25 +951,12 @@ pub fn list_scan(
             AxisGrouping::Coupled,
         ));
         for pos in points {
-            // Per-step rewind boundary (bluesky one_1d_step.move():
-            // plan_stubs.py:1669).
-            yield Msg::Checkpoint;
-            yield Msg::Set {
-                obj: motor.clone(),
-                value: pos,
-                group: Some("set".into()),
-            };
-            yield Msg::Wait {
-                group: "set".into(),
-                error_on_timeout: true,
-                timeout: None,
-            };
-            yield Msg::Create { stream_name: "primary".into() };
-            yield Msg::Read(motor_reader.clone());
-            for d in &detectors {
-                yield Msg::Read(d.clone());
+            let motors: Vec<StepMotor> = vec![(motor.clone(), motor_reader.clone(), Some(pos))];
+            let mut sub = per_step(detectors.clone(), motors);
+            while let Some(item) = futures::StreamExt::next(&mut sub).await {
+                let crate::core::plan::PlanItem::Bare(m) = item;
+                yield m;
             }
-            yield Msg::Save;
         }
         yield Msg::CloseRun {
             exit_status: "success".into(),
@@ -1052,8 +1153,23 @@ pub fn inner_product_scan(
     num: usize,
     axes: Vec<ScanAxis>,
 ) -> Plan {
+    inner_product_scan_per_step(detectors, num, axes, None)
+}
+
+/// N-motor coupled `inner_product_scan`, delegating each point to `per_step`.
+/// `None` uses [`stubs::one_nd_step`] (`Checkpoint → Set* → Wait → Create →
+/// Read* → Save`, all motors commanded), byte-for-byte the previous
+/// `inner_product_scan` body. Ports bluesky's `inner_product_scan` `per_step`
+/// hook (plans.py:942).
+pub fn inner_product_scan_per_step(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    num: usize,
+    axes: Vec<ScanAxis>,
+    per_step: Option<PerStep>,
+) -> Plan {
     let bounds: Vec<(f64, f64)> = axes.iter().map(|(_, _, s, e)| (*s, *e)).collect();
     let pts = patterns::inner_product(num, &bounds);
+    let per_step = per_step.unwrap_or_else(|| Arc::new(stubs::one_nd_step) as PerStep);
     plan_box(async_stream::stream! {
         let motor_readers: Vec<Arc<dyn ReadableObj>> =
             axes.iter().map(|(_, mr, _, _)| mr.clone()).collect();
@@ -1065,25 +1181,18 @@ pub fn inner_product_scan(
             AxisGrouping::Coupled,
         ));
         for row in pts {
-            // Per-step rewind boundary before this point's moves (bluesky
-            // move_per_step, plan_stubs.py:1695).
-            yield Msg::Checkpoint;
-            for (i, val) in row.iter().enumerate() {
-                yield Msg::Set {
-                    obj: axes[i].0.clone(),
-                    value: *val,
-                    group: Some("set".into()),
-                };
+            // Every axis is commanded each point (Some), matching the previous
+            // unconditional Set-all loop.
+            let motors: Vec<StepMotor> = axes
+                .iter()
+                .zip(row.iter())
+                .map(|((m, mr, _, _), val)| (m.clone(), mr.clone(), Some(*val)))
+                .collect();
+            let mut sub = per_step(detectors.clone(), motors);
+            while let Some(item) = futures::StreamExt::next(&mut sub).await {
+                let crate::core::plan::PlanItem::Bare(m) = item;
+                yield m;
             }
-            yield Msg::Wait { group: "set".into(), error_on_timeout: true, timeout: None };
-            yield Msg::Create { stream_name: "primary".into() };
-            for (_, mr, _, _) in &axes {
-                yield Msg::Read(mr.clone());
-            }
-            for d in &detectors {
-                yield Msg::Read(d.clone());
-            }
-            yield Msg::Save;
         }
         yield Msg::CloseRun { exit_status: "success".into(), reason: None };
     })
@@ -1134,6 +1243,21 @@ pub fn scan_nd(
     motors: Vec<(Arc<dyn MovableObj>, Arc<dyn ReadableObj>)>,
     points: Vec<Vec<f64>>,
 ) -> Plan {
+    scan_nd_per_step(detectors, motors, points, None)
+}
+
+/// `scan_nd` delegating each point to `per_step`. `None` uses
+/// [`stubs::one_nd_step`], which reproduces the previous `scan_nd` traversal
+/// byte-for-byte (each point moves only the motors whose target differs from
+/// their last-set position — the `pos_cache`/`StepMotor::None` skip — then reads
+/// all motor readers and detectors). Ports bluesky's `scan_nd` `per_step` hook
+/// (plans.py:271).
+pub fn scan_nd_per_step(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    motors: Vec<(Arc<dyn MovableObj>, Arc<dyn ReadableObj>)>,
+    points: Vec<Vec<f64>>,
+    per_step: Option<PerStep>,
+) -> Plan {
     let motor_readers: Vec<Arc<dyn ReadableObj>> =
         motors.iter().map(|(_, mr)| mr.clone()).collect();
     let md = scan_run_md(
@@ -1143,7 +1267,7 @@ pub fn scan_nd(
         Some(points.len()),
         AxisGrouping::Coupled,
     );
-    scan_nd_with_md(detectors, motors, points, md)
+    scan_nd_with_md(detectors, motors, points, md, per_step)
 }
 
 /// The shared body of the `scan_nd` family: drive each row of `points` and read
@@ -1156,7 +1280,9 @@ fn scan_nd_with_md(
     motors: Vec<(Arc<dyn MovableObj>, Arc<dyn ReadableObj>)>,
     points: Vec<Vec<f64>>,
     md: RunMetadata,
+    per_step: Option<PerStep>,
 ) -> Plan {
+    let per_step = per_step.unwrap_or_else(|| Arc::new(stubs::one_nd_step) as PerStep);
     plan_box(async_stream::stream! {
         yield Msg::OpenRun(md);
         // Per-motor last-set position — bsrs's port of bluesky's
@@ -1169,38 +1295,33 @@ fn scan_nd_with_md(
         // pos_cache with a None default, so the first `pos == None` is False).
         // Exact equality mirrors bluesky's `pos == pos_cache[motor]`: grid
         // points recur exactly, so an epsilon is unwanted (it would skip a
-        // genuine small move).
+        // genuine small move). The pos_cache decision becomes each motor's
+        // `StepMotor` target (`Some` to command, `None` to skip); `one_nd_step`
+        // then emits Checkpoint/Set*/Wait and reads all motor readers, so the
+        // default reproduces the previous inline loop exactly.
         let mut pos_cache: Vec<Option<f64>> = vec![None; motors.len()];
         for row in points {
-            // Per-step rewind boundary before this point's moves (bluesky
-            // move_per_step, plan_stubs.py:1695).
-            yield Msg::Checkpoint;
-            for (i, v) in row.iter().enumerate() {
-                if i >= motors.len() { break; }
-                if pos_cache[i] == Some(*v) {
-                    // This step does not move motor i (bluesky move_per_step
-                    // `if pos == pos_cache[motor]: continue`, plan_stubs.py:1698).
-                    continue;
-                }
-                yield Msg::Set {
-                    obj: motors[i].0.clone(),
-                    value: *v,
-                    group: Some("set".into()),
-                };
-                pos_cache[i] = Some(*v);
+            let step_motors: Vec<StepMotor> = motors
+                .iter()
+                .enumerate()
+                .map(|(i, (m, mr))| {
+                    // Row shorter than motors: trailing motors are never
+                    // commanded (target None) but are still read, matching the
+                    // previous `for (i, v) in row.iter()` + break/continue.
+                    let target = if i < row.len() && pos_cache[i] != Some(row[i]) {
+                        pos_cache[i] = Some(row[i]);
+                        Some(row[i])
+                    } else {
+                        None
+                    };
+                    (m.clone(), mr.clone(), target)
+                })
+                .collect();
+            let mut sub = per_step(detectors.clone(), step_motors);
+            while let Some(item) = futures::StreamExt::next(&mut sub).await {
+                let crate::core::plan::PlanItem::Bare(m) = item;
+                yield m;
             }
-            // Yielded unconditionally, matching bluesky (the wait on an empty
-            // `set` group is a no-op). Real grid points always move the fast
-            // axis, so the group is non-empty in practice.
-            yield Msg::Wait { group: "set".into(), error_on_timeout: true, timeout: None };
-            yield Msg::Create { stream_name: "primary".into() };
-            for (_, mr) in &motors {
-                yield Msg::Read(mr.clone());
-            }
-            for d in &detectors {
-                yield Msg::Read(d.clone());
-            }
-            yield Msg::Save;
         }
         yield Msg::CloseRun { exit_status: "success".into(), reason: None };
     })
@@ -1266,7 +1387,10 @@ pub fn list_grid_scan_snake(
         Some(pts.len()),
         AxisGrouping::Grid,
     );
-    scan_nd_with_md(detectors, motors, pts, md)
+    // grid-family per_step is deferred: grid_scan_snake settles the slow axis
+    // in a separate "set1" group per row, which does not match one_nd_step's
+    // single-group move. Route through the default until that reconciliation.
+    scan_nd_with_md(detectors, motors, pts, md, None)
 }
 
 /// `rel_list_grid_scan(dets, axes)` — relative variant of [`list_grid_scan`]
@@ -3290,6 +3414,143 @@ mod tests {
                 );
             }
         }
+    }
+
+    // A custom per_shot replaces the whole shot: `count_per_shot` runs it once
+    // per repetition and emits none of the default read_shot's Checkpoint/reads.
+    #[tokio::test]
+    async fn count_per_shot_uses_custom_hook_verbatim() {
+        let d = rdr("det");
+        let per_shot: PerShot = Arc::new(|dets: Vec<Arc<dyn ReadableObj>>| {
+            plan_box(async_stream::stream! {
+                yield Msg::Create { stream_name: "custom".into() };
+                for det in &dets {
+                    yield Msg::Read(det.clone());
+                }
+                yield Msg::Save;
+            })
+        });
+        let msgs = drain(count_per_shot(vec![d], 3, Some(per_shot))).await;
+        assert_eq!(
+            msgs.iter().filter(|m| matches!(m, Msg::Checkpoint)).count(),
+            0,
+            "custom per_shot owns the shot; the default Checkpoint is gone"
+        );
+        assert_eq!(
+            msgs.iter()
+                .filter(|m| matches!(m, Msg::Create { stream_name } if stream_name == "custom"))
+                .count(),
+            3,
+            "custom shot runs once per repetition"
+        );
+        assert_eq!(
+            msgs.iter().filter(|m| matches!(m, Msg::OpenRun(_))).count(),
+            1,
+            "count still owns the run envelope"
+        );
+        assert_eq!(
+            msgs.iter()
+                .filter(|m| matches!(m, Msg::CloseRun { .. }))
+                .count(),
+            1,
+            "count still owns the run envelope"
+        );
+    }
+
+    // A custom per_step replaces the whole step and receives this step's motor
+    // targets threaded through `StepMotor`.
+    #[tokio::test]
+    async fn scan_per_step_uses_custom_hook_and_threads_targets() {
+        let motor = Arc::new(FakeMotor {
+            name: "m".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let per_step: PerStep = Arc::new(
+            |_dets: Vec<Arc<dyn ReadableObj>>, motors: Vec<StepMotor>| {
+                plan_box(async_stream::stream! {
+                    for (m, _r, target) in &motors {
+                        if let Some(v) = target {
+                            yield Msg::Set { obj: m.clone(), value: *v, group: Some("custom".into()) };
+                        }
+                    }
+                })
+            },
+        );
+        let msgs = drain(scan_per_step(
+            vec![],
+            motor,
+            rdr("m_rbv"),
+            0.0,
+            10.0,
+            3,
+            Some(per_step),
+        ))
+        .await;
+        assert_eq!(
+            msgs.iter().filter(|m| matches!(m, Msg::Checkpoint)).count(),
+            0,
+            "custom step omits the default Checkpoint/Create/Read/Save"
+        );
+        assert_eq!(
+            msgs.iter()
+                .filter(|m| matches!(m, Msg::Create { .. }))
+                .count(),
+            0,
+            "custom step omits the default Create bundle"
+        );
+        let sets: Vec<f64> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                Msg::Set { value, group, .. } if group.as_deref() == Some("custom") => Some(*value),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sets,
+            vec![0.0, 5.0, 10.0],
+            "each step's target is threaded through StepMotor to the hook"
+        );
+    }
+
+    // scan_nd's pos_cache decision reaches the hook as each motor's StepMotor
+    // target: `Some` to command, `None` when already at position (skip). A slow
+    // axis constant across inner points is marked `None` on those points.
+    #[tokio::test]
+    async fn scan_nd_per_step_marks_unchanged_motor_none() {
+        let m1 = Arc::new(FakeMotor {
+            name: "m1".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let m2 = Arc::new(FakeMotor {
+            name: "m2".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let masks: Arc<std::sync::Mutex<Vec<Vec<bool>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let masks_c = masks.clone();
+        let per_step: PerStep = Arc::new(
+            move |_dets: Vec<Arc<dyn ReadableObj>>, motors: Vec<StepMotor>| {
+                masks_c
+                    .lock()
+                    .unwrap()
+                    .push(motors.iter().map(|(_, _, t)| t.is_some()).collect());
+                plan_box(async_stream::stream! { yield Msg::Checkpoint; })
+            },
+        );
+        let motors = vec![(m1, rdr("m1r")), (m2, rdr("m2r"))];
+        // Slow axis m1 holds 0 across the first two points, then steps to 1.
+        let points = vec![vec![0.0, 0.0], vec![0.0, 1.0], vec![1.0, 0.0]];
+        let _ = drain(scan_nd_per_step(vec![], motors, points, Some(per_step))).await;
+        let got = masks.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec![
+                vec![true, true],  // first point: pos_cache empty, both command
+                vec![false, true], // m1 holds 0 (skip), m2 steps 0->1
+                vec![true, true],  // m1 steps 0->1, m2 steps 1->0
+            ],
+            "pos_cache skip surfaces as StepMotor::None at the hook"
+        );
     }
 
     // A delegating rel_ plan inherits the base plan's per-step checkpoints.
