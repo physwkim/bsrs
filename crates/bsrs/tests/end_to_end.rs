@@ -54,6 +54,7 @@ async fn adaptive_scan_runs_to_completion() {
         0.5,
         1.0,
         false,
+        0.8,
     );
     let result = re.run_async(plan).await.expect("adaptive_scan failed");
     assert_eq!(result.exit_status, "success");

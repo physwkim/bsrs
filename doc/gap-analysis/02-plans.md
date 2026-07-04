@@ -17,7 +17,8 @@ The primary gaps are:
   cannot be customized (P0, PLAN-01).
 - **No staging** inside any compound plan — devices are never armed (P0, PLAN-09).
 - **Three core plans have divergent algorithms** from bluesky: `ramp_plan`,
-  `tune_centroid`, `adaptive_scan` (P0, PLAN-04/05/06).
+  `tune_centroid`, `adaptive_scan` (P0, PLAN-04/05/06). `adaptive_scan` **DONE**
+  (slope-normalised + threshold + smoothing); `tune_centroid`/`ramp_plan` open.
 - **`scan` is 1D only**; bluesky's is N-D (P0, PLAN-03).
 - **`mv`/`mvr` are single-motor only**; bluesky accepts parallel multi-motor pairs (P1,
   PLAN-10).
@@ -123,7 +124,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-06 — `adaptive_scan` step-sizing algorithm diverges from bluesky
+### PLAN-06 — `adaptive_scan` step-sizing algorithm diverges from bluesky — **DONE**
 
 - **bsrs:** `lib.rs:945–1027` — halves step on `|delta| > target * 1.5`, doubles on
   `|delta| < target * 0.5`; no slope, no smoothing, no `threshold`
@@ -137,6 +138,17 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
   also emits `Msg("checkpoint")` before each step (via `bps.mv`); bsrs does not.
 - **Fix sketch:** Replace halving/doubling with `slope = (n - p).abs() / step; new_step = clip(target_delta / slope, min_step, max_step)` (guarded for slope=0).  Add `threshold: f64 = 0.8` param.  Apply exponential smoothing.  Emit `Checkpoint` before each position.
 - **Effort:** M
+- **Resolution:** `adaptive_scan` / `rel_adaptive_scan` rewritten to bluesky's
+  slope-normalised algorithm: initial step is the half-range `(max-min)/2`;
+  strict boundary `pos*dir < stop*dir`; first point seeds the reference with no
+  adaptation; `slope = |ΔI|/step`, `new_step = clip(target_delta/slope, min,
+  max)` (or `min(step*1.1, max)` when the slope is flat); backstep over the
+  overshot region when `new_step < step*threshold`; exponential smoothing
+  `0.2·new + 0.8·old`.  Added the `threshold: f64` parameter and a fail-fast
+  guard for `0 < min_step < max_step` (bluesky's `ValueError`).  `Checkpoint`
+  was already emitted per step.  Tests: invalid-bounds fail-before-run,
+  initial-step = half-range (catches the old midpoint bug), and a
+  backstep-past-threshold trajectory asserted to the exact position.
 
 ---
 

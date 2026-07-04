@@ -1706,20 +1706,22 @@ pub fn fly(
 }
 
 /// `adaptive_scan(detectors, signal_field, motor, motor_reader, start,
-/// stop, min_step, max_step, target_delta, backstep)` — adaptive
-/// step-sized 1-D scan. Mirrors bluesky's `adaptive_scan`.
+/// stop, min_step, max_step, target_delta, backstep, threshold)` — adaptive
+/// step-sized 1-D scan. Ports bluesky's `adaptive_scan` (plans.py:673)
+/// slope-normalised step sizing.
 ///
-/// At each step, reads `signal_field` from the first detector's
-/// reading. Compares delta to the previous reading:
-/// - If `|delta|` exceeds `target_delta * 1.5`, the next step
-///   shrinks (toward `min_step`) and optionally back-steps (when
-///   `backstep=true`) to capture the missed transition.
-/// - If `|delta|` is well below `target_delta * 0.5`, the next step
-///   doubles (toward `max_step`).
+/// At each step it reads `signal_field`, forms the gradient
+/// `slope = |ΔI| / step`, and picks the next step so the *signal* changes
+/// by about `target_delta`: `new_step = clip(target_delta / slope, min_step,
+/// max_step)` (or a gentle `min(step*1.1, max_step)` grow when the slope is
+/// flat). The applied step is exponentially smoothed (`0.2·new + 0.8·old`).
+/// When `backstep` and the new step falls below `step * threshold`, it steps
+/// back over the region it overshot and re-scans it with the finer step.
 ///
-/// Useful for scanning across a peak / edge where uniform-step
-/// density would either miss the feature or oversample the flat
-/// regions.
+/// Requires `0 < min_step < max_step`; otherwise the plan fails immediately
+/// (bluesky raises `ValueError`). Useful for scanning across a peak / edge
+/// where uniform-step density would either miss the feature or oversample the
+/// flat regions.
 #[allow(clippy::too_many_arguments)]
 pub fn adaptive_scan(
     detectors: Vec<Arc<dyn ReadableObj>>,
@@ -1732,30 +1734,37 @@ pub fn adaptive_scan(
     max_step: f64,
     target_delta: f64,
     backstep: bool,
+    threshold: f64,
 ) -> Plan {
     let signal_field = signal_field.into();
-    let mid_step = (min_step + max_step) * 0.5;
     plan_box(async_stream::stream! {
+        if !(min_step > 0.0 && min_step < max_step) {
+            yield Msg::Fail(format!(
+                "adaptive_scan: require 0 < min_step < max_step, got min_step={min_step}, max_step={max_step}"
+            ));
+            return;
+        }
         yield Msg::OpenRun(RunMetadata {
             plan_name: Some("adaptive_scan".into()),
             ..Default::default()
         });
         let direction = if stop >= start { 1.0_f64 } else { -1.0 };
         let mut pos = start;
-        let mut prev_signal: Option<f64> = None;
-        let mut step = mid_step.max(min_step.min(max_step));
+        let mut past_i: Option<f64> = None;
+        // bluesky's initial step is the half-range, not the midpoint.
+        let mut step = (max_step - min_step) / 2.0;
+        // Safety cap: backstep can oscillate on degenerate signals; bluesky
+        // relies on physics to terminate, we bound it to avoid a hang.
         let max_iters = 10_000_usize;
         let mut iter = 0_usize;
-        loop {
+        // Strict boundary matches bluesky `while next_pos*dir < stop*dir`.
+        while pos * direction < stop * direction {
             iter += 1;
             if iter > max_iters {
                 break;
             }
-            if (direction > 0.0 && pos > stop) || (direction < 0.0 && pos < stop) {
-                break;
-            }
-            // Per-step rewind boundary (bluesky one_1d_step.move(): :1669).
-            // After the break checks, so a terminal iteration emits none.
+            // Per-step rewind boundary (bluesky emits `checkpoint` before the
+            // `mv`, plans.py:764).
             yield Msg::Checkpoint;
             yield Msg::Set { obj: motor.clone(), value: pos, group: Some("set".into()) };
             yield Msg::Wait {
@@ -1769,36 +1778,46 @@ pub fn adaptive_scan(
                 yield Msg::Read(d.clone());
             }
             yield Msg::Save;
-            // Best-effort signal sample for adaptation. We don't
-            // have direct access to the value yielded into the
-            // bundler from this side of the plan stream, so we
-            // re-read the first detector. For soft / fast-read
-            // detectors this is cheap; for slow ones consider a
-            // separate signal channel.
-            let now_signal: Option<f64> = if let Some(d) = detectors.first() {
+            // Signal sample for adaptation. bsrs plans do not receive the
+            // value bundled by `Msg::Read`, so re-read `signal_field` from the
+            // first detector that reports it (bluesky reads it from whichever
+            // device carries `target_field`, plans.py:770).
+            let mut cur_i: Option<f64> = None;
+            for d in &detectors {
                 if let Ok(map) = d.read_dyn().await {
-                    map.get(&signal_field).and_then(|rv| rv.value.as_f64())
-                } else { None }
-            } else { None };
-            let next_step = match (prev_signal, now_signal) {
-                (Some(p), Some(n)) => {
-                    let abs_delta = (n - p).abs();
-                    if abs_delta > target_delta * 1.5 {
-                        let new_step = (step * 0.5).max(min_step);
-                        if backstep && new_step < step {
-                            pos -= step * direction;
-                        }
-                        new_step
-                    } else if abs_delta < target_delta * 0.5 {
-                        (step * 2.0).min(max_step)
-                    } else {
-                        step
+                    if let Some(v) = map.get(&signal_field).and_then(|rv| rv.value.as_f64()) {
+                        cur_i = Some(v);
+                        break;
                     }
                 }
-                _ => step,
+            }
+            // First point: seed the reference, advance, no adaptation.
+            let Some(p) = past_i else {
+                past_i = cur_i;
+                pos += step * direction;
+                continue;
             };
-            prev_signal = now_signal.or(prev_signal);
-            step = next_step.clamp(min_step, max_step);
+            // No signal this point: keep the step, do not update the reference.
+            let Some(n) = cur_i else {
+                pos += step * direction;
+                continue;
+            };
+            let di = (n - p).abs();
+            let slope = di / step;
+            let new_step = if slope != 0.0 {
+                (target_delta / slope).clamp(min_step, max_step)
+            } else {
+                (step * 1.1).min(max_step)
+            };
+            if backstep && new_step < step * threshold {
+                // Overshot: step back over the region and re-scan it finer.
+                // Verbatim bluesky arithmetic (`next_pos -= step`, no sign).
+                pos -= step;
+                step = new_step;
+            } else {
+                past_i = Some(n);
+                step = 0.2 * new_step + 0.8 * step;
+            }
             pos += step * direction;
         }
         yield Msg::CloseRun {
@@ -1900,6 +1919,7 @@ pub fn rel_adaptive_scan(
     max_step: f64,
     target_delta: f64,
     backstep: bool,
+    threshold: f64,
 ) -> Plan {
     let signal_field = signal_field.into();
     let reset_motor = motor.clone();
@@ -1928,6 +1948,7 @@ pub fn rel_adaptive_scan(
             max_step,
             target_delta,
             backstep,
+            threshold,
         );
         use futures::StreamExt;
         while let Some(item) = inner.next().await {
@@ -2119,6 +2140,182 @@ mod tests {
         async fn trigger_dyn(&self) -> Status {
             Status::done()
         }
+    }
+
+    /// Detector whose `read_dyn` returns a predetermined signal sequence, one
+    /// value per call (clamped to the last), under a fixed field name. Lets an
+    /// adaptive plan be driven with a deterministic signal so the resulting
+    /// motor trajectory can be asserted exactly.
+    struct SequenceDetector {
+        name: String,
+        field: String,
+        values: Vec<f64>,
+        cursor: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl SequenceDetector {
+        fn new(name: &str, field: &str, values: Vec<f64>) -> Arc<Self> {
+            Arc::new(Self {
+                name: name.into(),
+                field: field.into(),
+                values,
+                cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })
+        }
+    }
+
+    impl NamedObj for SequenceDetector {
+        fn name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ReadableObj for SequenceDetector {
+        async fn read_dyn(
+            &self,
+        ) -> Result<HashMap<String, ReadingValue>, crate::core::error::BsrsError> {
+            let i = self
+                .cursor
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .min(self.values.len().saturating_sub(1));
+            let v = self.values.get(i).copied().unwrap_or(0.0);
+            let mut map = HashMap::new();
+            map.insert(
+                self.field.clone(),
+                ReadingValue::new(serde_json::json!(v), 0.0),
+            );
+            Ok(map)
+        }
+        async fn describe_dyn(
+            &self,
+        ) -> Result<HashMap<String, crate::event_model::DataKey>, crate::core::error::BsrsError>
+        {
+            Ok(HashMap::new())
+        }
+    }
+
+    /// Collect the `value`s of every `Msg::Set` targeting motor `name`, in
+    /// order — the trajectory an adaptive plan drove the motor through.
+    fn set_targets(msgs: &[Msg], name: &str) -> Vec<f64> {
+        msgs.iter()
+            .filter_map(|m| match m {
+                Msg::Set { obj, value, .. } if obj.name() == name => Some(*value),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn adaptive_scan_rejects_invalid_step_bounds() {
+        // bluesky raises ValueError unless 0 < min_step < max_step. bsrs fails
+        // the plan before opening a run.
+        let det = SequenceDetector::new("d", "sig", vec![1.0]) as Arc<dyn ReadableObj>;
+        let m = Arc::new(FakeMotor {
+            name: "m".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let msgs = drain(adaptive_scan(
+            vec![det],
+            "sig",
+            m,
+            rdr("mr"),
+            0.0,
+            2.0,
+            0.5, // min_step
+            0.5, // max_step == min_step → invalid
+            1.0,
+            false,
+            0.8,
+        ))
+        .await;
+        assert!(
+            matches!(msgs.first(), Some(Msg::Fail(_))),
+            "expected a leading Fail, got {msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| matches!(m, Msg::OpenRun(_))),
+            "no run should open on invalid bounds"
+        );
+    }
+
+    #[tokio::test]
+    async fn adaptive_scan_initial_step_is_half_range() {
+        // First move is at `start`; the second is one initial step later, and
+        // the initial step is the half-range (max-min)/2, NOT the midpoint.
+        // Constant signal keeps the run finite and the second step exact.
+        let det = SequenceDetector::new("d", "sig", vec![5.0; 64]) as Arc<dyn ReadableObj>;
+        let m = Arc::new(FakeMotor {
+            name: "m".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let msgs = drain(adaptive_scan(
+            vec![det],
+            "sig",
+            m,
+            rdr("mr"),
+            0.0,  // start
+            10.0, // stop
+            1.0,  // min_step
+            4.0,  // max_step  → half-range = 1.5, midpoint would be 2.5
+            2.0,
+            false,
+            0.8,
+        ))
+        .await;
+        let targets = set_targets(&msgs, "m");
+        assert_eq!(targets.first().copied(), Some(0.0), "first move at start");
+        assert_eq!(
+            targets.get(1).copied(),
+            Some(1.5),
+            "second move one half-range step later"
+        );
+        // backstep disabled → the trajectory only advances.
+        assert!(
+            targets.windows(2).all(|w| w[1] >= w[0]),
+            "no backstep without backstep=true: {targets:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn adaptive_scan_backsteps_when_step_shrinks_past_threshold() {
+        // A large signal jump between the first two points forces
+        // new_step = clip(target_delta/slope, min, max) down to min_step, well
+        // below step*threshold, so with backstep=true the motor steps back
+        // over the region it overshot — a non-monotonic trajectory.
+        let det = SequenceDetector::new("d", "sig", vec![0.0, 10.0, 10.0, 10.0, 10.0, 10.0])
+            as Arc<dyn ReadableObj>;
+        let m = Arc::new(FakeMotor {
+            name: "m".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let msgs = drain(adaptive_scan(
+            vec![det],
+            "sig",
+            m,
+            rdr("mr"),
+            0.0,  // start
+            20.0, // stop
+            0.5,  // min_step  → half-range = 2.25
+            5.0,  // max_step
+            1.0,  // target_delta
+            true, // backstep
+            0.8,
+        ))
+        .await;
+        let targets = set_targets(&msgs, "m");
+        assert_eq!(targets.first().copied(), Some(0.0));
+        assert_eq!(
+            targets.get(1).copied(),
+            Some(2.25),
+            "initial half-range step"
+        );
+        // Third move steps back: pos -= old_step (2.25) then += new_step (0.5).
+        assert_eq!(
+            targets.get(2).copied(),
+            Some(0.5),
+            "backstep over the overshot region: {targets:?}"
+        );
     }
 
     // Empty triggerables → no Trigger and no Wait (bluesky no_wait guard),
