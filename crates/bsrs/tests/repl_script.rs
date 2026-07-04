@@ -368,6 +368,7 @@ fn bps_namespace_stub_plans() {
     let (out, err, code) = run_script(
         r#"
 local m1 = soft_motor("m1", 0.0)
+local m2 = soft_motor("m2", 0.0)
 local d1 = soft_detector("d1")
 
 -- 1-Msg / small stubs
@@ -375,6 +376,9 @@ assert(string.find(RE:run(bps.null()), "exit_status="))
 assert(string.find(RE:run(bps.sleep(0.005)), "exit_status="))
 assert(string.find(RE:run(bps.mv(m1, 0.5)), "exit_status="))
 assert(string.find(RE:run(bps.mvr(m1, 0.1)), "exit_status="))
+-- PLAN-10: variadic multi-motor mv / mvr (all into one group, one wait)
+assert(string.find(RE:run(bps.mv(m1, 0.5, m2, 1.5)), "exit_status="))
+assert(string.find(RE:run(bps.mvr(m1, 0.1, m2, -0.2)), "exit_status="))
 assert(string.find(RE:run(bps.abs_set(m1, 1.0)), "exit_status="))
 
 -- bps.read inside a properly-bracketed run

@@ -2398,6 +2398,53 @@ fn monitors_of(t: &mlua::Table) -> mlua::Result<Vec<Arc<dyn MonitorableObj>>> {
     Ok(out)
 }
 
+/// Parse a variadic `(device, number)` argument list into `(capability, value)`
+/// pairs for the multi-motor `mv`/`mvr` stubs (bluesky `mv(*args)`). `project`
+/// maps each `LuaDevice` to the capability the stub needs (movable / locatable).
+fn move_pairs<T: ?Sized>(
+    args: &[mlua::Value],
+    ctx: &str,
+    project: impl Fn(&LuaDevice) -> Option<Arc<T>>,
+) -> mlua::Result<Vec<(Arc<T>, f64)>> {
+    if args.is_empty() || !args.len().is_multiple_of(2) {
+        return Err(mlua::Error::RuntimeError(format!(
+            "{ctx} expects (motor, value) pairs"
+        )));
+    }
+    let mut out = Vec::with_capacity(args.len() / 2);
+    let mut i = 0;
+    while i < args.len() {
+        let ud = args[i].as_userdata().ok_or_else(|| {
+            mlua::Error::RuntimeError(format!("{ctx}: argument {} must be a device", i + 1))
+        })?;
+        let d = ud.borrow::<LuaDevice>()?;
+        let dev = project(&d).ok_or_else(|| {
+            mlua::Error::RuntimeError(format!("{} lacks the capability required by {ctx}", d.name))
+        })?;
+        let v = match &args[i + 1] {
+            mlua::Value::Number(n) => *n,
+            mlua::Value::Integer(n) => *n as f64,
+            _ => {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "{ctx}: argument {} must be a number",
+                    i + 2
+                )))
+            }
+        };
+        out.push((dev, v));
+        i += 2;
+    }
+    Ok(out)
+}
+
+fn mv_pairs(args: &[mlua::Value], ctx: &str) -> mlua::Result<Vec<(Arc<dyn MovableObj>, f64)>> {
+    move_pairs(args, ctx, |d| d.movable.clone())
+}
+
+fn mvr_pairs(args: &[mlua::Value], ctx: &str) -> mlua::Result<Vec<(Arc<dyn LocatableObj>, f64)>> {
+    move_pairs(args, ctx, |d| d.locatable.clone())
+}
+
 type MotorMR = (Arc<dyn MovableObj>, Arc<dyn ReadableObj>, String);
 
 fn motor_movable_readable(ud: &mlua::AnyUserData) -> mlua::Result<MotorMR> {
@@ -2942,26 +2989,22 @@ fn register_bps(lua: &Lua) -> mlua::Result<()> {
             },
         )?,
     )?;
+    // `bps.mv(m1, v1[, m2, v2, ...])` — variadic like bluesky's `mv(*args)`:
+    // every (motor, target) pair moves in parallel behind one wait. The 2-arg
+    // form is the single-motor case.
     bps.set(
         "mv",
-        lua.create_function(|_, (mu, v): (mlua::AnyUserData, f64)| {
-            let d = mu.borrow::<LuaDevice>()?;
-            let mv = d
-                .movable
-                .clone()
-                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not movable", d.name)))?;
-            Ok(wrap_prebuilt("mv", stubs::mv(mv, v)))
+        lua.create_function(|_, args: mlua::Variadic<mlua::Value>| {
+            let moves = mv_pairs(&args, "mv")?;
+            Ok(wrap_prebuilt("mv", stubs::mv_many(moves)))
         })?,
     )?;
+    // `bps.mvr(m1, d1[, m2, d2, ...])` — variadic relative multi-motor move.
     bps.set(
         "mvr",
-        lua.create_function(|_, (mu, delta): (mlua::AnyUserData, f64)| {
-            let d = mu.borrow::<LuaDevice>()?;
-            let lo = d
-                .locatable
-                .clone()
-                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not locatable", d.name)))?;
-            Ok(wrap_prebuilt("mvr", stubs::mvr(lo, delta)))
+        lua.create_function(|_, args: mlua::Variadic<mlua::Value>| {
+            let moves = mvr_pairs(&args, "mvr")?;
+            Ok(wrap_prebuilt("mvr", stubs::mvr_many(moves)))
         })?,
     )?;
     bps.set(

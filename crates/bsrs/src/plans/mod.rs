@@ -234,37 +234,65 @@ pub mod stubs {
         })
     }
 
-    /// `mv(motor, value)` — set + wait. Same group lifetime.
-    pub fn mv(motor: Arc<dyn MovableObj>, value: f64) -> Plan {
+    /// `mv_many(moves)` — bluesky's variadic `mv(*args)` (plan_stubs.py:357):
+    /// fire every `(motor, target)` into ONE shared group, then wait once, so
+    /// the motors move in parallel behind a single barrier. Daily beamline
+    /// pattern (e.g. sample position + detector distance together). The
+    /// single-motor [`mv`] is the one-element case.
+    pub fn mv_many(moves: Vec<(Arc<dyn MovableObj>, f64)>) -> Plan {
         plan_box(async_stream::stream! {
-            yield Msg::Set { obj: motor, value, group: Some("mv".into()) };
+            for (motor, value) in &moves {
+                yield Msg::Set { obj: motor.clone(), value: *value, group: Some("mv".into()) };
+            }
+            // One wait for the whole group — parallel motion, single barrier.
             yield Msg::Wait { group: "mv".into(), error_on_timeout: true, timeout: None };
         })
     }
 
-    /// `mvr(motor, delta)` — relative move. The plan reads the current
-    /// setpoint (commanded position) via `LocatableObj::locate_dyn` *inside*
-    /// the generator, adds `delta`, then yields `Set`+`Wait` for the absolute
-    /// target. Bases on the setpoint, not the readback, matching bluesky's
-    /// `relative_set_wrapper` (`__read_and_stash_a_motor`).
-    /// Motor must implement `LocatableObj` (which extends `MovableObj`).
-    pub fn mvr(motor: Arc<dyn LocatableObj>, delta: f64) -> Plan {
+    /// `mv(motor, value)` — set + wait. The single-motor case of [`mv_many`].
+    pub fn mv(motor: Arc<dyn MovableObj>, value: f64) -> Plan {
+        mv_many(vec![(motor, value)])
+    }
+
+    /// `mvr_many(moves)` — relative multi-motor move: each motor's absolute
+    /// target is its own current setpoint (via `LocatableObj::locate_dyn`) plus
+    /// its `delta`. Every target is resolved FIRST (all reads before any
+    /// motion), then all `Set`s fire into one shared group and a single `Wait`
+    /// follows — so a `locate_dyn` failure on any motor aborts the run via
+    /// `Msg::Fail` before a single motor starts moving. Bases on the setpoint,
+    /// not the readback, matching bluesky's `relative_set_wrapper`
+    /// (`__read_and_stash_a_motor`). The single-motor [`mvr`] is the
+    /// one-element case.
+    pub fn mvr_many(moves: Vec<(Arc<dyn LocatableObj>, f64)>) -> Plan {
         plan_box(async_stream::stream! {
-            let loc = match motor.locate_dyn().await {
-                Ok(l) => l,
-                Err(e) => {
-                    // Fail the run cleanly via Msg::Fail rather than
-                    // panicking the plan task. The engine's Fail
-                    // handler closes the run with exit_status="fail".
-                    yield Msg::Fail(format!("mvr({}): locate_dyn failed: {e}", motor.name()));
-                    return;
-                }
-            };
-            let target = loc.setpoint + delta;
-            let movable: Arc<dyn MovableObj> = motor;
-            yield Msg::Set { obj: movable, value: target, group: Some("mv".into()) };
+            // Read every setpoint before yielding any Set, so a locate failure
+            // fails the run before any motion begins.
+            let mut targets: Vec<(Arc<dyn MovableObj>, f64)> = Vec::with_capacity(moves.len());
+            for (motor, delta) in moves {
+                let loc = match motor.locate_dyn().await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        // Fail the run cleanly via Msg::Fail rather than
+                        // panicking the plan task. The engine's Fail handler
+                        // closes the run with exit_status="fail".
+                        yield Msg::Fail(format!("mvr({}): locate_dyn failed: {e}", motor.name()));
+                        return;
+                    }
+                };
+                targets.push((motor as Arc<dyn MovableObj>, loc.setpoint + delta));
+            }
+            for (motor, value) in &targets {
+                yield Msg::Set { obj: motor.clone(), value: *value, group: Some("mv".into()) };
+            }
             yield Msg::Wait { group: "mv".into(), error_on_timeout: true, timeout: None };
         })
+    }
+
+    /// `mvr(motor, delta)` — relative move. The single-motor case of
+    /// [`mvr_many`]. Motor must implement `LocatableObj` (which extends
+    /// `MovableObj`).
+    pub fn mvr(motor: Arc<dyn LocatableObj>, delta: f64) -> Plan {
+        mvr_many(vec![(motor, delta)])
     }
 
     /// `rel_set(motor, value, group)` — set relative to the motor's current
@@ -2752,6 +2780,183 @@ mod tests {
             (set_value(&msgs) - 7.0).abs() < 1e-9,
             "relative_set_wrapper must base on setpoint (→7.0): got {}",
             set_value(&msgs)
+        );
+    }
+
+    // -- PLAN-10: multi-motor mv / mvr --------------------------------------
+
+    #[tokio::test]
+    async fn mv_many_fires_all_motors_into_one_group_and_waits_once() {
+        // bluesky mv(*args) sets every motor into one group and waits ONCE, so
+        // the moves run in parallel behind a single barrier.
+        struct M(&'static str);
+        impl NamedObj for M {
+            fn name(&self) -> &str {
+                self.0
+            }
+        }
+        #[async_trait::async_trait]
+        impl MovableObj for M {
+            async fn set_dyn(&self, _value: f64) -> Status {
+                Status::done()
+            }
+        }
+        let m1: Arc<dyn MovableObj> = Arc::new(M("x"));
+        let m2: Arc<dyn MovableObj> = Arc::new(M("y"));
+        let m3: Arc<dyn MovableObj> = Arc::new(M("z"));
+
+        let msgs = drain(stubs::mv_many(vec![(m1, 1.0), (m2, 2.0), (m3, 3.0)])).await;
+
+        let sets: Vec<(&str, f64, Option<&str>)> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                Msg::Set { obj, value, group } => Some((obj.name(), *value, group.as_deref())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sets,
+            vec![
+                ("x", 1.0, Some("mv")),
+                ("y", 2.0, Some("mv")),
+                ("z", 3.0, Some("mv")),
+            ],
+            "one Set per motor, all in the shared \"mv\" group, in order"
+        );
+        let waits: Vec<&str> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                Msg::Wait { group, .. } => Some(group.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(waits, vec!["mv"], "exactly one Wait, after all Sets");
+        assert!(
+            matches!(msgs.last(), Some(Msg::Wait { .. })),
+            "the single Wait is the last message (parallel barrier)"
+        );
+    }
+
+    #[tokio::test]
+    async fn mvr_many_bases_each_target_on_its_own_setpoint_then_one_wait() {
+        struct L {
+            name: &'static str,
+            setpoint: f64,
+        }
+        impl NamedObj for L {
+            fn name(&self) -> &str {
+                self.name
+            }
+        }
+        #[async_trait::async_trait]
+        impl MovableObj for L {
+            async fn set_dyn(&self, _value: f64) -> Status {
+                Status::done()
+            }
+        }
+        #[async_trait::async_trait]
+        impl crate::core::msg::LocatableObj for L {
+            async fn locate_dyn(&self) -> Result<DynLocation, crate::core::error::BsrsError> {
+                Ok(DynLocation {
+                    setpoint: self.setpoint,
+                    readback: 0.0,
+                })
+            }
+        }
+        let a: Arc<dyn crate::core::msg::LocatableObj> = Arc::new(L {
+            name: "a",
+            setpoint: 5.0,
+        });
+        let b: Arc<dyn crate::core::msg::LocatableObj> = Arc::new(L {
+            name: "b",
+            setpoint: 10.0,
+        });
+
+        let msgs = drain(stubs::mvr_many(vec![(a, 2.0), (b, -3.0)])).await;
+
+        let sets: Vec<(&str, f64)> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                Msg::Set { obj, value, group } => {
+                    assert_eq!(group.as_deref(), Some("mv"), "shared group");
+                    Some((obj.name(), *value))
+                }
+                _ => None,
+            })
+            .collect();
+        // a: 5.0 + 2.0 = 7.0 ; b: 10.0 + (-3.0) = 7.0 — each on its own setpoint.
+        assert_eq!(sets, vec![("a", 7.0), ("b", 7.0)]);
+        assert_eq!(
+            msgs.iter()
+                .filter(|m| matches!(m, Msg::Wait { .. }))
+                .count(),
+            1,
+            "one Wait for the whole group"
+        );
+        assert!(matches!(msgs.last(), Some(Msg::Wait { .. })));
+    }
+
+    #[tokio::test]
+    async fn mvr_many_locate_failure_aborts_before_any_set() {
+        // All setpoints are read BEFORE any Set is emitted, so a locate failure
+        // on any motor fails the run before a single motor starts moving.
+        struct GoodLoc;
+        impl NamedObj for GoodLoc {
+            fn name(&self) -> &str {
+                "good"
+            }
+        }
+        #[async_trait::async_trait]
+        impl MovableObj for GoodLoc {
+            async fn set_dyn(&self, _value: f64) -> Status {
+                Status::done()
+            }
+        }
+        #[async_trait::async_trait]
+        impl crate::core::msg::LocatableObj for GoodLoc {
+            async fn locate_dyn(&self) -> Result<DynLocation, crate::core::error::BsrsError> {
+                Ok(DynLocation {
+                    setpoint: 1.0,
+                    readback: 1.0,
+                })
+            }
+        }
+        struct BadLoc;
+        impl NamedObj for BadLoc {
+            fn name(&self) -> &str {
+                "bad"
+            }
+        }
+        #[async_trait::async_trait]
+        impl MovableObj for BadLoc {
+            async fn set_dyn(&self, _value: f64) -> Status {
+                Status::done()
+            }
+        }
+        #[async_trait::async_trait]
+        impl crate::core::msg::LocatableObj for BadLoc {
+            async fn locate_dyn(&self) -> Result<DynLocation, crate::core::error::BsrsError> {
+                Err(crate::core::error::BsrsError::Plan("no readback".into()))
+            }
+        }
+        let good: Arc<dyn crate::core::msg::LocatableObj> = Arc::new(GoodLoc);
+        let bad: Arc<dyn crate::core::msg::LocatableObj> = Arc::new(BadLoc);
+
+        // Good motor first, bad second: the good setpoint reads OK, but the bad
+        // locate aborts before any Set is emitted.
+        let msgs = drain(stubs::mvr_many(vec![(good, 1.0), (bad, 1.0)])).await;
+
+        assert!(
+            !msgs.iter().any(|m| matches!(m, Msg::Set { .. })),
+            "no motion may start before every setpoint is resolved"
+        );
+        assert!(
+            !msgs.iter().any(|m| matches!(m, Msg::Wait { .. })),
+            "no barrier without any motion"
+        );
+        assert!(
+            matches!(msgs.last(), Some(Msg::Fail(_))),
+            "a locate failure aborts the run via Msg::Fail"
         );
     }
 
