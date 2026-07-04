@@ -41,6 +41,15 @@ pub struct ConfigureArgs {
 pub type AwaitableFactory =
     Arc<dyn Fn() -> BoxFuture<'static, crate::core::error::Result<()>> + Send + Sync>;
 
+/// Error sink for a [`Msg::PushContingency`] region. While a run has one of
+/// these on its contingency stack, the engine routes a message error into the
+/// innermost sink (as its `Display` string) and keeps running, instead of
+/// failing the run — letting the plan-level `contingency_wrapper` observe the
+/// error, run its `except`/`finally` recovery, and choose whether to re-raise
+/// (via [`Msg::Fail`]). Mirrors how bluesky's generator plans catch an engine
+/// error at the `yield` point.
+pub type ContingencySink = Arc<std::sync::Mutex<Option<String>>>;
+
 /// The complete set of commands that plans can issue. Closed enum + `Custom`.
 #[non_exhaustive]
 pub enum Msg {
@@ -283,6 +292,18 @@ pub enum Msg {
     /// standard `Read` / `Save` / `Collect` path does not construct.
     Publish(Box<crate::event_model::Document>),
 
+    /// Begin a contingency region: push `sink` onto the engine's contingency
+    /// stack. A message error that occurs before the matching
+    /// [`Msg::PopContingency`] is written into the innermost sink and the run
+    /// keeps going, rather than failing immediately — so the
+    /// `contingency_wrapper` that owns `sink` can run its `except`/`finally`
+    /// recovery. Emitted only by `contingency_wrapper`; not for direct use.
+    PushContingency(ContingencySink),
+    /// End the current contingency region: pop the top of the engine's
+    /// contingency stack. Paired with [`Msg::PushContingency`] by
+    /// `contingency_wrapper`.
+    PopContingency,
+
     /// No-op message — useful for spinning the loop.
     Null,
 }
@@ -332,6 +353,8 @@ impl Msg {
                 | Msg::Subscribe { .. }
                 | Msg::Unsubscribe(_)
                 | Msg::Fail(_)
+                | Msg::PushContingency(_)
+                | Msg::PopContingency
                 | Msg::Null
         )
     }
@@ -471,6 +494,8 @@ impl Clone for Msg {
             Msg::Custom { .. } => Msg::Null,
             Msg::Publish(d) => Msg::Publish(d.clone()),
             Msg::Locate(o) => Msg::Locate(o.clone()),
+            Msg::PushContingency(sink) => Msg::PushContingency(sink.clone()),
+            Msg::PopContingency => Msg::PopContingency,
             Msg::Null => Msg::Null,
         }
     }
@@ -518,6 +543,8 @@ impl std::fmt::Debug for Msg {
             Msg::Custom { name, .. } => write!(f, "Custom({name})"),
             Msg::Publish(d) => write!(f, "Publish({})", document_label(d)),
             Msg::Locate(o) => write!(f, "Locate({})", o.name()),
+            Msg::PushContingency(_) => write!(f, "PushContingency"),
+            Msg::PopContingency => write!(f, "PopContingency"),
             Msg::Null => write!(f, "Null"),
         }
     }

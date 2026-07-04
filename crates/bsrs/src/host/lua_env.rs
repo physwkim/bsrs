@@ -3403,9 +3403,12 @@ fn register_bpp(lua: &Lua) -> mlua::Result<()> {
             |_, (plan_ud, fin_ud): (mlua::AnyUserData, mlua::AnyUserData)| {
                 let inner = take_inner_plan(&plan_ud)?;
                 let fin = take_inner_plan(&fin_ud)?;
+                // Lua's 2-arg `contingency(plan, fin)` maps to a try/finally:
+                // `fin` runs on both normal completion and error. The richer
+                // except/else branches are Rust-only for now.
                 Ok(wrap_prebuilt(
                     "contingency_wrapper",
-                    pp::contingency_wrapper(inner, fin),
+                    pp::contingency_wrapper(inner, None, None, Some(fin), true),
                 ))
             },
         )?,

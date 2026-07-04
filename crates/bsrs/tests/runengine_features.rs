@@ -2484,3 +2484,121 @@ async fn sigint_count_resets_across_runs() {
     assert_eq!(re.state(), EngineRunState::Idle);
     let _ = AtomicU8::new(0); // touch import to silence unused warning
 }
+
+// ---------------------------------------------------------------------------
+// PLAN-22: contingency_wrapper try/except/else/finally, powered by the engine's
+// contingency stack (Msg::PushContingency / PopContingency). A message error
+// inside the wrapped plan is routed into the wrapper's sink and the run keeps
+// running so the wrapper can branch, instead of failing immediately.
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::AtomicUsize;
+
+/// A one-message plan that bumps `counter` when the engine processes it (via a
+/// `WaitFor` factory), so a test can observe whether a given branch ran.
+fn bump_plan(counter: Arc<AtomicUsize>) -> Plan {
+    plan_box(async_stream::stream! {
+        let c = counter.clone();
+        let factory: bsrs::core::msg::AwaitableFactory = Arc::new(move || {
+            let c = c.clone();
+            Box::pin(async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+        yield Msg::WaitFor { factories: vec![factory], timeout: None };
+    })
+}
+
+/// A plan that always errors when the engine runs it.
+fn boom_plan() -> Plan {
+    plan_box(async_stream::stream! {
+        yield Msg::Fail("boom".into());
+    })
+}
+
+fn drain_into(inner: Plan) -> Plan {
+    // Wrap `inner` inside OpenRun / CloseRun so it runs as a real run.
+    plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        let mut inner = inner;
+        while let Some(item) = futures::StreamExt::next(&mut inner).await {
+            let bsrs::core::plan::PlanItem::Bare(m) = item else { unreachable!() };
+            yield m;
+        }
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    })
+}
+
+#[tokio::test]
+async fn contingency_wrapper_runs_except_and_finally_then_reraises_on_error() {
+    let except_ran = Arc::new(AtomicUsize::new(0));
+    let else_ran = Arc::new(AtomicUsize::new(0));
+    let final_ran = Arc::new(AtomicUsize::new(0));
+
+    let guarded = bsrs::plans::preprocessors::contingency_wrapper(
+        boom_plan(),
+        Some(bump_plan(except_ran.clone())),
+        Some(bump_plan(else_ran.clone())),
+        Some(bump_plan(final_ran.clone())),
+        true,
+    );
+    let re = RunEngine::new(vec![]);
+    let result = re.run_async(drain_into(guarded)).await.unwrap();
+
+    // The error re-raised after recovery: the run fails.
+    assert_eq!(result.exit_status, "fail");
+    assert_eq!(except_ran.load(Ordering::SeqCst), 1, "except branch ran");
+    assert_eq!(
+        else_ran.load(Ordering::SeqCst),
+        0,
+        "else branch must NOT run on error"
+    );
+    assert_eq!(final_ran.load(Ordering::SeqCst), 1, "finally always runs");
+}
+
+#[tokio::test]
+async fn contingency_wrapper_runs_else_and_finally_on_success() {
+    let except_ran = Arc::new(AtomicUsize::new(0));
+    let else_ran = Arc::new(AtomicUsize::new(0));
+    let final_ran = Arc::new(AtomicUsize::new(0));
+
+    let inner = plan_box(async_stream::stream! { yield Msg::Null; });
+    let guarded = bsrs::plans::preprocessors::contingency_wrapper(
+        inner,
+        Some(bump_plan(except_ran.clone())),
+        Some(bump_plan(else_ran.clone())),
+        Some(bump_plan(final_ran.clone())),
+        true,
+    );
+    let re = RunEngine::new(vec![]);
+    let result = re.run_async(drain_into(guarded)).await.unwrap();
+
+    assert_eq!(result.exit_status, "success");
+    assert_eq!(
+        except_ran.load(Ordering::SeqCst),
+        0,
+        "except must NOT run on success"
+    );
+    assert_eq!(else_ran.load(Ordering::SeqCst), 1, "else branch ran");
+    assert_eq!(final_ran.load(Ordering::SeqCst), 1, "finally always runs");
+}
+
+#[tokio::test]
+async fn contingency_wrapper_auto_raise_false_swallows_error() {
+    let except_ran = Arc::new(AtomicUsize::new(0));
+
+    let guarded = bsrs::plans::preprocessors::contingency_wrapper(
+        boom_plan(),
+        Some(bump_plan(except_ran.clone())),
+        None,
+        None,
+        false, // swallow: do not re-raise after except
+    );
+    let re = RunEngine::new(vec![]);
+    let result = re.run_async(drain_into(guarded)).await.unwrap();
+
+    // auto_raise=false swallows the error: the run continues to a clean close.
+    assert_eq!(result.exit_status, "success");
+    assert_eq!(except_ran.load(Ordering::SeqCst), 1, "except branch ran");
+}

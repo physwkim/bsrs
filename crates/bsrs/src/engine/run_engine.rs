@@ -390,6 +390,14 @@ struct EngineState {
     /// bluesky's `_temp_callback_ids` — entries are removed
     /// automatically when the run ends.
     temp_subscribers: Vec<SubscriptionId>,
+    /// Active `contingency_wrapper` error sinks, innermost last (a LIFO stack).
+    /// While non-empty, a message error is written into the top sink (as its
+    /// `Display` string) and the run keeps going, rather than failing — so the
+    /// wrapper that pushed it can run its `except`/`finally` recovery and decide
+    /// whether to re-raise via `Msg::Fail`. Pushed by `Msg::PushContingency`,
+    /// popped by `Msg::PopContingency`; the equivalent of the exception
+    /// propagating to the nearest enclosing generator `try` in bluesky.
+    contingency_stack: Vec<crate::core::msg::ContingencySink>,
     msg_cache: VecDeque<Msg>,
     replay_queue: VecDeque<Msg>,
     rewindable: bool,
@@ -696,6 +704,10 @@ impl RunEngine {
         // Drained already at finalize by `backstop_collect` (before RunStop);
         // clear whatever failed to collect so it does not leak into the next run.
         let _ = std::mem::take(&mut state.uncollected);
+        // A run that ends with a contingency region still on the stack (e.g. an
+        // abort tore the wrapper down before its PopContingency) must not leak
+        // it into the next run.
+        let _ = std::mem::take(&mut state.contingency_stack);
         let temp_subs = std::mem::take(&mut state.temp_subscribers);
         let _ = std::mem::take(&mut state.pausables);
         let _ = std::mem::take(&mut state.suspenders); // Drop aborts watchers
@@ -1323,6 +1335,27 @@ impl RunEngine {
                 Ok(Some(uid)) => run_uid = Some(uid),
                 Ok(None) => {}
                 Err(e) => {
+                    // If a `contingency_wrapper` region is active, route the
+                    // error into its innermost sink and keep running instead of
+                    // failing the run. The wrapper reads the sink right after it
+                    // forwarded the offending message, runs its `except`/`finally`
+                    // recovery, and re-raises via `Msg::Fail` if it chooses to.
+                    // This is bsrs's stand-in for an exception surfacing at a
+                    // generator `yield` inside a Python `try` block.
+                    let routed = {
+                        let state = self.state.lock().await;
+                        match state.contingency_stack.last() {
+                            Some(sink) => {
+                                *sink.lock().unwrap() = Some(format!("{e}"));
+                                true
+                            }
+                            None => false,
+                        }
+                    };
+                    if routed {
+                        tracing::debug!("plan error routed to contingency: {e}");
+                        continue;
+                    }
                     tracing::error!("plan error: {e}");
                     exit_status = "fail".into();
                     self.drain_and_close("fail", Some(format!("{e}"))).await?;
@@ -2148,6 +2181,15 @@ impl RunEngine {
             Msg::Null => {}
             Msg::Fail(reason) => {
                 return Err(BsrsError::Plan(reason));
+            }
+            Msg::PushContingency(sink) => {
+                // Clear any stale error before arming, so this region starts
+                // with an empty sink regardless of what the Arc last held.
+                *sink.lock().unwrap() = None;
+                self.state.lock().await.contingency_stack.push(sink);
+            }
+            Msg::PopContingency => {
+                self.state.lock().await.contingency_stack.pop();
             }
         }
         Ok(None)

@@ -427,17 +427,106 @@ pub fn fly_during_wrapper(
     )
 }
 
-/// `contingency_wrapper(plan, finally)` — run `plan`; whether it
-/// finishes normally or aborts, then run `finally`. Bluesky's full
-/// contingency_wrapper supports try/except/else branches with
-/// exception-class filtering; bsrs's stream model doesn't surface
-/// plan-level exceptions, so this is the conservative finalize-style
-/// shape (always run `finally`). For now, identical behaviour to
-/// `finalize_wrapper`; kept as a separate name so callers expressing
-/// intent ("run cleanup if anything goes wrong") see a matching
-/// API name.
-pub fn contingency_wrapper(inner: Plan, finally: Plan) -> Plan {
-    finalize_wrapper(inner, finally)
+/// `contingency_wrapper(plan, except_plan, else_plan, final_plan, auto_raise)`
+/// — bluesky's full try/except/else/finally plan bracket
+/// (preprocessors.py:508). Unlike [`finalize_wrapper`] (a pure stream bracket
+/// that only appends `final_plan` when `plan` completes normally), this observes
+/// a message *error* mid-plan and branches on it:
+///
+/// - `except_plan` runs when a message in `plan` errored. After it runs, the
+///   original error is re-raised iff `auto_raise` (bluesky's default `True`),
+///   so the run still fails; `auto_raise = false` swallows the error and the
+///   run continues. A `None` `except_plan` re-raises unconditionally.
+/// - `else_plan` runs when `plan` completed with no error.
+/// - `final_plan` runs on both paths, before any re-raise propagates — matching
+///   Python `finally` executing before the exception leaves the block.
+///
+/// The error observation is powered by the engine's contingency stack: this
+/// wrapper pushes an error sink ([`Msg::PushContingency`]) around `plan`, so a
+/// message error is routed into the sink (and the run kept alive) instead of
+/// failing immediately; the wrapper reads the sink right after forwarding the
+/// offending message. `except`/`else`/`final` run *outside* this wrapper's own
+/// contingency (it pops first), so an error in them propagates outward.
+///
+/// Deviation from bluesky: `except_plan` is a pre-built `Plan`, not a function
+/// of the exception — bsrs surfaces the error only as a reason string, threaded
+/// onto the re-raised [`Msg::Fail`]. Recovery plans that only need to clean up
+/// (e.g. `drop`) do not need the value.
+///
+/// Engine-teardown paths (abort/halt dropping the plan future) are bsrs's
+/// analogue of `GeneratorExit`: the wrapper's future is dropped, so nothing
+/// after the suspended `yield` runs — `final_plan` is skipped, matching
+/// bluesky's `cleanup = False` branch.
+pub fn contingency_wrapper(
+    inner: Plan,
+    except_plan: Option<Plan>,
+    else_plan: Option<Plan>,
+    final_plan: Option<Plan>,
+    auto_raise: bool,
+) -> Plan {
+    plan_box(async_stream::stream! {
+        let sink: crate::core::msg::ContingencySink = Arc::new(Mutex::new(None));
+        yield Msg::PushContingency(sink.clone());
+
+        // try: forward `inner`. A message error under this contingency is
+        // written into `sink` by the engine (which keeps running); we detect it
+        // right after forwarding the offending message.
+        let mut errored: Option<String> = None;
+        let mut inner = inner;
+        while let Some(item) = inner.next().await {
+            let PlanItem::Bare(m) = item;
+            yield m;
+            if let Some(e) = sink.lock().unwrap().take() {
+                errored = Some(e);
+                break;
+            }
+        }
+
+        // Leave our contingency region before running recovery, so an error in
+        // the except/else/finally plans propagates outward (to an enclosing
+        // contingency, or fails the run) rather than looping back into us.
+        yield Msg::PopContingency;
+
+        // except / else — mutually exclusive.
+        let mut reraise: Option<String> = None;
+        match errored {
+            Some(reason) => match except_plan {
+                Some(ep) => {
+                    let mut ep = ep;
+                    while let Some(item) = ep.next().await {
+                        let PlanItem::Bare(m) = item;
+                        yield m;
+                    }
+                    if auto_raise {
+                        reraise = Some(reason);
+                    }
+                }
+                None => reraise = Some(reason),
+            },
+            None => {
+                if let Some(ep) = else_plan {
+                    let mut ep = ep;
+                    while let Some(item) = ep.next().await {
+                        let PlanItem::Bare(m) = item;
+                        yield m;
+                    }
+                }
+            }
+        }
+
+        // finally: both paths, before any re-raise leaves the block.
+        if let Some(fp) = final_plan {
+            let mut fp = fp;
+            while let Some(item) = fp.next().await {
+                let PlanItem::Bare(m) = item;
+                yield m;
+            }
+        }
+
+        if let Some(reason) = reraise {
+            yield Msg::Fail(reason);
+        }
+    })
 }
 
 /// `reset_positions_wrapper(plan, motors)` — capture each motor's position

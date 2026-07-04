@@ -2517,3 +2517,148 @@ async fn explicitly_collected_flyer_is_not_re_drained_by_backstop() {
         "an explicitly collected flyer must not be re-drained by the backstop"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PLAN-22: trigger_and_read wraps its reads in a contingency (except=drop,
+// else=save). A read failure mid-bundle discards the partial bundle through the
+// sanctioned Drop path and re-raises, and the failure is catchable by an outer
+// contingency (bluesky plan_stubs.py trigger_and_read).
+// ---------------------------------------------------------------------------
+
+/// A readable whose `read_dyn` always errors — stands in for a device that
+/// faults mid-acquisition.
+struct FailingReadable {
+    name: String,
+}
+
+impl bsrs::core::msg::NamedObj for FailingReadable {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[async_trait::async_trait]
+impl bsrs::core::msg::ReadableObj for FailingReadable {
+    async fn read_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, bsrs::core::reading::ReadingValue>,
+        bsrs::core::error::BsrsError,
+    > {
+        Err(bsrs::core::error::BsrsError::Plan(
+            "device read faulted".into(),
+        ))
+    }
+    async fn describe_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, bsrs::event_model::DataKey>,
+        bsrs::core::error::BsrsError,
+    > {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            format!("{}_val", self.name),
+            bsrs::event_model::DataKey {
+                source: format!("test://{}", self.name),
+                dtype: bsrs::event_model::Dtype::Number,
+                shape: vec![],
+                dtype_numpy: Some("<f8".into()),
+                external: None,
+                units: None,
+                precision: None,
+                object_name: None,
+                dims: None,
+                limits: None,
+                choices: None,
+            },
+        );
+        Ok(m)
+    }
+}
+
+#[tokio::test]
+async fn trigger_and_read_read_error_drops_bundle_and_fails() {
+    // A read fault inside trigger_and_read must discard the open bundle (no
+    // Descriptor, no Event) and fail the run — the contingency's except=drop
+    // path, then the auto_raise re-raise.
+    use bsrs::core::msg::{ReadableObj, TriggerableObj};
+    let readable: Arc<dyn ReadableObj> = Arc::new(FailingReadable {
+        name: "bad_det".into(),
+    });
+    let body = bsrs::plans::stubs::trigger_and_read(
+        Vec::<Arc<dyn TriggerableObj>>::new(),
+        vec![readable],
+        "primary",
+    );
+    let wrapped =
+        bsrs::plans::preprocessors::run_wrapper(body, bsrs::core::msg::RunMetadata::default());
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let result = re.run_async(wrapped).await.unwrap();
+
+    assert_eq!(
+        result.exit_status, "fail",
+        "re-raised read fault fails the run"
+    );
+    let docs = sink.snapshot().await;
+    assert!(
+        matches!(docs.first(), Some(Document::Start(_))),
+        "run opened"
+    );
+    assert!(
+        matches!(docs.last(), Some(Document::Stop(_))),
+        "run closed with a Stop"
+    );
+    assert!(
+        !docs.iter().any(|d| matches!(d, Document::Descriptor(_))),
+        "dropped bundle emits no Descriptor"
+    );
+    assert!(
+        !docs.iter().any(|d| matches!(d, Document::Event(_))),
+        "dropped bundle emits no Event"
+    );
+}
+
+#[tokio::test]
+async fn trigger_and_read_read_error_is_catchable_by_outer_contingency() {
+    // The re-raised read fault propagates out of trigger_and_read's own
+    // contingency and can be caught by an ENCLOSING contingency (nested
+    // Push/Pop). Here the outer wrapper swallows it (except=null, auto_raise
+    // false), so the run completes successfully — impossible under the old
+    // fail-fast model — while the faulted bundle still emits no Descriptor/Event.
+    use bsrs::core::msg::{ReadableObj, TriggerableObj};
+    let readable: Arc<dyn ReadableObj> = Arc::new(FailingReadable {
+        name: "bad_det".into(),
+    });
+    let inner = bsrs::plans::stubs::trigger_and_read(
+        Vec::<Arc<dyn TriggerableObj>>::new(),
+        vec![readable],
+        "primary",
+    );
+    let caught = bsrs::plans::preprocessors::contingency_wrapper(
+        inner,
+        Some(bsrs::plans::stubs::null()),
+        None,
+        None,
+        false, // swallow the read fault
+    );
+    let wrapped =
+        bsrs::plans::preprocessors::run_wrapper(caught, bsrs::core::msg::RunMetadata::default());
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let result = re.run_async(wrapped).await.unwrap();
+
+    assert_eq!(
+        result.exit_status, "success",
+        "outer contingency swallowed the read fault"
+    );
+    let docs = sink.snapshot().await;
+    assert!(
+        !docs.iter().any(|d| matches!(d, Document::Descriptor(_))),
+        "dropped bundle emits no Descriptor even when the fault is caught"
+    );
+    assert!(
+        !docs.iter().any(|d| matches!(d, Document::Event(_))),
+        "dropped bundle emits no Event even when the fault is caught"
+    );
+}

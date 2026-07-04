@@ -550,10 +550,33 @@ pub mod stubs {
                 yield Msg::Wait { group: "trig".into(), error_on_timeout: true, timeout: None };
             }
             yield Msg::Create { stream_name: name };
-            for r in &readables {
-                yield Msg::Read(r.clone());
+            // bluesky wraps the reads in a contingency: on a read exception the
+            // open bundle is `drop`ped (not `save`d) and the error re-raised;
+            // on success the bundle is `save`d (plan_stubs.py:1466-1481). Port
+            // that so a mid-bundle read failure discards the partial bundle
+            // through the sanctioned Drop path instead of relying on the run-end
+            // bundler teardown, and so a future caller that catches the failure
+            // never inherits a half-open bundle.
+            let read_plan = {
+                let readables = readables.clone();
+                plan_box(async_stream::stream! {
+                    for r in &readables {
+                        yield Msg::Read(r.clone());
+                    }
+                })
+            };
+            let guarded = preprocessors::contingency_wrapper(
+                read_plan,
+                Some(drop_bundle()),
+                Some(save()),
+                None,
+                true,
+            );
+            let mut guarded = guarded;
+            while let Some(item) = futures::StreamExt::next(&mut guarded).await {
+                let crate::core::plan::PlanItem::Bare(m) = item;
+                yield m;
             }
-            yield Msg::Save;
         })
     }
 
