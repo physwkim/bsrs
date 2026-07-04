@@ -698,6 +698,16 @@ pub trait FlyableObj: NamedObj {
         let _ = success;
         Ok(())
     }
+    /// This object's collectable view, if it has one — the flyer twin of
+    /// [`ReadableObj::as_configurable`]. The engine records the collectable of
+    /// every kicked-off flyer so it can drain any that were kicked off but
+    /// never explicitly collected before the run closes (bluesky's
+    /// `RunBundler.backstop_collect`, bundlers.py:1190). A flyer that is also
+    /// [`CollectableObj`] returns `Some(self)`; the default — a pure flyer with
+    /// no buffered data to drain — yields `None`.
+    fn as_collectable(self: Arc<Self>) -> Option<Arc<dyn CollectableObj>> {
+        None
+    }
 }
 
 /// Anything that can be `prepare()`'d for a step / fly scan.

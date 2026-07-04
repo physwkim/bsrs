@@ -373,6 +373,14 @@ struct EngineState {
     /// Flyers touched by `Msg::Kickoff` during this run, same role
     /// as `movable_objs_touched`.
     flyable_objs_touched: HashMap<String, Arc<dyn crate::core::msg::FlyableObj>>,
+    /// Flyers kicked off but not yet collected — the collectable view of every
+    /// `Msg::Kickoff` object that exposes one ([`FlyableObj::as_collectable`]),
+    /// keyed by name. An entry is removed when the object is collected
+    /// (`Msg::Collect`). At run finalize the engine drains whatever remains so
+    /// a flyer aborted between kickoff and collect still lands its buffered data
+    /// before RunStop. Mirrors bluesky's `_uncollected` set + `backstop_collect`
+    /// (bundlers.py:172, 1190).
+    uncollected: HashMap<String, Arc<dyn crate::core::msg::CollectableObj>>,
     /// Devices that opted into pause/resume hooks via
     /// `Msg::RegisterPausable` or `RunEngine::register_pausable`.
     /// Walked on every pause-enter and resume.
@@ -685,6 +693,9 @@ impl RunEngine {
         let staged = std::mem::take(&mut state.staged);
         let movables = std::mem::take(&mut state.movable_objs_touched);
         let flyables = std::mem::take(&mut state.flyable_objs_touched);
+        // Drained already at finalize by `backstop_collect` (before RunStop);
+        // clear whatever failed to collect so it does not leak into the next run.
+        let _ = std::mem::take(&mut state.uncollected);
         let temp_subs = std::mem::take(&mut state.temp_subscribers);
         let _ = std::mem::take(&mut state.pausables);
         let _ = std::mem::take(&mut state.suspenders); // Drop aborts watchers
@@ -1098,6 +1109,176 @@ impl RunEngine {
 
     // -- main loop ----------------------------------------------------------
 
+    /// Collect one collectable object into the open run: declare any new
+    /// stream(s), emit their stream-asset docs, then emit the per-collect
+    /// events. Sole owner of the collect path — driven by `Msg::Collect` and by
+    /// [`Self::backstop_collect`] at finalize. On success the object is removed
+    /// from the uncollected set so the finalize backstop does not re-drain it.
+    async fn collect_object(
+        &self,
+        obj: Arc<dyn crate::core::msg::CollectableObj>,
+        stream_name: Option<String>,
+    ) -> Result<()> {
+        // Open-run precondition, checked before the device is described.
+        // bluesky's _collect rejects a collect with no open run at the top
+        // (run_engine.py:2201-2206) *before* current_run.collect() runs
+        // describe_collect. bsrs called describe_collect_dyn before its
+        // bundler check below, so a collect with no open run did a wasted
+        // device describe round-trip before erroring. Gate it here,
+        // mirroring the Read path which describes only when bundling. The
+        // later `ok_or_else` checks stay as defense for the bundler being
+        // cleared mid-await (a pause landing while collect_dyn is awaiting).
+        {
+            let state = self.state.lock().await;
+            if state.bundler.is_none() {
+                return Err(BsrsError::Plan(
+                    "A 'collect' message was sent but no run is open".into(),
+                ));
+            }
+        }
+        let descs = obj.describe_collect_dyn().await?;
+        // The collect object's configuration, for any descriptor
+        // declared below — bluesky's collect path runs
+        // `ensure_cached(obj)` + `_prepare_stream`, which folds the
+        // object's config into the descriptor (bundlers.py:814-819).
+        let config = self
+            .ensure_object_configuration(obj.name(), obj.as_configurable())
+            .await?;
+        let new_descriptors: Vec<crate::event_model::EventDescriptor> = {
+            let mut state = self.state.lock().await;
+            let bundler = state
+                .bundler
+                .as_mut()
+                .ok_or_else(|| BsrsError::Plan("Collect with no open run".into()))?;
+            let mut out = Vec::new();
+            for (name, dks) in &descs {
+                if bundler.descriptor_uid(name).is_none() {
+                    let configuration = HashMap::from([(obj.name().to_string(), config.clone())]);
+                    out.push(bundler.declare_stream(name.clone(), dks.clone(), configuration)?);
+                }
+            }
+            out
+        };
+        for descriptor in new_descriptors {
+            self.broadcast(&Document::Descriptor(descriptor)).await?;
+        }
+        // Emit the writer's StreamResource/StreamDatum, stamped with the
+        // collect stream's just-composed EventDescriptor UID, so stream
+        // data links back to its descriptor (CBEM-13). StandardDetector
+        // collects into a single stream; pass that stream's descriptor.
+        let (collect_stream, collect_descriptor) = {
+            let state = self.state.lock().await;
+            let bundler = state.bundler.as_ref().ok_or_else(|| {
+                BsrsError::Plan("Collect lost open run before stream docs".into())
+            })?;
+            let stream = descs.keys().next().cloned();
+            (
+                stream.clone(),
+                stream.and_then(|s| bundler.descriptor_uid(&s)),
+            )
+        };
+        if let Some(descriptor_uid) = collect_descriptor {
+            let mut asset_docs = obj.collect_stream_docs_dyn(&descriptor_uid).await?;
+            if !asset_docs.is_empty() {
+                // Validate + stamp the drain, fill the datums'
+                // seq_nums from the stream's counter, and advance it
+                // by the indices width: no per-frame Event exists on
+                // this path to advance it ("we do it ourselves",
+                // bluesky bundlers.py:1180). The summary index event
+                // composed below then lands after the datum span,
+                // keeping one monotonic sequence axis.
+                let stream = collect_stream
+                    .as_deref()
+                    .expect("descriptor_uid implies a collect stream name");
+                let mut state = self.state.lock().await;
+                let bundler = state.bundler.as_mut().ok_or_else(|| {
+                    BsrsError::Plan("Collect lost open run before stream docs".into())
+                })?;
+                let next_seq = bundler.compose().peek_next_seq(stream).ok_or_else(|| {
+                    BsrsError::Plan(format!(
+                        "Collect stream `{stream}` has a descriptor but \
+                         no sequence counter"
+                    ))
+                })?;
+                let external_keys = bundler
+                    .compose()
+                    .external_data_keys(stream)
+                    .unwrap_or_default();
+                let run_start = bundler.start_uid.clone();
+                let width = pack_external_assets(
+                    &mut asset_docs,
+                    &run_start,
+                    next_seq,
+                    &external_keys,
+                    bundler.stream_resource_data_keys_mut(),
+                )?;
+                if width > 0 {
+                    bundler.compose().advance_seq(stream, width);
+                }
+                drop(state);
+                for doc in asset_docs {
+                    self.broadcast(&doc).await?;
+                }
+            }
+        }
+        let events = obj.collect_dyn().await?;
+        for (name, data, timestamps) in events {
+            let stream = stream_name.clone().unwrap_or(name);
+            let ev = {
+                let state = self.state.lock().await;
+                let bundler = state.bundler.as_ref().ok_or_else(|| {
+                    BsrsError::Plan(
+                        "Collect lost open run mid-process (bundler cleared while \
+                         collect_dyn was awaiting)"
+                            .into(),
+                    )
+                })?;
+                bundler
+                    .compose()
+                    .event(&stream, data, timestamps)
+                    .ok_or_else(|| BsrsError::Plan("event for unknown stream".into()))?
+            };
+            self.broadcast(&Document::Event(ev)).await?;
+        }
+        // Collected: drop it from the uncollected set so the finalize backstop
+        // will not drain it a second time. bluesky `_uncollected.discard(obj)`
+        // (bundlers.py:1090).
+        self.state.lock().await.uncollected.remove(obj.name());
+        Ok(())
+    }
+
+    /// Before a run closes, drain any flyer that was kicked off but never
+    /// explicitly collected, so its buffered data lands in the run rather than
+    /// being lost. Mirrors bluesky's `RunBundler.backstop_collect`
+    /// (bundlers.py:1190), called from the `_run` finally on every exit path
+    /// (run_engine.py:1777). Runs only while the run is still open, and swallows
+    /// per-object errors — "some might not support partial collection".
+    async fn backstop_collect(&self) {
+        let pending: Vec<Arc<dyn crate::core::msg::CollectableObj>> = {
+            let state = self.state.lock().await;
+            if state.bundler.is_none() {
+                return;
+            }
+            state.uncollected.values().cloned().collect()
+        };
+        for obj in pending {
+            let name = obj.name().to_string();
+            if let Err(e) = self.collect_object(obj, None).await {
+                tracing::warn!("backstop collect failed for flyer {name}: {e}");
+            }
+        }
+    }
+
+    /// Drain uncollected flyers, then close any open run with `status`/`reason`.
+    /// The single finalize path for `run_loop`: bluesky runs `backstop_collect`
+    /// immediately before `close_run` in its `_run` finally (run_engine.py:1777,
+    /// 1789), so every run — success or abort — emits its flyer data before the
+    /// RunStop that ends the run.
+    async fn drain_and_close(&self, status: &str, reason: Option<String>) -> Result<()> {
+        self.backstop_collect().await;
+        self.close_run_if_open(status, reason).await
+    }
+
     async fn run_loop(&self, plan: Plan) -> Result<RunResult> {
         let plan = Mutex::new(plan);
         let mut run_uid: Option<String> = None;
@@ -1144,7 +1325,7 @@ impl RunEngine {
                 Err(e) => {
                     tracing::error!("plan error: {e}");
                     exit_status = "fail".into();
-                    self.close_run_if_open("fail", Some(format!("{e}"))).await?;
+                    self.drain_and_close("fail", Some(format!("{e}"))).await?;
                     return Ok(RunResult {
                         run_uid,
                         exit_status,
@@ -1160,7 +1341,7 @@ impl RunEngine {
             // not a hardcoded string — bluesky threads `_reason` onto the stop
             // document (run_engine.py:1792).
             let reason = self.stop_reason();
-            self.close_run_if_open(&exit_status, reason).await?;
+            self.drain_and_close(&exit_status, reason).await?;
             return Ok(RunResult {
                 run_uid,
                 exit_status,
@@ -1169,8 +1350,7 @@ impl RunEngine {
         if exit_status == "success" && self.is_stopping.load(Ordering::SeqCst) {
             // `stop()` sets no reason, so this resolves to `None` (bluesky's
             // default `_reason = ""`), not a hardcoded "user-requested stop".
-            self.close_run_if_open("success", self.stop_reason())
-                .await?;
+            self.drain_and_close("success", self.stop_reason()).await?;
             return Ok(RunResult {
                 run_uid,
                 exit_status,
@@ -1180,7 +1360,7 @@ impl RunEngine {
         // Normal exit: close any open run as success.
         let still_open = self.state.lock().await.bundler.is_some();
         if still_open {
-            self.close_run_if_open("success", None).await?;
+            self.drain_and_close("success", None).await?;
             exit_status = "success".into();
         } else if run_uid.is_some() && exit_status == "no-run" {
             exit_status = "success".into();
@@ -1624,6 +1804,13 @@ impl RunEngine {
                     state
                         .flyable_objs_touched
                         .insert(obj.name().to_string(), obj.clone());
+                    // Record the flyer's collectable view (if any) so a
+                    // finalize-time backstop can drain it should the run abort
+                    // before the plan issues its own `Msg::Collect`. bluesky
+                    // adds `msg.obj` to `_uncollected` here (bundlers.py:707).
+                    if let Some(coll) = obj.clone().as_collectable() {
+                        state.uncollected.insert(coll.name().to_string(), coll);
+                    }
                 }
                 let status = obj.kickoff_dyn().await;
                 if let Some(g) = group.clone() {
@@ -1639,133 +1826,7 @@ impl RunEngine {
                 self.handle_status(status, group).await?;
             }
             Msg::Collect { obj, stream_name } => {
-                // Open-run precondition, checked before the device is described.
-                // bluesky's _collect rejects a collect with no open run at the top
-                // (run_engine.py:2201-2206) *before* current_run.collect() runs
-                // describe_collect. bsrs called describe_collect_dyn before its
-                // bundler check below, so a collect with no open run did a wasted
-                // device describe round-trip before erroring. Gate it here,
-                // mirroring the Read path which describes only when bundling. The
-                // later `ok_or_else` checks stay as defense for the bundler being
-                // cleared mid-await (a pause landing while collect_dyn is awaiting).
-                {
-                    let state = self.state.lock().await;
-                    if state.bundler.is_none() {
-                        return Err(BsrsError::Plan(
-                            "A 'collect' message was sent but no run is open".into(),
-                        ));
-                    }
-                }
-                let descs = obj.describe_collect_dyn().await?;
-                // The collect object's configuration, for any descriptor
-                // declared below — bluesky's collect path runs
-                // `ensure_cached(obj)` + `_prepare_stream`, which folds the
-                // object's config into the descriptor (bundlers.py:814-819).
-                let config = self
-                    .ensure_object_configuration(obj.name(), obj.as_configurable())
-                    .await?;
-                let new_descriptors: Vec<crate::event_model::EventDescriptor> = {
-                    let mut state = self.state.lock().await;
-                    let bundler = state
-                        .bundler
-                        .as_mut()
-                        .ok_or_else(|| BsrsError::Plan("Collect with no open run".into()))?;
-                    let mut out = Vec::new();
-                    for (name, dks) in &descs {
-                        if bundler.descriptor_uid(name).is_none() {
-                            let configuration =
-                                HashMap::from([(obj.name().to_string(), config.clone())]);
-                            out.push(bundler.declare_stream(
-                                name.clone(),
-                                dks.clone(),
-                                configuration,
-                            )?);
-                        }
-                    }
-                    out
-                };
-                for descriptor in new_descriptors {
-                    self.broadcast(&Document::Descriptor(descriptor)).await?;
-                }
-                // Emit the writer's StreamResource/StreamDatum, stamped with the
-                // collect stream's just-composed EventDescriptor UID, so stream
-                // data links back to its descriptor (CBEM-13). StandardDetector
-                // collects into a single stream; pass that stream's descriptor.
-                let (collect_stream, collect_descriptor) = {
-                    let state = self.state.lock().await;
-                    let bundler = state.bundler.as_ref().ok_or_else(|| {
-                        BsrsError::Plan("Collect lost open run before stream docs".into())
-                    })?;
-                    let stream = descs.keys().next().cloned();
-                    (
-                        stream.clone(),
-                        stream.and_then(|s| bundler.descriptor_uid(&s)),
-                    )
-                };
-                if let Some(descriptor_uid) = collect_descriptor {
-                    let mut asset_docs = obj.collect_stream_docs_dyn(&descriptor_uid).await?;
-                    if !asset_docs.is_empty() {
-                        // Validate + stamp the drain, fill the datums'
-                        // seq_nums from the stream's counter, and advance it
-                        // by the indices width: no per-frame Event exists on
-                        // this path to advance it ("we do it ourselves",
-                        // bluesky bundlers.py:1180). The summary index event
-                        // composed below then lands after the datum span,
-                        // keeping one monotonic sequence axis.
-                        let stream = collect_stream
-                            .as_deref()
-                            .expect("descriptor_uid implies a collect stream name");
-                        let mut state = self.state.lock().await;
-                        let bundler = state.bundler.as_mut().ok_or_else(|| {
-                            BsrsError::Plan("Collect lost open run before stream docs".into())
-                        })?;
-                        let next_seq =
-                            bundler.compose().peek_next_seq(stream).ok_or_else(|| {
-                                BsrsError::Plan(format!(
-                                    "Collect stream `{stream}` has a descriptor but \
-                                     no sequence counter"
-                                ))
-                            })?;
-                        let external_keys = bundler
-                            .compose()
-                            .external_data_keys(stream)
-                            .unwrap_or_default();
-                        let run_start = bundler.start_uid.clone();
-                        let width = pack_external_assets(
-                            &mut asset_docs,
-                            &run_start,
-                            next_seq,
-                            &external_keys,
-                            bundler.stream_resource_data_keys_mut(),
-                        )?;
-                        if width > 0 {
-                            bundler.compose().advance_seq(stream, width);
-                        }
-                        drop(state);
-                        for doc in asset_docs {
-                            self.broadcast(&doc).await?;
-                        }
-                    }
-                }
-                let events = obj.collect_dyn().await?;
-                for (name, data, timestamps) in events {
-                    let stream = stream_name.clone().unwrap_or(name);
-                    let ev = {
-                        let state = self.state.lock().await;
-                        let bundler = state.bundler.as_ref().ok_or_else(|| {
-                            BsrsError::Plan(
-                                "Collect lost open run mid-process (bundler cleared while \
-                                 collect_dyn was awaiting)"
-                                    .into(),
-                            )
-                        })?;
-                        bundler
-                            .compose()
-                            .event(&stream, data, timestamps)
-                            .ok_or_else(|| BsrsError::Plan("event for unknown stream".into()))?
-                    };
-                    self.broadcast(&Document::Event(ev)).await?;
-                }
+                self.collect_object(obj, stream_name).await?;
             }
             Msg::Monitor { obj, name } => {
                 {

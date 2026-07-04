@@ -2329,3 +2329,191 @@ async fn dropped_bundle_reads_do_not_leak_into_next_descriptor() {
         "event must not carry the dropped det_a reading"
     );
 }
+
+// ENG-09: a flyer kicked off but never collected must have its buffered data
+// drained into the run before RunStop, on every finalize path (bluesky's
+// `backstop_collect` in the `_run` finally, run_engine.py:1777). A unified
+// Flyable+Collectable device (bluesky's flyer IS its own collectable) exposes
+// itself via `as_collectable`, so the engine's uncollected set can reach it.
+struct FlyCollector {
+    collects: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl bsrs::core::msg::NamedObj for FlyCollector {
+    fn name(&self) -> &str {
+        "flycoll"
+    }
+}
+#[async_trait::async_trait]
+impl bsrs::core::msg::FlyableObj for FlyCollector {
+    async fn kickoff_dyn(&self) -> bsrs::core::status::Status {
+        bsrs::core::status::Status::done()
+    }
+    async fn complete_dyn(&self) -> bsrs::core::status::Status {
+        bsrs::core::status::Status::done()
+    }
+    fn as_collectable(self: Arc<Self>) -> Option<Arc<dyn bsrs::core::msg::CollectableObj>> {
+        Some(self)
+    }
+}
+#[async_trait::async_trait]
+impl bsrs::core::msg::CollectableObj for FlyCollector {
+    async fn describe_collect_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, bsrs::event_model::DataKey>,
+        >,
+        bsrs::core::error::BsrsError,
+    > {
+        let key = bsrs::event_model::DataKey {
+            source: "soft://flycoll".into(),
+            dtype: bsrs::event_model::Dtype::Number,
+            shape: vec![],
+            dtype_numpy: None,
+            external: None,
+            units: None,
+            precision: None,
+            object_name: None,
+            dims: None,
+            limits: None,
+            choices: None,
+        };
+        Ok(std::collections::HashMap::from([(
+            "primary".to_string(),
+            std::collections::HashMap::from([("fly_val".to_string(), key)]),
+        )]))
+    }
+    async fn collect_dyn(
+        &self,
+    ) -> Result<
+        Vec<(
+            String,
+            std::collections::HashMap<String, serde_json::Value>,
+            std::collections::HashMap<String, f64>,
+        )>,
+        bsrs::core::error::BsrsError,
+    > {
+        self.collects
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(vec![(
+            "primary".to_string(),
+            std::collections::HashMap::from([("fly_val".to_string(), serde_json::json!(42.0))]),
+            std::collections::HashMap::from([("fly_val".to_string(), 1.0)]),
+        )])
+    }
+}
+
+#[tokio::test]
+async fn uncollected_flyer_is_backstop_collected_on_abort() {
+    use bsrs::core::Msg;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    let collects = Arc::new(AtomicUsize::new(0));
+    let flyer = Arc::new(FlyCollector {
+        collects: collects.clone(),
+    });
+    let sink = Arc::new(CapturingSink::new());
+    let re = Arc::new(RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]));
+
+    // Kick off, complete, then pause BEFORE any collect. The test aborts while
+    // paused: the flyer is in the uncollected set with data still buffered.
+    let fly: Arc<dyn bsrs::core::msg::FlyableObj> = flyer.clone();
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Kickoff { obj: fly.clone(), group: Some("k".into()) };
+        yield Msg::Wait { group: "k".into(), error_on_timeout: true, timeout: None };
+        yield Msg::Complete { obj: fly.clone(), group: Some("c".into()) };
+        yield Msg::Wait { group: "c".into(), error_on_timeout: true, timeout: None };
+        yield Msg::Pause { defer: false };
+        // Never reached — the abort tears the run down at the pause gate.
+        yield Msg::Collect { obj: fly.clone().as_collectable().unwrap(), stream_name: None };
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+
+    let re_run = re.clone();
+    let join = tokio::spawn(async move { re_run.run_async(plan).await });
+    for _ in 0..200 {
+        if re.is_paused() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(re.is_paused(), "engine never paused before the collect");
+    re.abort("test abort before collect");
+    let result = tokio::time::timeout(Duration::from_secs(5), join)
+        .await
+        .expect("run did not finish")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.exit_status, "abort");
+
+    // The buffered flyer data must have been drained exactly once by the
+    // backstop, and its Event must land before the RunStop.
+    assert_eq!(
+        collects.load(Ordering::SeqCst),
+        1,
+        "backstop must collect the kicked-off-but-uncollected flyer exactly once"
+    );
+    let docs = sink.snapshot().await;
+    let event_idx = docs.iter().position(|d| {
+        matches!(d, bsrs::core::Document::Event(ev) if ev.data.get("fly_val") == Some(&serde_json::json!(42.0)))
+    });
+    let stop_idx = docs
+        .iter()
+        .position(|d| matches!(d, bsrs::core::Document::Stop(_)));
+    let event_idx = event_idx.expect("backstop-drained flyer Event is missing from the stream");
+    let stop_idx = stop_idx.expect("run must still emit a RunStop");
+    assert!(
+        event_idx < stop_idx,
+        "the drained flyer Event ({event_idx}) must precede RunStop ({stop_idx})"
+    );
+    // The drained Event must reference a Descriptor already on the wire.
+    let desc_uid = match &docs[event_idx] {
+        bsrs::core::Document::Event(ev) => ev.descriptor.clone(),
+        _ => unreachable!(),
+    };
+    let desc_idx = docs
+        .iter()
+        .position(|d| matches!(d, bsrs::core::Document::Descriptor(desc) if desc.uid == desc_uid))
+        .expect("drained Event references a Descriptor that was never emitted");
+    assert!(
+        desc_idx < event_idx,
+        "the flyer stream Descriptor ({desc_idx}) must precede its Event ({event_idx})"
+    );
+}
+
+#[tokio::test]
+async fn explicitly_collected_flyer_is_not_re_drained_by_backstop() {
+    use bsrs::core::Msg;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let collects = Arc::new(AtomicUsize::new(0));
+    let flyer = Arc::new(FlyCollector {
+        collects: collects.clone(),
+    });
+    let re = RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new());
+
+    let fly: Arc<dyn bsrs::core::msg::FlyableObj> = flyer.clone();
+    let coll = flyer.clone() as Arc<dyn bsrs::core::msg::CollectableObj>;
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Kickoff { obj: fly.clone(), group: Some("k".into()) };
+        yield Msg::Wait { group: "k".into(), error_on_timeout: true, timeout: None };
+        yield Msg::Complete { obj: fly.clone(), group: Some("c".into()) };
+        yield Msg::Wait { group: "c".into(), error_on_timeout: true, timeout: None };
+        yield Msg::Collect { obj: coll, stream_name: None };
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+
+    let result = re.run_async(plan).await.unwrap();
+    assert_eq!(result.exit_status, "success");
+    // The explicit collect discards the flyer from the uncollected set, so the
+    // finalize backstop must NOT collect it a second time.
+    assert_eq!(
+        collects.load(Ordering::SeqCst),
+        1,
+        "an explicitly collected flyer must not be re-drained by the backstop"
+    );
+}
