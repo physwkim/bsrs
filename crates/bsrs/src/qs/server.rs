@@ -471,7 +471,10 @@ pub(crate) async fn execute_queue_loop(
             Ok(r) => r.exit_status.clone(),
             Err(_) => "fail".to_string(),
         };
-        let run_uid = run_result.as_ref().ok().and_then(|r| r.run_uid.clone());
+        let run_uid = run_result
+            .as_ref()
+            .ok()
+            .and_then(|r| r.run_uids.last().cloned());
         // Bookkeeping after the run.
         {
             let mut s = state.lock().unwrap();

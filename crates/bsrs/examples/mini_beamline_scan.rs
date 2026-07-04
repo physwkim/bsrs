@@ -261,7 +261,7 @@ async fn async_main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let result = re.run_async(plan).await?;
     eprintln!(
         "[bsrs] scan finished: exit_status={} run_uid={:?}",
-        result.exit_status, result.run_uid
+        result.exit_status, result.run_uids.last()
     );
     eprintln!("[bsrs] documents captured in {jsonl_path}");
 

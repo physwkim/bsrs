@@ -217,13 +217,31 @@ pub enum MsgResult {
     },
 }
 
-/// Final state of a finished run.
-#[derive(Debug, Clone)]
+/// Final state of a finished run — bsrs's analogue of bluesky's
+/// `RunEngineResult` (run_engine.py:92). bluesky's `plan_result` (the value the
+/// plan generator returns via `StopIteration`) has no bsrs equivalent: bsrs
+/// plans are `async_stream`s that yield `Msg`s and return `()`, so there is no
+/// plan return value to carry — that field is intentionally absent.
+///
+/// Not `Clone`: [`exception`](Self::exception) holds a [`BsrsError`], which is
+/// not `Clone` (it wraps non-`Clone` sources such as `serde_json::Error`).
+#[derive(Debug)]
 pub struct RunResult {
-    /// Run start UID, if a run was opened.
-    pub run_uid: Option<String>,
+    /// Every `RunStart` UID opened during this call, in the order the runs
+    /// opened. Empty if the plan opened no run. bluesky
+    /// `RunEngineResult.run_start_uids`.
+    pub run_uids: Vec<String>,
     /// Final exit status (`success` / `abort` / `fail` / `halt` / `no-run`).
     pub exit_status: String,
+    /// `true` unless the plan ran to a clean completion — i.e. it was stopped,
+    /// aborted, halted, or failed. bluesky `RunEngineResult.interrupted`.
+    pub interrupted: bool,
+    /// Text reason for an abort/halt/stop, or the failure's error message;
+    /// empty when the plan completed cleanly. bluesky `RunEngineResult.reason`.
+    pub reason: String,
+    /// The error that failed the run, if any — `Some` only on the `fail` path,
+    /// `None` on success/abort/halt. bluesky `RunEngineResult.exception`.
+    pub exception: Option<BsrsError>,
 }
 
 /// Per-call options for [`RunEngine::run_async_with`]. Mirrors
@@ -1318,9 +1336,43 @@ impl RunEngine {
         self.close_run_if_open(status, reason).await
     }
 
+    /// Assemble the [`RunResult`], deriving `interrupted` and `reason` from the
+    /// engine's terminal state. `exception` is `Some` only on the failure path;
+    /// its message then supplies `reason`, otherwise the caller-set abort/halt/
+    /// stop reason ([`stop_reason`](Self::stop_reason)) does.
+    fn build_result(
+        &self,
+        run_uids: Vec<String>,
+        exit_status: String,
+        exception: Option<BsrsError>,
+    ) -> RunResult {
+        // Interrupted = anything but a clean run to completion. bluesky sets
+        // `_interrupted` on pause/stop/abort/halt/fail; a natural end leaves it
+        // false. (Pause returns before a result is built, so it is not tested
+        // here.)
+        let interrupted = exit_status == "fail"
+            || self.is_halting.load(Ordering::SeqCst)
+            || self.is_stopping.load(Ordering::SeqCst)
+            || self.is_aborting.load(Ordering::SeqCst);
+        let reason = match &exception {
+            Some(e) => e.to_string(),
+            None => self.stop_reason().unwrap_or_default(),
+        };
+        RunResult {
+            run_uids,
+            exit_status,
+            interrupted,
+            reason,
+            exception,
+        }
+    }
+
     async fn run_loop(&self, plan: Plan) -> Result<RunResult> {
         let plan = Mutex::new(plan);
-        let mut run_uid: Option<String> = None;
+        // Every RunStart UID opened during this call, in open order (bluesky
+        // accumulates `_run_start_uids` in `_open_run`); `handle` returns a UID
+        // exactly once per `Msg::OpenRun`, so no de-duplication is needed.
+        let mut run_uids: Vec<String> = Vec::new();
         let mut exit_status = String::from("no-run");
 
         let resolve_exit = |this: &Self, current: &mut String| {
@@ -1359,7 +1411,7 @@ impl RunEngine {
                 h(&msg);
             }
             match self.handle(msg).await {
-                Ok(Some(uid)) => run_uid = Some(uid),
+                Ok(Some(uid)) => run_uids.push(uid),
                 Ok(None) => {}
                 Err(e) => {
                     // If a `contingency_wrapper` region is active, route the
@@ -1386,10 +1438,9 @@ impl RunEngine {
                     tracing::error!("plan error: {e}");
                     exit_status = "fail".into();
                     self.drain_and_close("fail", Some(format!("{e}"))).await?;
-                    return Ok(RunResult {
-                        run_uid,
-                        exit_status,
-                    });
+                    // Move the error itself into the result so callers can match
+                    // on its variant (bluesky's `RunEngineResult.exception`).
+                    return Ok(self.build_result(run_uids, exit_status, Some(e)));
                 }
             }
         }
@@ -1402,19 +1453,13 @@ impl RunEngine {
             // document (run_engine.py:1792).
             let reason = self.stop_reason();
             self.drain_and_close(&exit_status, reason).await?;
-            return Ok(RunResult {
-                run_uid,
-                exit_status,
-            });
+            return Ok(self.build_result(run_uids, exit_status, None));
         }
         if exit_status == "success" && self.is_stopping.load(Ordering::SeqCst) {
             // `stop()` sets no reason, so this resolves to `None` (bluesky's
             // default `_reason = ""`), not a hardcoded "user-requested stop".
             self.drain_and_close("success", self.stop_reason()).await?;
-            return Ok(RunResult {
-                run_uid,
-                exit_status,
-            });
+            return Ok(self.build_result(run_uids, exit_status, None));
         }
 
         // Normal exit: close any open run as success.
@@ -1422,14 +1467,11 @@ impl RunEngine {
         if still_open {
             self.drain_and_close("success", None).await?;
             exit_status = "success".into();
-        } else if run_uid.is_some() && exit_status == "no-run" {
+        } else if !run_uids.is_empty() && exit_status == "no-run" {
             exit_status = "success".into();
         }
 
-        Ok(RunResult {
-            run_uid,
-            exit_status,
-        })
+        Ok(self.build_result(run_uids, exit_status, None))
     }
 
     /// Pull the next message: handle pause gating, replay queue, then plan.

@@ -169,7 +169,7 @@ by key. `None` key = the single-run default (fully backward-compatible).
 
 ---
 
-### ENG-05 `RunResult` missing plan_result, interrupted, reason, exception; one uid only (P1)
+### ENG-05 `RunResult` missing plan_result, interrupted, reason, exception; one uid only (P1) — **DONE**
 
 **bsrs:** `engine.rs:203-207`:
 ```rust
@@ -202,6 +202,27 @@ from an abort without re-parsing `exit_status`.
 (currently only captures the last one assigned to `run_uid`).
 
 **Effort:** M
+
+**Resolution:** `RunResult` now has `run_uids: Vec<String>` (every RunStart uid opened
+during the call, accumulated in `run_loop` via `run_uids.push(uid)` — `handle` returns a
+uid exactly once per `Msg::OpenRun`, so no de-dup is needed), `interrupted: bool`,
+`reason: String`, and `exception: Option<BsrsError>`. A private `build_result(run_uids,
+exit_status, exception)` funnels all four construction sites through one place: it derives
+`interrupted` from the terminal state (`fail` / halting / stopping / aborting; a natural
+clean end leaves it false) and `reason` from the exception's `Display` (fail path) else
+`stop_reason()` (abort/halt/stop). The failure path moves the actual `BsrsError` into
+`exception` so callers can match on its variant rather than re-parse a string.
+`plan_result` is **intentionally omitted** — bsrs plans are `async_stream`s that yield
+`Msg`s and return `()`, so there is no generator return value to carry. `RunResult` also
+drops its `Clone` derive: `BsrsError` is not `Clone` (it wraps non-`Clone` sources such as
+`serde_json::Error`) and no caller cloned the whole struct. Downstream readers of the old
+single `run_uid` (`lua_env` two REPL result strings, `qs/server` `current_run_uid`,
+`qs/dispatch` JSON `run_uid` field, three examples) now take `run_uids.last()`, preserving
+the previous most-recently-opened-uid semantics and the qs wire format. Tests:
+`run_result_records_uid_and_marks_clean_success` (clean run → one uid, not interrupted,
+empty reason, no exception) and `run_result_on_failure_carries_typed_exception_and_reason`
+(Msg::Fail → interrupted, uid retained, `Some(BsrsError::Plan("boom"))`, reason `"plan
+logic error: boom"`).
 
 ---
 

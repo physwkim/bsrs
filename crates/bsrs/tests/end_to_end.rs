@@ -749,6 +749,74 @@ async fn configure_inside_open_bundle_is_rejected() {
     );
 }
 
+// ENG-05: a clean single-run plan records its RunStart uid in `run_uids`, is not
+// flagged interrupted, and carries no reason/exception.
+#[tokio::test]
+async fn run_result_records_uid_and_marks_clean_success() {
+    let re = RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new());
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        yield bsrs::core::Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let result = re
+        .run_async(plan)
+        .await
+        .expect("run_async returns a RunResult");
+    assert_eq!(result.exit_status, "success");
+    assert_eq!(
+        result.run_uids.len(),
+        1,
+        "one run opened -> one uid: {:?}",
+        result.run_uids
+    );
+    assert!(
+        !result.run_uids[0].is_empty(),
+        "the recorded uid is non-empty"
+    );
+    assert!(!result.interrupted, "a clean run is not interrupted");
+    assert!(
+        result.reason.is_empty(),
+        "no reason on a clean success: {:?}",
+        result.reason
+    );
+    assert!(result.exception.is_none(), "no exception on success");
+}
+
+// ENG-05: a failed run is flagged interrupted, keeps the uid of the run that had
+// opened before the failure, and carries the typed error plus a matching reason.
+#[tokio::test]
+async fn run_result_on_failure_carries_typed_exception_and_reason() {
+    use bsrs::core::error::BsrsError;
+    let re = RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new());
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        // Fail-fast: the engine turns Msg::Fail into BsrsError::Plan and the run
+        // loop catches it into RunResult{exit_status:"fail"} (not an Err).
+        yield bsrs::core::Msg::Fail("boom".into());
+        yield bsrs::core::Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let result = re
+        .run_async(plan)
+        .await
+        .expect("handler error is caught into RunResult, not surfaced as Err");
+    assert_eq!(result.exit_status, "fail");
+    assert!(result.interrupted, "a failed run is interrupted");
+    assert_eq!(
+        result.run_uids.len(),
+        1,
+        "the run opened before it failed, so its uid is recorded: {:?}",
+        result.run_uids
+    );
+    // The typed error is carried so callers can match on the variant, not just
+    // re-parse a string.
+    match &result.exception {
+        Some(BsrsError::Plan(m)) => assert_eq!(m.as_str(), "boom"),
+        other => panic!("expected a Plan exception carrying \"boom\", got {other:?}"),
+    }
+    // `reason` mirrors the exception's Display.
+    assert_eq!(result.reason, "plan logic error: boom");
+}
+
 /// Readable + Configurable device for descriptor-configuration tests: one
 /// read field `{name}_x`, one config field `{name}_gain`, a counter on
 /// config reads (to prove the run-level cache), and a `configure_dyn` that

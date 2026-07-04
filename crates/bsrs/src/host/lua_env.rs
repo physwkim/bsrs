@@ -520,7 +520,11 @@ impl UserData for LuaRunEngine {
             Ok(format!(
                 "exit_status={} run_uid={}",
                 result.exit_status,
-                result.run_uid.unwrap_or_else(|| "—".into())
+                result
+                    .run_uids
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| "—".into())
             ))
         });
         methods.add_method("pause", |_, this, deferred: Option<bool>| {
@@ -958,7 +962,11 @@ impl UserData for LuaRunEngine {
                 Ok(format!(
                     "exit_status={} run_uid={}",
                     result.exit_status,
-                    result.run_uid.unwrap_or_else(|| "—".into())
+                    result
+                        .run_uids
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| "—".into())
                 ))
             },
         );

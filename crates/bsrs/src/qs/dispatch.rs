@@ -1145,7 +1145,9 @@ fn queue_item_execute(
             "success": r.exit_status == "success",
             "msg": "",
             "exit_status": r.exit_status,
-            "run_uid": r.run_uid,
+            // Preserve the single-valued `run_uid` wire field (the most recently
+            // opened run); RunResult now carries all opened UIDs in `run_uids`.
+            "run_uid": r.run_uids.last(),
         }),
         Err(e) => err(format!("run failed: {e}")),
     }
