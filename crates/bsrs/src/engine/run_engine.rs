@@ -263,8 +263,15 @@ struct WaitGroup {
     members: Vec<Status>,
 }
 
-/// Optional pre/post-suspend plan injection (placeholder for M4+).
-pub type SuspendCallback = Box<dyn FnOnce() -> Plan + Send + Sync>;
+/// Factory for a suspender `pre_plan` / `post_plan` — an injected plan run
+/// when the engine enters (`pre_plan`) or leaves (`post_plan`) a suspension.
+/// It is a factory (not a bare [`Plan`]) so a fresh message stream is produced
+/// each time a suspension fires, mirroring bluesky's `pre_plan` / `post_plan`
+/// (`run_engine.py:1199`), which are generator callables re-invoked per
+/// suspend. The produced plan's messages run through the *same* handlers as the
+/// main plan — so a `pre_plan` can e.g. close a shutter (real `Set`/`Wait`) and
+/// emit documents before the wait, and `post_plan` can re-open it on resume.
+pub type SuspendCallback = Arc<dyn Fn() -> Plan + Send + Sync>;
 
 /// The RunEngine.
 pub struct RunEngine {
@@ -281,6 +288,16 @@ pub struct RunEngine {
     /// engine is actually paused instead of busy-looping a resume —
     /// distinct from `permit` (which wakes the *plan* loop on resume).
     pause_notify: Arc<Notify>,
+    /// Injected plan factories for the currently-requested suspension, set by
+    /// [`Self::suspend_until_with_plans`] *before* the pause takes effect. The
+    /// pause gate in `next_msg` takes `pending_pre_plan` right after
+    /// `on_pause_enter` (before the suspend wait) and `pending_post_plan` right
+    /// after `on_resume` (before the rewind replay), driving each produced plan
+    /// through the engine handlers. A plain `StdMutex` (not the async `state`
+    /// lock) so the synchronous `suspend_until_with_plans` can store them before
+    /// `mark_paused` without an await. Mirrors bluesky pre/post_plan injection.
+    pending_pre_plan: StdMutex<Option<SuspendCallback>>,
+    pending_post_plan: StdMutex<Option<SuspendCallback>>,
     is_running: AtomicBool,
     deferred_pause: AtomicBool,
     is_aborting: AtomicBool,
@@ -583,6 +600,8 @@ impl RunEngine {
             permit: Arc::new(Notify::new()),
             is_paused: Arc::new(AtomicBool::new(false)),
             pause_notify: Arc::new(Notify::new()),
+            pending_pre_plan: StdMutex::new(None),
+            pending_post_plan: StdMutex::new(None),
             is_running: AtomicBool::new(false),
             deferred_pause: AtomicBool::new(false),
             is_aborting: AtomicBool::new(false),
@@ -1008,6 +1027,29 @@ impl RunEngine {
         fut: BoxFuture<'static, ()>,
         justification: Option<String>,
     ) {
+        self.suspend_until_with_plans(fut, justification, None, None);
+    }
+
+    /// Like [`Self::suspend_until_with`] but injects `pre_plan` on suspension
+    /// (after motors stop, before the wait) and `post_plan` on resume (after
+    /// Pausable devices re-notify, before the rewind replay). Mirrors bluesky's
+    /// `request_suspend(fut, pre_plan=…, post_plan=…)` (`run_engine.py:1199`):
+    /// close a shutter before parking, re-open it on resume. Each factory is a
+    /// [`SuspendCallback`]; its plan's messages run through the same handlers as
+    /// the main plan (real device motion + document emission), *not* as opaque
+    /// side-effects. `None` for either leaves that phase unchanged.
+    pub fn suspend_until_with_plans(
+        self: &Arc<Self>,
+        fut: BoxFuture<'static, ()>,
+        justification: Option<String>,
+        pre_plan: Option<SuspendCallback>,
+        post_plan: Option<SuspendCallback>,
+    ) {
+        // Store the injected plans BEFORE `mark_paused` flips `is_paused`: the
+        // pause gate reads them the moment it observes the pause, so a store
+        // that raced after `mark_paused` could be missed on a fast pause entry.
+        *self.pending_pre_plan.lock().unwrap() = pre_plan;
+        *self.pending_post_plan.lock().unwrap() = post_plan;
         self.mark_paused();
         let me = Arc::downgrade(self);
         let label = justification.unwrap_or_else(|| "suspended".into());
@@ -1478,9 +1520,37 @@ impl RunEngine {
     async fn next_msg(&self, plan: &Mutex<Plan>) -> Option<Msg> {
         // Pause gate
         while self.is_paused.load(Ordering::SeqCst) && !self.is_aborting.load(Ordering::SeqCst) {
+            // Arm the resume notification BEFORE the (possibly slow)
+            // pause-enter + pre_plan work. `permit` is a bare `Notify` whose
+            // `notify_waiters` drops the wakeup if no waiter is registered yet,
+            // so a suspend future that resolves and calls `resume` mid-pre_plan
+            // would otherwise be lost and the engine would hang. `enable()`
+            // registers the waiter up front; the `is_paused` re-check below
+            // closes the tiny window between the loop condition and `enable()`.
+            let resumed = self.permit.notified();
+            tokio::pin!(resumed);
+            resumed.as_mut().enable();
+
             self.on_pause_enter().await;
-            self.permit.notified().await;
+            // pre_plan: run after the motor-stop / Pausable walk and before the
+            // suspend wait, driven through the same handlers as the main plan.
+            let pre = self.pending_pre_plan.lock().unwrap().take();
+            if let Some(pre) = pre {
+                self.run_injected_plan(pre()).await;
+            }
+            // Wait for resume — unless it already fired during pause-enter or
+            // pre_plan (captured by the armed `resumed`, or observed here as a
+            // cleared `is_paused` when the notify landed before `enable()`).
+            if self.is_paused.load(Ordering::SeqCst) {
+                resumed.await;
+            }
             self.on_resume().await;
+            // post_plan: run after Pausable resume + monitor restore and before
+            // the rewind replay drains, mirroring bluesky's post_plan.
+            let post = self.pending_post_plan.lock().unwrap().take();
+            if let Some(post) = post {
+                self.run_injected_plan(post()).await;
+            }
         }
         if self.is_aborting.load(Ordering::SeqCst) {
             return None;
@@ -1507,6 +1577,26 @@ impl RunEngine {
             }
         }
         Some(m)
+    }
+
+    /// Drive an injected suspender plan (`pre_plan` / `post_plan`) through the
+    /// engine handlers, exactly as the main plan is driven — so its `Set`/`Wait`
+    /// move real devices and any documents are emitted — but WITHOUT rewind
+    /// caching (these messages are not part of the rewindable main-plan region,
+    /// so a later resume must not replay them) and WITHOUT re-entering the pause
+    /// gate (the caller is already inside it). A failing message is logged and
+    /// ends the injection; it does not abort the run. Mirrors bluesky running
+    /// pre/post_plan messages through the same `_run` loop.
+    async fn run_injected_plan(&self, mut plan: Plan) {
+        while !self.is_aborting.load(Ordering::SeqCst) {
+            let Some(PlanItem::Bare(m)) = plan.next().await else {
+                break;
+            };
+            if let Err(e) = self.handle(m).await {
+                tracing::warn!("suspender injected plan message failed: {e}");
+                break;
+            }
+        }
     }
 
     async fn on_pause_enter(&self) {

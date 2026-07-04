@@ -363,7 +363,26 @@ beam flickers back and immediately fail because the beam is still unstable.
 
 ---
 
-### ENG-11 Suspender `pre_plan` / `post_plan` injection missing (P1)
+### ENG-11 Suspender `pre_plan` / `post_plan` injection missing (P1) — **DONE**
+
+**Resolution:** Added `suspend_until_with_plans(fut, justification, pre_plan, post_plan)`
+(`suspend_until_with` now delegates with `None, None`). `SuspendCallback` was repurposed from
+its unused `Box<dyn FnOnce() -> Plan>` placeholder to `Arc<dyn Fn() -> Plan + Send + Sync>` — a
+*factory* so each suspension produces a fresh message stream (mirrors bluesky's generator-callable
+pre/post_plan). The factories are stored on the engine before `mark_paused`, and the pause gate in
+`next_msg` drives them through the **same handlers as the main plan** via `run_injected_plan`:
+`pre_plan` after `on_pause_enter` (motor-stop + Pausable walk) and before the suspend wait;
+`post_plan` after `on_resume` (Pausable re-notify + monitor restore) and before the rewind replay
+— matching bluesky's order (run_engine.py:1199). Because a bare `Notify` (`permit`) drops a wakeup
+with no registered waiter, the gate now arms `permit.notified()` (`enable()`) *before* the
+pause-enter + pre_plan work and re-checks `is_paused`, closing the lost-wakeup race that
+pre_plan's real device motion would otherwise widen into a hang. Injected messages are **not**
+rewind-cached, so a later resume does not replay them. `run_injected_plan` is abort-aware and logs
+(does not propagate) a failing injected message. Test:
+`suspend_with_plans_runs_pre_on_pause_and_post_on_resume` proves the pre/post `Set` land real
+setpoints on a RecordingMotor, in order, pre strictly before the future resolves. Wiring
+`with_pre_plan` / `with_post_plan` ergonomics into the `SuspendBool*` / `SuspendThreshold` /
+`SuspendOutsideBand` builders (they call `suspend_until_with` per trip) is a mechanical follow-up.
 
 **bsrs:** `suspend_until_with` (`engine.rs:699-718`) immediately pauses + spawns a task that
 calls `resume()` when `fut` resolves. No way to inject a plan before the suspend or after it.
@@ -644,7 +663,7 @@ collects exceptions and either swallows them (if `ignore_exceptions=True`) or wa
 | ENG-08 | `seq_num` not reset on rewind | P1 | M |
 | ENG-09 | `backstop_collect` not called on cleanup | P1 | S |
 | ENG-10 | Suspender `sleep` (resume-delay) missing | P1 | S |
-| ENG-11 | Suspender `pre_plan` / `post_plan` injection missing | P1 | M |
+| ~~ENG-11~~ | ~~Suspender `pre_plan` / `post_plan` injection missing~~ **DONE** | P1 | M |
 | ENG-12 | Suspenders not checked for tripped state before plan start | P1 | M |
 | ENG-13 | `SuspendWhenOutsideBand` and `SuspendWhenChanged` missing | P1 | S–M |
 | ENG-14 | `scan_id` not written back to `RE.md` after each run | P1 | S |

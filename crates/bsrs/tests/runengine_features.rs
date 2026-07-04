@@ -1989,6 +1989,124 @@ async fn suspend_until_pauses_then_auto_resumes() {
     );
 }
 
+// A movable that records every setpoint it receives, so a test can prove an
+// injected pre/post-suspend plan's `Set` was driven through the engine
+// handlers (real device motion), not merely that a factory was invoked.
+struct RecordingMotor {
+    name: String,
+    log: Arc<StdMutex<Vec<f64>>>,
+}
+
+impl bsrs::core::msg::NamedObj for RecordingMotor {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn inspect_dyn(&self) -> Value {
+        serde_json::json!({ "name": self.name, "type": "RecordingMotor" })
+    }
+}
+
+#[async_trait::async_trait]
+impl bsrs::core::msg::MovableObj for RecordingMotor {
+    async fn set_dyn(&self, value: f64) -> bsrs::core::status::Status {
+        self.log.lock().unwrap().push(value);
+        bsrs::core::status::Status::done()
+    }
+}
+
+// ENG-11: suspend_until_with_plans runs `pre_plan` on suspension (after the
+// motor-stop walk, before the wait) and `post_plan` on resume (before the
+// rewind replay). Both are real plans whose `Set`/`Wait` go through the same
+// handlers as the main plan — verified by the setpoints they land on the
+// RecordingMotor, and by their order relative to the suspend future resolving.
+#[tokio::test]
+async fn suspend_with_plans_runs_pre_on_pause_and_post_on_resume() {
+    use bsrs::core::msg::MovableObj;
+
+    let log = Arc::new(StdMutex::new(Vec::<f64>::new()));
+    let pre_motor: Arc<dyn MovableObj> = Arc::new(RecordingMotor {
+        name: "shutter".into(),
+        log: log.clone(),
+    });
+    let post_motor = pre_motor.clone();
+
+    // Factories (not bare plans): each call yields a fresh stream, mirroring
+    // bluesky's generator-callable pre/post_plan.
+    let pre: bsrs::engine::SuspendCallback = Arc::new(move || {
+        let m = pre_motor.clone();
+        plan_box(async_stream::stream! {
+            yield Msg::Set { obj: m.clone(), value: 10.0, group: Some("pre".into()) };
+            yield Msg::Wait { group: "pre".into(), error_on_timeout: true, timeout: None };
+        })
+    });
+    let post: bsrs::engine::SuspendCallback = Arc::new(move || {
+        let m = post_motor.clone();
+        plan_box(async_stream::stream! {
+            yield Msg::Set { obj: m.clone(), value: 20.0, group: Some("post".into()) };
+            yield Msg::Wait { group: "post".into(), error_on_timeout: true, timeout: None };
+        })
+    });
+
+    let re = Arc::new(RunEngine::new(vec![]));
+    let re2 = re.clone();
+    // Two short sleeps: the first is the window for `suspend_until_with_plans`
+    // to land; the pause gate then triggers at the sleep boundary. Once
+    // suspended the engine parks in the gate, so the second sleep does not run
+    // until resume — the plan cannot finish before the injection is observed.
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::Sleep(Duration::from_millis(30));
+        yield Msg::Sleep(Duration::from_millis(30));
+    });
+    let join = tokio::spawn(async move { re2.run_async(plan).await });
+
+    wait_for_state(&re, EngineRunState::Running).await;
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    re.suspend_until_with_plans(
+        Box::pin(async move {
+            let _ = rx.await;
+        }),
+        Some("shutter interlock".into()),
+        Some(pre),
+        Some(post),
+    );
+
+    // pre_plan runs while still suspended, before the future resolves.
+    {
+        let log = log.clone();
+        wait_until("pre_plan Set landed", move || {
+            log.lock().unwrap().contains(&10.0)
+        })
+        .await;
+    }
+    assert!(
+        !log.lock().unwrap().contains(&20.0),
+        "post_plan must not run before the suspend future resolves"
+    );
+
+    // Resolve the suspend condition → resume → post_plan.
+    let _ = tx.send(());
+    {
+        let log = log.clone();
+        wait_until("post_plan Set landed", move || {
+            log.lock().unwrap().contains(&20.0)
+        })
+        .await;
+    }
+
+    let _ = tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("did not resume + finish in time")
+        .unwrap()
+        .unwrap();
+
+    let final_log = log.lock().unwrap().clone();
+    assert_eq!(
+        final_log,
+        vec![10.0, 20.0],
+        "pre_plan (10) then post_plan (20), each exactly once"
+    );
+}
+
 // -- Msg::Input --------------------------------------------------------------
 
 #[tokio::test]
