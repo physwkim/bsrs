@@ -301,9 +301,13 @@ async fn fly_plan_drives_standard_detector_to_completion() {
     let sink = Arc::new(CapturingSink::new());
     let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
 
-    let plan = bsrs::ophyd_async::fly(
-        det.clone() as Arc<dyn FlyableObj>,
-        det.clone() as Arc<dyn CollectableObj>,
+    // fly no longer stages its flyers (bluesky parity); stage externally, as
+    // bluesky's stage_decorator does.
+    let plan = bsrs::plans::preprocessors::stage_wrapper(
+        bsrs::ophyd_async::fly(vec![(
+            det.clone() as Arc<dyn FlyableObj>,
+            det.clone() as Arc<dyn CollectableObj>,
+        )]),
         vec![det.clone() as Arc<dyn StageableObj>],
     );
     let result = re.run_async(plan).await.expect("fly failed");

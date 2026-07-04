@@ -182,7 +182,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-07 — `fly` handles only single flyer; bluesky `fly` handles a list of flyers
+### PLAN-07 — `fly` handles only single flyer; bluesky `fly` handles a list of flyers — **DONE**
 
 - **bsrs:** `lib.rs:889–927` — single `FlyableObj` + single `CollectableObj`
 - **ref:** `plans.py:2305–2338` — `fly(flyers: list[Flyable])`, kicks off all, completes
@@ -194,6 +194,18 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
   `Kickoff` for each into group "kick", wait; fan out `Complete` for each into group
   "done", wait; then collect each.  Remove inline staging (see PLAN-09).
 - **Effort:** S
+- **Resolution:** `plans::fly` now takes `Vec<Flyer>` (`Flyer = (Arc<dyn FlyableObj>,
+  Arc<dyn CollectableObj>)`) and delegates to the canonical `stubs::kickoff_all(objs,
+  "kick", wait=true)` / `stubs::complete_all(objs, "complete", wait=true)` helpers (one
+  group + one barrier each, running the flyers concurrently), then collects each
+  collectable in order.  Inline staging was removed — as in bluesky, `fly` does not
+  stage; callers wrap with `preprocessors::stage_wrapper` (bluesky's `stage_decorator`).
+  An empty flyer list opens and closes the run with nothing between (no spurious
+  kickoff/wait/collect).  The Lua `bp.fly` binding is unchanged (still the
+  not-yet-wired stub).  Tests: `fly_kicks_completes_then_collects_each_flyer` asserts the
+  full 10-message sequence and grouping; `fly_with_no_flyers_only_opens_and_closes`
+  covers the empty case; `end_to_end::fly_plan_drives_standard_detector_to_completion`
+  now stages externally via `stage_wrapper`.
 
 ---
 

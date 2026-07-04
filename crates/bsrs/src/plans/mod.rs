@@ -1730,38 +1730,51 @@ pub fn rel_spiral_fermat(
     preprocessors::reset_positions_wrapper(rel, vec![x_motor, y_motor])
 }
 
-/// `fly(flyer, dets)` — kickoff, collect while completing, unstage.
-pub fn fly(
-    flyer: Arc<dyn FlyableObj>,
-    collectable: Arc<dyn CollectableObj>,
-    stageables: Vec<Arc<dyn StageableObj>>,
-) -> Plan {
+/// One flyer of a [`fly`] scan: its `Flyable` (kickoff/complete) paired with the
+/// `Collectable` that drains its buffered data. bsrs splits bluesky's single
+/// `Flyable` interface across two traits, so a flyer is a `(Flyable, Collectable)`
+/// pair.
+pub type Flyer = (Arc<dyn FlyableObj>, Arc<dyn CollectableObj>);
+
+/// `fly(flyers)` — fly scan over one or more flyers. Ports bluesky's `fly`
+/// (plans.py:2305): kick off every flyer, wait, tell every flyer to complete,
+/// wait, then collect each. Mirrors `kickoff_all` / `complete_all` (one group,
+/// one barrier) so the flyers run concurrently rather than one-at-a-time.
+///
+/// No staging: as in bluesky, `fly` does not stage its flyers — wrap it with
+/// [`preprocessors::stage_wrapper`] (bluesky's `stage_decorator`) when the
+/// devices need staging.
+pub fn fly(flyers: Vec<Flyer>) -> Plan {
     plan_box(async_stream::stream! {
         yield Msg::OpenRun(RunMetadata {
             plan_name: Some("fly".into()),
             ..Default::default()
         });
-        for s in &stageables {
-            yield Msg::Stage(s.clone());
+        // Kick off every flyer under one group and wait, then tell every flyer
+        // to complete under one group and wait — reusing the canonical
+        // `kickoff_all` / `complete_all` stubs (bluesky's helpers of the same
+        // name). An empty flyer list emits no kickoff/complete/wait at all,
+        // matching bluesky's `for flyer in flyers` loops.
+        if !flyers.is_empty() {
+            let objs: Vec<Arc<dyn FlyableObj>> =
+                flyers.iter().map(|(f, _)| f.clone()).collect();
+            let mut kick = stubs::kickoff_all(objs.clone(), Some("kick".into()), true);
+            while let Some(item) = futures::StreamExt::next(&mut kick).await {
+                let crate::core::plan::PlanItem::Bare(m) = item;
+                yield m;
+            }
+            let mut done = stubs::complete_all(objs, Some("complete".into()), true);
+            while let Some(item) = futures::StreamExt::next(&mut done).await {
+                let crate::core::plan::PlanItem::Bare(m) = item;
+                yield m;
+            }
         }
-        yield Msg::Kickoff { obj: flyer.clone(), group: Some("kick".into()) };
-        yield Msg::Wait {
-            group: "kick".into(),
-            error_on_timeout: true,
-            timeout: None,
-        };
-        yield Msg::Complete { obj: flyer.clone(), group: Some("done".into()) };
-        yield Msg::Wait {
-            group: "done".into(),
-            error_on_timeout: true,
-            timeout: None,
-        };
-        yield Msg::Collect {
-            obj: collectable.clone(),
-            stream_name: None,
-        };
-        for s in &stageables {
-            yield Msg::Unstage(s.clone());
+        // Collect each flyer's buffered data.
+        for (_, c) in &flyers {
+            yield Msg::Collect {
+                obj: c.clone(),
+                stream_name: None,
+            };
         }
         yield Msg::CloseRun {
             exit_status: "success".into(),
@@ -2109,6 +2122,44 @@ mod tests {
         }
     }
 
+    /// Minimal collectable for `fly` drain tests. `describe_collect_dyn` /
+    /// `collect_dyn` are never called by `drain` (only the engine invokes
+    /// them); the plan only carries the object inside `Msg::Collect`.
+    struct FakeCollectable(String);
+
+    impl crate::core::msg::NamedObj for FakeCollectable {
+        fn name(&self) -> &str {
+            &self.0
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CollectableObj for FakeCollectable {
+        async fn describe_collect_dyn(
+            &self,
+        ) -> Result<
+            std::collections::HashMap<
+                String,
+                std::collections::HashMap<String, crate::event_model::DataKey>,
+            >,
+            crate::core::error::BsrsError,
+        > {
+            Ok(Default::default())
+        }
+        async fn collect_dyn(
+            &self,
+        ) -> Result<
+            Vec<(
+                String,
+                std::collections::HashMap<String, serde_json::Value>,
+                std::collections::HashMap<String, f64>,
+            )>,
+            crate::core::error::BsrsError,
+        > {
+            Ok(Vec::new())
+        }
+    }
+
     /// Minimal preparable for `prepare` stub-stream tests. `prepare_dyn` is
     /// never called by `drain` (only the engine invokes it).
     struct FakePreparable(String);
@@ -2141,6 +2192,18 @@ mod tests {
             .collect()
     }
 
+    /// `n` `(Flyable, Collectable)` pairs, both named `fly{i}`.
+    fn flyer_pairs(n: usize) -> Vec<Flyer> {
+        (0..n)
+            .map(|i| {
+                (
+                    Arc::new(FakeFlyer(format!("fly{i}"))) as Arc<dyn FlyableObj>,
+                    Arc::new(FakeCollectable(format!("fly{i}"))) as Arc<dyn CollectableObj>,
+                )
+            })
+            .collect()
+    }
+
     fn kickoff_group(m: &Msg) -> Option<&str> {
         match m {
             Msg::Kickoff { group, .. } => group.as_deref(),
@@ -2151,6 +2214,13 @@ mod tests {
     fn complete_group(m: &Msg) -> Option<&str> {
         match m {
             Msg::Complete { group, .. } => group.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn collect_name(m: &Msg) -> Option<&str> {
+        match m {
+            Msg::Collect { obj, .. } => Some(obj.name()),
             _ => None,
         }
     }
@@ -3717,6 +3787,62 @@ mod tests {
         assert!(g.starts_with("complete_all-"), "got {g:?}");
         assert!(msgs.iter().all(|m| complete_group(m) == Some(g.as_str())));
         assert!(!msgs.iter().any(|m| matches!(m, Msg::Wait { .. })));
+    }
+
+    // fly over several flyers kicks each off under one "kick" group and waits,
+    // completes each under one "complete" group and waits, then collects each —
+    // the multi-flyer generalization of bluesky's `fly` (PLAN-07).
+    #[tokio::test]
+    async fn fly_kicks_completes_then_collects_each_flyer() {
+        let msgs = drain(fly(flyer_pairs(2))).await;
+
+        // OpenRun("fly"); Kickoff×2/kick; Wait/kick; Complete×2/complete;
+        // Wait/complete; Collect×2; CloseRun.
+        assert_eq!(msgs.len(), 10, "got {msgs:#?}");
+        assert!(
+            matches!(&msgs[0], Msg::OpenRun(md) if md.plan_name.as_deref() == Some("fly")),
+            "first msg is OpenRun(fly): {:?}",
+            msgs[0]
+        );
+
+        // Both flyers kicked off first, sharing the "kick" group, then one Wait.
+        assert_eq!(kickoff_group(&msgs[1]), Some("kick"));
+        assert_eq!(kickoff_group(&msgs[2]), Some("kick"));
+        assert!(
+            matches!(&msgs[3], Msg::Wait { group, .. } if group == "kick"),
+            "msg[3] waits on kick: {:?}",
+            msgs[3]
+        );
+
+        // Then both completed under the "complete" group, then one Wait.
+        assert_eq!(complete_group(&msgs[4]), Some("complete"));
+        assert_eq!(complete_group(&msgs[5]), Some("complete"));
+        assert!(
+            matches!(&msgs[6], Msg::Wait { group, .. } if group == "complete"),
+            "msg[6] waits on complete: {:?}",
+            msgs[6]
+        );
+
+        // Each flyer's collectable is collected, in order.
+        assert_eq!(collect_name(&msgs[7]), Some("fly0"));
+        assert_eq!(collect_name(&msgs[8]), Some("fly1"));
+
+        assert!(
+            matches!(&msgs[9], Msg::CloseRun { exit_status, .. } if exit_status == "success"),
+            "last msg is a successful CloseRun: {:?}",
+            msgs[9]
+        );
+    }
+
+    // An empty flyer list opens and closes the run with nothing in between —
+    // no spurious kickoff, wait, or collect (bluesky's `for flyer in flyers`
+    // loops iterate zero times).
+    #[tokio::test]
+    async fn fly_with_no_flyers_only_opens_and_closes() {
+        let msgs = drain(fly(Vec::new())).await;
+        assert_eq!(msgs.len(), 2, "got {msgs:#?}");
+        assert!(matches!(&msgs[0], Msg::OpenRun(_)));
+        assert!(matches!(&msgs[1], Msg::CloseRun { .. }));
     }
 
     fn preparable(name: &str) -> Arc<dyn PreparableObj> {
