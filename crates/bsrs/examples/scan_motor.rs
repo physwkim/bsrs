@@ -17,7 +17,7 @@ async fn main() -> Result<()> {
     let trace: Arc<dyn DocumentSink> = Arc::new(StderrTraceSink);
     let re = RunEngine::new(vec![trace]);
 
-    let plan = bsrs::ophyd_async::scan(
+    let plan = bsrs::ophyd_async::scan_1d(
         vec![det as Arc<dyn ReadableObj>],
         motor.clone() as Arc<dyn MovableObj>,
         motor as Arc<dyn ReadableObj>,

@@ -98,7 +98,7 @@ async fn scan_plan_emits_motor_and_detector_readings() {
     let sink = Arc::new(CapturingSink::new());
     let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
 
-    let plan = bsrs::ophyd_async::scan(
+    let plan = bsrs::ophyd_async::scan_1d(
         vec![det.clone() as Arc<dyn bsrs::core::msg::ReadableObj>],
         motor.clone() as Arc<dyn bsrs::core::msg::MovableObj>,
         motor.clone() as Arc<dyn bsrs::core::msg::ReadableObj>,
@@ -163,7 +163,7 @@ async fn scan_family_runstart_carries_scan_metadata() {
     let motor = Arc::new(SoftMotor::new("m1", Some(0.0)));
     let sink = Arc::new(CapturingSink::new());
     let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
-    re.run_async(bsrs::ophyd_async::scan(
+    re.run_async(bsrs::ophyd_async::scan_1d(
         vec![SoftDetector::new("det1") as Arc<dyn bsrs::core::msg::ReadableObj>],
         motor.clone() as Arc<dyn bsrs::core::msg::MovableObj>,
         motor.clone() as Arc<dyn bsrs::core::msg::ReadableObj>,

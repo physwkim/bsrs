@@ -1345,7 +1345,10 @@ fn register_plan_factories(lua: &Lua) -> mlua::Result<()> {
                 .readable
                 .clone()
                 .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not readable", m.name)))?;
-            let plan = crate::plans::scan(detectors, movable, readable, start, stop, num);
+            // Lua's `scan(dets, motor, start, stop, num)` is the 1-D form, so it
+            // maps to the Rust `scan_1d` convenience; the N-motor `scan` takes a
+            // Vec<ScanAxis> that Lua does not construct here.
+            let plan = crate::plans::scan_1d(detectors, movable, readable, start, stop, num);
             Ok(LuaPlan {
                 label: format!("scan(n={})", num),
                 kind: TMutex::new(Some(LuaPlanKind::Prebuilt(plan))),
@@ -2547,9 +2550,11 @@ fn register_bp(lua: &Lua) -> mlua::Result<()> {
         lua.create_function(
             |_, (dt, mu, start, stop, num): (mlua::Table, mlua::AnyUserData, f64, f64, usize)| {
                 let (mv, rd, _) = motor_movable_readable(&mu)?;
+                // `bp.scan(dets, motor, start, stop, num)` is the 1-D form → the
+                // Rust `scan_1d` convenience (the N-motor `scan` takes ScanAxis).
                 Ok(wrap_prebuilt(
                     format!("scan(n={num})"),
-                    crate::plans::scan(dets(&dt)?, mv, rd, start, stop, num),
+                    crate::plans::scan_1d(dets(&dt)?, mv, rd, start, stop, num),
                 ))
             },
         )?,

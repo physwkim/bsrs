@@ -948,10 +948,36 @@ pub fn count_with_trigger(
     })
 }
 
-/// 1-D step `scan` from `start` to `stop` (inclusive) in `num` steps.
-/// Convenience form of [`scan_per_step`] with the default per-step action
+/// `scan(detectors, axes, num)` — the canonical N-motor step scan: move every
+/// axis simultaneously (inner product) from its `start` to its `stop` in `num`
+/// steps, reading the detectors at each point. Ports bluesky's `scan`
+/// (plans.py:1185), which moves all listed motors together and emits
+/// `plan_name = "scan"`. A single-axis call is an ordinary 1-D scan; the
+/// [`scan_1d`] convenience takes the motor/bounds inline for that common case.
+/// Convenience form of [`scan_per_step`] with the default per-step action.
+pub fn scan(detectors: Vec<Arc<dyn ReadableObj>>, axes: Vec<ScanAxis>, num: usize) -> Plan {
+    scan_per_step(detectors, axes, num, None)
+}
+
+/// N-motor `scan` delegating each point to `per_step` (default
+/// [`stubs::one_nd_step`]). Same inner-product traversal as
+/// [`inner_product_scan_per_step`] but emits `plan_name = "scan"` (bluesky's
+/// canonical name). Ports bluesky's `scan` `per_step` hook (plans.py:1096).
+pub fn scan_per_step(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    axes: Vec<ScanAxis>,
+    num: usize,
+    per_step: Option<PerStep>,
+) -> Plan {
+    inner_product_core(detectors, num, axes, per_step, "scan")
+}
+
+/// 1-D step `scan` from `start` to `stop` (inclusive) in `num` steps — the
+/// single-motor convenience form of [`scan`]. Ports the common `scan(dets, m,
+/// s, e, num=N)` shape; emits `plan_name = "scan"` like the N-motor form.
+/// Convenience form of [`scan_1d_per_step`] with the default per-step action
 /// ([`stubs::one_nd_step`]).
-pub fn scan(
+pub fn scan_1d(
     detectors: Vec<Arc<dyn ReadableObj>>,
     motor: Arc<dyn MovableObj>,
     motor_reader: Arc<dyn ReadableObj>,
@@ -959,15 +985,15 @@ pub fn scan(
     stop: f64,
     num: usize,
 ) -> Plan {
-    scan_per_step(detectors, motor, motor_reader, start, stop, num, None)
+    scan_1d_per_step(detectors, motor, motor_reader, start, stop, num, None)
 }
 
 /// 1-D step `scan` delegating each step to `per_step`. `None` uses
 /// [`stubs::one_nd_step`] (`Checkpoint → Set → Wait → Create → Read* → Save`),
-/// byte-for-byte the previous `scan` body. Ports bluesky's `scan` `per_step`
+/// byte-for-byte the previous 1-D `scan` body. Ports bluesky's `scan` `per_step`
 /// hook (plans.py:1096): a custom hook owns the whole move-and-read step, so it
 /// can trigger detectors, read into extra streams, or settle differently.
-pub fn scan_per_step(
+pub fn scan_1d_per_step(
     detectors: Vec<Arc<dyn ReadableObj>>,
     motor: Arc<dyn MovableObj>,
     motor_reader: Arc<dyn ReadableObj>,
@@ -1070,7 +1096,7 @@ pub fn rel_scan(
     num: usize,
 ) -> Plan {
     let reset_motor = motor.clone();
-    let inner = scan(
+    let inner = scan_1d(
         detectors,
         motor,
         motor_reader,
@@ -1254,6 +1280,22 @@ pub fn inner_product_scan_per_step(
     axes: Vec<ScanAxis>,
     per_step: Option<PerStep>,
 ) -> Plan {
+    inner_product_core(detectors, num, axes, per_step, "inner_product_scan")
+}
+
+/// Shared inner-product traversal for [`scan`] and [`inner_product_scan`]: move
+/// every axis together (all commanded each point) from `start` to `stop` in
+/// `num` steps, delegating each point to `per_step` (default
+/// [`stubs::one_nd_step`]). The two public entry points differ only in the
+/// emitted `plan_name`, so it is a parameter here; the traversal lives in one
+/// place.
+fn inner_product_core(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    num: usize,
+    axes: Vec<ScanAxis>,
+    per_step: Option<PerStep>,
+    plan_name: &'static str,
+) -> Plan {
     let bounds: Vec<(f64, f64)> = axes.iter().map(|(_, _, s, e)| (*s, *e)).collect();
     let pts = patterns::inner_product(num, &bounds);
     let per_step = per_step.unwrap_or_else(|| Arc::new(stubs::one_nd_step) as PerStep);
@@ -1261,7 +1303,7 @@ pub fn inner_product_scan_per_step(
         let motor_readers: Vec<Arc<dyn ReadableObj>> =
             axes.iter().map(|(_, mr, _, _)| mr.clone()).collect();
         yield Msg::OpenRun(scan_run_md(
-            "inner_product_scan",
+            plan_name,
             &detectors,
             &motor_readers,
             Some(num),
@@ -3487,7 +3529,7 @@ mod tests {
             name: "m".into(),
             bias: 0.0,
         }) as Arc<dyn MovableObj>;
-        let msgs = drain(scan(vec![], motor, rdr("m_rbv"), 0.0, 10.0, 3)).await;
+        let msgs = drain(scan_1d(vec![], motor, rdr("m_rbv"), 0.0, 10.0, 3)).await;
         assert_eq!(
             msgs.iter().filter(|m| matches!(m, Msg::Checkpoint)).count(),
             3,
@@ -3646,7 +3688,7 @@ mod tests {
     // A custom per_step replaces the whole step and receives this step's motor
     // targets threaded through `StepMotor`.
     #[tokio::test]
-    async fn scan_per_step_uses_custom_hook_and_threads_targets() {
+    async fn scan_1d_per_step_uses_custom_hook_and_threads_targets() {
         let motor = Arc::new(FakeMotor {
             name: "m".into(),
             bias: 0.0,
@@ -3662,7 +3704,7 @@ mod tests {
                 })
             },
         );
-        let msgs = drain(scan_per_step(
+        let msgs = drain(scan_1d_per_step(
             vec![],
             motor,
             rdr("m_rbv"),
@@ -3695,6 +3737,63 @@ mod tests {
             sets,
             vec![0.0, 5.0, 10.0],
             "each step's target is threaded through StepMotor to the hook"
+        );
+    }
+
+    // The canonical N-motor `scan` moves every axis together (inner product) and
+    // opens the run with bluesky's `plan_name = "scan"`.
+    #[tokio::test]
+    async fn scan_moves_all_axes_together_and_opens_run_named_scan() {
+        let mx = Arc::new(FakeMotor {
+            name: "x".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let my = Arc::new(FakeMotor {
+            name: "y".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let axes: Vec<ScanAxis> = vec![(mx, rdr("xr"), 0.0, 2.0), (my, rdr("yr"), 10.0, 12.0)];
+        let msgs = drain(scan(vec![], axes, 3)).await;
+        assert!(
+            matches!(&msgs[0], Msg::OpenRun(md) if md.plan_name.as_deref() == Some("scan")),
+            "N-motor scan opens plan_name=scan"
+        );
+        assert_eq!(
+            msgs.iter().filter(|m| matches!(m, Msg::Set { .. })).count(),
+            6,
+            "3 coupled points × 2 axes = 6 Sets (moved together)"
+        );
+        assert_eq!(
+            msgs.iter().filter(|m| matches!(m, Msg::Save)).count(),
+            3,
+            "3 inner-product points"
+        );
+    }
+
+    // A single-axis `scan` is an ordinary 1-D scan: same Checkpoint/Set/Save
+    // shape as the `scan_1d` convenience.
+    #[tokio::test]
+    async fn scan_single_axis_matches_scan_1d_shape() {
+        let m = || {
+            Arc::new(FakeMotor {
+                name: "m".into(),
+                bias: 0.0,
+            }) as Arc<dyn MovableObj>
+        };
+        let nd = drain(scan(vec![], vec![(m(), rdr("m_rbv"), 0.0, 10.0)], 3)).await;
+        let one_d = drain(scan_1d(vec![], m(), rdr("m_rbv"), 0.0, 10.0, 3)).await;
+        let shape = |ms: &[Msg]| {
+            (
+                ms.iter().filter(|m| matches!(m, Msg::Checkpoint)).count(),
+                ms.iter().filter(|m| matches!(m, Msg::Set { .. })).count(),
+                ms.iter().filter(|m| matches!(m, Msg::Save)).count(),
+                ms.len(),
+            )
+        };
+        assert_eq!(
+            shape(&nd),
+            shape(&one_d),
+            "single-axis scan and scan_1d emit the same Msg shape"
         );
     }
 

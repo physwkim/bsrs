@@ -23,7 +23,9 @@ The primary gaps are:
   `adaptive_scan` (slope-normalised + threshold + smoothing), `tune_centroid`
   (multi-pass refinement), `ramp_plan` (completion-predicate polling +
   monitor/timeout/period; Lua binding removed pending a Lua completion design).
-- **`scan` is 1D only**; bluesky's is N-D (P0, PLAN-03).
+- ~~**`scan` is 1D only**; bluesky's is N-D (P0, PLAN-03).~~ **DONE** — `scan(dets,
+  axes: Vec<ScanAxis>, num)` is now the canonical N-motor inner-product form
+  (plan_name "scan"); `scan_1d` is the 1-D convenience.
 - **`mv`/`mvr` are single-motor only**; bluesky accepts parallel multi-motor pairs (P1,
   PLAN-10).
 - ~~**Snake traversal absent** from all N-D grid scans and pattern generators (P1,
@@ -119,7 +121,23 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-03 — `scan` is 1D single-motor; bluesky `scan` accepts N motors (inner product)
+### PLAN-03 — `scan` is 1D single-motor; bluesky `scan` accepts N motors (inner product) — **DONE**
+
+- **Resolution:** Renamed the 1-D `scan` to `scan_1d` (+ `scan_1d_per_step`) and
+  made `scan(dets, axes: Vec<ScanAxis>, num)` the canonical N-motor inner-product
+  form (all axes moved together each point), matching bluesky's `scan`
+  (plans.py:1185). Both emit `plan_name = "scan"`. `scan`/`scan_per_step` share
+  the traversal with `inner_product_scan` through a new private
+  `inner_product_core(..., plan_name)` — the only difference between them is the
+  emitted name, so it is a parameter and the loop lives in one place;
+  `inner_product_scan` is kept as a back-compat alias (its own `plan_name`). All
+  ~10 old `scan(...)` call sites (rel_scan, examples, end_to_end, plans tests, and
+  both Lua `scan`/`bp.scan` bindings) were updated to `scan_1d`; the Lua bindings
+  stay 1-D (Lua does not construct `Vec<ScanAxis>`), so existing Lua scripts are
+  unaffected. Document emission is unchanged for every existing caller (they now
+  go through `scan_1d`, which emits the same "scan" run as before). Tests:
+  `scan_moves_all_axes_together_and_opens_run_named_scan`,
+  `scan_single_axis_matches_scan_1d_shape`.
 
 - **bsrs:** `lib.rs:377–419` — `scan(dets, motor, reader, start, stop, num)`
 - **ref:** `plans.py:1185–1291` — `scan(dets, *args, num=N)` where `args` is
