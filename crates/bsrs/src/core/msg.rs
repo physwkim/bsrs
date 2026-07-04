@@ -616,6 +616,18 @@ pub trait ReadableObj: NamedObj {
     fn hint_fields(&self) -> Option<Vec<String>> {
         None
     }
+    /// Staging capability query: if this readable is also a [`StageableObj`]
+    /// (a detector that arms on stage, a signal that holds a monitor), return
+    /// `Some(self)` so a plan can `Stage` it before the run and `Unstage` it
+    /// after — mirroring bluesky staging `list(detectors) + motors`. The
+    /// default is `None` (not stageable); devices that impl [`StageableObj`]
+    /// override to `Some(self)`. An `Arc<Self>` receiver lets the returned
+    /// handle share ownership without the device holding a self-reference. This
+    /// is the static-typing analogue of bluesky's duck-typed "does it have a
+    /// `stage()` method?" check.
+    fn as_stageable(self: Arc<Self>) -> Option<Arc<dyn StageableObj>> {
+        None
+    }
     /// Whether this readable also writes external assets, i.e. it emits
     /// `StreamResource` / `StreamDatum` documents alongside its Event. Default
     /// `false`; only asset-writing readables (e.g. `StandardDetector` in step
@@ -667,6 +679,13 @@ pub trait MovableObj: NamedObj {
     async fn stop_on_pause(&self, success: bool) -> Result<(), crate::core::error::BsrsError> {
         let _ = success;
         Ok(())
+    }
+    /// Staging capability query — the movable analogue of
+    /// [`ReadableObj::as_stageable`], so a plan stages `list(detectors) +
+    /// motors` uniformly. Default `None` (no library motor is stageable today);
+    /// a stageable motor overrides to `Some(self)`.
+    fn as_stageable(self: Arc<Self>) -> Option<Arc<dyn StageableObj>> {
+        None
     }
 }
 

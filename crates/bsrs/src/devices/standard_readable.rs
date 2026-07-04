@@ -202,6 +202,9 @@ impl ReadableObj for StandardReadable {
     async fn describe_dyn(&self) -> Result<HashMap<String, DataKey>> {
         AsyncReadable::describe(self).await
     }
+    fn as_stageable(self: Arc<Self>) -> Option<Arc<dyn StageableObj>> {
+        Some(self)
+    }
     fn hint_fields(&self) -> Option<Vec<String>> {
         if self.hints.is_empty() {
             None

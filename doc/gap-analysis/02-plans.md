@@ -17,7 +17,13 @@ The primary gaps are:
   cannot be customized (P0, PLAN-01).~~ **DONE** — `PerStep`/`PerShot`/`StepMotor`
   + `count_per_shot`/`scan_per_step`/`list_scan_per_step`/`inner_product_scan_per_step`/`scan_nd_per_step`
   (grid family deferred pending a settle-semantics decision).
-- **No staging** inside any compound plan — devices are never armed (P0, PLAN-09).
+- ~~**No staging** inside any compound plan — devices are never armed (P0, PLAN-09).~~
+  **DONE** — the six OpenRun cores (`count_ext`, `scan_1d_per_step`,
+  `list_scan_per_step`, `inner_product_core`, `scan_nd_with_md`,
+  `grid_scan_snake`) wrap their body with `stage_wrapper`; opt-in via
+  `as_stageable` on `ReadableObj`/`MovableObj`. Specialized plans
+  (`spiral*`/`adaptive_scan`/`ramp_plan`/`fly`/`tune_centroid`) tracked as
+  follow-up.
 - ~~**Three core plans have divergent algorithms** from bluesky: `ramp_plan`,
   `tune_centroid`, `adaptive_scan` (P0, PLAN-04/05/06).~~ **ALL DONE**:
   `adaptive_scan` (slope-normalised + threshold + smoothing), `tune_centroid`
@@ -286,7 +292,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-09 — No staging in any compound plan — devices never armed/configured
+### ~~PLAN-09~~ — No staging in any compound plan — devices never armed/configured — **DONE**
 
 - **bsrs:** `lib.rs:322–1155` — no plan emits `Stage`/`Unstage`
 - **ref:** `plans.py:489,614,748,etc.` — every compound plan wraps body with
@@ -295,7 +301,41 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
   unstages in LIFO order after.  Staging is where detectors arm, motors enable limits,
   etc.  Bsrs plans never stage/unstage.  Any device that requires staging to function
   correctly will fail silently when used in a bsrs plan.
-- **Fix sketch:** Either (a) wrap each compound plan body with `stage_wrapper(inner, devices + motors)`, or (b) document explicitly that callers are responsible for staging via `stage_wrapper`.  Option (b) is simpler and keeps plan composition clean; add a top-level note and a test.
+- **Resolution:** Took option (a) — every compound plan now stages its own
+  devices, matching bluesky's `stage_decorator`; callers stay staging-agnostic.
+  - New `plans::stageables_for(detectors, motors)` collects the distinct
+    `StageableObj` devices among the detectors + motors, deduplicated by
+    identity. It is *opt-in by type*: a new `as_stageable(self: Arc<Self>) ->
+    Option<Arc<dyn StageableObj>>` on `ReadableObj`/`MovableObj` defaults to
+    `None`, so only devices that override it (`StandardReadable`,
+    `StandardDetector`) are staged. This is the static-typing analogue of
+    ophyd-async probing a device for a `stage()` method — Rust trait objects
+    can't be capability-probed, so the object exposes the capability itself.
+  - The six independent-OpenRun cores — `count_ext`, `scan_1d_per_step`,
+    `list_scan_per_step`, `inner_product_core`, `scan_nd_with_md`,
+    `grid_scan_snake` — wrap their body with `preprocessors::stage_wrapper`,
+    emitting `Stage(each)` before `OpenRun` and `Unstage(each, LIFO)` after
+    `CloseRun`. All higher-level plans delegate into these cores, so `scan`,
+    `rel_scan`, `grid_scan`, `list_scan`, `scan_nd`, `inner_product_scan`,
+    `list_grid_scan`, etc. inherit staging with no per-plan change.
+  - `count_ext`'s delay-length validation now runs *before* staging, so an
+    invalid `count` arms nothing and leaks no partial run.
+  - When nothing is stageable (all sim/test devices) the wrapper emits no
+    `Stage`/`Unstage`, so existing plan message streams are byte-for-byte
+    unchanged — verified by `count_does_not_stage_non_stageable_detector`.
+  - Engine already auto-unstages tracked `staged` devices at run-end (a
+    finalizer even if the wrapper's `Unstage` is skipped on abort), so the
+    wrapper adds the happy-path bracket without weakening abort cleanup.
+  - Tests: `count_stages_stageable_detector_around_the_run` (Stage→OpenRun…
+    CloseRun→Unstage bracket), `scan_1d_stages_stageable_detector_before_open`
+    (scan family stages too), `count_does_not_stage_non_stageable_detector`
+    (opt-in honoured).
+  - **Follow-up (out of this finding):** the specialized plans `spiral*`,
+    `adaptive_scan`, `ramp_plan`, `fly`, and `tune_centroid` build their own
+    runs and are not yet wrapped. `fly` in particular stages *flyers*, not
+    step detectors, so it has distinct staging semantics; the others are step
+    plans that could reuse `stageables_for`. Tracked separately, not folded in
+    here to keep the finding scoped to the shared step-plan cores.
 - **Effort:** M
 
 ---

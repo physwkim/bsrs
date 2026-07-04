@@ -396,6 +396,9 @@ where
         // Read cached DataKeys, never re-open the writer (DB-04).
         self.cached_data_keys()
     }
+    fn as_stageable(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn StageableObj>> {
+        Some(self)
+    }
     fn hint_fields(&self) -> Option<Vec<String>> {
         Some(vec![format!("{}_index", self.name)])
     }

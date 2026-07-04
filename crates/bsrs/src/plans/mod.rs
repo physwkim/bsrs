@@ -823,6 +823,34 @@ pub fn count_per_shot(
     count_ext(detectors, Some(num), CountDelay::None, per_shot)
 }
 
+/// Collect the distinct [`StageableObj`] devices among `detectors` + `motors`
+/// — bluesky stages `list(detectors) + motors` before a run and unstages after.
+/// Deduplicated by identity so a device appearing as both a reader and a motor
+/// is staged once; devices that are not stageable ([`ReadableObj::as_stageable`]
+/// / [`MovableObj::as_stageable`] → `None`, e.g. a bare motor or a plain
+/// readable) are skipped — the static-typing analogue of bluesky staging only
+/// the objects that expose a `stage()` method. A compound plan feeds the result
+/// to [`preprocessors::stage_wrapper`]; when nothing is stageable (the common
+/// case for sim/test devices) the wrapper emits no `Stage`/`Unstage` and the
+/// message stream is unchanged.
+fn stageables_for(
+    detectors: &[Arc<dyn ReadableObj>],
+    motors: &[Arc<dyn MovableObj>],
+) -> Vec<Arc<dyn StageableObj>> {
+    let mut out: Vec<Arc<dyn StageableObj>> = Vec::new();
+    let candidates = detectors
+        .iter()
+        .cloned()
+        .filter_map(|d| d.as_stageable())
+        .chain(motors.iter().cloned().filter_map(|m| m.as_stageable()));
+    for s in candidates {
+        if !out.iter().any(|o| Arc::ptr_eq(o, &s)) {
+            out.push(s);
+        }
+    }
+    out
+}
+
 /// `count_ext(detectors, num, delay, per_shot)` — the full `count`: read the
 /// detectors `num` times (or forever when `num` is `None`), sleeping `delay`
 /// between shots and delegating each shot to `per_shot`. Ports bluesky's `count`
@@ -843,23 +871,29 @@ pub fn count_ext(
     delay: CountDelay,
     per_shot: Option<PerShot>,
 ) -> Plan {
+    // Upfront delay-length validation, mirroring bluesky's `ValueError` when a
+    // finite `num` outruns an explicit delay sequence (needs `num - 1`
+    // intervals). Fail before staging or opening the run so an invalid `count`
+    // arms nothing and leaks no partial run.
+    if let (Some(n), CountDelay::Sequence(seq)) = (num, &delay) {
+        if n > 1 && seq.len() < n - 1 {
+            let msg = format!(
+                "count: num={n} needs at least {} delay entries but got {}",
+                n - 1,
+                seq.len()
+            );
+            return plan_box(async_stream::stream! {
+                yield Msg::Fail(msg);
+            });
+        }
+    }
     // The default per_shot carries the per-shot Checkpoint (bluesky one_shot:
     // plan_stubs.py:1622), so a pause/resume rewinds only the current shot.
     let per_shot = per_shot.unwrap_or_else(|| Arc::new(stubs::read_shot) as PerShot);
-    plan_box(async_stream::stream! {
-        // Upfront delay-length validation, mirroring bluesky's `ValueError` when
-        // a finite `num` outruns an explicit delay sequence (needs `num - 1`
-        // intervals). Fail before opening the run so no partial run leaks.
-        if let (Some(n), CountDelay::Sequence(seq)) = (num, &delay) {
-            if n > 1 && seq.len() < n - 1 {
-                yield Msg::Fail(format!(
-                    "count: num={n} needs at least {} delay entries but got {}",
-                    n - 1,
-                    seq.len()
-                ));
-                return;
-            }
-        }
+    // Stage the detectors before the run and unstage after (PLAN-09); `count`
+    // has no motors. Non-stageable detectors contribute nothing.
+    let staged = stageables_for(&detectors, &[]);
+    let inner = plan_box(async_stream::stream! {
         yield Msg::OpenRun(scan_run_md("count", &detectors, &[], num, AxisGrouping::Time));
         let mut i: usize = 0;
         loop {
@@ -900,7 +934,8 @@ pub fn count_ext(
             exit_status: "success".into(),
             reason: None,
         };
-    })
+    });
+    preprocessors::stage_wrapper(inner, staged)
 }
 
 /// `count_with_trigger(detectors, num)` — trigger then read each iteration.
@@ -1008,7 +1043,9 @@ pub fn scan_1d_per_step(
         0.0
     };
     let per_step = per_step.unwrap_or_else(|| Arc::new(stubs::one_nd_step) as PerStep);
-    plan_box(async_stream::stream! {
+    // Stage detectors + the motor before the run, unstage after (PLAN-09).
+    let staged = stageables_for(&detectors, std::slice::from_ref(&motor));
+    let inner = plan_box(async_stream::stream! {
         yield Msg::OpenRun(scan_run_md(
             "scan",
             &detectors,
@@ -1029,7 +1066,8 @@ pub fn scan_1d_per_step(
             exit_status: "success".into(),
             reason: None,
         };
-    })
+    });
+    preprocessors::stage_wrapper(inner, staged)
 }
 
 /// `list_scan(detectors, motor, points)` — visit each position in `points`,
@@ -1055,7 +1093,9 @@ pub fn list_scan_per_step(
     per_step: Option<PerStep>,
 ) -> Plan {
     let per_step = per_step.unwrap_or_else(|| Arc::new(stubs::one_nd_step) as PerStep);
-    plan_box(async_stream::stream! {
+    // Stage detectors + the motor before the run, unstage after (PLAN-09).
+    let staged = stageables_for(&detectors, std::slice::from_ref(&motor));
+    let inner = plan_box(async_stream::stream! {
         yield Msg::OpenRun(scan_run_md(
             "list_scan",
             &detectors,
@@ -1075,7 +1115,8 @@ pub fn list_scan_per_step(
             exit_status: "success".into(),
             reason: None,
         };
-    })
+    });
+    preprocessors::stage_wrapper(inner, staged)
 }
 
 /// `rel_scan(detectors, motor, start, stop, num)` — like `scan` but
@@ -1183,7 +1224,9 @@ pub fn grid_scan_snake(
     } else {
         0.0
     };
-    plan_box(async_stream::stream! {
+    // Stage detectors + both motors before the run, unstage after (PLAN-09).
+    let staged = stageables_for(&detectors, &[motor1.clone(), motor2.clone()]);
+    let inner = plan_box(async_stream::stream! {
         yield Msg::OpenRun(scan_run_md(
             "grid_scan",
             &detectors,
@@ -1240,7 +1283,8 @@ pub fn grid_scan_snake(
             exit_status: "success".into(),
             reason: None,
         };
-    })
+    });
+    preprocessors::stage_wrapper(inner, staged)
 }
 
 // ---------------------------------------------------------------------------
@@ -1299,7 +1343,11 @@ fn inner_product_core(
     let bounds: Vec<(f64, f64)> = axes.iter().map(|(_, _, s, e)| (*s, *e)).collect();
     let pts = patterns::inner_product(num, &bounds);
     let per_step = per_step.unwrap_or_else(|| Arc::new(stubs::one_nd_step) as PerStep);
-    plan_box(async_stream::stream! {
+    // Stage detectors + every axis motor before the run, unstage after (PLAN-09).
+    let stage_motors: Vec<Arc<dyn MovableObj>> =
+        axes.iter().map(|(m, _, _, _)| m.clone()).collect();
+    let staged = stageables_for(&detectors, &stage_motors);
+    let inner = plan_box(async_stream::stream! {
         let motor_readers: Vec<Arc<dyn ReadableObj>> =
             axes.iter().map(|(_, mr, _, _)| mr.clone()).collect();
         yield Msg::OpenRun(scan_run_md(
@@ -1324,7 +1372,8 @@ fn inner_product_core(
             }
         }
         yield Msg::CloseRun { exit_status: "success".into(), reason: None };
-    })
+    });
+    preprocessors::stage_wrapper(inner, staged)
 }
 
 /// `x2x_scan(dets, motor1, m1_reader, motor2, m2_reader, start, stop, num)` —
@@ -1412,7 +1461,10 @@ fn scan_nd_with_md(
     per_step: Option<PerStep>,
 ) -> Plan {
     let per_step = per_step.unwrap_or_else(|| Arc::new(stubs::one_nd_step) as PerStep);
-    plan_box(async_stream::stream! {
+    // Stage detectors + every motor before the run, unstage after (PLAN-09).
+    let stage_motors: Vec<Arc<dyn MovableObj>> = motors.iter().map(|(m, _)| m.clone()).collect();
+    let staged = stageables_for(&detectors, &stage_motors);
+    let inner = plan_box(async_stream::stream! {
         yield Msg::OpenRun(md);
         // Per-motor last-set position — bsrs's port of bluesky's
         // move_per_step `pos_cache` (plan_stubs.py:1688-1702). A motor whose
@@ -1453,7 +1505,8 @@ fn scan_nd_with_md(
             }
         }
         yield Msg::CloseRun { exit_status: "success".into(), reason: None };
-    })
+    });
+    preprocessors::stage_wrapper(inner, staged)
 }
 
 /// Which axes of an N-D grid scan follow a snake (boustrophedon) trajectory.
@@ -2568,6 +2621,121 @@ mod tests {
         {
             Ok(HashMap::new())
         }
+    }
+
+    /// Readable that is ALSO stageable: its `as_stageable` returns `Some`, so a
+    /// compound plan `Stage`s it before the run and `Unstage`s it after
+    /// (PLAN-09). Contrast [`FakeReadable`], which is not stageable and so is
+    /// never staged.
+    struct StageableFake(String);
+
+    impl NamedObj for StageableFake {
+        fn name(&self) -> &str {
+            &self.0
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ReadableObj for StageableFake {
+        async fn read_dyn(
+            &self,
+        ) -> Result<HashMap<String, ReadingValue>, crate::core::error::BsrsError> {
+            Ok(HashMap::new())
+        }
+        async fn describe_dyn(
+            &self,
+        ) -> Result<HashMap<String, crate::event_model::DataKey>, crate::core::error::BsrsError>
+        {
+            Ok(HashMap::new())
+        }
+        fn as_stageable(self: Arc<Self>) -> Option<Arc<dyn StageableObj>> {
+            Some(self)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StageableObj for StageableFake {
+        async fn stage_dyn(&self) -> Result<(), crate::core::error::BsrsError> {
+            Ok(())
+        }
+        async fn unstage_dyn(&self) -> Result<(), crate::core::error::BsrsError> {
+            Ok(())
+        }
+    }
+
+    // PLAN-09: a compound plan stages its stageable detectors before the run
+    // and unstages them (LIFO) after, bracketing OpenRun/CloseRun.
+    #[tokio::test]
+    async fn count_stages_stageable_detector_around_the_run() {
+        let det: Arc<dyn ReadableObj> = Arc::new(StageableFake("sdet".into()));
+        let msgs = drain(count(vec![det], 1)).await;
+        assert!(
+            matches!(&msgs[0], Msg::Stage(o) if o.name() == "sdet"),
+            "first message must Stage the detector, got {:?}",
+            &msgs[0]
+        );
+        assert!(
+            matches!(&msgs[1], Msg::OpenRun(_)),
+            "OpenRun must follow the Stage, got {:?}",
+            &msgs[1]
+        );
+        assert!(
+            matches!(msgs.last(), Some(Msg::Unstage(o)) if o.name() == "sdet"),
+            "last message must Unstage the detector, got {:?}",
+            msgs.last()
+        );
+        let close = msgs
+            .iter()
+            .position(|m| matches!(m, Msg::CloseRun { .. }))
+            .expect("CloseRun present");
+        let unstage = msgs
+            .iter()
+            .rposition(|m| matches!(m, Msg::Unstage(_)))
+            .expect("Unstage present");
+        assert!(close < unstage, "Unstage must come after CloseRun");
+    }
+
+    // The opt-in is honoured: a plain (non-stageable) detector emits no
+    // Stage/Unstage, so existing plans over sim/test devices are unchanged.
+    #[tokio::test]
+    async fn count_does_not_stage_non_stageable_detector() {
+        let msgs = drain(count(vec![rdr("d")], 1)).await;
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, Msg::Stage(_) | Msg::Unstage(_))),
+            "a non-stageable detector must not be staged"
+        );
+    }
+
+    // The scan family stages too (via scan_1d_per_step), not just count.
+    #[tokio::test]
+    async fn scan_1d_stages_stageable_detector_before_open() {
+        let det: Arc<dyn ReadableObj> = Arc::new(StageableFake("sdet".into()));
+        let motor = Arc::new(FakeMotor {
+            name: "m".into(),
+            bias: 0.0,
+        });
+        let reader = rdr("m_rbv");
+        let msgs = drain(scan_1d(
+            vec![det],
+            motor as Arc<dyn MovableObj>,
+            reader,
+            0.0,
+            1.0,
+            2,
+        ))
+        .await;
+        assert!(
+            matches!(&msgs[0], Msg::Stage(o) if o.name() == "sdet"),
+            "scan_1d must Stage the detector first, got {:?}",
+            &msgs[0]
+        );
+        assert!(
+            matches!(msgs.last(), Some(Msg::Unstage(o)) if o.name() == "sdet"),
+            "scan_1d must Unstage the detector last, got {:?}",
+            msgs.last()
+        );
     }
 
     /// Triggerable carried only inside `Msg::Trigger`; `trigger_dyn` is never
