@@ -1827,13 +1827,23 @@ pub fn adaptive_scan(
     })
 }
 
-/// `tune_centroid(detectors, signal_field, motor, motor_reader, start,
-/// stop, num)` — a uniform scan that finds the centroid of
-/// `signal_field` across the detector readings, then sets `motor`
-/// to that centroid. Mirrors a simplified bluesky `tune_centroid`.
+/// `tune_centroid(detectors, signal_field, motor, motor_reader, start, stop,
+/// min_step, num, step_factor, snake)` — iteratively tune `motor` to the
+/// centroid of `signal_field`. Ports bluesky's multi-pass `tune_centroid`
+/// (plans.py:873).
 ///
-/// Centroid = `Σ(pos_i * sig_i) / Σ(sig_i)`. If all signals are zero
-/// (or non-numeric), the motor stops at the last scan position.
+/// Each pass scans `num` points across the current window, accumulates the
+/// centroid `Σ(xᵢ·Iᵢ) / Σ(Iᵢ)`, then re-centers a window narrowed by
+/// `step_factor` on that centroid and rescans — until the per-pass step falls
+/// below `min_step`. The motor is finally moved to the converged centroid. If a
+/// pass sees no signal (`ΣI == 0`) the plan stops without a final move, matching
+/// bluesky. With `snake = true` the scan direction alternates each pass to save
+/// return travel.
+///
+/// Requires `min_step > 0` and `step_factor > 1.0` (bluesky raises
+/// `ValueError`); otherwise the plan fails before opening a run. As in bsrs's
+/// other feedback plans, the signal is re-read plan-side via `read_dyn`, and the
+/// commanded position is used for the centroid abscissa.
 #[allow(clippy::too_many_arguments)]
 pub fn tune_centroid(
     detectors: Vec<Arc<dyn ReadableObj>>,
@@ -1842,28 +1852,49 @@ pub fn tune_centroid(
     motor_reader: Arc<dyn ReadableObj>,
     start: f64,
     stop: f64,
+    min_step: f64,
     num: usize,
+    step_factor: f64,
+    snake: bool,
 ) -> Plan {
     let signal_field = signal_field.into();
-    let step = if num > 1 {
-        (stop - start) / (num as f64 - 1.0)
-    } else {
-        0.0
+    let span = move |a: f64, b: f64| {
+        if num > 1 {
+            (b - a) / (num as f64 - 1.0)
+        } else {
+            0.0
+        }
     };
     plan_box(async_stream::stream! {
+        if min_step <= 0.0 {
+            yield Msg::Fail("tune_centroid: min_step must be positive".into());
+            return;
+        }
+        if step_factor <= 1.0 {
+            yield Msg::Fail("tune_centroid: step_factor must be greater than 1.0".into());
+            return;
+        }
         yield Msg::OpenRun(RunMetadata {
             plan_name: Some("tune_centroid".into()),
             ..Default::default()
         });
-        let mut sum_xy = 0.0_f64;
-        let mut sum_y = 0.0_f64;
-        let mut last_pos = start;
-        for i in 0..num {
-            // Per-step rewind boundary (bluesky one_1d_step.move(): :1669).
+        // Global bounds are fixed; the per-pass window shrinks inside them.
+        let low_limit = start.min(stop);
+        let high_limit = start.max(stop);
+        let mut pass_start = start;
+        let mut pass_stop = stop;
+        let mut next_pos = pass_start;
+        let mut step = span(pass_start, pass_stop);
+        let mut peak_position: Option<f64> = None;
+        let mut sum_i = 0.0_f64;
+        let mut sum_xi = 0.0_f64;
+        // step_factor > 1 guarantees the step shrinks each pass, so this
+        // terminates without an iteration cap.
+        while step.abs() >= min_step && (low_limit..=high_limit).contains(&next_pos) {
+            // Per-step rewind boundary (bluesky emits `checkpoint` before mv,
+            // plans.py:990).
             yield Msg::Checkpoint;
-            let pos = start + step * (i as f64);
-            last_pos = pos;
-            yield Msg::Set { obj: motor.clone(), value: pos, group: Some("set".into()) };
+            yield Msg::Set { obj: motor.clone(), value: next_pos, group: Some("set".into()) };
             yield Msg::Wait {
                 group: "set".into(),
                 error_on_timeout: true,
@@ -1875,26 +1906,52 @@ pub fn tune_centroid(
                 yield Msg::Read(d.clone());
             }
             yield Msg::Save;
-            if let Some(d) = detectors.first() {
+            // Re-read the signal from the first detector that carries it.
+            let mut cur_i: Option<f64> = None;
+            for d in &detectors {
                 if let Ok(map) = d.read_dyn().await {
-                    if let Some(y) = map.get(&signal_field).and_then(|rv| rv.value.as_f64()) {
-                        sum_xy += pos * y;
-                        sum_y += y;
+                    if let Some(v) = map.get(&signal_field).and_then(|rv| rv.value.as_f64()) {
+                        cur_i = Some(v);
+                        break;
                     }
                 }
             }
+            if let Some(y) = cur_i {
+                sum_i += y;
+                sum_xi += next_pos * y;
+            }
+            next_pos += step;
+            let in_range = pass_start.min(pass_stop) <= next_pos
+                && next_pos <= pass_start.max(pass_stop);
+            if !in_range {
+                if sum_i == 0.0 {
+                    // No signal this pass: give up without a final move.
+                    yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+                    return;
+                }
+                let centroid = sum_xi / sum_i;
+                peak_position = Some(centroid);
+                sum_i = 0.0;
+                sum_xi = 0.0;
+                let new_range = (pass_stop - pass_start) / step_factor;
+                pass_start = (centroid - new_range / 2.0).clamp(low_limit, high_limit);
+                pass_stop = (centroid + new_range / 2.0).clamp(low_limit, high_limit);
+                if snake {
+                    std::mem::swap(&mut pass_start, &mut pass_stop);
+                }
+                step = span(pass_start, pass_stop);
+                next_pos = pass_start;
+            }
         }
-        let target = if sum_y.abs() > f64::EPSILON {
-            sum_xy / sum_y
-        } else {
-            last_pos
-        };
-        yield Msg::Set { obj: motor.clone(), value: target, group: Some("center".into()) };
-        yield Msg::Wait {
-            group: "center".into(),
-            error_on_timeout: true,
-            timeout: None,
-        };
+        // Move to the converged centroid (bluesky's trailing `mv`).
+        if let Some(peak) = peak_position {
+            yield Msg::Set { obj: motor.clone(), value: peak, group: Some("center".into()) };
+            yield Msg::Wait {
+                group: "center".into(),
+                error_on_timeout: true,
+                timeout: None,
+            };
+        }
         yield Msg::CloseRun {
             exit_status: "success".into(),
             reason: None,
@@ -2315,6 +2372,78 @@ mod tests {
             targets.get(2).copied(),
             Some(0.5),
             "backstep over the overshot region: {targets:?}"
+        );
+    }
+
+    fn create_count(msgs: &[Msg]) -> usize {
+        msgs.iter()
+            .filter(|m| matches!(m, Msg::Create { .. }))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn tune_centroid_runs_multiple_passes_and_converges() {
+        // Flat signal → each pass's centroid is the window midpoint (2.0), and
+        // the window re-centers there and narrows by step_factor until the step
+        // drops below min_step. With range 4, num 5, step_factor 3, the steps
+        // are 1.0, 0.333, 0.111 (all ≥ 0.1) then 0.037 (< 0.1): three passes,
+        // 15 points — proof the scan is multi-pass, not single-pass.
+        let det = SequenceDetector::new("d", "sig", vec![1.0]) as Arc<dyn ReadableObj>;
+        let m = Arc::new(FakeMotor {
+            name: "m".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let msgs = drain(tune_centroid(
+            vec![det],
+            "sig",
+            m,
+            rdr("mr"),
+            0.0, // start
+            4.0, // stop
+            0.1, // min_step
+            5,   // num
+            3.0, // step_factor
+            false,
+        ))
+        .await;
+        assert_eq!(create_count(&msgs), 15, "three passes of five points");
+        let targets = set_targets(&msgs, "m");
+        assert!(
+            (targets.last().copied().unwrap() - 2.0).abs() < 1e-9,
+            "final move to the converged centroid 2.0: {targets:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tune_centroid_weights_position_by_signal() {
+        // Single pass (min_step 0.5 stops after the first step of 1.0, since the
+        // next is 0.333 < 0.5). A peaked signal [0,1,3,0,0] over positions
+        // 0,1,2,3,4 gives centroid ΣxI/ΣI = (1·1 + 2·3)/(1+3) = 1.75 — distinct
+        // from the plain mean 2.0, so the weighting is exercised.
+        let det = SequenceDetector::new("d", "sig", vec![0.0, 1.0, 3.0, 0.0, 0.0])
+            as Arc<dyn ReadableObj>;
+        let m = Arc::new(FakeMotor {
+            name: "m".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let msgs = drain(tune_centroid(
+            vec![det],
+            "sig",
+            m,
+            rdr("mr"),
+            0.0,
+            4.0,
+            0.5, // min_step → only the first pass runs
+            5,
+            3.0,
+            false,
+        ))
+        .await;
+        assert_eq!(create_count(&msgs), 5, "one pass of five points");
+        let targets = set_targets(&msgs, "m");
+        assert!(
+            (targets.last().copied().unwrap() - 1.75).abs() < 1e-9,
+            "final move to the signal-weighted centroid 1.75: {targets:?}"
         );
     }
 

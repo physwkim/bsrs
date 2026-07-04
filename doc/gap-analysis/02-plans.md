@@ -18,7 +18,8 @@ The primary gaps are:
 - **No staging** inside any compound plan — devices are never armed (P0, PLAN-09).
 - **Three core plans have divergent algorithms** from bluesky: `ramp_plan`,
   `tune_centroid`, `adaptive_scan` (P0, PLAN-04/05/06). `adaptive_scan` **DONE**
-  (slope-normalised + threshold + smoothing); `tune_centroid`/`ramp_plan` open.
+  (slope-normalised + threshold + smoothing); `tune_centroid` **DONE** (multi-pass
+  refinement); `ramp_plan` open (needs a Status-completion mechanism).
 - **`scan` is 1D only**; bluesky's is N-D (P0, PLAN-03).
 - **`mv`/`mvr` are single-motor only**; bluesky accepts parallel multi-motor pairs (P1,
   PLAN-10).
@@ -106,7 +107,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-05 — `tune_centroid` is single-pass; bluesky iteratively refines with shrinking range
+### PLAN-05 — `tune_centroid` is single-pass; bluesky iteratively refines with shrinking range — **DONE**
 
 - **bsrs:** `lib.rs:1037–1100` — one uniform scan, one centroid computed, one final move
 - **ref:** `plans.py:873–1023` — loops `while abs(step) >= min_step`, re-centers range
@@ -121,6 +122,19 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
   `sum_I`/`sum_xI` per pass and computing `new_start = centroid - new_range/2`.  Add
   `min_step: f64`, `step_factor: f64 = 3.0`, `snake: bool = false`.
 - **Effort:** M
+- **Resolution:** `tune_centroid` rewritten to bluesky's multi-pass loop:
+  each pass scans `num` points, accumulates `ΣI`/`ΣxI`, and on leaving the
+  window computes the centroid, re-centers a `step_factor`-narrowed window
+  (clamped to the global bounds) on it, and rescans — until `|step| < min_step`.
+  `snake` swaps the pass endpoints so the direction alternates.  A pass with
+  `ΣI == 0` stops without a final move (bluesky's early `return`); otherwise the
+  motor moves to the converged centroid.  Added `min_step`, `step_factor`,
+  `snake` parameters and fail-fast guards (`min_step > 0`, `step_factor > 1`).
+  `step_factor > 1` guarantees termination, so no iteration cap is needed.
+  Signal re-read plan-side via `read_dyn`; commanded position used for the
+  abscissa (unchanged from the prior bsrs version).  Tests: flat signal → three
+  passes / 15 points converging to 2.0 (proves multi-pass), and a peaked
+  single-pass signal `[0,1,3,0,0]` → weighted centroid 1.75 ≠ mean 2.0.
 
 ---
 

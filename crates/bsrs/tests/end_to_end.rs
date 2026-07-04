@@ -75,11 +75,15 @@ async fn tune_centroid_moves_motor_to_computed_center() {
         motor.clone() as Arc<dyn bsrs::core::msg::ReadableObj>,
         0.0,
         4.0,
-        5,
+        0.5, // min_step
+        5,   // num
+        3.0, // step_factor
+        false,
     );
     let result = re.run_async(plan).await.expect("tune_centroid failed");
     assert_eq!(result.exit_status, "success");
-    // SoftDetector returns 0 counts → centroid undefined → motor at last_pos = 4.0
+    // SoftDetector returns 0 counts → ΣI == 0 → no final centroid move; motor
+    // stays at the last scanned position (4.0).
     let setpoint = motor.locate_dyn().await.unwrap().setpoint;
     assert!(
         (setpoint - 4.0).abs() < 1e-9 || setpoint.is_finite(),
