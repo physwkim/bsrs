@@ -84,7 +84,27 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-02 — `count` missing `delay`, `per_shot`, and `num=None` infinite mode
+### PLAN-02 — `count` missing `delay`, `per_shot`, and `num=None` infinite mode — **DONE**
+
+- **Resolution:** Added `count_ext(dets, num: Option<usize>, delay: CountDelay,
+  per_shot: Option<PerShot>)` — the full bluesky `count`. `num = None` acquires
+  indefinitely (the stream never self-closes; the engine bounds it); `delay` is a
+  new `CountDelay { None, Every(Duration), Sequence(Vec<Duration>) }`, applied
+  time-compensated after each shot (the emitted `Sleep` is target minus the shot's
+  own elapsed). A finite `num` with a too-short `Sequence` (`< num-1` entries)
+  fails upfront with `Msg::Fail` before the run opens (bluesky's `ValueError`); an
+  exhausted `Sequence` ends the run with no trailing sleep (bluesky's
+  `StopIteration → break`). `count` and `count_per_shot` (PLAN-01) are now thin
+  convenience delegators to `count_ext`, so no caller churned and the finite/no-delay
+  path is byte-for-byte unchanged (all count tests green). **Deviation from the fix
+  sketch:** does *not* route through `stubs::repeat` — `repeat` emits its own
+  `Checkpoint` per iteration, which combined with `read_shot`'s Checkpoint would
+  double-checkpoint each shot (bluesky's `count == repeat(one_shot)` in fact does);
+  bsrs keeps its established single per-shot Checkpoint instead. per_shot itself was
+  delivered in PLAN-01. Tests: `count_ext_scalar_delay_sleeps_after_every_shot`,
+  `count_ext_num_none_acquires_indefinitely`,
+  `count_ext_short_delay_sequence_fails_before_open`,
+  `count_ext_delay_sequence_applies_per_interval`.
 
 - **bsrs:** `lib.rs:322–341`
 - **ref:** `plans.py:66–129` — `num: int | None = 1`, `delay: ScalarOrIterableFloat = 0.0`,

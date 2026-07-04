@@ -780,6 +780,29 @@ pub type PerStep = Arc<dyn Fn(Vec<Arc<dyn ReadableObj>>, Vec<StepMotor>) -> Plan
 /// bsrs's analogue of bluesky's `per_shot`; the default is [`stubs::read_shot`].
 pub type PerShot = Arc<dyn Fn(Vec<Arc<dyn ReadableObj>>) -> Plan + Send + Sync>;
 
+/// Inter-shot delay for [`count_ext`]. Ports bluesky's `count` `delay`
+/// (`ScalarOrIterableFloat`, plans.py:66). The delay is time-compensated: the
+/// emitted `Sleep` is the target minus the wall-clock the shot itself took, so a
+/// slow shot shortens the sleep and never lengthens the cadence (matching
+/// bluesky's `d - (now - then)` and bsrs's [`stubs::repeat`]).
+#[derive(Debug, Clone, Default)]
+pub enum CountDelay {
+    /// No delay between shots (bluesky `delay=0.0`).
+    #[default]
+    None,
+    /// The same target delay after every shot (bluesky scalar `delay`). Applied
+    /// after every shot, including the last — mirroring bluesky, whose scalar
+    /// delay is an infinite `itertools.repeat`, and bsrs's [`stubs::repeat`].
+    Every(Duration),
+    /// One target delay per inter-shot interval (bluesky iterable `delay`);
+    /// entry `i` is applied after shot `i`. For a finite `num` this must have at
+    /// least `num - 1` entries, or the plan fails immediately with `Msg::Fail`,
+    /// mirroring bluesky's `ValueError`. When the sequence is exhausted the run
+    /// closes (bluesky's `StopIteration → break`), so no trailing sleep follows
+    /// the final delivered entry.
+    Sequence(Vec<Duration>),
+}
+
 /// `count(detectors, num)` — read each detector `num` times. Convenience form of
 /// [`count_per_shot`] with the default per-shot action ([`stubs::one_shot`]).
 pub fn count(detectors: Vec<Arc<dyn ReadableObj>>, num: usize) -> Plan {
@@ -787,7 +810,8 @@ pub fn count(detectors: Vec<Arc<dyn ReadableObj>>, num: usize) -> Plan {
 }
 
 /// `count_per_shot(detectors, num, per_shot)` — read the detectors `num` times,
-/// delegating each shot to `per_shot`. `None` uses [`stubs::read_shot`]
+/// delegating each shot to `per_shot`. Convenience form of [`count_ext`] with a
+/// finite `num` and no delay. `None` uses [`stubs::read_shot`]
 /// (`Checkpoint → Create → Read* → Save`), byte-for-byte the previous `count`
 /// body. Ports bluesky's `count` `per_shot` hook (plans.py:66): a custom hook can
 /// trigger before reading, read into a different stream, or repeat a shot.
@@ -796,18 +820,81 @@ pub fn count_per_shot(
     num: usize,
     per_shot: Option<PerShot>,
 ) -> Plan {
-    // The default carries the per-shot Checkpoint (bluesky count == repeat(one_shot),
-    // both emitting a Checkpoint per shot: plan_stubs.py:1808, :1622), so a
-    // pause/resume rewinds only the current shot, not the whole run.
+    count_ext(detectors, Some(num), CountDelay::None, per_shot)
+}
+
+/// `count_ext(detectors, num, delay, per_shot)` — the full `count`: read the
+/// detectors `num` times (or forever when `num` is `None`), sleeping `delay`
+/// between shots and delegating each shot to `per_shot`. Ports bluesky's `count`
+/// (plans.py:66) `num`/`delay`/`per_shot`:
+///
+/// - `num = None` acquires indefinitely until the engine cancels (bluesky's
+///   `num=None`); `Some(n)` takes exactly `n` shots.
+/// - `delay` is time-compensated per [`CountDelay`].
+/// - `per_shot = None` uses [`stubs::read_shot`].
+///
+/// Each shot carries exactly one `Checkpoint` (inside `per_shot`); unlike bluesky
+/// `count == repeat(one_shot)`, which double-checkpoints (both the `repeat` and
+/// the `one_shot` emit one), bsrs keeps the single per-shot Checkpoint it already
+/// used, so it does not route through [`stubs::repeat`].
+pub fn count_ext(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    num: Option<usize>,
+    delay: CountDelay,
+    per_shot: Option<PerShot>,
+) -> Plan {
+    // The default per_shot carries the per-shot Checkpoint (bluesky one_shot:
+    // plan_stubs.py:1622), so a pause/resume rewinds only the current shot.
     let per_shot = per_shot.unwrap_or_else(|| Arc::new(stubs::read_shot) as PerShot);
     plan_box(async_stream::stream! {
-        yield Msg::OpenRun(scan_run_md("count", &detectors, &[], Some(num), AxisGrouping::Time));
-        for _ in 0..num {
+        // Upfront delay-length validation, mirroring bluesky's `ValueError` when
+        // a finite `num` outruns an explicit delay sequence (needs `num - 1`
+        // intervals). Fail before opening the run so no partial run leaks.
+        if let (Some(n), CountDelay::Sequence(seq)) = (num, &delay) {
+            if n > 1 && seq.len() < n - 1 {
+                yield Msg::Fail(format!(
+                    "count: num={n} needs at least {} delay entries but got {}",
+                    n - 1,
+                    seq.len()
+                ));
+                return;
+            }
+        }
+        yield Msg::OpenRun(scan_run_md("count", &detectors, &[], num, AxisGrouping::Time));
+        let mut i: usize = 0;
+        loop {
+            if let Some(n) = num {
+                if i >= n {
+                    break;
+                }
+            }
+            // Captured before the shot so the compensation covers the shot's own
+            // duration (bluesky's `now = time.time()` before the plan runs).
+            let start = std::time::Instant::now();
             let mut shot = per_shot(detectors.clone());
             while let Some(item) = futures::StreamExt::next(&mut shot).await {
                 let crate::core::plan::PlanItem::Bare(m) = item;
                 yield m;
             }
+            // Next inter-shot delay. `None` from a Sequence means it is exhausted
+            // (bluesky's `StopIteration`), which ends the run.
+            let target: Option<Duration> = match &delay {
+                CountDelay::None => Some(Duration::ZERO),
+                CountDelay::Every(d) => Some(*d),
+                CountDelay::Sequence(seq) => seq.get(i).copied(),
+            };
+            match target {
+                None => break,
+                Some(d) => {
+                    if !d.is_zero() {
+                        let elapsed = start.elapsed();
+                        if d > elapsed {
+                            yield Msg::Sleep(d - elapsed);
+                        }
+                    }
+                }
+            }
+            i += 1;
         }
         yield Msg::CloseRun {
             exit_status: "success".into(),
@@ -3454,6 +3541,105 @@ mod tests {
                 .count(),
             1,
             "count still owns the run envelope"
+        );
+    }
+
+    // A scalar delay yields a time-compensated Sleep after every shot, including
+    // the last (bluesky's scalar delay is an infinite repeat).
+    #[tokio::test]
+    async fn count_ext_scalar_delay_sleeps_after_every_shot() {
+        let d = rdr("det");
+        let dt = Duration::from_millis(100);
+        let msgs = drain(count_ext(vec![d], Some(3), CountDelay::Every(dt), None)).await;
+        let sleeps: Vec<Duration> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                Msg::Sleep(s) => Some(*s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sleeps.len(), 3, "one Sleep after each of the 3 shots");
+        for s in &sleeps {
+            assert!(
+                *s > Duration::ZERO && *s <= dt,
+                "compensated sleep {s:?} must be in (0, {dt:?}]"
+            );
+        }
+    }
+
+    // `num = None` acquires indefinitely: the stream keeps producing shot bundles
+    // and never closes the run on its own.
+    #[tokio::test]
+    async fn count_ext_num_none_acquires_indefinitely() {
+        let d = rdr("det");
+        let mut plan = count_ext(vec![d], None, CountDelay::None, None);
+        let mut got = Vec::new();
+        for _ in 0..20 {
+            match plan.next().await {
+                Some(PlanItem::Bare(m)) => got.push(m),
+                None => break,
+            }
+        }
+        assert_eq!(
+            got.iter().filter(|m| matches!(m, Msg::OpenRun(_))).count(),
+            1,
+            "opens the run once"
+        );
+        assert_eq!(
+            got.iter()
+                .filter(|m| matches!(m, Msg::CloseRun { .. }))
+                .count(),
+            0,
+            "never closes on its own — bounded only by the consumer"
+        );
+        assert!(
+            got.iter().filter(|m| matches!(m, Msg::Save)).count() >= 3,
+            "keeps taking shots"
+        );
+    }
+
+    // A finite `num` with too few explicit delays fails upfront, before the run
+    // opens (bluesky's ValueError).
+    #[tokio::test]
+    async fn count_ext_short_delay_sequence_fails_before_open() {
+        let d = rdr("det");
+        let seq = CountDelay::Sequence(vec![Duration::from_millis(10)]); // 1 < num-1 == 2
+        let msgs = drain(count_ext(vec![d], Some(3), seq, None)).await;
+        assert!(
+            matches!(msgs.first(), Some(Msg::Fail(_))),
+            "first Msg is Fail, got {:?}",
+            msgs.first()
+        );
+        assert_eq!(
+            msgs.iter().filter(|m| matches!(m, Msg::OpenRun(_))).count(),
+            0,
+            "no run opened on validation failure"
+        );
+    }
+
+    // An explicit delay sequence is applied per interval; when it is exhausted the
+    // run closes with no trailing sleep (bluesky's StopIteration -> break).
+    #[tokio::test]
+    async fn count_ext_delay_sequence_applies_per_interval() {
+        let d = rdr("det");
+        let seq = CountDelay::Sequence(vec![Duration::from_millis(50), Duration::from_millis(70)]);
+        let msgs = drain(count_ext(vec![d], Some(3), seq, None)).await;
+        assert_eq!(
+            msgs.iter().filter(|m| matches!(m, Msg::Save)).count(),
+            3,
+            "all 3 shots run"
+        );
+        assert_eq!(
+            msgs.iter().filter(|m| matches!(m, Msg::Sleep(_))).count(),
+            2,
+            "2 intervals delivered, no trailing sleep after the last shot"
+        );
+        assert_eq!(
+            msgs.iter()
+                .filter(|m| matches!(m, Msg::CloseRun { .. }))
+                .count(),
+            1,
+            "run closes cleanly once the sequence is exhausted"
         );
     }
 
