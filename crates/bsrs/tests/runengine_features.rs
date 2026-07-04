@@ -2225,6 +2225,46 @@ async fn per_call_md_wins_over_per_run_open_run_extra() {
 }
 
 #[tokio::test]
+async fn run_start_carries_plan_type_generator_overridable_by_extra() {
+    // ENG-22: bluesky stamps every RunStart with `plan_type`
+    // (`type(self._plan).__name__`, "generator" for generator plans) at a
+    // ChainMap level below the OpenRun kwargs (run_engine.py:1858-1868). bsrs
+    // plans are lazy Msg streams, so plan_type defaults to "generator" and a
+    // plan that sets it via the OpenRun extra must win.
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    re.run_async(one_count_plan()).await.unwrap();
+
+    // A plan that overrides plan_type through the OpenRun extra.
+    let plan = plan_box(async_stream::stream! {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("plan_type".to_string(), Value::String("custom".into()));
+        yield Msg::OpenRun(bsrs::core::msg::RunMetadata { extra, ..Default::default() });
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    re.run_async(plan).await.unwrap();
+
+    let docs = sink.snapshot().await;
+    let starts: Vec<&Value> = docs
+        .iter()
+        .filter_map(|d| match d {
+            Document::Start(s) => s.extra.get("plan_type"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        starts[0],
+        &Value::String("generator".into()),
+        "default plan_type is generator"
+    );
+    assert_eq!(
+        starts[1],
+        &Value::String("custom".into()),
+        "OpenRun extra overrides the computed plan_type"
+    );
+}
+
+#[tokio::test]
 async fn run_async_with_temp_subs_auto_remove_at_run_end() {
     let count = Arc::new(AtomicU64::new(0));
     let c2 = count.clone();

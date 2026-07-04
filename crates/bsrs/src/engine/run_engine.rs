@@ -2320,6 +2320,13 @@ impl RunEngine {
                                                          // {plan_type, plan_name} above self.md and below msg.kwargs and
                                                          // _metadata_per_call, so this is an `insert` (overwrite persistent),
                                                          // not the previous `or_insert` (which left it lowest-precedence).
+                                                         // plan_type: bluesky computes `type(self._plan).__name__`, which is
+                                                         // "generator" for every generator-function plan. bsrs plans are lazy
+                                                         // `Msg` streams — generators — so the faithful value is the constant
+                                                         // "generator"; a plan or caller that wants a different plan_type sets
+                                                         // it via the OpenRun `extra` or per-call md, both inserted after this
+                                                         // and thus higher precedence.
+            m.insert("plan_type".into(), Value::String("generator".into()));
             if let Some(ref pn) = meta.plan_name {
                 m.insert("plan_name".into(), Value::String(pn.clone()));
             }
