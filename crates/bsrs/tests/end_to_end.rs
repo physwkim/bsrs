@@ -2662,3 +2662,124 @@ async fn trigger_and_read_read_error_is_catchable_by_outer_contingency() {
         "dropped bundle emits no Event even when the fault is caught"
     );
 }
+
+// ---------------------------------------------------------------------------
+// ENG-12: an installed suspender that is already tripped at plan start gates
+// the run — the first message does not run until the condition clears
+// (bluesky RunEngine.__call__ prepends a wait_for on every tripped suspender).
+// ---------------------------------------------------------------------------
+
+/// A suspender whose tripped state is controlled by the test. `tripped()`
+/// returns `Some(clear-future)` iff `is_tripped` is set; the clear-future first
+/// signals `reached` (so the test knows the gate is blocking) then awaits
+/// `clear`.
+struct GateSuspender {
+    name: String,
+    is_tripped: bool,
+    reached: Arc<tokio::sync::Notify>,
+    clear: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl bsrs::engine::Suspender for GateSuspender {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn watch(&self) -> futures::future::BoxFuture<'static, ()> {
+        let clear = self.clear.clone();
+        Box::pin(async move { clear.notified().await })
+    }
+    fn tripped(&self) -> Option<futures::future::BoxFuture<'static, ()>> {
+        if !self.is_tripped {
+            return None;
+        }
+        let reached = self.reached.clone();
+        let clear = self.clear.clone();
+        Some(Box::pin(async move {
+            // Register the clear waiter, then signal the gate is blocking. The
+            // `.notified()` future is created (and thus enqueued) before we
+            // notify `reached`, so `clear.notify_one()` from the test after it
+            // observes `reached` can never be lost.
+            let wait = clear.notified();
+            reached.notify_one();
+            wait.await;
+        }))
+    }
+}
+
+#[tokio::test]
+async fn tripped_suspender_gates_plan_start_until_cleared() {
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let clear = Arc::new(tokio::sync::Notify::new());
+    let gate = Arc::new(GateSuspender {
+        name: "beam".into(),
+        is_tripped: true,
+        reached: reached.clone(),
+        clear: clear.clone(),
+    });
+
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let re = Arc::new(RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new()));
+
+    let id = re.next_suspender_id();
+    let gate_dyn: Arc<dyn bsrs::engine::Suspender> = gate;
+    let payload: Arc<dyn std::any::Any + Send + Sync> = Arc::new(gate_dyn);
+    re.install_suspender(id, payload).await.unwrap();
+
+    let started_plan = started.clone();
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        // Runs on the first poll of the plan stream — i.e. once the gate has
+        // let the run loop begin.
+        started_plan.store(true, std::sync::atomic::Ordering::SeqCst);
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        yield bsrs::core::Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+
+    let re_run = re.clone();
+    let handle = tokio::spawn(async move { re_run.run_async(plan).await });
+
+    // Deterministic: wait until the gate future is actually blocking on `clear`.
+    reached.notified().await;
+    assert!(
+        !started.load(std::sync::atomic::Ordering::SeqCst),
+        "plan must not start while the suspender is tripped"
+    );
+
+    // Clear the condition; the gate resolves and the plan runs to completion.
+    clear.notify_one();
+    let result = handle.await.unwrap().unwrap();
+    assert_eq!(result.exit_status, "success");
+    assert!(
+        started.load(std::sync::atomic::Ordering::SeqCst),
+        "plan must run once the suspender clears"
+    );
+}
+
+#[tokio::test]
+async fn untripped_suspender_does_not_gate_plan_start() {
+    // A suspender that reports `tripped() == None` at start must not delay the
+    // run — the gate returns immediately.
+    let gate = Arc::new(GateSuspender {
+        name: "beam".into(),
+        is_tripped: false,
+        reached: Arc::new(tokio::sync::Notify::new()),
+        clear: Arc::new(tokio::sync::Notify::new()),
+    });
+    let re = Arc::new(RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new()));
+    let id = re.next_suspender_id();
+    let gate_dyn: Arc<dyn bsrs::engine::Suspender> = gate;
+    let payload: Arc<dyn std::any::Any + Send + Sync> = Arc::new(gate_dyn);
+    re.install_suspender(id, payload).await.unwrap();
+
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        yield bsrs::core::Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    // Without the gate blocking, the run completes promptly; bound it so a
+    // regression that makes an un-tripped suspender block is caught as a hang.
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), re.run_async(plan))
+        .await
+        .expect("un-tripped suspender must not gate plan start")
+        .unwrap();
+    assert_eq!(result.exit_status, "success");
+}

@@ -683,6 +683,33 @@ impl RunEngine {
             }
             p
         };
+        // ENG-12: honor suspenders that are already tripped at plan start.
+        // bluesky's `__call__` collects every currently-tripped suspender's
+        // clear-future and prepends a `wait_for` before the plan, so a scan
+        // never runs its first point while a condition (e.g. beam down) is bad
+        // (run_engine.py:933-967). Gather the tripped futures from the
+        // installed suspenders, log the justifications, and wait for all to
+        // clear before entering the run loop. A non-tripped suspender returns
+        // `None`, so a clear engine starts immediately. This runs *outside* the
+        // loop_timeout below because, like bluesky, waiting for beam is
+        // intentionally unbounded.
+        let tripped: Vec<(String, BoxFuture<'static, ()>)> = {
+            let state = self.state.lock().await;
+            state
+                .suspenders
+                .values()
+                .filter_map(|h| h.inner.tripped().map(|f| (h.inner.name().to_string(), f)))
+                .collect()
+        };
+        if !tripped.is_empty() {
+            let names: Vec<&str> = tripped.iter().map(|(n, _)| n.as_str()).collect();
+            tracing::warn!(
+                "at least one suspender is tripped; waiting to start: {}",
+                names.join(", ")
+            );
+            futures::future::join_all(tripped.into_iter().map(|(_, f)| f)).await;
+        }
+
         let timeout = *self.loop_timeout.lock().unwrap();
         let outcome = match timeout {
             Some(d) => match tokio::time::timeout(d, self.run_loop(plan)).await {
