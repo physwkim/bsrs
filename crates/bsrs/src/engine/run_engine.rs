@@ -2002,18 +2002,30 @@ impl RunEngine {
                 let run_open = { self.state.lock().await.bundler.is_some() };
                 if run_open {
                     let config = read_object_configuration(obj.as_ref()).await?;
+                    // Compose the new generations WITHOUT installing them, then
+                    // broadcast, then install. A monitor pump composes its events
+                    // against the stream's *current* descriptor on a separate
+                    // task; installing only after the broadcast guarantees the new
+                    // descriptor is on the wire before the pump can stamp it onto
+                    // an event (descriptor-before-event holds by construction, not
+                    // by a runtime lock).
                     let new_descriptors = {
                         let mut state = self.state.lock().await;
                         match state.bundler.as_mut() {
                             Some(b) => {
                                 b.cache_configuration(obj.name().to_string(), config.clone());
-                                b.reconfigure_streams(obj.name(), config)
+                                b.compose_reconfigure(obj.name(), config)
                             }
                             None => Vec::new(),
                         }
                     };
-                    for d in new_descriptors {
-                        self.broadcast(&Document::Descriptor(d)).await?;
+                    for d in &new_descriptors {
+                        self.broadcast(&Document::Descriptor(d.clone())).await?;
+                    }
+                    if !new_descriptors.is_empty() {
+                        if let Some(b) = self.state.lock().await.bundler.as_mut() {
+                            b.install_reconfigured(&new_descriptors);
+                        }
                     }
                 }
             }

@@ -985,6 +985,260 @@ async fn monitor_emits_descriptor_then_events() {
     );
 }
 
+// A device that is both Monitorable and Configurable, so a `configure` can
+// re-emit the descriptor of a stream fed by its own monitor pump — the path
+// that exercises the descriptor-before-event ordering guarantee.
+struct ConfigurableMonitor {
+    name: String,
+    tx: tokio::sync::watch::Sender<bsrs::core::reading::ReadingValue>,
+    gain: StdMutex<f64>,
+}
+
+impl ConfigurableMonitor {
+    fn new(name: &str) -> Arc<Self> {
+        let (tx, _rx) = tokio::sync::watch::channel(bsrs::core::reading::ReadingValue {
+            value: Value::from(0.0),
+            timestamp: 0.0,
+            alarm_severity: None,
+            message: None,
+        });
+        Arc::new(Self {
+            name: name.into(),
+            tx,
+            gain: StdMutex::new(2.5),
+        })
+    }
+    fn push(&self, v: f64, ts: f64) {
+        let _ = self.tx.send(bsrs::core::reading::ReadingValue {
+            value: Value::from(v),
+            timestamp: ts,
+            alarm_severity: None,
+            message: None,
+        });
+    }
+}
+
+impl bsrs::core::msg::NamedObj for ConfigurableMonitor {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[async_trait::async_trait]
+impl bsrs::core::msg::ReadableObj for ConfigurableMonitor {
+    async fn read_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, bsrs::core::reading::ReadingValue>,
+        bsrs::core::error::BsrsError,
+    > {
+        let v = self.tx.borrow().clone();
+        Ok(std::collections::HashMap::from([(self.name.clone(), v)]))
+    }
+    async fn describe_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, bsrs::event_model::DataKey>,
+        bsrs::core::error::BsrsError,
+    > {
+        Ok(std::collections::HashMap::from([(
+            self.name.clone(),
+            bsrs::event_model::DataKey {
+                source: format!("test://{}", self.name),
+                dtype: bsrs::event_model::Dtype::Number,
+                shape: vec![],
+                dtype_numpy: Some("<f8".into()),
+                external: None,
+                units: None,
+                precision: None,
+                object_name: None,
+                dims: None,
+                limits: None,
+                choices: None,
+            },
+        )]))
+    }
+    fn as_configurable(&self) -> Option<&dyn bsrs::core::msg::ConfigurableObj> {
+        Some(self)
+    }
+}
+
+#[async_trait::async_trait]
+impl bsrs::core::msg::MonitorableObj for ConfigurableMonitor {
+    async fn subscribe_dyn(
+        &self,
+    ) -> Result<bsrs::core::subscription::Subscription, bsrs::core::error::BsrsError> {
+        Ok(bsrs::core::subscription::Subscription::new(
+            self.tx.subscribe(),
+            bsrs::core::status::SubToken::noop(),
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl bsrs::core::msg::ConfigurableObj for ConfigurableMonitor {
+    async fn read_configuration_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, bsrs::core::reading::ReadingValue>,
+        bsrs::core::error::BsrsError,
+    > {
+        let g = *self.gain.lock().unwrap();
+        Ok(std::collections::HashMap::from([(
+            format!("{}_gain", self.name),
+            bsrs::core::reading::ReadingValue {
+                value: Value::from(g),
+                timestamp: 0.0,
+                alarm_severity: None,
+                message: None,
+            },
+        )]))
+    }
+    async fn describe_configuration_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, bsrs::event_model::DataKey>,
+        bsrs::core::error::BsrsError,
+    > {
+        Ok(std::collections::HashMap::from([(
+            format!("{}_gain", self.name),
+            bsrs::event_model::DataKey {
+                source: format!("test://{}.gain", self.name),
+                dtype: bsrs::event_model::Dtype::Number,
+                shape: vec![],
+                dtype_numpy: Some("<f8".into()),
+                external: None,
+                units: None,
+                precision: None,
+                object_name: None,
+                dims: None,
+                limits: None,
+                choices: None,
+            },
+        )]))
+    }
+    async fn configure_dyn(
+        &self,
+        _args: bsrs::core::msg::ConfigureArgs,
+    ) -> Result<(), bsrs::core::error::BsrsError> {
+        *self.gain.lock().unwrap() = 5.0;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn configure_during_monitor_reemits_descriptor_before_any_event() {
+    // Closes the monitor-pump ordering boundary: configuring an object that is
+    // being MONITORED re-emits its stream's descriptor as a new generation, and
+    // that descriptor must reach the wire before any event the pump stamps with
+    // it. The Configure handler composes the new descriptor, broadcasts it, and
+    // only THEN installs it as the generation the pump reads — so the invariant
+    // "every Event references a descriptor already emitted" holds regardless of
+    // when the pump task fires relative to the configure.
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let mon = ConfigurableMonitor::new("cm1");
+    let mon_for_monitor: Arc<dyn bsrs::core::msg::MonitorableObj> = mon.clone();
+    let mon_for_configure: Arc<dyn bsrs::core::msg::ConfigurableObj> = mon.clone();
+    let mon_for_drive = mon.clone();
+
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Monitor { obj: mon_for_monitor.clone(), name: None };
+        yield Msg::Sleep(Duration::from_millis(50));
+        // First generation events.
+        for i in 1..=2 {
+            mon_for_drive.push(i as f64, i as f64);
+            yield Msg::Sleep(Duration::from_millis(50));
+        }
+        // Reconfigure the monitored object mid-stream -> new descriptor gen.
+        yield Msg::Configure { obj: mon_for_configure.clone(), args: Default::default() };
+        // Second generation events.
+        for i in 3..=4 {
+            mon_for_drive.push(i as f64, i as f64);
+            yield Msg::Sleep(Duration::from_millis(50));
+        }
+        yield Msg::Unmonitor(mon_for_monitor);
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    re.run_async(plan).await.unwrap();
+
+    let docs = sink.snapshot().await;
+
+    // Two descriptor generations for the (single) monitor stream: same name and
+    // data_keys schema, distinct uids — configure advanced the configuration
+    // sub-document, not the schema.
+    let descriptors: Vec<_> = docs
+        .iter()
+        .filter_map(|d| match d {
+            Document::Descriptor(d) => Some(d),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        descriptors.len(),
+        2,
+        "configure during monitor emits a second descriptor generation"
+    );
+    assert_eq!(
+        descriptors[0].name, descriptors[1].name,
+        "both generations name the same stream"
+    );
+    assert_ne!(
+        descriptors[0].uid, descriptors[1].uid,
+        "the reconfigured generation has a fresh uid"
+    );
+    assert_eq!(
+        descriptors[0]
+            .data_keys
+            .keys()
+            .collect::<std::collections::BTreeSet<_>>(),
+        descriptors[1]
+            .data_keys
+            .keys()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "schema (data_keys) is frozen across generations"
+    );
+    assert_eq!(
+        descriptors[1]
+            .configuration
+            .get("cm1")
+            .and_then(|c| c.data.get("cm1_gain")),
+        Some(&Value::from(5.0)),
+        "the second generation carries the post-configure gain"
+    );
+
+    // The ordering guarantee: walk the sink in order and require every Event's
+    // descriptor uid to have been emitted by an earlier Descriptor doc. This is
+    // exactly the property the emit-before-install split protects; it must hold
+    // for whatever interleaving the async pump produced.
+    let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut saw_gen2_event = false;
+    for d in &docs {
+        match d {
+            Document::Descriptor(desc) => {
+                emitted.insert(desc.uid.clone());
+            }
+            Document::Event(ev) => {
+                assert!(
+                    emitted.contains(&ev.descriptor),
+                    "event references descriptor {} not yet emitted (ordering violated)",
+                    ev.descriptor
+                );
+                if ev.descriptor == descriptors[1].uid {
+                    saw_gen2_event = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    // The pump picked up the reconfigured generation for post-configure values.
+    assert!(
+        saw_gen2_event,
+        "expected at least one monitor event against the reconfigured descriptor"
+    );
+}
+
 #[tokio::test]
 async fn bare_monitor_default_stream_name_is_unique_not_device_name() {
     // bluesky defaults a name-less `monitor` stream to short_uid("monitor")
