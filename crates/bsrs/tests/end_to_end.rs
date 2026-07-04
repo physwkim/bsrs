@@ -122,6 +122,93 @@ async fn scan_plan_emits_motor_and_detector_readings() {
 }
 
 #[tokio::test]
+async fn scan_family_runstart_carries_scan_metadata() {
+    // PLAN-25: every scan-family RunStart must carry the device-name lists,
+    // point counts, and the `dimensions` hint bluesky injects, so a Python-side
+    // BEC/LiveTable can label axes and size the scan. Assert on the SERIALIZED
+    // RunStart (the wire document), not in-memory field placement.
+    use bsrs::core::Document::Start;
+
+    fn start_json(docs: &[bsrs::core::Document]) -> serde_json::Value {
+        match &docs[0] {
+            Start(s) => serde_json::to_value(s).expect("RunStart serializes"),
+            _ => panic!("doc 0 is not a RunStart"),
+        }
+    }
+
+    // count: a time series — detectors + point counts + the implicit `time`
+    // axis, no motors.
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    re.run_async(bsrs::ophyd_async::count(vec![SoftDetector::new("det1")], 5))
+        .await
+        .unwrap();
+    let v = start_json(&sink.snapshot().await);
+    assert_eq!(v["detectors"], serde_json::json!(["det1"]));
+    assert_eq!(v["num_points"], serde_json::json!(5));
+    assert_eq!(v["num_intervals"], serde_json::json!(4));
+    assert!(v.get("motors").is_none(), "count has no motors: {v}");
+    assert_eq!(
+        v["hints"]["dimensions"],
+        serde_json::json!([[["time"], "primary"]]),
+        "count reports the implicit time axis"
+    );
+
+    // scan: one coupled motor axis.
+    let motor = Arc::new(SoftMotor::new("m1", Some(0.0)));
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    re.run_async(bsrs::ophyd_async::scan(
+        vec![SoftDetector::new("det1") as Arc<dyn bsrs::core::msg::ReadableObj>],
+        motor.clone() as Arc<dyn bsrs::core::msg::MovableObj>,
+        motor.clone() as Arc<dyn bsrs::core::msg::ReadableObj>,
+        0.0,
+        4.0,
+        5,
+    ))
+    .await
+    .unwrap();
+    let v = start_json(&sink.snapshot().await);
+    assert_eq!(v["detectors"], serde_json::json!(["det1"]));
+    assert_eq!(v["motors"], serde_json::json!(["m1"]));
+    assert_eq!(v["num_points"], serde_json::json!(5));
+    assert_eq!(
+        v["hints"]["dimensions"],
+        serde_json::json!([[["m1"], "primary"]]),
+        "one motor = one combined axis"
+    );
+
+    // grid_scan: two independent axes, one `dimensions` entry per motor.
+    let m1 = Arc::new(SoftMotor::new("m1", Some(0.0)));
+    let m2 = Arc::new(SoftMotor::new("m2", Some(0.0)));
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    re.run_async(bsrs::plans::grid_scan(
+        vec![SoftDetector::new("det1") as Arc<dyn bsrs::core::msg::ReadableObj>],
+        m1.clone() as Arc<dyn bsrs::core::msg::MovableObj>,
+        m1.clone() as Arc<dyn bsrs::core::msg::ReadableObj>,
+        0.0,
+        1.0,
+        2,
+        m2.clone() as Arc<dyn bsrs::core::msg::MovableObj>,
+        m2.clone() as Arc<dyn bsrs::core::msg::ReadableObj>,
+        0.0,
+        1.0,
+        3,
+    ))
+    .await
+    .unwrap();
+    let v = start_json(&sink.snapshot().await);
+    assert_eq!(v["motors"], serde_json::json!(["m1", "m2"]));
+    assert_eq!(v["num_points"], serde_json::json!(6), "2 × 3 grid");
+    assert_eq!(
+        v["hints"]["dimensions"],
+        serde_json::json!([[["m1"], "primary"], [["m2"], "primary"]]),
+        "a grid reports one axis per motor"
+    );
+}
+
+#[tokio::test]
 async fn binary_frame_sink_writes_and_emits_stream_docs() {
     use bsrs::protocols_async::{DetectorWriter, Frame, FrameSink};
     use bsrs::stream::sinks::BinaryFrameSink;

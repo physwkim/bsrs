@@ -30,6 +30,112 @@ fn short_uid(label: &str) -> String {
     format!("{label}-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
+/// How a scan's motors map onto the independent axes reported in the
+/// `dimensions` hint. Coupled motors (inner-product) move together and form a
+/// single combined axis; grid (outer-product) motors are independent axes, one
+/// per motor; a `Time` series (`count`) has no motor and reports the implicit
+/// `time` axis. Mirrors the split between bluesky's `derive_default_hints`
+/// (coupled, plans.py:58-63) and the per-motor `motor_hints` in the
+/// outer-product plans (plans.py:350).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AxisGrouping {
+    /// One combined axis over all motors' hinted fields (inner product).
+    Coupled,
+    /// One axis per motor (outer product / grid).
+    Grid,
+    /// No motor; the implicit `time` axis (`count`).
+    Time,
+}
+
+/// A motor reader's hinted axis fields — its `hint_fields()`, or its own name
+/// when it declares none. Ports bluesky `motor.hints["fields"]`, which defaults
+/// to `[motor.name]`.
+fn motor_hint_fields(reader: &Arc<dyn ReadableObj>) -> Vec<String> {
+    reader
+        .hint_fields()
+        .unwrap_or_else(|| vec![reader.name().to_string()])
+}
+
+/// Assemble the RunStart metadata bluesky's scan-family plans inject so a
+/// consumer (BEC / LiveTable / LiveFit) can label axes and size the scan:
+/// the device-name lists (`detectors`, `motors`), the point counts
+/// (`num_points`, `num_intervals`), and the `dimensions` hint grouped per
+/// [`AxisGrouping`]. Rides the same `RunMetadata::extra` -> `RunStart` path as
+/// `plan_name`/`scan_id`, so every key lands as a top-level RunStart field.
+/// Ports the `_md` dicts in bluesky/plans.py (count 104-116, outer_product
+/// 336-352) plus `derive_default_hints` (plans.py:58-63).
+fn scan_run_md(
+    plan_name: &str,
+    detectors: &[Arc<dyn ReadableObj>],
+    motors: &[Arc<dyn ReadableObj>],
+    num_points: Option<usize>,
+    grouping: AxisGrouping,
+) -> RunMetadata {
+    use crate::event_model::{DimensionItem, Hints};
+    use serde_json::Value;
+
+    let mut extra: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    extra.insert(
+        "detectors".into(),
+        Value::from(
+            detectors
+                .iter()
+                .map(|d| d.name().to_string())
+                .collect::<Vec<_>>(),
+        ),
+    );
+    if !motors.is_empty() {
+        extra.insert(
+            "motors".into(),
+            Value::from(
+                motors
+                    .iter()
+                    .map(|m| m.name().to_string())
+                    .collect::<Vec<_>>(),
+            ),
+        );
+    }
+    if let Some(n) = num_points {
+        extra.insert("num_points".into(), Value::from(n));
+        // bluesky: `num_intervals = num - 1` (plans.py:106).
+        extra.insert("num_intervals".into(), Value::from(n.saturating_sub(1)));
+    }
+    // One `[fields, "primary"]` entry per independent axis.
+    let axes: Vec<Vec<String>> = match grouping {
+        AxisGrouping::Time => vec![vec!["time".to_string()]],
+        AxisGrouping::Coupled => vec![motors.iter().flat_map(motor_hint_fields).collect()],
+        AxisGrouping::Grid => motors.iter().map(motor_hint_fields).collect(),
+    };
+    let dimensions: Vec<Vec<DimensionItem>> = axes
+        .into_iter()
+        .filter(|fields| !fields.is_empty())
+        .map(|fields| {
+            vec![
+                DimensionItem::Fields(fields),
+                DimensionItem::Name("primary".to_string()),
+            ]
+        })
+        .collect();
+    let hints = Hints {
+        dimensions: if dimensions.is_empty() {
+            None
+        } else {
+            Some(dimensions)
+        },
+    };
+    // `serde_json::to_value(Hints)` cannot fail (no maps with non-string keys,
+    // no non-finite floats); unwrap is a real invariant, not a silenced error.
+    extra.insert(
+        "hints".into(),
+        serde_json::to_value(hints).expect("Hints serializes to a JSON object"),
+    );
+    RunMetadata {
+        plan_name: Some(plan_name.to_string()),
+        extra,
+        ..Default::default()
+    }
+}
+
 // ===========================================================================
 //  plan_stubs (single-Msg / small composites; mirrors bluesky.plan_stubs)
 // ===========================================================================
@@ -547,10 +653,7 @@ pub mod stubs {
 /// `count(detectors, num)` — read each detector `num` times.
 pub fn count(detectors: Vec<Arc<dyn ReadableObj>>, num: usize) -> Plan {
     plan_box(async_stream::stream! {
-        yield Msg::OpenRun(RunMetadata {
-            plan_name: Some("count".into()),
-            ..Default::default()
-        });
+        yield Msg::OpenRun(scan_run_md("count", &detectors, &[], Some(num), AxisGrouping::Time));
         for _ in 0..num {
             // Per-shot rewind boundary (bluesky count == repeat(one_shot),
             // both of which emit a Checkpoint per shot: plan_stubs.py:1808,
@@ -576,10 +679,13 @@ pub fn count_with_trigger(
     num: usize,
 ) -> Plan {
     plan_box(async_stream::stream! {
-        yield Msg::OpenRun(RunMetadata {
-            plan_name: Some("count_with_trigger".into()),
-            ..Default::default()
-        });
+        yield Msg::OpenRun(scan_run_md(
+            "count_with_trigger",
+            &detectors,
+            &[],
+            Some(num),
+            AxisGrouping::Time,
+        ));
         for _ in 0..num {
             // Per-shot rewind boundary (bluesky count == repeat(one_shot):
             // plan_stubs.py:1808, :1622). Without it a pause/resume rewinds
@@ -626,10 +732,13 @@ pub fn scan(
         0.0
     };
     plan_box(async_stream::stream! {
-        yield Msg::OpenRun(RunMetadata {
-            plan_name: Some("scan".into()),
-            ..Default::default()
-        });
+        yield Msg::OpenRun(scan_run_md(
+            "scan",
+            &detectors,
+            std::slice::from_ref(&motor_reader),
+            Some(num),
+            AxisGrouping::Coupled,
+        ));
         for i in 0..num {
             // Per-step rewind boundary (bluesky one_1d_step.move(): a
             // Checkpoint before the set, plan_stubs.py:1669). Without it a
@@ -669,10 +778,13 @@ pub fn list_scan(
     points: Vec<f64>,
 ) -> Plan {
     plan_box(async_stream::stream! {
-        yield Msg::OpenRun(RunMetadata {
-            plan_name: Some("list_scan".into()),
-            ..Default::default()
-        });
+        yield Msg::OpenRun(scan_run_md(
+            "list_scan",
+            &detectors,
+            std::slice::from_ref(&motor_reader),
+            Some(points.len()),
+            AxisGrouping::Coupled,
+        ));
         for pos in points {
             // Per-step rewind boundary (bluesky one_1d_step.move():
             // plan_stubs.py:1669).
@@ -768,10 +880,13 @@ pub fn grid_scan(
         0.0
     };
     plan_box(async_stream::stream! {
-        yield Msg::OpenRun(RunMetadata {
-            plan_name: Some("grid_scan".into()),
-            ..Default::default()
-        });
+        yield Msg::OpenRun(scan_run_md(
+            "grid_scan",
+            &detectors,
+            &[motor1_reader.clone(), motor2_reader.clone()],
+            Some(n1 * n2),
+            AxisGrouping::Grid,
+        ));
         for i in 0..n1 {
             // Row-change rewind boundary: a pause during the slow-axis move
             // rewinds here, re-driving motor1 (bluesky move_per_step emits a
@@ -846,10 +961,15 @@ pub fn inner_product_scan(
     let bounds: Vec<(f64, f64)> = axes.iter().map(|(_, _, s, e)| (*s, *e)).collect();
     let pts = patterns::inner_product(num, &bounds);
     plan_box(async_stream::stream! {
-        yield Msg::OpenRun(RunMetadata {
-            plan_name: Some("inner_product_scan".into()),
-            ..Default::default()
-        });
+        let motor_readers: Vec<Arc<dyn ReadableObj>> =
+            axes.iter().map(|(_, mr, _, _)| mr.clone()).collect();
+        yield Msg::OpenRun(scan_run_md(
+            "inner_product_scan",
+            &detectors,
+            &motor_readers,
+            Some(num),
+            AxisGrouping::Coupled,
+        ));
         for row in pts {
             // Per-step rewind boundary before this point's moves (bluesky
             // move_per_step, plan_stubs.py:1695).
@@ -911,17 +1031,40 @@ pub fn x2x_scan(
 
 /// `scan_nd(dets, motors, points)` — visit each row of `points` (shape
 /// `[N, len(motors)]`). Stripped-down `scan_nd`; bluesky's full version
-/// accepts `cycler` objects, this one takes the pre-computed list.
+/// accepts `cycler` objects, this one takes the pre-computed list. The motors
+/// are reported as a single combined axis in the `dimensions` hint (bluesky's
+/// `derive_default_hints` default, plans.py:58-63); outer-product callers that
+/// want one axis per motor use [`scan_nd_with_md`] with a `Grid`-grouped md.
 pub fn scan_nd(
     detectors: Vec<Arc<dyn ReadableObj>>,
     motors: Vec<(Arc<dyn MovableObj>, Arc<dyn ReadableObj>)>,
     points: Vec<Vec<f64>>,
 ) -> Plan {
+    let motor_readers: Vec<Arc<dyn ReadableObj>> =
+        motors.iter().map(|(_, mr)| mr.clone()).collect();
+    let md = scan_run_md(
+        "scan_nd",
+        &detectors,
+        &motor_readers,
+        Some(points.len()),
+        AxisGrouping::Coupled,
+    );
+    scan_nd_with_md(detectors, motors, points, md)
+}
+
+/// The shared body of the `scan_nd` family: drive each row of `points` and read
+/// `motors`+`detectors` into `primary`, opening the run with the caller-built
+/// `md`. Keeps the `dimensions`-grouping decision (coupled vs grid) at the
+/// caller — `scan_nd` passes a combined axis, `list_grid_scan` one per motor —
+/// while the traversal stays in one place.
+fn scan_nd_with_md(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    motors: Vec<(Arc<dyn MovableObj>, Arc<dyn ReadableObj>)>,
+    points: Vec<Vec<f64>>,
+    md: RunMetadata,
+) -> Plan {
     plan_box(async_stream::stream! {
-        yield Msg::OpenRun(RunMetadata {
-            plan_name: Some("scan_nd".into()),
-            ..Default::default()
-        });
+        yield Msg::OpenRun(md);
         // Per-motor last-set position — bsrs's port of bluesky's
         // move_per_step `pos_cache` (plan_stubs.py:1688-1702). A motor whose
         // target equals its last-set value is NOT re-commanded this point:
@@ -976,7 +1119,19 @@ pub fn list_grid_scan(detectors: Vec<Arc<dyn ReadableObj>>, axes: Vec<ListGridAx
     let pts = patterns::outer_list_product(&lists);
     let motors: Vec<(Arc<dyn MovableObj>, Arc<dyn ReadableObj>)> =
         axes.into_iter().map(|(m, r, _)| (m, r)).collect();
-    scan_nd(detectors, motors, pts)
+    // A grid: each motor is its own axis in the `dimensions` hint (bluesky's
+    // outer-product `motor_hints`, plans.py:350), unlike `scan_nd`'s coupled
+    // default.
+    let motor_readers: Vec<Arc<dyn ReadableObj>> =
+        motors.iter().map(|(_, mr)| mr.clone()).collect();
+    let md = scan_run_md(
+        "list_grid_scan",
+        &detectors,
+        &motor_readers,
+        Some(pts.len()),
+        AxisGrouping::Grid,
+    );
+    scan_nd_with_md(detectors, motors, pts, md)
 }
 
 /// `rel_list_grid_scan(dets, axes)` — relative variant of [`list_grid_scan`]
@@ -1028,10 +1183,13 @@ pub fn spiral_square(
 ) -> Plan {
     let pts = patterns::spiral_square_pattern(x_center, y_center, x_range, y_range, x_num, y_num);
     plan_box(async_stream::stream! {
-        yield Msg::OpenRun(RunMetadata {
-            plan_name: Some("spiral_square".into()),
-            ..Default::default()
-        });
+        yield Msg::OpenRun(scan_run_md(
+            "spiral_square",
+            &detectors,
+            &[x_reader.clone(), y_reader.clone()],
+            None,
+            AxisGrouping::Grid,
+        ));
         for (x, y) in pts {
             // Per-point rewind boundary (bluesky move_per_step, :1695).
             yield Msg::Checkpoint;
@@ -1069,10 +1227,13 @@ pub fn spiral(
 ) -> Plan {
     let pts = patterns::spiral(x_start, y_start, x_range, y_range, dr, nth);
     plan_box(async_stream::stream! {
-        yield Msg::OpenRun(RunMetadata {
-            plan_name: Some("spiral".into()),
-            ..Default::default()
-        });
+        yield Msg::OpenRun(scan_run_md(
+            "spiral",
+            &detectors,
+            &[x_reader.clone(), y_reader.clone()],
+            None,
+            AxisGrouping::Grid,
+        ));
         for (x, y) in pts {
             // Per-point rewind boundary (bluesky move_per_step, :1695).
             yield Msg::Checkpoint;
@@ -1260,10 +1421,13 @@ pub fn spiral_fermat(
 ) -> Plan {
     let pts = patterns::spiral_fermat_pattern(x_start, y_start, x_range, y_range, dr, factor);
     plan_box(async_stream::stream! {
-        yield Msg::OpenRun(RunMetadata {
-            plan_name: Some("spiral_fermat".into()),
-            ..Default::default()
-        });
+        yield Msg::OpenRun(scan_run_md(
+            "spiral_fermat",
+            &detectors,
+            &[x_reader.clone(), y_reader.clone()],
+            None,
+            AxisGrouping::Grid,
+        ));
         for (x, y) in pts {
             // Per-point rewind boundary (bluesky move_per_step, :1695).
             yield Msg::Checkpoint;
