@@ -358,6 +358,11 @@ assert(string.find(
   RE:run(bp.list_grid_scan({d1},
     {{motor=m1, points={0, 0.1}}, {motor=m2, points={0, 0.1, 0.2}}}, {2})),
   "exit_status=success"))
+-- PLAN-28: multi-motor inner-product list_scan; lists are zipped (equal length).
+assert(string.find(
+  RE:run(bp.list_scan_nd({d1},
+    {{motor=m1, points={0, 0.1, 0.2}}, {motor=m2, points={0, 0.1, 0.2}}})),
+  "exit_status=success"))
 assert(string.find(
   RE:run(bp.inner_product_scan({d1}, 3,
     {{motor=m1, start=0, stop=1}, {motor=m2, start=0, stop=2}})),

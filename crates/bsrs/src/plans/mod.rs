@@ -1211,6 +1211,66 @@ pub fn list_scan_per_step(
     preprocessors::stage_wrapper(inner, staged)
 }
 
+/// `list_scan_nd(detectors, axes, per_step)` — multi-motor **inner-product**
+/// list scan: every axis's Nth position is visited together, so the axes'
+/// position lists are zipped, not crossed (bluesky's multi-motor
+/// `list_scan(dets, m1, [pts1], m2, [pts2], …)`, plans.py:132, which builds
+/// `inner_list_product` then `scan_nd`). The single-axis [`list_scan`] is the
+/// one-motor convenience; this is the general form.
+///
+/// All position lists must be the same length. A mismatch fails the run before
+/// it opens by emitting [`Msg::Fail`] — mirroring bluesky's `ValueError`, and
+/// matching how [`count_ext`] rejects a too-short delay sequence — rather than
+/// silently visiting an empty trajectory (which is what a bare
+/// `inner_list_product` returns on unequal lengths).
+///
+/// Like bluesky's `scan_nd`/`move_per_step`, a motor is not re-commanded at a
+/// point where its target equals its previous one (the `pos_cache` in
+/// [`scan_nd_with_md`]). All motors are reported as one combined axis in the
+/// `dimensions` hint (bluesky's coupled `derive_default_hints`), unlike the
+/// per-axis Grid hint of [`list_grid_scan`].
+pub fn list_scan_nd(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    axes: Vec<ListScanAxis>,
+    per_step: Option<PerStep>,
+) -> Plan {
+    // Equal-length check up front, mirroring bluesky's `ValueError`. Without it,
+    // `inner_list_product` silently returns an empty trajectory on a mismatch,
+    // hiding the user's error as a zero-point run.
+    if let Some((first, rest)) = axes.split_first() {
+        let len0 = first.2.len();
+        if let Some(bad) = rest.iter().find(|a| a.2.len() != len0) {
+            let msg = format!(
+                "list_scan: all position lists must be the same length; \
+                 '{}' has {} but '{}' has {}",
+                first.0.name(),
+                len0,
+                bad.0.name(),
+                bad.2.len()
+            );
+            return plan_box(async_stream::stream! {
+                yield Msg::Fail(msg);
+            });
+        }
+    }
+    let lists: Vec<Vec<f64>> = axes.iter().map(|(_, _, l)| l.clone()).collect();
+    let pts = patterns::inner_list_product(&lists);
+    let motors: Vec<(Arc<dyn MovableObj>, Arc<dyn ReadableObj>)> =
+        axes.into_iter().map(|(m, r, _)| (m, r)).collect();
+    let motor_readers: Vec<Arc<dyn ReadableObj>> =
+        motors.iter().map(|(_, mr)| mr.clone()).collect();
+    // Inner product: all motors form one combined axis (Coupled), like the
+    // single-motor `list_scan`, not `list_grid_scan`'s per-motor Grid axes.
+    let md = scan_run_md(
+        "list_scan",
+        &detectors,
+        &motor_readers,
+        Some(pts.len()),
+        AxisGrouping::Coupled,
+    );
+    scan_nd_with_md(detectors, motors, pts, md, per_step)
+}
+
 /// `rel_scan(detectors, motor, start, stop, num)` — like `scan` but
 /// `start`/`stop` are relative to the motor's current position. Caller
 /// supplies `current` (read off the motor before invoking).
@@ -1394,6 +1454,12 @@ pub type ListGridAxis = (Arc<dyn MovableObj>, Arc<dyn ReadableObj>, Vec<f64>);
 /// where `points` are offsets from the motor's current setpoint and the
 /// motor must be `LocatableObj` so that the setpoint can be snapshotted.
 pub type RelListGridAxis = (Arc<dyn LocatableObj>, Arc<dyn ReadableObj>, Vec<f64>);
+
+/// One axis of a multi-motor inner-product [`list_scan_nd`]:
+/// `(motor, motor_reader, points)`. Every axis's `points` list must be the same
+/// length — the lists are zipped position-by-position (bluesky's
+/// `inner_list_product`), unlike the outer-product [`ListGridAxis`].
+pub type ListScanAxis = (Arc<dyn MovableObj>, Arc<dyn ReadableObj>, Vec<f64>);
 
 /// `inner_product_scan(dets, num, [(motor1, s1, e1), ...])` — all motors move
 /// together (linspaced) for `num` points. Mirrors bluesky's
@@ -4176,6 +4242,86 @@ mod tests {
             ],
             "pos_cache skip surfaces as StepMotor::None at the hook"
         );
+    }
+
+    // Multi-motor list_scan (PLAN-28): the axes' position lists are zipped
+    // (inner product), every point commands all motors together, and the run
+    // carries plan_name "list_scan".
+    #[tokio::test]
+    async fn list_scan_nd_zips_motor_positions_inner_product() {
+        let m1 = Arc::new(FakeMotor {
+            name: "m1".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let m2 = Arc::new(FakeMotor {
+            name: "m2".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let axes: Vec<ListScanAxis> = vec![
+            (m1, rdr("m1r"), vec![0.0, 1.0, 2.0]),
+            (m2, rdr("m2r"), vec![10.0, 11.0, 12.0]),
+        ];
+        let msgs = drain(list_scan_nd(vec![], axes, None)).await;
+        assert!(
+            matches!(&msgs[0], Msg::OpenRun(md) if md.plan_name.as_deref() == Some("list_scan")),
+            "opens a list_scan run, got {:?}",
+            msgs.first()
+        );
+        // Zipped, not crossed: row i is (m1[i], m2[i]); all distinct so every
+        // motor is commanded at every one of the 3 points.
+        assert_eq!(set_targets(&msgs, "m1"), vec![0.0, 1.0, 2.0]);
+        assert_eq!(set_targets(&msgs, "m2"), vec![10.0, 11.0, 12.0]);
+    }
+
+    // Unequal list lengths fail the run before it opens (bluesky's ValueError),
+    // rather than silently visiting an empty inner_list_product trajectory.
+    #[tokio::test]
+    async fn list_scan_nd_unequal_lengths_fail_before_open() {
+        let m1 = Arc::new(FakeMotor {
+            name: "m1".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let m2 = Arc::new(FakeMotor {
+            name: "m2".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let axes: Vec<ListScanAxis> = vec![
+            (m1, rdr("m1r"), vec![0.0, 1.0]),
+            (m2, rdr("m2r"), vec![10.0]),
+        ];
+        let msgs = drain(list_scan_nd(vec![], axes, None)).await;
+        assert!(
+            matches!(msgs.first(), Some(Msg::Fail(_))),
+            "unequal list lengths must Fail first, got {msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| matches!(m, Msg::OpenRun(_))),
+            "no run should open on a length mismatch"
+        );
+    }
+
+    // Faithful to bluesky scan_nd/move_per_step: a motor is not re-commanded at
+    // a point where its target repeats the previous one (the pos_cache in
+    // scan_nd_with_md). m1 holds 0.0 across the first two points.
+    #[tokio::test]
+    async fn list_scan_nd_skips_recommanding_repeated_position() {
+        let m1 = Arc::new(FakeMotor {
+            name: "m1".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let m2 = Arc::new(FakeMotor {
+            name: "m2".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let axes: Vec<ListScanAxis> = vec![
+            (m1, rdr("m1r"), vec![0.0, 0.0, 1.0]),
+            (m2, rdr("m2r"), vec![5.0, 6.0, 7.0]),
+        ];
+        let msgs = drain(list_scan_nd(vec![], axes, None)).await;
+        // m1's middle 0.0 equals the previous target → skipped (no Set).
+        assert_eq!(set_targets(&msgs, "m1"), vec![0.0, 1.0]);
+        // m2 changes each point → commanded each point.
+        assert_eq!(set_targets(&msgs, "m2"), vec![5.0, 6.0, 7.0]);
     }
 
     // A delegating rel_ plan inherits the base plan's per-step checkpoints.

@@ -2604,6 +2604,21 @@ fn register_bp(lua: &Lua) -> mlua::Result<()> {
             },
         )?,
     )?;
+    // Multi-motor inner-product list scan (bluesky's variadic list_scan). Axes
+    // are given as a table of `{motor=, points={...}}` rows — the same shape as
+    // list_grid_scan — but here the lists are zipped, not crossed. All `points`
+    // lists must be equal length (the plan Fails otherwise).
+    bp.set(
+        "list_scan_nd",
+        lua.create_function(|_, (dt, axes_t): (mlua::Table, mlua::Table)| {
+            let dets = dets_table_to_readables(&dt)?;
+            let axes = axes_table_to_list_grid_axes(&axes_t)?;
+            Ok(wrap_prebuilt(
+                "list_scan_nd",
+                crate::plans::list_scan_nd(dets, axes, None),
+            ))
+        })?,
+    )?;
     bp.set(
         "rel_scan",
         lua.create_function(

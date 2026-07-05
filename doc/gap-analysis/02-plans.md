@@ -71,8 +71,6 @@ PLAN-34 `wait_for` + `Msg::WaitFor` (mod.rs:368); PLAN-35 `prepare` + `Msg::Prep
   `num_intervals`/`hints.dimensions` into RunStart via `extra` (mod.rs:67 →
   run_engine.rs:2761/2811), with a per-call `md` override at `run_async_with`. Missing:
   RunStart `plan_args`, and a per-plan `md:` argument on the compound plans.
-- **PLAN-28** — `list_scan_per_step` adds the `per_step` hook (mod.rs:1088); still
-  single-motor — no multi-motor inner-list-product at the public API.
 - **PLAN-32** — `Msg::Locate` + engine handler (run_engine.rs:2065) + Lua `locate()`
   (lua_env.rs:1955) exist; missing only a Rust `stubs::locate` plan helper.
 
@@ -92,10 +90,10 @@ PLAN-34 `wait_for` + `Msg::WaitFor` (mod.rs:368); PLAN-35 `prepare` + `Msg::Prep
   arg-parsing helpers), PLAN-36 (`caching_repeater`, deprecated).
 
 **Genuine in-scope backlog from doc 02** (implement in this order):
-PLAN-28, PLAN-25, PLAN-32, PLAN-27. (PLAN-08 done — the `wait` done-flag it needed is
+PLAN-25, PLAN-32, PLAN-27. (PLAN-08 done — the `wait` done-flag it needed is
 `MsgResult::WaitComplete`, delivered via the plan↔engine response channel. PLAN-20 done —
 faithful ring-based spiral/fermat rewrite with `dr_y`+`tilt`. PLAN-29 done — typed
-`broadcast_msg` fan.)
+`broadcast_msg` fan. PLAN-28 done — multi-motor inner-product `list_scan_nd`.)
 
 ---
 
@@ -675,13 +673,33 @@ faithful ring-based spiral/fermat rewrite with `dr_y`+`tilt`. PLAN-29 done — t
 
 ---
 
-### PLAN-28 — `list_scan` is single-motor only; bluesky supports multi-motor inner-list-product — **PARTIAL (in-scope)**
+### ~~PLAN-28~~ — `list_scan` is single-motor only; bluesky supports multi-motor inner-list-product — **DONE**
 
-- **bsrs:** `lib.rs:423–457`
+- **bsrs:** `plans::list_scan_nd(dets, axes, per_step)` (`ListScanAxis` = `(motor,
+  reader, points)`), plus Lua `bp.list_scan_nd(dets, {{motor=, points=}, …})`.
 - **ref:** `plans.py:132–222` — `list_scan(dets, motor1, [pts1], motor2, [pts2], …, per_step=…)`
 - **Gap:** Bluesky `list_scan` zips multiple motor position lists (inner product) and
-  can accept a `per_step` callback.  Bsrs takes one motor and one `Vec<f64>`.
-- **Fix sketch:** Accept `Vec<(Arc<dyn MovableObj>, Arc<dyn ReadableObj>, Vec<f64>)>` and call `inner_list_product`; add `per_step` hook.
+  can accept a `per_step` callback. Bsrs took one motor and one `Vec<f64>`.
+- **Resolution:** Added `list_scan_nd`, the general multi-motor form; the existing
+  single-axis `list_scan` stays as the one-motor convenience (matching how bsrs
+  keeps `scan` alongside `inner_product_scan`). It zips the per-axis lists with
+  `patterns::inner_list_product` and runs the `scan_nd_with_md` traversal
+  (Coupled/one-combined-axis, `plan_name = "list_scan"`), so — like bluesky's
+  `scan_nd`/`move_per_step` — a motor is not re-commanded where its target repeats
+  (`pos_cache`). Unequal-length lists fail the run before it opens via `Msg::Fail`
+  (bluesky raises `ValueError`; `count_ext` uses the same up-front-Fail shape),
+  instead of silently visiting the empty trajectory a bare `inner_list_product`
+  returns. `per_step` is threaded through (default `one_nd_step`).
+- **Tests:** `list_scan_nd_zips_motor_positions_inner_product` (zipped not crossed,
+  all motors commanded, `plan_name` "list_scan"), `list_scan_nd_unequal_lengths_
+  fail_before_open` (mismatch → leading `Fail`, no `OpenRun`),
+  `list_scan_nd_skips_recommanding_repeated_position` (pos_cache boundary), plus a
+  `bp.list_scan_nd` REPL smoke line.
+- **Note (unchanged, separate):** single-motor `list_scan`/`list_scan_per_step`
+  retain their always-command 1-D body (they set the motor at every point even on a
+  repeated position); `list_scan_nd` is the pos_cache-faithful path. Reconciling the
+  1-D body to `list_scan_nd` would change existing single-motor emissions and is out
+  of PLAN-28's scope.
 - **Effort:** S
 
 ---
