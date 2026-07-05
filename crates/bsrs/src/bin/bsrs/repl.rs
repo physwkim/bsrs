@@ -5,10 +5,11 @@
 //! surface without a Python install.
 //!
 //! Line editing is `reedline` (the Nushell editor, prompt_toolkit's
-//! equivalent): live Lua syntax highlighting, a completion menu (Tab),
-//! fish-style history autosuggestion, reverse history search (Ctrl-R), and
-//! true in-place multi-line editing — an incomplete Lua chunk drops to a
-//! `... ` continuation line.
+//! equivalent): live Lua syntax highlighting, a completion menu (Tab) that
+//! learns the globals and table fields you define, fish-style history
+//! autosuggestion, reverse history search (Ctrl-R), and true in-place
+//! multi-line editing — an incomplete Lua chunk drops to a `... `
+//! continuation line.
 //!
 //! Built-ins available at the prompt:
 //!
@@ -28,9 +29,9 @@
 //! Slash-style helpers: type `:help`, `:quit`, `:exit`, `:script <path>`.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bsrs::engine::RunEngine;
 use clap::Args;
@@ -170,21 +171,159 @@ fn base_keywords() -> Vec<&'static str> {
     ]
 }
 
-/// reedline `Completer` over bsrs's curated Lua tokens (prefix match on the
-/// word under the cursor). Drives the columnar completion menu.
+/// Completion candidates: top-level names (no separator) plus per-container
+/// members reached via `base.field` / `base:method`.
+///
+/// Seeded from the curated [`base_keywords`], then refreshed after every eval
+/// from the live Lua state so user-defined variables (`det1 = soft_detector(…)`)
+/// and their table fields become completable. Held behind an `Arc<Mutex<…>>`
+/// shared between the completer and the eval loop.
+#[derive(Default)]
+struct CompletionModel {
+    /// Names completable with no separator: globals + built-ins + slash cmds.
+    globals: Vec<String>,
+    /// Member names per container, for `base.` / `base:` completion.
+    members: HashMap<String, Vec<String>>,
+}
+
+impl CompletionModel {
+    /// The always-available baseline derived from the curated token list.
+    fn with_static() -> Self {
+        let mut m = CompletionModel::default();
+        for tok in base_keywords() {
+            // Slash commands (`:help`, ...) are whole-token globals, not a
+            // `base:member` access — keep them intact.
+            if tok.starts_with(':') {
+                m.globals.push(tok.to_string());
+                continue;
+            }
+            match tok.find([':', '.']) {
+                Some(idx) => {
+                    let base = &tok[..idx];
+                    let member = &tok[idx + 1..];
+                    m.globals.push(base.to_string());
+                    m.members
+                        .entry(base.to_string())
+                        .or_default()
+                        .push(member.to_string());
+                }
+                None => m.globals.push(tok.to_string()),
+            }
+        }
+        m
+    }
+
+    /// Fold live Lua state on top: every non-`_` global name, and one level of
+    /// fields for table-valued globals (`msg.*`, `string.*`, user tables, ...).
+    ///
+    /// Userdata methods (e.g. `det1:trigger`) are not reflected here — mlua
+    /// exposes no stable member enumeration for `UserData` — so `RE:*` still
+    /// comes from the curated list and other userdata complete by name only.
+    fn add_live(&mut self, lua: &mlua::Lua) {
+        for pair in lua.globals().pairs::<mlua::String, mlua::Value>() {
+            let Ok((k, v)) = pair else { continue };
+            let Ok(name) = k.to_str() else { continue };
+            let name = name.to_string();
+            if name.starts_with('_') {
+                continue;
+            }
+            self.globals.push(name.clone());
+            if let mlua::Value::Table(t) = &v {
+                let entry = self.members.entry(name).or_default();
+                for sub in t.pairs::<mlua::String, mlua::Value>() {
+                    let Ok((sk, _sv)) = sub else { continue };
+                    if let Ok(field) = sk.to_str() {
+                        if !field.starts_with('_') {
+                            entry.push(field.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sort + dedup so the menu is stable and free of repeats.
+    fn finish(&mut self) {
+        self.globals.sort();
+        self.globals.dedup();
+        for members in self.members.values_mut() {
+            members.sort();
+            members.dedup();
+        }
+    }
+
+    /// Candidate replacements for `word` (the whole dotted path under the
+    /// cursor). Splits on the last `.`/`:` for member completion, otherwise a
+    /// prefix match over `globals`.
+    fn candidates_for(&self, word: &str) -> Vec<String> {
+        // Slash command prefix — match the whole token, not a member access.
+        if word.starts_with(':') {
+            return self
+                .globals
+                .iter()
+                .filter(|g| g.starts_with(word))
+                .cloned()
+                .collect();
+        }
+        if let Some(idx) = word.rfind(['.', ':']) {
+            let base = &word[..idx];
+            let sep = &word[idx..=idx];
+            let partial = &word[idx + 1..];
+            return match self.members.get(base) {
+                Some(members) => members
+                    .iter()
+                    .filter(|m| m.starts_with(partial))
+                    .map(|m| format!("{base}{sep}{m}"))
+                    .collect(),
+                None => Vec::new(),
+            };
+        }
+        self.globals
+            .iter()
+            .filter(|g| g.starts_with(word))
+            .cloned()
+            .collect()
+    }
+}
+
+/// Build a fresh model (static baseline + live snapshot) and publish it to the
+/// shared handle. Called once at startup and after every input that can define
+/// or remove globals.
+fn refresh_completion(model: &Arc<Mutex<CompletionModel>>, lua: &mlua::Lua) {
+    let mut m = CompletionModel::with_static();
+    m.add_live(lua);
+    m.finish();
+    if let Ok(mut guard) = model.lock() {
+        *guard = m;
+    }
+}
+
+/// reedline `Completer` backed by the live [`CompletionModel`]. Drives the
+/// columnar completion menu.
 struct BsrsCompleter {
-    keywords: Vec<&'static str>,
+    model: Arc<Mutex<CompletionModel>>,
 }
 
 impl BsrsCompleter {
-    fn new() -> Self {
+    fn new(model: Arc<Mutex<CompletionModel>>) -> Self {
+        Self { model }
+    }
+
+    /// A completer over just the static baseline (used in unit tests).
+    #[cfg(test)]
+    fn new_static() -> Self {
         Self {
-            keywords: base_keywords(),
+            model: Arc::new(Mutex::new({
+                let mut m = CompletionModel::with_static();
+                m.finish();
+                m
+            })),
         }
     }
 
     /// Start of the word under `pos`: scan back to the previous whitespace or
-    /// `(`, `,`, `=`, `{`, `[`, newline delimiter, else beginning of line.
+    /// `(`, `,`, `=`, `{`, `[`, newline delimiter, else beginning of line. Note
+    /// `.` and `:` are NOT delimiters — a dotted path is one word.
     fn word_start(line: &str, pos: usize) -> usize {
         let end = pos.min(line.len());
         let bytes = &line.as_bytes()[..end];
@@ -207,12 +346,10 @@ impl BsrsCompleter {
         if word.is_empty() {
             return (start, Vec::new());
         }
-        let hits = self
-            .keywords
-            .iter()
-            .filter(|k| k.starts_with(word))
-            .map(|k| (*k).to_string())
-            .collect();
+        let hits = match self.model.lock() {
+            Ok(m) => m.candidates_for(word),
+            Err(_) => Vec::new(),
+        };
         (start, hits)
     }
 }
@@ -737,8 +874,14 @@ pub(crate) fn interactive_loop(lua: &mlua::Lua) -> i32 {
     let edit_mode = Box::new(Emacs::new(keybindings));
     let completion_menu = Box::new(ColumnarMenu::default().with_name("completion_menu"));
 
+    // Completion model shared with the completer; seeded from the live Lua
+    // state now (built-ins + anything `--init` defined) and refreshed after
+    // every input that can change globals.
+    let model = Arc::new(Mutex::new(CompletionModel::default()));
+    refresh_completion(&model, lua);
+
     let mut line_editor = Reedline::create()
-        .with_completer(Box::new(BsrsCompleter::new()))
+        .with_completer(Box::new(BsrsCompleter::new(model.clone())))
         .with_validator(Box::new(LuaValidator::new()))
         .with_highlighter(Box::new(LuaHighlighter::new()))
         .with_hinter(Box::new(
@@ -773,6 +916,7 @@ pub(crate) fn interactive_loop(lua: &mlua::Lua) -> i32 {
                         if let Err(e) = run_file(lua, std::path::Path::new(path)) {
                             eprintln!("error: {e}");
                         }
+                        refresh_completion(&model, lua);
                         continue;
                     }
                     _ => {}
@@ -780,6 +924,8 @@ pub(crate) fn interactive_loop(lua: &mlua::Lua) -> i32 {
                 // reedline's validator has already ensured the input is a
                 // syntactically complete chunk (possibly multi-line).
                 eval_line(lua, &line);
+                // Pick up any globals the input defined (or removed).
+                refresh_completion(&model, lua);
             }
             // Ctrl-C aborts the line being edited; keep the session open.
             Ok(Signal::CtrlC) => println!("(interrupted)"),
@@ -966,7 +1112,7 @@ mod tests {
 
     #[test]
     fn completer_prefix_matches_at_word_boundaries() {
-        let c = BsrsCompleter::new();
+        let c = BsrsCompleter::new_static();
 
         // Bare prefix at BOL.
         let (start, hits) = c.candidates("cou", 3);
@@ -978,13 +1124,49 @@ mod tests {
         assert_eq!(start2, 7);
         assert!(hits2.iter().any(|h| h == "count"));
 
-        // Namespaced token.
+        // Namespaced token completes via the `base.member` split.
         let (_, hits3) = c.candidates("msg.op", 6);
         assert!(hits3.iter().any(|h| h == "msg.open_run"));
+
+        // `RE:` with an empty partial lists the curated methods.
+        let (_, hits4) = c.candidates("RE:", 3);
+        assert!(hits4.iter().any(|h| h == "RE:run"));
+
+        // Slash-command prefix.
+        let (_, hits5) = c.candidates(":he", 3);
+        assert!(hits5.iter().any(|h| h == ":help"));
 
         // Empty word (cursor right after a delimiter) → no candidates.
         let (_, none) = c.candidates("RE:run(", 7);
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn completion_model_reflects_live_globals() {
+        let lua = mlua::Lua::new();
+        lua.load("det1 = 5\nmytab = { alpha = 1, beta = 2 }")
+            .exec()
+            .unwrap();
+
+        let mut m = CompletionModel::with_static();
+        m.add_live(&lua);
+        m.finish();
+
+        // A user-defined global becomes completable by name.
+        assert!(m.candidates_for("det").iter().any(|c| c == "det1"));
+        // Its table fields complete via both `.` and `:`.
+        assert!(m
+            .candidates_for("mytab.al")
+            .iter()
+            .any(|c| c == "mytab.alpha"));
+        assert!(m
+            .candidates_for("mytab:be")
+            .iter()
+            .any(|c| c == "mytab:beta"));
+        // The curated static tokens survive the merge.
+        assert!(m.candidates_for("RE:ru").iter().any(|c| c == "RE:run"));
+        // `_`-prefixed internals (`_G`, `_VERSION`) are filtered out.
+        assert!(m.candidates_for("_").is_empty());
     }
 
     /// The lexer must tile the input exactly: concatenating the segment texts
