@@ -5,9 +5,10 @@
 //! surface without a Python install.
 //!
 //! Line editing is `reedline` (the Nushell editor, prompt_toolkit's
-//! equivalent): a completion menu (Tab), fish-style history autosuggestion,
-//! reverse history search (Ctrl-R), and true in-place multi-line editing —
-//! an incomplete Lua chunk drops to a `... ` continuation line.
+//! equivalent): live Lua syntax highlighting, a completion menu (Tab),
+//! fish-style history autosuggestion, reverse history search (Ctrl-R), and
+//! true in-place multi-line editing — an incomplete Lua chunk drops to a
+//! `... ` continuation line.
 //!
 //! Built-ins available at the prompt:
 //!
@@ -27,6 +28,7 @@
 //! Slash-style helpers: type `:help`, `:quit`, `:exit`, `:script <path>`.
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -35,8 +37,9 @@ use clap::Args;
 use nu_ansi_term::{Color, Style};
 use reedline::{
     default_emacs_keybindings, ColumnarMenu, Completer, DefaultHinter, Emacs, FileBackedHistory,
-    History, KeyCode, KeyModifiers, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch,
-    Reedline, ReedlineEvent, ReedlineMenu, Signal, Span, Suggestion, ValidationResult, Validator,
+    Highlighter, History, KeyCode, KeyModifiers, MenuBuilder, Prompt, PromptEditMode,
+    PromptHistorySearch, Reedline, ReedlineEvent, ReedlineMenu, Signal, Span, StyledText,
+    Suggestion, ValidationResult, Validator,
 };
 
 use bsrs::host::lua_env::build_lua;
@@ -294,6 +297,272 @@ impl Prompt for BsrsPrompt {
     }
 }
 
+/// Lexical token classes we color at the prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokKind {
+    /// Lua reserved word (`function`, `local`, `end`, `if`, ...).
+    Keyword,
+    /// A bsrs top-level global (`RE`, `count`, `scan`, `msg`, ...).
+    Global,
+    /// String literal (`"..."`, `'...'`, `[[...]]`, `[=[...]=]`).
+    StringLit,
+    /// Numeric literal (decimal / hex / float / exponent).
+    Number,
+    /// Comment (`-- ...` line or `--[[ ... ]]` block).
+    Comment,
+    /// Anything else — identifiers, operators, whitespace, punctuation.
+    Text,
+}
+
+/// Lua 5.4 reserved words.
+const LUA_KEYWORDS: &[&str] = &[
+    "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "goto", "if", "in",
+    "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while",
+];
+
+/// bsrs top-level globals registered in the REPL environment (bare names only —
+/// method forms like `RE:run` color via the `RE` head).
+const BSRS_GLOBALS: &[&str] = &[
+    "RE",
+    "soft_detector",
+    "soft_motor",
+    "soft_pausable",
+    "count",
+    "scan",
+    "mvr",
+    "sleep",
+    "null",
+    "plan",
+    "print",
+    "msg",
+    "bp",
+    "bps",
+    "bpt",
+    "bpp",
+    "tiled",
+    "coroutine",
+];
+
+/// If `chars[i..]` opens a Lua long bracket (`[` `=`* `[`), return its level
+/// (the count of `=`); otherwise `None`.
+fn long_bracket_open(chars: &[char], i: usize) -> Option<usize> {
+    if chars.get(i) != Some(&'[') {
+        return None;
+    }
+    let mut j = i + 1;
+    let mut level = 0;
+    while chars.get(j) == Some(&'=') {
+        level += 1;
+        j += 1;
+    }
+    if chars.get(j) == Some(&'[') {
+        Some(level)
+    } else {
+        None
+    }
+}
+
+/// Index just past the closing `]` `=`{level} `]` of a long bracket that opens
+/// at `i`; returns `chars.len()` if unterminated (highlight to end of buffer).
+fn long_bracket_scan(chars: &[char], i: usize, level: usize) -> usize {
+    let n = chars.len();
+    // Opening is `[` + level*`=` + `[` → content starts after it.
+    let mut j = i + level + 2;
+    while j < n {
+        if chars[j] == ']' {
+            let mut k = j + 1;
+            let mut cnt = 0;
+            while chars.get(k) == Some(&'=') {
+                cnt += 1;
+                k += 1;
+            }
+            if cnt == level && chars.get(k) == Some(&']') {
+                return k + 1;
+            }
+        }
+        j += 1;
+    }
+    n
+}
+
+/// reedline `Highlighter`: a single-pass Lua lexer that colors keywords,
+/// bsrs globals, strings, numbers, and comments. Classification lives in the
+/// pure `lex` (unit-tested); `highlight` only maps `TokKind` → color.
+struct LuaHighlighter {
+    keywords: HashSet<&'static str>,
+    globals: HashSet<&'static str>,
+}
+
+impl LuaHighlighter {
+    fn new() -> Self {
+        Self {
+            keywords: LUA_KEYWORDS.iter().copied().collect(),
+            globals: BSRS_GLOBALS.iter().copied().collect(),
+        }
+    }
+
+    fn style_for(kind: TokKind) -> Style {
+        match kind {
+            TokKind::Keyword => Style::new().fg(Color::Purple),
+            TokKind::Global => Style::new().fg(Color::LightBlue),
+            TokKind::StringLit => Style::new().fg(Color::Green),
+            TokKind::Number => Style::new().fg(Color::Cyan),
+            TokKind::Comment => Style::new().fg(Color::DarkGray),
+            TokKind::Text => Style::new(),
+        }
+    }
+
+    /// Tokenize `src` into `(kind, text)` segments covering it exactly (the
+    /// concatenation of the texts equals `src`).
+    fn lex(&self, src: &str) -> Vec<(TokKind, String)> {
+        let chars: Vec<char> = src.chars().collect();
+        let n = chars.len();
+        let mut i = 0usize;
+        let mut out: Vec<(TokKind, String)> = Vec::new();
+
+        while i < n {
+            let c = chars[i];
+
+            // Comment: `--` line, or `--[[ ... ]]` / `--[=[ ... ]=]` block.
+            if c == '-' && chars.get(i + 1) == Some(&'-') {
+                let start = i;
+                let after = i + 2;
+                let end = match long_bracket_open(&chars, after) {
+                    Some(level) => long_bracket_scan(&chars, after, level),
+                    None => {
+                        let mut j = after;
+                        while j < n && chars[j] != '\n' {
+                            j += 1;
+                        }
+                        j
+                    }
+                };
+                out.push((TokKind::Comment, chars[start..end].iter().collect()));
+                i = end;
+                continue;
+            }
+
+            // Long string: `[[ ... ]]` / `[=[ ... ]=]`.
+            if c == '[' {
+                if let Some(level) = long_bracket_open(&chars, i) {
+                    let end = long_bracket_scan(&chars, i, level);
+                    out.push((TokKind::StringLit, chars[i..end].iter().collect()));
+                    i = end;
+                    continue;
+                }
+            }
+
+            // Short string: `"..."` / `'...'` (with `\` escapes; stops at an
+            // unescaped newline so a stray quote doesn't paint the whole buffer).
+            if c == '"' || c == '\'' {
+                let start = i;
+                let mut j = i + 1;
+                while j < n {
+                    if chars[j] == '\\' && j + 1 < n {
+                        j += 2;
+                        continue;
+                    }
+                    if chars[j] == c {
+                        j += 1;
+                        break;
+                    }
+                    if chars[j] == '\n' {
+                        break;
+                    }
+                    j += 1;
+                }
+                out.push((TokKind::StringLit, chars[start..j].iter().collect()));
+                i = j;
+                continue;
+            }
+
+            // Number: decimal / hex / float / exponent.
+            if c.is_ascii_digit()
+                || (c == '.' && chars.get(i + 1).is_some_and(|d| d.is_ascii_digit()))
+            {
+                let start = i;
+                let mut j = i;
+                if c == '0' && matches!(chars.get(i + 1), Some('x' | 'X')) {
+                    j += 2;
+                    while j < n
+                        && (chars[j].is_ascii_hexdigit()
+                            || chars[j] == '.'
+                            || matches!(chars[j], 'p' | 'P')
+                            || (matches!(chars[j], '+' | '-') && matches!(chars[j - 1], 'p' | 'P')))
+                    {
+                        j += 1;
+                    }
+                } else {
+                    while j < n
+                        && (chars[j].is_ascii_digit()
+                            || chars[j] == '.'
+                            || matches!(chars[j], 'e' | 'E')
+                            || (matches!(chars[j], '+' | '-') && matches!(chars[j - 1], 'e' | 'E')))
+                    {
+                        j += 1;
+                    }
+                }
+                out.push((TokKind::Number, chars[start..j].iter().collect()));
+                i = j;
+                continue;
+            }
+
+            // Identifier / keyword / global.
+            if c.is_alphabetic() || c == '_' {
+                let start = i;
+                let mut j = i;
+                while j < n && (chars[j].is_alphanumeric() || chars[j] == '_') {
+                    j += 1;
+                }
+                let word: String = chars[start..j].iter().collect();
+                let kind = if self.keywords.contains(word.as_str()) {
+                    TokKind::Keyword
+                } else if self.globals.contains(word.as_str()) {
+                    TokKind::Global
+                } else {
+                    TokKind::Text
+                };
+                out.push((kind, word));
+                i = j;
+                continue;
+            }
+
+            // Default run: whitespace / operators / punctuation, up to the next
+            // token start.
+            let start = i;
+            let mut j = i;
+            while j < n {
+                let d = chars[j];
+                let boundary = (d == '-' && chars.get(j + 1) == Some(&'-'))
+                    || d == '"'
+                    || d == '\''
+                    || d.is_alphabetic()
+                    || d == '_'
+                    || d.is_ascii_digit()
+                    || (d == '[' && long_bracket_open(&chars, j).is_some())
+                    || (d == '.' && chars.get(j + 1).is_some_and(|x| x.is_ascii_digit()));
+                if j > start && boundary {
+                    break;
+                }
+                j += 1;
+            }
+            out.push((TokKind::Text, chars[start..j].iter().collect()));
+            i = j;
+        }
+        out
+    }
+}
+
+impl Highlighter for LuaHighlighter {
+    fn highlight(&self, line: &str, _cursor: usize) -> StyledText {
+        let mut styled = StyledText::new();
+        for (kind, text) in self.lex(line) {
+            styled.push((Self::style_for(kind), text));
+        }
+        styled
+    }
+}
+
 /// Arguments for `bsrs repl`.
 #[derive(Args, Debug)]
 pub struct ReplArgs {
@@ -471,6 +740,7 @@ pub(crate) fn interactive_loop(lua: &mlua::Lua) -> i32 {
     let mut line_editor = Reedline::create()
         .with_completer(Box::new(BsrsCompleter::new()))
         .with_validator(Box::new(LuaValidator::new()))
+        .with_highlighter(Box::new(LuaHighlighter::new()))
         .with_hinter(Box::new(
             DefaultHinter::default().with_style(Style::new().fg(Color::DarkGray)),
         ))
@@ -715,5 +985,83 @@ mod tests {
         // Empty word (cursor right after a delimiter) → no candidates.
         let (_, none) = c.candidates("RE:run(", 7);
         assert!(none.is_empty());
+    }
+
+    /// The lexer must tile the input exactly: concatenating the segment texts
+    /// reproduces the source (no dropped or duplicated characters).
+    fn assert_covers(h: &LuaHighlighter, src: &str) -> Vec<(TokKind, String)> {
+        let toks = h.lex(src);
+        let joined: String = toks.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(joined, src, "lexer must cover the whole input");
+        toks
+    }
+
+    fn has(toks: &[(TokKind, String)], kind: TokKind, text: &str) -> bool {
+        toks.iter().any(|(k, t)| *k == kind && t == text)
+    }
+
+    #[test]
+    fn highlighter_classifies_core_tokens() {
+        let h = LuaHighlighter::new();
+
+        let toks = assert_covers(&h, "local x = 1");
+        assert!(has(&toks, TokKind::Keyword, "local"));
+        assert!(has(&toks, TokKind::Number, "1"));
+        // A plain identifier is Text, not Keyword/Global.
+        assert!(has(&toks, TokKind::Text, "x"));
+
+        let toks = assert_covers(&h, "RE:run(count({det1}, 5))");
+        assert!(has(&toks, TokKind::Global, "RE"));
+        assert!(has(&toks, TokKind::Global, "count"));
+        assert!(has(&toks, TokKind::Number, "5"));
+        // `run` is a method name, not a bsrs global → Text.
+        assert!(has(&toks, TokKind::Text, "run"));
+
+        // Strings: short, single-quoted, and long-bracket.
+        assert!(has(
+            &assert_covers(&h, "\"hi\""),
+            TokKind::StringLit,
+            "\"hi\""
+        ));
+        assert!(has(
+            &assert_covers(&h, "'a\\'b'"),
+            TokKind::StringLit,
+            "'a\\'b'"
+        ));
+        assert!(has(
+            &assert_covers(&h, "s = [[multi]]"),
+            TokKind::StringLit,
+            "[[multi]]"
+        ));
+
+        // Numbers: hex + float-with-exponent.
+        assert!(has(&assert_covers(&h, "x = 0xFF"), TokKind::Number, "0xFF"));
+        assert!(has(
+            &assert_covers(&h, "y = 1.5e-3"),
+            TokKind::Number,
+            "1.5e-3"
+        ));
+
+        // Comments: line + block.
+        assert!(has(
+            &assert_covers(&h, "-- a note"),
+            TokKind::Comment,
+            "-- a note"
+        ));
+        let toks = assert_covers(&h, "--[[block]] x");
+        assert!(has(&toks, TokKind::Comment, "--[[block]]"));
+        assert!(has(&toks, TokKind::Text, "x"));
+    }
+
+    #[test]
+    fn highlighter_handles_unterminated_and_multiline() {
+        let h = LuaHighlighter::new();
+        // Unterminated long string paints to end without panicking.
+        let toks = assert_covers(&h, "s = [[open");
+        assert!(has(&toks, TokKind::StringLit, "[[open"));
+        // A line comment stops at the newline; the next line lexes normally.
+        let toks = assert_covers(&h, "-- c\nlocal y");
+        assert!(has(&toks, TokKind::Comment, "-- c"));
+        assert!(has(&toks, TokKind::Keyword, "local"));
     }
 }
