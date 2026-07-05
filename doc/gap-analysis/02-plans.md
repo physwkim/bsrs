@@ -37,8 +37,9 @@ The primary gaps are:
 - ~~**Snake traversal absent** from all N-D grid scans and pattern generators (P1,
   PLAN-19).~~ **DONE** — `outer_product_snake` / `list_grid_scan_snake` /
   `grid_scan_snake` + `SnakeAxes`.
-- **No `md` parameter** on any plan — downstream tools cannot identify scan types or
-  motors (P1, PLAN-25).
+- ~~**No `md` parameter** on any plan — downstream tools cannot identify scan types or
+  motors (P1, PLAN-25).~~ **DONE** — RunStart `plan_args` on every plan + qs queue-item
+  `meta` forwarded to per-call md.
 - `plan_mutator` lacks the (head, tail) insertion pair that bluesky uses in
   `trigger_and_read` (P1, PLAN-21).
 
@@ -67,10 +68,6 @@ PLAN-34 `wait_for` + `Msg::WaitFor` (mod.rs:368); PLAN-35 `prepare` + `Msg::Prep
 (mod.rs:420).
 
 **PARTIAL, IN-SCOPE** (emission-relevant remainder):
-- **PLAN-25** — `scan_run_md` already emits `detectors`/`motors`/`num_points`/
-  `num_intervals`/`hints.dimensions` into RunStart via `extra` (mod.rs:67 →
-  run_engine.rs:2761/2811), with a per-call `md` override at `run_async_with`. Missing:
-  RunStart `plan_args`, and a per-plan `md:` argument on the compound plans.
 - **PLAN-32** — `Msg::Locate` + engine handler (run_engine.rs:2065) + Lua `locate()`
   (lua_env.rs:1955) exist; missing only a Rust `stubs::locate` plan helper.
 
@@ -90,9 +87,10 @@ PLAN-34 `wait_for` + `Msg::WaitFor` (mod.rs:368); PLAN-35 `prepare` + `Msg::Prep
   arg-parsing helpers), PLAN-36 (`caching_repeater`, deprecated).
 
 **Genuine in-scope backlog from doc 02** (implement in this order):
-PLAN-25, PLAN-32, PLAN-27. (PLAN-08 done — the `wait` done-flag it needed is
+PLAN-32, PLAN-27. (PLAN-08 done — the `wait` done-flag it needed is
 `MsgResult::WaitComplete`, delivered via the plan↔engine response channel. PLAN-20 done —
-faithful ring-based spiral/fermat rewrite with `dr_y`+`tilt`. PLAN-29 done — typed
+faithful ring-based spiral/fermat rewrite with `dr_y`+`tilt`. PLAN-25 done — RunStart
+`plan_args` on every plan + qs queue-item `meta` forwarded to per-call md. PLAN-29 done — typed
 `broadcast_msg` fan. PLAN-28 done — multi-motor inner-product `list_scan_nd`.)
 
 ---
@@ -636,16 +634,36 @@ faithful ring-based spiral/fermat rewrite with `dr_y`+`tilt`. PLAN-29 done — t
 
 ---
 
-### PLAN-25 — No `md` parameter on any compound plan; minimal RunMetadata — **PARTIAL (in-scope)**
+### ~~PLAN-25~~ — RunStart metadata (`plan_args`) + submitter `md` — **DONE**
 
-- **bsrs:** `lib.rs:322–1155` — only `plan_name` is set in `RunMetadata`
+- **bsrs:** `plans::scan_run_md` / `run_md_with_args` (mod.rs); `qs::server::execute_queue_loop`
 - **ref:** `plans.py:66,107–116` — every plan builds a `_md` dict with `detectors`,
   `motors`, `num_points`, `num_intervals`, `plan_args`, `plan_name`, `hints`
 - **Gap:** Bluesky run metadata is consumed by the Best-Effort Callback (auto-plots),
-  data catalogs (Tiled, Databroker), and the queue server.  Without `detectors`,
-  `motors`, `num_points`, and `hints.dimensions`, downstream tools cannot label axes,
-  route documents, or reconstruct scans.  This affects every plan.
-- **Fix sketch:** Extend `RunMetadata` with `detectors: Vec<String>`, `motors: Vec<String>`, `num_points: Option<usize>`, `plan_args: HashMap<String, Value>`, `hints: HashMap<String, Value>`.  Populate each plan's `_md` equivalent.  Add optional `md: Option<RunMetadata>` parameter to every plan that merges user overrides.
+  data catalogs (Tiled, Databroker), and the queue server. `detectors`/`motors`/
+  `num_points`/`num_intervals`/`hints.dimensions` were already emitted (prior work);
+  the remainder was RunStart `plan_args` and an `md` override path.
+- **Resolution (2 commits):**
+  1. **`plan_args`** — `scan_run_md` gained a `plan_args: Value` param inserted into
+     the RunStart `extra`; every run-opening plan (12 scan-family callers + the 4
+     that build their own RunStart via the new `run_md_with_args`) now emits a
+     per-plan args object mirroring bluesky's `_md["plan_args"]` keys. bluesky stores
+     each device as its Python `repr()`; bsrs has no repr, so device args are
+     captured by `name()` (the reconstruction token, same spelling as the
+     `detectors`/`motors` lists). `per_step` is reported `"default"`/`"custom"`;
+     `count` delay serializes to seconds (`None`→null).
+  2. **submitter `md`** — the qs queue loop dropped each item's `meta` (bare
+     `run_async(plan)` with a dead `_meta` placeholder). It now forwards
+     `item.meta` (object) into `RunOptions.md` and runs via `run_async_with`, so
+     submitter metadata lands in RunStart as bluesky's highest-precedence
+     `_metadata_per_call` layer.
+- **Scope note:** a per-plan `md:` *argument* on every compound plan was
+  **not** added — it duplicates the existing per-call md (`run_async_with`, the
+  operator-override channel the Lua REPL already uses) for bsrs's single-run
+  plans, and would churn ~20 signatures for no new document content. Confirmed
+  with the user.
+- **Tests:** `scan_1d_captures_plan_args_into_runstart`,
+  `count_captures_num_and_delay_in_plan_args`, `queue_item_meta_reaches_runstart`.
 - **Effort:** M
 
 ---
