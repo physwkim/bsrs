@@ -36,7 +36,7 @@ metrics = ["qs", "dep:metrics", "dep:metrics-exporter-prometheus"]
 # --- host runtime (Lua bridge, module `host`); needs the qs module ---
 host = ["qs", "dep:mlua", "dep:roxmltree"]
 # --- CLI binary (`bsrs` / `qs` subcommands); EPICS-capable like the old default ---
-cli = ["host", "ca", "pva", "dep:clap", "dep:rustyline", "dep:tracing-subscriber"]
+cli = ["host", "ca", "pva", "dep:clap", "dep:rustyline", "dep:reedline", "dep:nu-ansi-term", "dep:tracing-subscriber"]
 # --- `bsrs frame-source` real backends (PVA monitor source + HDF5 sink) ---
 frame-source = ["cli", "pva", "hdf5"]
 
@@ -68,6 +68,8 @@ mlua = { workspace = true, optional = true }
 roxmltree = { version = "0.20", optional = true }
 clap = { workspace = true, optional = true }
 rustyline = { workspace = true, optional = true }
+reedline = { workspace = true, optional = true }
+nu-ansi-term = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 metrics = { version = "0.24", optional = true }
 metrics-exporter-prometheus = { version = "0.16", optional = true, default-features = false, features = ["http-listener"] }

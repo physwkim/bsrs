@@ -4,6 +4,11 @@
 //! pre-registered as Lua globals. Goal: IPython-equivalent dev/test
 //! surface without a Python install.
 //!
+//! Line editing is `reedline` (the Nushell editor, prompt_toolkit's
+//! equivalent): a completion menu (Tab), fish-style history autosuggestion,
+//! reverse history search (Ctrl-R), and true in-place multi-line editing —
+//! an incomplete Lua chunk drops to a `... ` continuation line.
+//!
 //! Built-ins available at the prompt:
 //!
 //! ```lua
@@ -19,171 +24,168 @@
 //! print(RE:state())
 //! ```
 //!
-//! Slash-style helpers: type `:help`, `:quit`, `:reset`, `:script <path>`.
+//! Slash-style helpers: type `:help`, `:quit`, `:exit`, `:script <path>`.
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use bsrs::engine::RunEngine;
 use clap::Args;
-use rustyline::completion::{Completer, Pair};
-use rustyline::error::ReadlineError;
-use rustyline::highlight::Highlighter;
-use rustyline::hint::Hinter;
-use rustyline::history::FileHistory;
-use rustyline::validate::Validator;
-use rustyline::{Context, Editor, Helper};
+use nu_ansi_term::{Color, Style};
+use reedline::{
+    default_emacs_keybindings, ColumnarMenu, Completer, DefaultHinter, Emacs, FileBackedHistory,
+    History, KeyCode, KeyModifiers, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch,
+    Reedline, ReedlineEvent, ReedlineMenu, Signal, Span, Suggestion, ValidationResult, Validator,
+};
 
 use bsrs::host::lua_env::build_lua;
 
-/// Static completion of bsrs's well-known Lua globals + namespaces.
+/// Curated completion tokens: bsrs's well-known Lua globals + namespaces,
+/// Lua keywords, and slash commands. Shared by the completer and its tests.
 ///
-/// rustyline lets us register a `Helper` that provides Tab completions.
-/// We don't introspect the Lua state at completion time (that would
-/// require sharing a `!Send` Lua handle into the editor); instead we
-/// expose the curated list of globals we register at REPL startup.
-struct BsrsReplHelper {
+/// We do not introspect live Lua state here (commit 3 adds a post-eval global
+/// snapshot); this is the always-available baseline.
+fn base_keywords() -> Vec<&'static str> {
+    vec![
+        // Engine handle.
+        "RE",
+        "RE:run",
+        "RE:run_async_with",
+        "RE:pause",
+        "RE:resume",
+        "RE:abort",
+        "RE:halt",
+        "RE:stop",
+        "RE:state",
+        "RE:md_get",
+        "RE:md_set",
+        "RE:md_remove",
+        "RE:md_replace",
+        "RE:is_paused",
+        "RE:current_run_uid",
+        "RE:set_loop_timeout",
+        "RE:set_record_interruptions",
+        "RE:record_interruptions_enabled",
+        "RE:set_input_handler",
+        "RE:set_md_validator",
+        "RE:set_md_normalizer",
+        "RE:set_scan_id_source",
+        "RE:set_before_plan",
+        "RE:set_after_plan",
+        "RE:register_command",
+        "RE:unregister_command",
+        "RE:subscribe",
+        "RE:unsubscribe",
+        "RE:register_pausable",
+        "RE:unregister_pausable",
+        "RE:suspend_until_seconds",
+        "RE:install_signal_handler",
+        "RE:next_suspender_id",
+        "RE:request_pause",
+        "RE:request_suspend",
+        "RE:take_msg_result",
+        "RE:clear_preprocessors",
+        // Device factories.
+        "soft_detector",
+        "soft_motor",
+        "soft_pausable",
+        // Plan factories.
+        "count",
+        "scan",
+        "mvr",
+        "sleep",
+        "null",
+        "plan",
+        "print",
+        // Bluesky-style namespaces (top-level globals).
+        "msg",
+        "bp",
+        "bps",
+        "bpt",
+        "bpp",
+        "tiled",
+        // Common msg.* tokens.
+        "msg.open_run",
+        "msg.close_run",
+        "msg.create",
+        "msg.save",
+        "msg.drop",
+        "msg.read",
+        "msg.set",
+        "msg.trigger",
+        "msg.wait",
+        "msg.sleep",
+        "msg.checkpoint",
+        "msg.clear_checkpoint",
+        "msg.rewindable",
+        "msg.pause",
+        "msg.resume",
+        "msg.null",
+        "msg.stage",
+        "msg.unstage",
+        "msg.stop_dev",
+        "msg.monitor",
+        "msg.unmonitor",
+        "msg.locate",
+        "msg.kickoff",
+        "msg.complete",
+        "msg.prepare",
+        "msg.wait_for",
+        "msg.input",
+        "msg.re_class",
+        "msg.configure",
+        "msg.declare_stream",
+        "msg.collect",
+        "msg.publish",
+        "msg.subscribe",
+        "msg.unsubscribe",
+        "msg.register_pausable",
+        "msg.unregister_pausable",
+        "msg.remove_suspender",
+        // Lua keywords commonly typed.
+        "function",
+        "local",
+        "return",
+        "coroutine.yield",
+        "coroutine.create",
+        "if",
+        "then",
+        "else",
+        "elseif",
+        "end",
+        "for",
+        "while",
+        "do",
+        "repeat",
+        "until",
+        // Slash commands.
+        ":help",
+        ":quit",
+        ":exit",
+        ":script",
+    ]
+}
+
+/// reedline `Completer` over bsrs's curated Lua tokens (prefix match on the
+/// word under the cursor). Drives the columnar completion menu.
+struct BsrsCompleter {
     keywords: Vec<&'static str>,
 }
 
-impl Default for BsrsReplHelper {
-    fn default() -> Self {
-        let keywords = vec![
-            // Engine handle.
-            "RE",
-            "RE:run",
-            "RE:run_async_with",
-            "RE:pause",
-            "RE:resume",
-            "RE:abort",
-            "RE:halt",
-            "RE:stop",
-            "RE:state",
-            "RE:md_get",
-            "RE:md_set",
-            "RE:md_remove",
-            "RE:md_replace",
-            "RE:is_paused",
-            "RE:current_run_uid",
-            "RE:set_loop_timeout",
-            "RE:set_record_interruptions",
-            "RE:record_interruptions_enabled",
-            "RE:set_input_handler",
-            "RE:set_md_validator",
-            "RE:set_md_normalizer",
-            "RE:set_scan_id_source",
-            "RE:set_before_plan",
-            "RE:set_after_plan",
-            "RE:register_command",
-            "RE:unregister_command",
-            "RE:subscribe",
-            "RE:unsubscribe",
-            "RE:register_pausable",
-            "RE:unregister_pausable",
-            "RE:suspend_until_seconds",
-            "RE:install_signal_handler",
-            "RE:next_suspender_id",
-            "RE:request_pause",
-            "RE:request_suspend",
-            "RE:take_msg_result",
-            "RE:clear_preprocessors",
-            // Device factories.
-            "soft_detector",
-            "soft_motor",
-            "soft_pausable",
-            // Plan factories.
-            "count",
-            "scan",
-            "mvr",
-            "sleep",
-            "null",
-            "plan",
-            "print",
-            // Bluesky-style namespaces (top-level globals).
-            "msg",
-            "bp",
-            "bps",
-            "bpt",
-            "bpp",
-            "tiled",
-            // Common msg.* tokens.
-            "msg.open_run",
-            "msg.close_run",
-            "msg.create",
-            "msg.save",
-            "msg.drop",
-            "msg.read",
-            "msg.set",
-            "msg.trigger",
-            "msg.wait",
-            "msg.sleep",
-            "msg.checkpoint",
-            "msg.clear_checkpoint",
-            "msg.rewindable",
-            "msg.pause",
-            "msg.resume",
-            "msg.null",
-            "msg.stage",
-            "msg.unstage",
-            "msg.stop_dev",
-            "msg.monitor",
-            "msg.unmonitor",
-            "msg.locate",
-            "msg.kickoff",
-            "msg.complete",
-            "msg.prepare",
-            "msg.wait_for",
-            "msg.input",
-            "msg.re_class",
-            "msg.configure",
-            "msg.declare_stream",
-            "msg.collect",
-            "msg.publish",
-            "msg.subscribe",
-            "msg.unsubscribe",
-            "msg.register_pausable",
-            "msg.unregister_pausable",
-            "msg.remove_suspender",
-            // Lua keywords commonly typed.
-            "function",
-            "local",
-            "return",
-            "coroutine.yield",
-            "coroutine.create",
-            "if",
-            "then",
-            "else",
-            "elseif",
-            "end",
-            "for",
-            "while",
-            "do",
-            "repeat",
-            "until",
-            // Slash commands.
-            ":help",
-            ":quit",
-            ":exit",
-            ":reset",
-            ":script",
-        ];
-        Self { keywords }
+impl BsrsCompleter {
+    fn new() -> Self {
+        Self {
+            keywords: base_keywords(),
+        }
     }
-}
 
-impl Completer for BsrsReplHelper {
-    type Candidate = Pair;
-    fn complete(
-        &self,
-        line: &str,
-        pos: usize,
-        _ctx: &Context<'_>,
-    ) -> rustyline::Result<(usize, Vec<Pair>)> {
-        // Find the start of the word being completed (last whitespace,
-        // `(`, `,`, `=`, `{`, `[`, or BOL).
-        let prefix_end = pos.min(line.len());
-        let bytes = &line.as_bytes()[..prefix_end];
-        let mut start = prefix_end;
+    /// Start of the word under `pos`: scan back to the previous whitespace or
+    /// `(`, `,`, `=`, `{`, `[`, newline delimiter, else beginning of line.
+    fn word_start(line: &str, pos: usize) -> usize {
+        let end = pos.min(line.len());
+        let bytes = &line.as_bytes()[..end];
+        let mut start = end;
         for (i, &b) in bytes.iter().enumerate().rev() {
             if matches!(b, b' ' | b'\t' | b'(' | b',' | b'=' | b'{' | b'[' | b'\n') {
                 start = i + 1;
@@ -191,29 +193,106 @@ impl Completer for BsrsReplHelper {
             }
             start = i;
         }
-        let word = &line[start..prefix_end];
+        start
+    }
+
+    /// Pure candidate logic (unit-tested): `(word_start, matching tokens)`.
+    fn candidates(&self, line: &str, pos: usize) -> (usize, Vec<String>) {
+        let start = Self::word_start(line, pos);
+        let end = pos.min(line.len());
+        let word = &line[start..end];
         if word.is_empty() {
-            return Ok((start, Vec::new()));
+            return (start, Vec::new());
         }
-        let candidates: Vec<Pair> = self
+        let hits = self
             .keywords
             .iter()
             .filter(|k| k.starts_with(word))
-            .map(|k| Pair {
-                display: (*k).to_string(),
-                replacement: (*k).to_string(),
-            })
+            .map(|k| (*k).to_string())
             .collect();
-        Ok((start, candidates))
+        (start, hits)
     }
 }
 
-impl Hinter for BsrsReplHelper {
-    type Hint = String;
+impl Completer for BsrsCompleter {
+    fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
+        let (start, hits) = self.candidates(line, pos);
+        let end = pos.min(line.len());
+        hits.into_iter()
+            .map(|value| Suggestion {
+                value,
+                display_override: None,
+                description: None,
+                style: None,
+                extra: None,
+                span: Span::new(start, end),
+                append_whitespace: false,
+                match_indices: None,
+            })
+            .collect()
+    }
 }
-impl Highlighter for BsrsReplHelper {}
-impl Validator for BsrsReplHelper {}
-impl Helper for BsrsReplHelper {}
+
+/// reedline `Validator` for multi-line input. Compiles the buffer WITHOUT
+/// executing it (via a private parse-only Lua): only an `incomplete_input`
+/// syntax error keeps the prompt open for more lines. A real syntax error is
+/// `Complete` — the eval loop reports it. Running Lua here would fire side
+/// effects on every Enter, so we must parse, not execute.
+struct LuaValidator {
+    parser: mlua::Lua,
+}
+
+impl LuaValidator {
+    fn new() -> Self {
+        Self {
+            parser: mlua::Lua::new(),
+        }
+    }
+
+    fn is_incomplete(&self, line: &str) -> bool {
+        matches!(
+            self.parser.load(line).into_function(),
+            Err(mlua::Error::SyntaxError {
+                incomplete_input: true,
+                ..
+            })
+        )
+    }
+}
+
+impl Validator for LuaValidator {
+    fn validate(&self, line: &str) -> ValidationResult {
+        if self.is_incomplete(line) {
+            ValidationResult::Incomplete
+        } else {
+            ValidationResult::Complete
+        }
+    }
+}
+
+/// `bsrs> ` main prompt, `... ` for explicit-newline continuation.
+struct BsrsPrompt;
+
+impl Prompt for BsrsPrompt {
+    fn render_prompt_left(&self) -> Cow<'_, str> {
+        Cow::Borrowed("bsrs")
+    }
+    fn render_prompt_right(&self) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+    fn render_prompt_indicator(&self, _mode: PromptEditMode) -> Cow<'_, str> {
+        Cow::Borrowed("> ")
+    }
+    fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
+        Cow::Borrowed("... ")
+    }
+    fn render_prompt_history_search_indicator(
+        &self,
+        _history_search: PromptHistorySearch,
+    ) -> Cow<'_, str> {
+        Cow::Borrowed("(reverse-search) ")
+    }
+}
 
 /// Arguments for `bsrs repl`.
 #[derive(Args, Debug)]
@@ -368,104 +447,103 @@ pub(crate) fn run_file(lua: &mlua::Lua, path: &std::path::Path) -> Result<(), St
 }
 
 pub(crate) fn interactive_loop(lua: &mlua::Lua) -> i32 {
-    let mut rl: Editor<BsrsReplHelper, FileHistory> = match Editor::new() {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("bsrs repl: rustyline init failed: {e}");
-            return 2;
-        }
+    // Persistent, file-backed history (fish-style autosuggestion reads from it
+    // via the DefaultHinter below). Fall back to in-memory if the file can't
+    // be opened.
+    let history: Box<dyn History> = match FileBackedHistory::with_file(1000, history_path()) {
+        Ok(h) => Box::new(h),
+        Err(_) => Box::new(FileBackedHistory::new(1000).expect("in-memory history")),
     };
-    rl.set_helper(Some(BsrsReplHelper::default()));
-    let _ = rl.load_history(&history_path());
 
-    println!("bsrs repl (Lua 5.4) — type `:help` for commands, Ctrl-D to exit");
+    // Tab opens / advances the columnar completion menu; otherwise Emacs keys.
+    let mut keybindings = default_emacs_keybindings();
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Tab,
+        ReedlineEvent::UntilFound(vec![
+            ReedlineEvent::Menu("completion_menu".to_string()),
+            ReedlineEvent::MenuNext,
+        ]),
+    );
+    let edit_mode = Box::new(Emacs::new(keybindings));
+    let completion_menu = Box::new(ColumnarMenu::default().with_name("completion_menu"));
 
-    let mut buffer = String::new();
+    let mut line_editor = Reedline::create()
+        .with_completer(Box::new(BsrsCompleter::new()))
+        .with_validator(Box::new(LuaValidator::new()))
+        .with_hinter(Box::new(
+            DefaultHinter::default().with_style(Style::new().fg(Color::DarkGray)),
+        ))
+        .with_history(history)
+        .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
+        .with_edit_mode(edit_mode);
+
+    let prompt = BsrsPrompt;
+
+    println!(
+        "bsrs repl (Lua 5.4, reedline) — `:help` for commands, Tab to complete, Ctrl-D to exit"
+    );
+
     loop {
-        let prompt = if buffer.is_empty() {
-            "bsrs> "
-        } else {
-            "    ... "
-        };
-        match rl.readline(prompt) {
-            Ok(line) => {
-                let _ = rl.add_history_entry(&line);
+        match line_editor.read_line(&prompt) {
+            Ok(Signal::Success(line)) => {
                 let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
                 // Slash-style commands.
-                if buffer.is_empty() {
-                    match trimmed {
-                        ":help" => {
-                            print_help();
-                            continue;
-                        }
-                        ":quit" | ":exit" => break,
-                        ":reset" => {
-                            buffer.clear();
-                            continue;
-                        }
-                        cmd if cmd.starts_with(":script ") => {
-                            let path = cmd["script ".len()..].trim();
-                            if let Err(e) = run_file(lua, std::path::Path::new(path)) {
-                                eprintln!("error: {e}");
-                            }
-                            continue;
-                        }
-                        _ => {}
+                match trimmed {
+                    ":help" => {
+                        print_help();
+                        continue;
                     }
-                }
-                if !buffer.is_empty() {
-                    buffer.push('\n');
-                }
-                buffer.push_str(&line);
-
-                // Try evaluating as expression first (so `1+1` prints `2`).
-                let as_expr = format!("return {buffer}");
-                match lua.load(&as_expr).set_name("=stdin").eval::<mlua::Value>() {
-                    Ok(v) => {
-                        match v {
-                            mlua::Value::Nil => {}
-                            mlua::Value::String(s) => println!(
-                                "{}",
-                                s.to_str()
-                                    .map(|c| c.to_string())
-                                    .unwrap_or_else(|_| String::new())
-                            ),
-                            other => println!("{other:?}"),
+                    ":quit" | ":exit" => break,
+                    cmd if cmd.starts_with(":script ") => {
+                        let path = cmd[":script ".len()..].trim();
+                        if let Err(e) = run_file(lua, std::path::Path::new(path)) {
+                            eprintln!("error: {e}");
                         }
-                        buffer.clear();
+                        continue;
                     }
-                    Err(_) => {
-                        // Try as a statement.
-                        match lua.load(&buffer).set_name("=stdin").exec() {
-                            Ok(()) => buffer.clear(),
-                            Err(mlua::Error::SyntaxError {
-                                incomplete_input: true,
-                                ..
-                            }) => {
-                                // Need more input — keep buffer.
-                            }
-                            Err(e) => {
-                                eprintln!("error: {e}");
-                                buffer.clear();
-                            }
-                        }
-                    }
+                    _ => {}
                 }
+                // reedline's validator has already ensured the input is a
+                // syntactically complete chunk (possibly multi-line).
+                eval_line(lua, &line);
             }
-            Err(ReadlineError::Interrupted) => {
-                // Ctrl-C: clear current buffer.
-                buffer.clear();
-                println!("(buffer cleared)");
-            }
-            Err(ReadlineError::Eof) => break,
+            // Ctrl-C aborts the line being edited; keep the session open.
+            Ok(Signal::CtrlC) => println!("(interrupted)"),
+            Ok(Signal::CtrlD) => break,
+            // `Signal` is `#[non_exhaustive]`; treat any future variant as a
+            // benign no-op rather than exiting.
+            Ok(_) => {}
             Err(e) => {
                 eprintln!("readline error: {e}");
                 break;
             }
         }
     }
-    let _ = rl.save_history(&history_path());
     0
+}
+
+/// Evaluate one complete input: try it as an expression first (so `1+1` prints
+/// `2`), then fall back to executing it as a statement.
+fn eval_line(lua: &mlua::Lua, src: &str) {
+    let as_expr = format!("return {src}");
+    match lua.load(&as_expr).set_name("=stdin").eval::<mlua::Value>() {
+        Ok(v) => match v {
+            mlua::Value::Nil => {}
+            mlua::Value::String(s) => {
+                println!("{}", s.to_str().map(|c| c.to_string()).unwrap_or_default())
+            }
+            other => println!("{other:?}"),
+        },
+        Err(_) => {
+            if let Err(e) = lua.load(src).set_name("=stdin").exec() {
+                eprintln!("error: {e}");
+            }
+        }
+    }
 }
 
 fn print_help() {
@@ -473,8 +551,8 @@ fn print_help() {
         r#"bsrs REPL commands:
   :help              show this help
   :quit / :exit      leave the REPL
-  :reset             clear the multi-line input buffer
   :script <path>     load and run a Lua file
+  Tab                open the completion menu; Ctrl-R searches history
 
 Lua globals registered:
   RE                 RunEngine handle
@@ -579,7 +657,8 @@ Coroutine yield return values:
   msg.close_run                           -> exit_status string
   every other msg.*                       -> nil
 
-Multi-line: incomplete input keeps the prompt at `... `; type `:reset` to drop.
+Multi-line: an incomplete chunk (open `function`/`do`/`(` ...) drops to a
+`... ` continuation line you can edit in place; Ctrl-C abandons it.
 "#
     );
 }
@@ -591,5 +670,50 @@ fn history_path() -> PathBuf {
         p
     } else {
         PathBuf::from(".bsrs_repl_history")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validator_flags_incomplete_blocks_but_not_errors() {
+        let v = LuaValidator::new();
+        // Open blocks / unbalanced delimiters → keep editing.
+        assert!(v.is_incomplete("function foo()"));
+        assert!(v.is_incomplete("for i=1,3 do"));
+        assert!(v.is_incomplete("if x then"));
+        assert!(v.is_incomplete("count({det1}, 5")); // unclosed paren
+                                                     // Complete chunks → submit.
+        assert!(!v.is_incomplete("x = 1"));
+        assert!(!v.is_incomplete("function foo() end"));
+        assert!(!v.is_incomplete("RE:run(count({det1}, 5))"));
+        // A real syntax error is "complete" (not incomplete): the eval loop
+        // reports it rather than the prompt hanging on a continuation line.
+        assert!(!v.is_incomplete("1 +* 2"));
+    }
+
+    #[test]
+    fn completer_prefix_matches_at_word_boundaries() {
+        let c = BsrsCompleter::new();
+
+        // Bare prefix at BOL.
+        let (start, hits) = c.candidates("cou", 3);
+        assert_eq!(start, 0);
+        assert!(hits.iter().any(|h| h == "count"));
+
+        // Word start is after the `(` delimiter.
+        let (start2, hits2) = c.candidates("RE:run(cou", 10);
+        assert_eq!(start2, 7);
+        assert!(hits2.iter().any(|h| h == "count"));
+
+        // Namespaced token.
+        let (_, hits3) = c.candidates("msg.op", 6);
+        assert!(hits3.iter().any(|h| h == "msg.open_run"));
+
+        // Empty word (cursor right after a delimiter) → no candidates.
+        let (_, none) = c.candidates("RE:run(", 7);
+        assert!(none.is_empty());
     }
 }
