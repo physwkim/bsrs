@@ -226,7 +226,7 @@ until completion (status.rs:340-371). Tested status.rs:570-616, 737-780.
 
 ---
 
-### CP-06 · Device hierarchy: parent / children / set_name propagation absent — **PARTIAL**
+### CP-06 · Device hierarchy: parent / children / set_name propagation — **DONE** (naming) · remainder **OUT-OF-SCOPE**
 
 **bsrs:** `#[derive(Device)]` (`crates/bsrs-derive/src/lib.rs:36`) generates
 `name() -> &str` returning the stored prefix string.  No `parent` field, no
@@ -264,6 +264,19 @@ Still missing: (1) no `parent` back-link field on any device; (2) no uniform `ch
 over an arbitrary `Device`'s sub-devices/signals — `children()` exists only on `DeviceVector`
 (`crates/bsrs/src/devices/device.rs:165`), not on the general `Device` trait (device.rs:22-41,
 which exposes only `name` / `connect_all_boxed` / `walk_signal_sources`).
+
+**Scope (2026-07-05):** The remaining two pieces are device-model navigation API, not
+document emission or qs wire protocol, and are therefore **OUT-OF-SCOPE** for the parity
+effort (bsrs owns document-emission + qs-wire correctness only; consumer-side / device-model
+navigation is out — same class as DB-14/15/16/17, CBEM-04/05/12). Evidence: `rg '\bparent\b'`
+across the crate finds no device `parent` in document emission — only `Resource.parent` /
+`StreamResource.parent` UIDs (an unrelated resource concept) and `checkpoint_store` /
+`areadetector` path/XML uses; `plans/mod.rs:153` states outright "bsrs has no device
+parent/child hierarchy." Descriptor / event assembly is driven by `StandardReadable`'s
+explicit child buckets + `walk_signal_sources`, never a general `Device::children()`. The
+document-emission-relevant capability of CP-06 — name propagation into descriptor `data_keys`
+(`t1x-setpoint`) — is **DONE**; the parent/children remainder does not change any emitted
+document.
 
 ---
 
@@ -433,7 +446,7 @@ backends/soft/signal.rs:244-260.
 
 ---
 
-### CP-12 · HasHints trait not formalized
+### CP-12 · HasHints trait not formalized — **DONE** (document hints) · trait formalization **OUT-OF-SCOPE**
 
 **bsrs:** `crates/bsrs-core/src/msg.rs:562` — `ReadableObj::hint_fields() ->
 Option<Vec<String>>` returns hinted field names as strings.  No `Hints` struct,
@@ -451,6 +464,17 @@ and `trait HasHints { fn hints(&self) -> Hints; }` to `bsrs-protocols-async`.
 Implement it on `Signal` when `kind == Kind::Hinted` and on `StandardReadable` (CP-03).
 
 **Effort:** S
+
+**Status (2026-07-05):** The document-emission-relevant hints capability is **DONE**.
+`ReadableObj::hint_fields()` (on `Signal` at `signal.rs:387`, `Detector` at `detector.rs:402`,
+and `StandardReadable` at `standard_readable.rs:208`) is collected by the RunEngine
+(`run_engine.rs:2042`) and emitted into the descriptor's per-object hints
+(`bundler.rs:231` → `Descriptor.hints: Option<HashMap<String, PerObjectHint>>`,
+`event_model/documents.rs:397-399`) and the `RunStart.hints` dimensions
+(`documents.rs:70-72`). A formalized `HasHints` protocol trait + `Hints` struct is
+device-model / consumer API surface whose named ref consumers — LiveTable, LivePlot — are
+out-of-scope live callbacks (per the parity-scope rule). The emitted document content is
+already correct; the trait formalization is **OUT-OF-SCOPE** for the parity effort.
 
 ---
 
@@ -675,13 +699,13 @@ role marker on trait objects, which are not yet available for tree traversal).
 | ~~CP-03~~ | ~~StandardReadable + StandardReadableFormat absent~~ **DONE** | P0 | M |
 | ~~CP-04~~ | ~~Mock mode / MockSignalBackend absent~~ **DONE** | P0 | M |
 | ~~CP-05~~ | ~~WatchableAsyncStatus + Watcher protocol~~ **DONE** | P1 | S |
-| CP-06 | Device parent/children/set_name propagation **PARTIAL** | P1 | M |
+| ~~CP-06~~ | ~~Device set_name/naming propagation~~ **DONE**; parent/children **OUT-OF-SCOPE** | P1 | M |
 | ~~CP-07~~ | ~~DeviceVector absent~~ **DONE** | P1 | M |
 | ~~CP-08~~ | ~~Signal caching layer (_SignalCache / staged)~~ **DONE** | P1 | M |
 | ~~CP-09~~ | ~~observe_value / wait_for_value helpers~~ **DONE** | P1 | S |
 | ~~CP-10~~ | ~~SoftSignalBackend absent~~ **DONE** | P1 | S |
 | ~~CP-11~~ | ~~backend.put(None) / put-default semantics~~ **DONE** | P1 | S |
-| CP-12 | HasHints trait not formalized | P1 | S |
+| ~~CP-12~~ | ~~HasHints: document hints emitted~~ **DONE**; trait formalization **OUT-OF-SCOPE** | P1 | S |
 | ~~CP-13~~ | ~~SignalMetadata / make_datakey helper~~ **DONE** | P1 | S |
 | ~~CP-14~~ | ~~AsyncStatus cancel / context-manager~~ **DONE** | P1 | M |
 | CP-15 | DerivedSignal absent | P2 | L |
@@ -693,7 +717,11 @@ role marker on trait objects, which are not yet available for tree traversal).
 
 **Counts:** P0 = 4, P1 = 10, P2 = 6
 
-**Reconciliation (as of 2026-07-05):** 13 DONE, 2 PARTIAL (CP-06, CP-20), 5 OPEN
-(CP-12, CP-15, CP-17, CP-18, CP-19). Source paths in the older entries reference the pre-consolidation
+**Reconciliation (as of 2026-07-05):** 13 DONE; plus CP-06 and CP-12, whose
+document-emission-relevant parts are DONE (name propagation into descriptor `data_keys`;
+per-object hints emitted into descriptor + `RunStart`) and whose remaining device-model API
+pieces (device `parent` back-link + general `Device::children()`; the `HasHints` protocol
+trait) are OUT-OF-SCOPE per the parity-scope rule (consumer-side / device-model navigation).
+1 PARTIAL (CP-20). 4 OPEN (CP-15, CP-17, CP-18, CP-19). Source paths in the older entries reference the pre-consolidation
 crate names (`bsrs-core`, `bsrs-devices`, …); the code now lives in the single `bsrs` crate under
 `crates/bsrs/src/{core,devices,protocols_async,event_model}/` plus the companion `bsrs-derive` crate.
