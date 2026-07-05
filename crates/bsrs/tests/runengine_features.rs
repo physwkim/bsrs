@@ -2973,3 +2973,40 @@ async fn respond_channel_delivers_location_to_plan() {
         "Respond(Locate) must deliver the device's setpoint + readback to the plan inline"
     );
 }
+
+/// PLAN-27: bluesky's value-returning `rd(obj)` — read one scalar from a `Readable`,
+/// picking the hinted (or sole) field — maps onto bsrs's response channel. A plan
+/// yields `Respond(Read)` and receives `MsgResult::Reading { data }` inline, then
+/// selects the field it needs. `rd` emits **no documents** (a bare `Read` outside a
+/// `Create`/`Save` bundle produces no Event), and a `stubs::rd(obj) -> Plan` cannot
+/// hand a value back in bsrs's stream model, so — as with `locate` (PLAN-32) — the
+/// inline pattern, not a stub, is the faithful shape. Exposed to Lua as `read()`.
+#[tokio::test]
+async fn respond_channel_delivers_reading_to_plan() {
+    let det = TestMonitor::new("det");
+    // Keep a receiver alive so `push` (a `watch::Sender::send`) is not a no-op —
+    // `TestMonitor::new` drops its own receiver, and `send` with zero receivers
+    // silently leaves the stored value untouched.
+    let _keep = det.rx();
+    det.push(42.0, 1.0);
+    let read_det = det.clone() as Arc<dyn ReadableObj>;
+    let captured: Arc<StdMutex<Option<f64>>> = Arc::new(StdMutex::new(None));
+    let cap = captured.clone();
+    let plan = bsrs::core::plan::plan_items(async_stream::stream! {
+        let (item, rx) = bsrs::core::plan::respond(Msg::Read(read_det.clone()));
+        yield item;
+        if let Ok(bsrs::engine::MsgResult::Reading { data }) = rx.await {
+            // `rd` returns the scalar of the single field.
+            if let Some(rv) = data.get("det") {
+                *cap.lock().unwrap() = rv.value.as_f64();
+            }
+        }
+    });
+    let re = RunEngine::new(vec![]);
+    re.run_async(plan).await.unwrap();
+    assert_eq!(
+        *captured.lock().unwrap(),
+        Some(42.0),
+        "Respond(Read) must deliver the device's reading to the plan inline"
+    );
+}

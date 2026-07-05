@@ -67,9 +67,6 @@ PLAN-10 `mv_many`/`mvr_many` (mod.rs:242/266); PLAN-14 `kickoff_all`/`complete_a
 PLAN-34 `wait_for` + `Msg::WaitFor` (mod.rs:368); PLAN-35 `prepare` + `Msg::Prepare`
 (mod.rs:420).
 
-**OPEN, IN-SCOPE** (changes emitted documents):
-- **PLAN-27** — no plan-level `rd` single-scalar read stub (weak: emits nothing itself).
-
 **OUT-OF-SCOPE** (verified absent/partial, outside parity scope):
 - Barrier/`wait` choreography (append `Msg::Wait`, no document effect): PLAN-11
   (`abs_set` wait), PLAN-12 (`trigger`/`kickoff`/`complete` wait), PLAN-13
@@ -82,14 +79,15 @@ PLAN-34 `wait_for` + `Msg::WaitFor` (mod.rs:368); PLAN-35 `prepare` + `Msg::Prep
   wrappers already provide the behavior), PLAN-31 (`classify`/`chunk_outer_product`
   arg-parsing helpers), PLAN-36 (`caching_repeater`, deprecated).
 
-**Genuine in-scope backlog from doc 02** (implement in this order):
-PLAN-27. (PLAN-08 done — the `wait` done-flag it needed is
-`MsgResult::WaitComplete`, delivered via the plan↔engine response channel. PLAN-20 done —
-faithful ring-based spiral/fermat rewrite with `dr_y`+`tilt`. PLAN-25 done — RunStart
-`plan_args` on every plan + qs queue-item `meta` forwarded to per-call md. PLAN-29 done — typed
-`broadcast_msg` fan. PLAN-28 done — multi-motor inner-product `list_scan_nd`. PLAN-32 done —
-`locate` value-return resolved by the response channel (`respond(Msg::Locate)`); no
-non-faithful `-> Plan` stub.)
+**Genuine in-scope backlog from doc 02: empty — all in-scope items resolved.**
+(PLAN-08 done — the `wait` done-flag it needed is `MsgResult::WaitComplete`,
+delivered via the plan↔engine response channel. PLAN-20 done — faithful ring-based
+spiral/fermat rewrite with `dr_y`+`tilt`. PLAN-25 done — RunStart `plan_args` on
+every plan + qs queue-item `meta` forwarded to per-call md. PLAN-29 done — typed
+`broadcast_msg` fan. PLAN-28 done — multi-motor inner-product `list_scan_nd`.
+PLAN-32 / PLAN-27 done — `locate` / `rd` value-return resolved by the response
+channel (`respond(Msg::Locate)` / `respond(Msg::Read)`); neither warrants a
+non-faithful `-> Plan` stub, and neither emits documents.)
 
 ---
 
@@ -678,14 +676,27 @@ non-faithful `-> Plan` stub.)
 
 ---
 
-### PLAN-27 — `rd` stub missing — no plan-level single-scalar read — **OPEN (in-scope)**
+### ~~PLAN-27~~ — `rd` single-scalar read — **DONE (resolved by the response channel; no standalone stub)**
 
-- **bsrs:** not present
+- **bsrs:** `Msg::Read(Arc<dyn ReadableObj>)` → `MsgResult::Reading { data }`; Lua
+  `read()` (lua_env.rs); inline value-return via `respond(Msg::Read(obj))` + `rx.await`,
+  the caller selecting the hinted/sole field.
 - **ref:** `plan_stubs.py:453–552`
-- **Gap:** `rd(obj)` reads a single scalar from a `Readable`, using hints or `Locatable`
-  protocol.  Used in plan bodies that need the current detector/motor value inline.
-- **Fix sketch:** Add `rd(obj: Arc<dyn ReadableObj>) -> Plan` that calls `read_dyn`, extracts the hint field or single field, and returns the value via a `Msg::ReadScalar` or by updating a shared cell.
-- **Effort:** S
+- **Reassessment:** identical to PLAN-32. bluesky's `rd(obj)` is a *value-returning
+  generator* (`v = yield from rd(det)`) — read one scalar from a `Readable`, picking
+  the hinted (or sole) field, falling back to `Locatable`. bsrs plans compose by
+  stream concatenation, so a `rd(obj) -> Plan` has no channel to return the scalar;
+  the fix sketch's "update a shared cell" is strictly more indirect than the inline
+  `respond` the caller (already inside an `async_stream` body) would write. The
+  faithful equivalent is the **response channel**: yield `respond(Msg::Read(obj))`,
+  await `MsgResult::Reading`, pick the field. `rd` emits **no documents** (a bare
+  `Read` outside a `Create`/`Save` bundle produces no Event), so it is outside the
+  document-emission parity scope regardless. Field-selection is a one-line caller
+  concern, not a stub. The engine handler + Lua `read()` already provide the
+  round-trip.
+- **Test:** `respond_channel_delivers_reading_to_plan` (a plan receives a device's
+  reading inline through `Msg::Read`).
+- **Effort:** S — closed by existing infra.
 
 ---
 
