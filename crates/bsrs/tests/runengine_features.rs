@@ -2909,3 +2909,67 @@ async fn respond_channel_delivers_wait_done_to_plan() {
         "Respond(Wait) on an empty group must deliver WaitComplete {{ done: true }} to the plan"
     );
 }
+
+/// A fixed-position motor for the `locate` round-trip test.
+struct FixedLocatable {
+    name: String,
+    setpoint: f64,
+    readback: f64,
+}
+
+impl bsrs::core::msg::NamedObj for FixedLocatable {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[async_trait::async_trait]
+impl bsrs::core::msg::MovableObj for FixedLocatable {
+    async fn set_dyn(&self, _value: f64) -> bsrs::core::status::Status {
+        bsrs::core::status::Status::done()
+    }
+}
+
+#[async_trait::async_trait]
+impl bsrs::core::msg::LocatableObj for FixedLocatable {
+    async fn locate_dyn(
+        &self,
+    ) -> Result<bsrs::core::msg::DynLocation, bsrs::core::error::BsrsError> {
+        Ok(bsrs::core::msg::DynLocation {
+            setpoint: self.setpoint,
+            readback: self.readback,
+        })
+    }
+}
+
+/// PLAN-32: bluesky's value-returning `locate(*objs)` generator maps onto bsrs's
+/// response channel — a plan yields `Respond(Locate)` and receives the setpoint +
+/// readback inline as `MsgResult::Location`. `locate` emits no documents, and a
+/// standalone `-> Plan` helper cannot hand a value back in bsrs's stream model
+/// (plans compose by stream concatenation, not `yield from … -> value`), so this
+/// inline pattern — not a `stubs::locate` — is the faithful bsrs shape. The same
+/// capability is already exposed to Lua as `locate()`.
+#[tokio::test]
+async fn respond_channel_delivers_location_to_plan() {
+    let motor: Arc<dyn bsrs::core::msg::LocatableObj> = Arc::new(FixedLocatable {
+        name: "th".into(),
+        setpoint: 3.5,
+        readback: 3.49,
+    });
+    let captured: Arc<StdMutex<Option<(f64, f64)>>> = Arc::new(StdMutex::new(None));
+    let cap = captured.clone();
+    let plan = bsrs::core::plan::plan_items(async_stream::stream! {
+        let (item, rx) = bsrs::core::plan::respond(Msg::Locate(motor.clone()));
+        yield item;
+        if let Ok(bsrs::engine::MsgResult::Location { setpoint, readback }) = rx.await {
+            *cap.lock().unwrap() = Some((setpoint, readback));
+        }
+    });
+    let re = RunEngine::new(vec![]);
+    re.run_async(plan).await.unwrap();
+    assert_eq!(
+        *captured.lock().unwrap(),
+        Some((3.5, 3.49)),
+        "Respond(Locate) must deliver the device's setpoint + readback to the plan inline"
+    );
+}

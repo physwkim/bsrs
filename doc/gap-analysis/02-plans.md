@@ -67,10 +67,6 @@ PLAN-10 `mv_many`/`mvr_many` (mod.rs:242/266); PLAN-14 `kickoff_all`/`complete_a
 PLAN-34 `wait_for` + `Msg::WaitFor` (mod.rs:368); PLAN-35 `prepare` + `Msg::Prepare`
 (mod.rs:420).
 
-**PARTIAL, IN-SCOPE** (emission-relevant remainder):
-- **PLAN-32** — `Msg::Locate` + engine handler (run_engine.rs:2065) + Lua `locate()`
-  (lua_env.rs:1955) exist; missing only a Rust `stubs::locate` plan helper.
-
 **OPEN, IN-SCOPE** (changes emitted documents):
 - **PLAN-27** — no plan-level `rd` single-scalar read stub (weak: emits nothing itself).
 
@@ -87,11 +83,13 @@ PLAN-34 `wait_for` + `Msg::WaitFor` (mod.rs:368); PLAN-35 `prepare` + `Msg::Prep
   arg-parsing helpers), PLAN-36 (`caching_repeater`, deprecated).
 
 **Genuine in-scope backlog from doc 02** (implement in this order):
-PLAN-32, PLAN-27. (PLAN-08 done — the `wait` done-flag it needed is
+PLAN-27. (PLAN-08 done — the `wait` done-flag it needed is
 `MsgResult::WaitComplete`, delivered via the plan↔engine response channel. PLAN-20 done —
 faithful ring-based spiral/fermat rewrite with `dr_y`+`tilt`. PLAN-25 done — RunStart
 `plan_args` on every plan + qs queue-item `meta` forwarded to per-call md. PLAN-29 done — typed
-`broadcast_msg` fan. PLAN-28 done — multi-motor inner-product `list_scan_nd`.)
+`broadcast_msg` fan. PLAN-28 done — multi-motor inner-product `list_scan_nd`. PLAN-32 done —
+`locate` value-return resolved by the response channel (`respond(Msg::Locate)`); no
+non-faithful `-> Plan` stub.)
 
 ---
 
@@ -773,14 +771,26 @@ faithful ring-based spiral/fermat rewrite with `dr_y`+`tilt`. PLAN-25 done — R
 
 ---
 
-### PLAN-32 — `locate` plan stub missing — **PARTIAL (in-scope)**
+### ~~PLAN-32~~ — `locate` — **DONE (resolved by the response channel; no standalone stub)**
 
-- **bsrs:** `LocatableObj` is used internally in `mvr`, `rel_list_scan`, etc., but
-  no `Msg::Locate` exists
+- **bsrs:** `Msg::Locate(Arc<dyn LocatableObj>)` + engine handler (run_engine.rs) →
+  `MsgResult::Location { setpoint, readback }`; Lua `locate()` (lua_env.rs:1948);
+  inline value-return via `respond(Msg::Locate(obj))` + `rx.await`.
 - **ref:** `plan_stubs.py:172–192` — `locate(*objs, squeeze=True)`
-- **Gap:** Plans cannot read multiple motor positions in one message.
-- **Fix sketch:** Add `Msg::Locate(Vec<Arc<dyn LocatableObj>>)` and `stubs::locate`.
-- **Effort:** S
+- **Reassessment:** bluesky's `locate` is a *value-returning generator*
+  (`pos = yield from locate(m)`), which works because Python generators send the
+  result back via `.send()`. bsrs plans are `BoxStream<PlanItem>` and compose by
+  stream *concatenation*, so a `stubs::locate(objs) -> Plan` has no channel to hand
+  a position back to its caller. The faithful bsrs equivalent is the **response
+  channel** (built for PLAN-08): a plan yields `respond(Msg::Locate(obj))` and
+  awaits `MsgResult::Location` inline — exactly where it needs the value. `locate`
+  also emits **no documents**, so it is outside the document-emission parity scope
+  regardless. Multi-motor `locate(*objs)` is expressed as one `respond` per motor
+  (or a caller-side loop); no `Vec` variant is warranted. Adding a `-> Plan` stub
+  would be non-faithful ceremony (senior-reviewer self-test).
+- **Test:** `respond_channel_delivers_location_to_plan` (a plan receives a device's
+  setpoint + readback inline through `Msg::Locate`).
+- **Effort:** S — closed by existing infra.
 
 ---
 
