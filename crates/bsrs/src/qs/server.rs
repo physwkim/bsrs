@@ -83,6 +83,15 @@ impl ServerBuilder {
         self.document_address = Some(addr.into());
         self
     }
+    /// Do not bind a Document PUB socket. The server's document sink is used
+    /// only when `environment_open` creates the engine; a caller that
+    /// *pre-opens* the engine (seeding `engine_slot` itself, with its own
+    /// document sink already attached) must call this so the server does not
+    /// contend for the same PUB address. Used by the fused console.
+    pub fn without_document_socket(mut self) -> Self {
+        self.document_address = None;
+        self
+    }
     /// Set the registered plans + devices.
     pub fn registry(mut self, r: Registry) -> Self {
         self.registry = Some(r);

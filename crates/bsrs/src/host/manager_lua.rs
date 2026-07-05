@@ -75,41 +75,51 @@ impl ManagerLuaState {
     }
 
     fn build_state(re: Arc<RunEngine>, registry: &Registry) -> mlua::Result<Lua> {
-        let lua = build_lua(re)?;
-        // Publish each registered device as a Lua global with its
-        // declared name. Walk the role tables; a device that appears
-        // under multiple roles (motor: readable + movable) carries
-        // both. Roles the registry doesn't currently track
-        // (locatable, stoppable, monitorable, ...) are left None —
-        // those calls error from Lua.
-        for name in registry.device_names() {
-            let dev = LuaDevice {
-                name: name.clone(),
-                readable: registry.readable(&name).cloned(),
-                movable: registry.movable(&name).cloned(),
-                locatable: registry.locatable(&name).cloned(),
-                stoppable: None,
-                triggerable: registry.triggerable(&name).cloned(),
-                stageable: registry.stageable(&name).cloned(),
-                monitorable: None,
-                flyable: registry.flyable(&name).cloned(),
-                preparable: None,
-                configurable: None,
-                collectable: registry.collectable(&name).cloned(),
-                pausable: None,
-            };
-            // If the registry has #[lua_methods] for this name, wrap
-            // the userdata in a Lua table that adds the custom
-            // methods and falls back to the userdata for built-ins.
-            if let Some(entry) = registry.lua_exposed(&name) {
-                let proxy = make_method_proxy(&lua, dev, entry)?;
-                lua.globals().set(name.as_str(), proxy)?;
-            } else {
-                lua.globals().set(name.as_str(), dev)?;
-            }
-        }
-        Ok(lua)
+        build_shared_lua(re, registry)
     }
+}
+
+/// Build an mlua state bound to `re` (via [`build_lua`]) with every device in
+/// `registry` published as a Lua global under its declared name. Shared by the
+/// daemon-side [`ManagerLuaState`] (remote `lua_eval`) and the fused console's
+/// local prompt: both faces resolve the *same* engine and the *same* device
+/// instances, though — because `mlua::Lua` is `!Send` — each runs its own Lua
+/// state on its own thread.
+pub fn build_shared_lua(re: Arc<RunEngine>, registry: &Registry) -> mlua::Result<Lua> {
+    let lua = build_lua(re)?;
+    // Publish each registered device as a Lua global with its
+    // declared name. Walk the role tables; a device that appears
+    // under multiple roles (motor: readable + movable) carries
+    // both. Roles the registry doesn't currently track
+    // (locatable, stoppable, monitorable, ...) are left None —
+    // those calls error from Lua.
+    for name in registry.device_names() {
+        let dev = LuaDevice {
+            name: name.clone(),
+            readable: registry.readable(&name).cloned(),
+            movable: registry.movable(&name).cloned(),
+            locatable: registry.locatable(&name).cloned(),
+            stoppable: None,
+            triggerable: registry.triggerable(&name).cloned(),
+            stageable: registry.stageable(&name).cloned(),
+            monitorable: None,
+            flyable: registry.flyable(&name).cloned(),
+            preparable: None,
+            configurable: None,
+            collectable: registry.collectable(&name).cloned(),
+            pausable: None,
+        };
+        // If the registry has #[lua_methods] for this name, wrap
+        // the userdata in a Lua table that adds the custom
+        // methods and falls back to the userdata for built-ins.
+        if let Some(entry) = registry.lua_exposed(&name) {
+            let proxy = make_method_proxy(&lua, dev, entry)?;
+            lua.globals().set(name.as_str(), proxy)?;
+        } else {
+            lua.globals().set(name.as_str(), dev)?;
+        }
+    }
+    Ok(lua)
 }
 
 /// Acquire a poison-resistant lock on the shared Lua state. If a

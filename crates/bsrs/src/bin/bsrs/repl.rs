@@ -359,7 +359,7 @@ pub fn run(args: ReplArgs) -> i32 {
     interactive_loop(&lua)
 }
 
-fn run_file(lua: &mlua::Lua, path: &std::path::Path) -> Result<(), String> {
+pub(crate) fn run_file(lua: &mlua::Lua, path: &std::path::Path) -> Result<(), String> {
     let src = std::fs::read_to_string(path).map_err(|e| format!("read {path:?}: {e}"))?;
     lua.load(&src)
         .set_name(path.to_string_lossy())
@@ -367,7 +367,7 @@ fn run_file(lua: &mlua::Lua, path: &std::path::Path) -> Result<(), String> {
         .map_err(|e| format!("{e}"))
 }
 
-fn interactive_loop(lua: &mlua::Lua) -> i32 {
+pub(crate) fn interactive_loop(lua: &mlua::Lua) -> i32 {
     let mut rl: Editor<BsrsReplHelper, FileHistory> = match Editor::new() {
         Ok(r) => r,
         Err(e) => {
