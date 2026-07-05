@@ -895,6 +895,68 @@ async fn plans_allowed_filtered_by_caller_group() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
 
+/// QS-14: `devices_allowed` must be group-filtered against the caller's
+/// `allowed_devices` (mirroring `plans_allowed`), while `devices_existing`
+/// stays the full list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn devices_allowed_filtered_by_caller_group() {
+    let toml = r#"
+        default_group = "restricted"
+
+        [user_groups.restricted]
+        allowed_plans = [".*"]
+        allowed_devices = ["det1"]
+
+        [user_groups.admin]
+        admin = true
+        allowed_plans = [".*"]
+        allowed_devices = [".*"]
+
+        [api_keys]
+        "admin-key" = "admin"
+    "#;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("permissions.toml");
+    std::fs::write(&path, toml).unwrap();
+
+    let det1 = SoftDetector::new("det1");
+    let det2 = SoftDetector::new("det2");
+    let mut reg = Registry::new();
+    reg.register_readable("det1", det1 as Arc<dyn ReadableObj>);
+    reg.register_readable("det2", det2 as Arc<dyn ReadableObj>);
+    let shutdown = spawn_server_with_perms(reg, path);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    // Restricted group (allowed_devices = ["det1"]) sees only det1.
+    let r = rpc(&req, "devices_allowed", json!({}));
+    let devs = r["devices_allowed"].as_object().expect("must be object");
+    assert!(devs.contains_key("det1"), "restricted must see det1: {r}");
+    assert!(
+        !devs.contains_key("det2"),
+        "restricted must NOT see det2: {r}"
+    );
+
+    // devices_existing is NOT group-filtered — restricted still sees both.
+    let r = rpc(&req, "devices_existing", json!({}));
+    let devs = r["devices_existing"].as_object().expect("must be object");
+    assert!(
+        devs.contains_key("det1") && devs.contains_key("det2"),
+        "devices_existing must list all devices regardless of group: {r}"
+    );
+
+    // Admin group (allowed_devices = [".*"]) sees both.
+    let r = rpc(&req, "devices_allowed", json!({"api_key": "admin-key"}));
+    let devs = r["devices_allowed"].as_object().expect("must be object");
+    assert!(
+        devs.contains_key("det1") && devs.contains_key("det2"),
+        "admin must see both devices: {r}"
+    );
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
 // -- QS-03: plans_allowed / devices_allowed rich dict ----------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

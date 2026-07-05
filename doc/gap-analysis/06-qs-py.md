@@ -406,15 +406,18 @@ The `run_blocking` loop exits when token fires.
 
 ---
 
-#### QS-14 — `plans_allowed` / `devices_allowed` require `user_group` param; bsrs ignores it — **PARTIAL**
+#### QS-14 — `plans_allowed` / `devices_allowed` require `user_group` param; bsrs ignores it — **DONE**
 
-**Status (PARTIAL):** Absent `user_group` is tolerated (the caller's group is resolved from
-`api_key` / `default_group`, so no error on omission), and `plans_allowed` now filters the
-returned dict by the caller's group via `permissions.filter_plans_for_group`
-(`crates/bsrs/src/qs/dispatch.rs:89-99`, `crates/bsrs/src/qs/permissions.rs:362-378`).
-**Missing:** `devices_allowed` (dispatch.rs:106-111) returns `registry.device_dict()`
-unfiltered — the group's `allowed_devices` regex set is compiled (permissions.rs:169,199)
-but never applied to the device listing, so a restricted group still sees all devices.
+**Resolution:** Both listings now filter by the caller's group. `devices_allowed`
+(`crates/bsrs/src/qs/dispatch.rs`) resolves the caller group, filters `registry.device_names()`
+through the new `Permissions::filter_devices_for_group` (mirrors `filter_plans_for_group`,
+against the group's compiled `allowed_devices` regex set), and renders the subset via
+`Registry::devices_dict_subset` — the single owner of the device-entry shape (`device_dict`
+delegates to it). `plans_allowed` was already group-filtered (`filter_plans_for_group`).
+`*_existing` stay unfiltered (full list), matching bluesky-queueserver. Absent/unknown
+`user_group` is tolerated (caller group from `api_key` / `default_group`). Test:
+`devices_allowed_filtered_by_caller_group` in `qs_round_trip.rs` (restricted sees a subset,
+`devices_existing` still lists all, admin sees all).
 
 **bsrs:** `dispatch.rs:87–122` — `user_group` param not read; same list returned to all callers.
 
@@ -825,7 +828,7 @@ the bsrs document PUB socket and calls `subscribe(cb)` callbacks on received doc
 | ~~QS-11~~ | ~~`instruction` item_type not supported~~ **DONE** | P1 | M |
 | ~~QS-12~~ | ~~Msgpack encoding not supported~~ **DONE** | P1 | M |
 | ~~QS-13~~ | ~~`manager_stop` returns NOT_IMPLEMENTED~~ **DONE** | P1 | S |
-| QS-14 | `plans_allowed` ignores `user_group` param **PARTIAL** | P1 | S/M |
+| ~~QS-14~~ | ~~`plans_allowed`/`devices_allowed` ignore `user_group` param~~ **DONE** | P1 | S/M |
 | ~~QS-15~~ | ~~Queue items missing `user`/`user_group` attribution~~ **DONE** | P1 | S |
 | ~~QS-16~~ | ~~`status_uid` missing from status~~ **DONE** | P2 | S |
 | ~~QS-17~~ | ~~`time` missing from status~~ **DONE** | P2 | S |
@@ -847,7 +850,7 @@ the bsrs document PUB socket and calls `subscribe(cb)` callbacks on received doc
 
 **Counts (original):** P0: 8, P1: 10, P2: 12 (total: 30)
 
-**Counts (reconciled 2026-07-05; QS-03 closed 2026-07-05):** QS-*: 21 DONE, 3 PARTIAL
-(QS-09, QS-14, QS-20), 0 OPEN (of 24). PY-*: 8 OUT-OF-SCOPE (of 8). Total 32: 21 DONE,
-3 PARTIAL, 0 OPEN, 8 OUT-OF-SCOPE (using project scope rule — bsrs-py PyO3 crate exists
+**Counts (reconciled 2026-07-05; QS-03 + QS-14 closed 2026-07-05):** QS-*: 22 DONE,
+2 PARTIAL (QS-09, QS-20), 0 OPEN (of 24). PY-*: 8 OUT-OF-SCOPE (of 8). Total 32: 22 DONE,
+2 PARTIAL, 0 OPEN, 8 OUT-OF-SCOPE (using project scope rule — bsrs-py PyO3 crate exists
 but is out of parity scope by design).

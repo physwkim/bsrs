@@ -347,17 +347,27 @@ impl Registry {
 
     /// Devices as a rich dict `{name: {name, description, module}}`
     /// matching the bluesky `devices_allowed` / `devices_existing` wire shape.
+    /// Every registered device (used by `devices_existing`).
     pub fn device_dict(&self) -> serde_json::Value {
+        self.devices_dict_subset(&self.device_names())
+    }
+
+    /// Rich device dict for a subset of names (e.g. a group-filtered
+    /// `devices_allowed` list). Names not registered are skipped.
+    pub fn devices_dict_subset(&self, names: &[String]) -> serde_json::Value {
+        let known: std::collections::BTreeSet<String> = self.device_names().into_iter().collect();
         let mut map = serde_json::Map::new();
-        for name in self.device_names() {
-            map.insert(
-                name.clone(),
-                serde_json::json!({
-                    "name": name,
-                    "description": "",
-                    "module": "bsrs_qs",
-                }),
-            );
+        for name in names {
+            if known.contains(name) {
+                map.insert(
+                    name.clone(),
+                    serde_json::json!({
+                        "name": name,
+                        "description": "",
+                        "module": "bsrs_qs",
+                    }),
+                );
+            }
         }
         serde_json::Value::Object(map)
     }

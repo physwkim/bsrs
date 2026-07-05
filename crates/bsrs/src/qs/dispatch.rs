@@ -107,12 +107,21 @@ pub(crate) fn dispatch(
             "plans_existing": registry.plan_dict(),
             "plans_existing_uid": "static",
         }),
-        "devices_allowed" => json!({
-            "success": true,
-            "msg": "",
-            "devices_allowed": registry.device_dict(),
-            "devices_allowed_uid": "static",
-        }),
+        "devices_allowed" => {
+            let all_names = registry.device_names();
+            let allowed: Vec<String> = permissions
+                .filter_devices_for_group(&group, &all_names)
+                .into_iter()
+                .cloned()
+                .collect();
+            let dict = registry.devices_dict_subset(&allowed);
+            json!({
+                "success": true,
+                "msg": "",
+                "devices_allowed": dict,
+                "devices_allowed_uid": "static",
+            })
+        }
         "devices_existing" => json!({
             "success": true,
             "msg": "",
