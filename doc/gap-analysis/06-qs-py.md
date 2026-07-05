@@ -6,6 +6,16 @@
 **bsrs-py ref:** `crates/bsrs-py/src/lib.rs`  
 **Python-py ref:** `daq/ophyd-async/`, `daq/bluesky/`
 
+> **Reconciliation update (2026-07-05):** The crates were consolidated; the QS source now
+> lives at `crates/bsrs/src/qs/` (single `bsrs` crate), so all QS `file:line` citations in
+> the resolutions below point there, not the historical `crates/bsrs-qs/src/` paths above.
+> Verdicts as of this reconciliation, over the 24 QS-* items: **20 QS DONE, 4 QS PARTIAL,
+> 0 QS OPEN** — see Priority Summary. All 8 PY-* items are
+> **OUT-OF-SCOPE**: bsrs has no Python bindings by design (the `crates/bsrs-py` crate
+> referenced above is not part of the `bsrs` single crate under review). The
+> "What matches" paragraph below is historical: `function_execute` and `manager_stop`
+> are now implemented, not NOT_IMPLEMENTED stubs.
+
 ---
 
 ## Part A — bsrs-qs vs bluesky-queueserver Wire Protocol
@@ -24,7 +34,13 @@ socket runs on the same default port 60615 (server.rs:56, comms.py:22).
 
 ---
 
-#### QS-01 — ZMQ envelope incompatible: Python uses `{method, params}` not JSON-RPC 2.0
+#### QS-01 — ZMQ envelope incompatible: Python uses `{method, params}` not JSON-RPC 2.0 — **DONE**
+
+**Resolution:** `crates/bsrs/src/qs/methods.rs:14-27` — `QsRequest` is now the plain
+`{ method: String, #[serde(default)] params: Value }` dict (no `jsonrpc`, no `id`), and
+`err()` returns the flat `{"success": false, "msg": …}` shape; every dispatch arm returns
+flat `{"success", "msg", …}` dicts (dispatch.rs). The wire envelope now matches
+`comms.py::_create_msg` exactly.
 
 **bsrs:** `crates/bsrs-qs/src/transport.rs:52`, `crates/bsrs-qs/src/methods.rs:8–19`  
 `RpcRequest { jsonrpc: String, method: String, params: Value, id: Option<Value> }`  
@@ -52,7 +68,11 @@ path; otherwise translates the plain `{method, params}` envelope and re-wraps th
 
 ---
 
-#### QS-02 — `ping` returns `"pong"` instead of full status
+#### QS-02 — `ping` returns `"pong"` instead of full status — **DONE**
+
+**Resolution:** `crates/bsrs/src/qs/dispatch.rs:69` — `"ping" => status_response(&state, &queue, &engine, rt)`
+routes `ping` through the identical `status_response` helper as `status`, returning the full
+status dict (matches `manager.py:_ping_handler` calling `_status_handler`).
 
 **bsrs:** `dispatch.rs:70`  
 `"ping" => RpcResponse::ok(id, json!({"success": true, "msg": "pong"}))`
@@ -71,7 +91,18 @@ one-liner, or make `"ping"` call `"status"` internally.
 
 ---
 
-#### QS-03 — `plans_allowed` / `devices_allowed` return list of names, not rich dict
+#### QS-03 — `plans_allowed` / `devices_allowed` return list of names, not rich dict — **PARTIAL**
+
+**Status (PARTIAL):** The wire *shape* is now a rich dict keyed by name. `plans_allowed`
+(`crates/bsrs/src/qs/dispatch.rs:89-99`) returns `build_plan_dict(...)` →
+`{name: {name, description, parameters, module}}`; `devices_allowed` / `*_existing`
+(dispatch.rs:100-117) return `registry.plan_dict()` / `registry.device_dict()`
+(`crates/bsrs/src/qs/registry.rs:173-204`) with the same dict shape. **Missing:** the
+per-plan schema is a stub — `description` is always `""` and `parameters` is always `[]`
+(dispatch.rs:519-533, registry.rs:178-186). Clients that read `.description` or iterate
+`.parameters` for each plan get empty values, not the real parameter types / defaults /
+docstrings that `manager.py:1927-1955` supplies. (`user_group` group-filtering for
+`plans_allowed` is now honoured — see QS-14.)
 
 **bsrs:** `dispatch.rs:87–122`  
 `"plans_allowed": registry.plan_names()` → `Vec<String>` (JSON array of strings)  
@@ -99,7 +130,11 @@ group may call, filtering the registry snapshot accordingly.
 
 ---
 
-#### QS-04 — `queue_item_add` response returns `item_uid`, not full `item`
+#### QS-04 — `queue_item_add` response returns `item_uid`, not full `item` — **DONE**
+
+**Resolution:** `crates/bsrs/src/qs/dispatch.rs:866-872` — `queue_item_add` now returns
+`{"success", "msg", "qsize", "item": <full serialized QueuedItem>, "plan_queue_uid"}`; the
+bare `item_uid` top-level key is gone (matches `manager.py:2412-2413`).
 
 **bsrs:** `dispatch.rs:688–699`  
 Returns `{"success", "msg", "qsize", "item_uid": …, "plan_queue_uid": …}`.
@@ -118,7 +153,12 @@ Remove the now-redundant `item_uid` top-level key.
 
 ---
 
-#### QS-05 — `queue_item_add_batch` response key `items_added` should be `items`, missing `results`
+#### QS-05 — `queue_item_add_batch` response key `items_added` should be `items`, missing `results` — **DONE**
+
+**Resolution:** `crates/bsrs/src/qs/dispatch.rs:922-929` — the batch response now returns
+`items` (list of full serialized item dicts) plus a parallel `results` array of
+`{"success", "msg"}` per input item; `success` is `false` if any item failed
+(matches `manager.py:2530-2531`).
 
 **bsrs:** `dispatch.rs:730–739`  
 Returns `{"success","msg","qsize","items_added":[uid…],"plan_queue_uid"}`.
@@ -137,7 +177,11 @@ Add `results: Vec<{success,msg}>` in parallel, one entry per input item.
 
 ---
 
-#### QS-06 — `re_metadata` response key is `metadata`, should be `re_metadata`
+#### QS-06 — `re_metadata` response key is `metadata`, should be `re_metadata` — **DONE**
+
+**Resolution:** `crates/bsrs/src/qs/dispatch.rs:1260-1264` — the `re_metadata` arm returns
+`{"success", "msg", "re_metadata": re.md()}`; the key is `re_metadata`, not `metadata`
+(matches `manager.py:3407`).
 
 **bsrs:** `dispatch.rs:1086–1092`  
 `json!({"success":true,"msg":"","metadata": re.md()})`
@@ -153,7 +197,18 @@ Add `results: Vec<{success,msg}>` in parallel, one entry per input item.
 
 ---
 
-#### QS-07 — `manager_state` missing five transitional states
+#### QS-07 — `manager_state` missing five transitional states — **DONE**
+
+**Resolution:** `crates/bsrs/src/qs/state.rs:10-42` — `EState` now carries the three
+transitional variants `CreatingEnvironment`, `ClosingEnvironment`, `DestroyingEnvironment`
+(emitting `"creating_environment"` / `"closing_environment"` / `"destroying_environment"`)
+alongside the base five. They are emitted transiently: `env_open` sets `CreatingEnvironment`
+before `Idle` (dispatch.rs:692-699), `env_close` sets `ClosingEnvironment` before
+`EnvironmentClosed` (dispatch.rs:713-715), `env_destroy` sets `DestroyingEnvironment`
+(dispatch.rs:730). This matches the `MState.CREATING_ENVIRONMENT` /
+`CLOSING_ENVIRONMENT` / `DESTROYING_ENVIRONMENT` polling contract. (Python's
+`STARTING_QUEUE` / `EXECUTING_TASK` and bsrs's `Aborting` remain design differences, not
+wire-protocol gaps.)
 
 **bsrs:** `state.rs:10–21` — EState: EnvironmentClosed, Idle, ExecutingQueue, Paused, Aborting  
 Emitted strings: `"environment_closed"`, `"idle"`, `"executing_queue"`, `"paused"`, `"aborting"`.
@@ -184,7 +239,13 @@ goes to "aborting").
 
 ---
 
-#### QS-08 — `pause_pending` missing from status
+#### QS-08 — `pause_pending` missing from status — **DONE**
+
+**Resolution:** `crates/bsrs/src/qs/dispatch.rs:660` — `status_response` emits
+`"pause_pending": st.pause_pending`. The field lives on `EngineState`
+(`crates/bsrs/src/qs/state.rs:185`), is set `true` in the `re_pause` handler
+(dispatch.rs:1204) and cleared on resume/abort/halt and when the engine idles
+(dispatch.rs:207, server.rs:404,416,532).
 
 **bsrs:** `dispatch.rs:549–601` — status JSON has no `pause_pending` key.
 
@@ -202,7 +263,17 @@ Paused. Emit `"pause_pending": st.pause_pending` in `status_response`.
 
 ---
 
-#### QS-09 — `queue_item_add` / `queue_item_add_batch` missing positional insertion (`pos`, `before_uid`, `after_uid`)
+#### QS-09 — `queue_item_add` / `queue_item_add_batch` missing positional insertion (`pos`, `before_uid`, `after_uid`) — **PARTIAL**
+
+**Status (PARTIAL):** `queue_item_add` now reads `pos` (string `"front"`/`"back"` or
+signed integer index, with the negative-index / clamp arithmetic of
+`plan_queue_ops.py`), `before_uid`, and `after_uid`, and rejects ambiguous combinations
+(`crates/bsrs/src/qs/dispatch.rs:787-865`), backed by
+`PlanQueue::insert_at` / `insert_before_uid` / `insert_after_uid`
+(`crates/bsrs/src/qs/queue.rs:195-223`). **Missing:** `queue_item_add_batch` still
+unconditionally `push_back`s every item (dispatch.rs:906) and reads no `pos` /
+`before_uid` / `after_uid` — the batch positional-insertion half of this item is not
+implemented.
 
 **bsrs:** `dispatch.rs:668–739` — `queue_item_add` always calls `q.push_back(queued)`;
 `queue_item_add_batch` always appends. No `pos`, `before_uid`, or `after_uid` param read.
@@ -224,7 +295,13 @@ override during a run) always silently falls to back. Before-/after-uid insertio
 
 ---
 
-#### QS-10 — `function_execute` is unimplemented
+#### QS-10 — `function_execute` is unimplemented — **DONE**
+
+**Resolution:** `crates/bsrs/src/qs/dispatch.rs:375-377,421-517` — `function_execute` reads
+`item{name,args,kwargs}`, validates `item_type == "function"`, synthesizes a Lua call, spawns
+it as a background task via `TaskTracker`, and returns `{"success","msg","item","task_uid"}`
+for polling through `task_status` / `task_result` (matches the `manager.py:2992` task-return
+shape). Requires a wired Lua evaluator (returns a defined error otherwise).
 
 **bsrs:** `dispatch.rs:419–430` — NOT_IMPLEMENTED stub.
 
@@ -243,7 +320,14 @@ Return the same `{"success","msg","task_uid"}` shape.
 
 ---
 
-#### QS-11 — `instruction` item_type not supported in `queue_item_add`
+#### QS-11 — `instruction` item_type not supported in `queue_item_add` — **DONE**
+
+**Resolution:** `crates/bsrs/src/qs/dispatch.rs:778-816` — `queue_item_add` reads
+`item.item_type`, dispatches `"plan"` vs `"instruction"`, and accepts the `queue_stop`
+instruction via `QueuedItem::instruction` (`crates/bsrs/src/qs/queue.rs:51-62`). At execution
+time the queue loop recognizes instruction items and honours `queue_stop` by archiving it and
+setting `queue_stop_pending` (`crates/bsrs/src/qs/server.rs:419-435`), matching
+`manager.py:1154-1169`.
 
 **bsrs:** `dispatch.rs:678–682` — `queue_item_add` reads `item.name` and looks up a plan;
 no `item_type` dispatch. `queue.rs:12–15` — `QueuedItem.item_type` is always set to `"plan"`.
@@ -266,7 +350,13 @@ Validate `item_type` in `queue_item_add`.
 
 ---
 
-#### QS-12 — msgpack encoding not supported
+#### QS-12 — msgpack encoding not supported — **DONE**
+
+**Resolution:** `crates/bsrs/src/qs/transport.rs:87-139` — `try_recv` probes the first byte
+(`0x7B` `{` → JSON, else msgpack via `rmp_serde::from_slice`), returns the detected
+`MsgEncoding`, and `send` mirrors it (`rmp_serde::to_vec_named` for msgpack, string map keys so
+Python `msgpack.unpackb` can index by name). The rep loop threads the encoding request→response
+(server.rs:354-374). Matches the `comms.py` per-frame encoding behaviour.
 
 **bsrs:** `transport.rs:51–52` — parses received bytes with `serde_json::from_slice`; sends
 `serde_json::to_vec`. No msgpack path.
@@ -287,7 +377,12 @@ encoding the client used (track per-request or negotiate via first message).
 
 ---
 
-#### QS-13 — `manager_stop` returns NOT_IMPLEMENTED (no clean shutdown path)
+#### QS-13 — `manager_stop` returns NOT_IMPLEMENTED (no clean shutdown path) — **DONE**
+
+**Resolution:** `crates/bsrs/src/qs/dispatch.rs:365-372` — `manager_stop` aborts any in-flight
+queue task and sets the `stop_requested` `AtomicBool`; the rep loop checks it after sending the
+response and exits cleanly (`crates/bsrs/src/qs/server.rs:377-380`), giving an RPC-level clean
+shutdown.
 
 **bsrs:** `dispatch.rs:419–430` — `manager_stop` returns NOT_IMPLEMENTED.
 
@@ -305,7 +400,15 @@ The `run_blocking` loop exits when token fires.
 
 ---
 
-#### QS-14 — `plans_allowed` / `devices_allowed` require `user_group` param; bsrs ignores it
+#### QS-14 — `plans_allowed` / `devices_allowed` require `user_group` param; bsrs ignores it — **PARTIAL**
+
+**Status (PARTIAL):** Absent `user_group` is tolerated (the caller's group is resolved from
+`api_key` / `default_group`, so no error on omission), and `plans_allowed` now filters the
+returned dict by the caller's group via `permissions.filter_plans_for_group`
+(`crates/bsrs/src/qs/dispatch.rs:89-99`, `crates/bsrs/src/qs/permissions.rs:362-378`).
+**Missing:** `devices_allowed` (dispatch.rs:106-111) returns `registry.device_dict()`
+unfiltered — the group's `allowed_devices` regex set is compiled (permissions.rs:169,199)
+but never applied to the device listing, so a restricted group still sees all devices.
 
 **bsrs:** `dispatch.rs:87–122` — `user_group` param not read; same list returned to all callers.
 
@@ -326,7 +429,13 @@ with that set before returning. Same for devices.
 
 ---
 
-#### QS-15 — Queue items missing `user` / `user_group` attribution
+#### QS-15 — Queue items missing `user` / `user_group` attribution — **DONE**
+
+**Resolution:** `crates/bsrs/src/qs/queue.rs:24-29` — `QueuedItem` now carries
+`user: Option<String>` and `user_group: Option<String>`. `queue_item_add` reads
+`params["user"]` / `params["user_group"]` (dispatch.rs:817-824) and `queue_item_add_batch`
+applies the batch-level user/group to each item (dispatch.rs:884-904); both serialize into
+queue and history snapshots.
 
 **bsrs:** `queue.rs:12–27` — `QueuedItem` has no `user` or `user_group` fields.
 
@@ -348,7 +457,11 @@ store. Serialize into snapshot/history responses.
 
 ---
 
-#### QS-16 — `status_uid` missing from status response
+#### QS-16 — `status_uid` missing from status response — **DONE**
+
+**Resolution:** `crates/bsrs/src/qs/dispatch.rs:645` — `status_response` emits
+`"status_uid": uuid::Uuid::new_v4().to_string()` (fresh UUID every call, matching
+`manager.py:436`).
 
 **bsrs:** `dispatch.rs:564–601` — no `status_uid` field.
 
@@ -361,7 +474,10 @@ used by polling clients to detect a changed status without deep equality checks.
 
 ---
 
-#### QS-17 — `time` field missing from status response
+#### QS-17 — `time` field missing from status response — **DONE**
+
+**Resolution:** `crates/bsrs/src/qs/dispatch.rs:646` — `status_response` emits
+`"time": crate::qs::state::now_iso8601()` (matches `manager.py:421`).
 
 **bsrs:** `dispatch.rs:564–601` — no `time` field.
 
@@ -373,7 +489,12 @@ used by polling clients to detect a changed status without deep equality checks.
 
 ---
 
-#### QS-18 — `worker_background_tasks` missing from status
+#### QS-18 — `worker_background_tasks` missing from status — **DONE**
+
+**Resolution:** `crates/bsrs/src/qs/dispatch.rs:661` — `status_response` emits
+`"worker_background_tasks": st.worker_background_tasks`. The counter lives on `EngineState`
+(state.rs:187) and is incremented/decremented around `lua_eval` and `function_execute` task
+spawns (dispatch.rs:326,348,483,508).
 
 **bsrs:** `dispatch.rs:564–601` — absent.
 
@@ -387,7 +508,11 @@ background tasks executing in the worker process).
 
 ---
 
-#### QS-19 — `config_get` response shape mismatch
+#### QS-19 — `config_get` response shape mismatch — **DONE**
+
+**Resolution:** `crates/bsrs/src/qs/dispatch.rs:71-81` — the `config_get` config dict now
+includes `"ip_connect_info": {}` alongside the bsrs-specific keys, so clients reading
+`resp["config"]["ip_connect_info"]` no longer KeyError (matches `manager.py:1919-1924`).
 
 **bsrs:** `dispatch.rs:72–84`  
 `"config": {"implementation": "bsrs-qs", "runtime": "rust", "version": …, "wire_protocol": …}`
@@ -404,7 +529,14 @@ the config dict for compatibility.
 
 ---
 
-#### QS-20 — `queue_item_move` and `queue_item_move_batch` missing `before_uid` / `after_uid` / `reorder`
+#### QS-20 — `queue_item_move` and `queue_item_move_batch` missing `before_uid` / `after_uid` / `reorder` — **PARTIAL**
+
+**Status (PARTIAL):** Single-item `queue_item_move` now reads `before_uid` / `after_uid` and
+dispatches to `PlanQueue::move_before_uid` / `move_after_uid`
+(`crates/bsrs/src/qs/dispatch.rs:1042-1076`, `crates/bsrs/src/qs/queue.rs:171-188`), falling
+back to `pos_dest`. **Missing:** `queue_item_move_batch` (dispatch.rs:1078-1103) still reads
+only `pos_dest` — no `before_uid` / `after_uid` for batch; and the `reorder` parameter is not
+implemented anywhere (`rg reorder` in `qs/` returns nothing).
 
 **bsrs:** `dispatch.rs:869–925` — only `uid` + `pos_dest` (front/back/int).
 
@@ -418,7 +550,12 @@ and move_batch.
 
 ---
 
-#### QS-21 — `queue_item_update` missing `replace` parameter
+#### QS-21 — `queue_item_update` missing `replace` parameter — **DONE**
+
+**Resolution:** `crates/bsrs/src/qs/dispatch.rs:947-957` — `queue_item_update` reads
+`params["replace"]`; when true it calls `PlanQueue::replace_at_uid` which installs the
+replacement item with its fresh UID (`crates/bsrs/src/qs/queue.rs:144-149`), else `update`
+preserves the UID (matches `manager.py:2552-2564`).
 
 **bsrs:** `dispatch.rs:742–774` — always keeps the same UID.
 
@@ -431,7 +568,12 @@ and move_batch.
 
 ---
 
-#### QS-22 — `re_runs` `option` parameter ignored; `is_open` always false
+#### QS-22 — `re_runs` `option` parameter ignored; `is_open` always false — **DONE**
+
+**Resolution:** `crates/bsrs/src/qs/dispatch.rs:1225-1242` — `re_runs` reads `option`
+(`"active"` = all, `"open"`, `"closed"`) and filters `EngineState.re_runs`, a
+`Vec<(uid, is_open)>` maintained by the queue loop (`crates/bsrs/src/qs/server.rs:493-505`).
+Emits per-run `{"uid", "is_open"}` (matches `manager.py:3344-3358`).
 
 **bsrs:** `dispatch.rs:1055–1065` — ignores `option`; emits `{"uid":…, "is_open": false}`.
 
@@ -444,7 +586,15 @@ and move_batch.
 
 ---
 
-#### QS-23 — ZMQ CURVE encryption not supported
+#### QS-23 — ZMQ CURVE encryption not supported — **DONE**
+
+**Resolution:** `crates/bsrs/src/qs/curve.rs` provides `generate_zmq_keys` /
+`apply_curve_server_key` (sets `ZMQ_CURVE_SERVER=1` + `ZMQ_CURVE_SECRETKEY`, Z85 validated).
+`ReqRepSocket::bind` applies the key before bind when supplied
+(`crates/bsrs/src/qs/transport.rs:42-53`), and `ServerBuilder` resolves the key from the
+explicit `curve_private_key` field or the `QSERVER_ZMQ_PRIVATE_KEY` env var
+(`crates/bsrs/src/qs/server.rs:147-163`), matching the reference config mechanism. Without a
+key the socket stays plaintext (reference default).
 
 **bsrs:** `transport.rs:18–34` — plain `zmq::REP` socket, no CURVE key configuration.
 
@@ -457,7 +607,13 @@ call `socket.set_curve_server(true)` + `set_curve_publickey` / `set_curve_secret
 
 ---
 
-#### QS-24 — `environment_destroy` is an alias for `environment_close`
+#### QS-24 — `environment_destroy` is an alias for `environment_close` — **DONE**
+
+**Resolution:** `crates/bsrs/src/qs/dispatch.rs:136,719-747` — `environment_destroy` now routes
+to a distinct `env_destroy`, which force-aborts any in-flight queue task
+(`queue_task.abort()`) before dropping the engine and sets the `DestroyingEnvironment`
+transitional state. This diverges from the graceful `env_close` path, matching the
+`manager.py:644-673` forced-teardown semantics for a hung worker.
 
 **bsrs:** `dispatch.rs:157` — `"environment_destroy" => env_close(…)` (identical call).
 
@@ -491,7 +647,9 @@ or directly aborts the running queue task before dropping the engine.
 
 ---
 
-#### PY-01 — No document subscription callback
+#### PY-01 — No document subscription callback — **OUT-OF-SCOPE**
+
+**Status (OUT-OF-SCOPE):** bsrs has no Python bindings by design.
 
 **bsrs-py:** `lib.rs:121–138` — `run()` returns `(exit_status, run_uid)`, no subscription.
 
@@ -514,7 +672,9 @@ in a `Arc<dyn DocumentSink>` bridged via `Python::with_gil`. Call it through the
 
 ---
 
-#### PY-02 — No EPICS-backed device bindings
+#### PY-02 — No EPICS-backed device bindings — **OUT-OF-SCOPE**
+
+**Status (OUT-OF-SCOPE):** bsrs has no Python bindings by design.
 
 **bsrs-py:** `lib.rs:41–87` — only `SoftMotor`, `SoftDetector` (in-memory, no EPICS).
 
@@ -533,7 +693,9 @@ MVP.
 
 ---
 
-#### PY-03 — Device protocol methods not callable from Python
+#### PY-03 — Device protocol methods not callable from Python — **OUT-OF-SCOPE**
+
+**Status (OUT-OF-SCOPE):** bsrs has no Python bindings by design.
 
 **bsrs-py:** `PySoftMotor` / `PySoftDetector` — expose only `name()` and `__repr__()`.
 
@@ -550,7 +712,9 @@ on `PySoftMotor`/`PySoftDetector`. Bridge through `py.allow_threads(…)` + `blo
 
 ---
 
-#### PY-04 — Minimal plan set (missing `grid_scan`, `rel_scan`, `mv`, `abs_set`, etc.)
+#### PY-04 — Minimal plan set (missing `grid_scan`, `rel_scan`, `mv`, `abs_set`, etc.) — **OUT-OF-SCOPE**
+
+**Status (OUT-OF-SCOPE):** bsrs has no Python bindings by design.
 
 **bsrs-py:** `lib.rs:141–190` — only `count` and `scan`.
 
@@ -566,7 +730,9 @@ priority. Add as `#[pyfunction]` wrappers following the same pattern as `scan`.
 
 ---
 
-#### PY-05 — No user-defined Python plan execution
+#### PY-05 — No user-defined Python plan execution — **OUT-OF-SCOPE**
+
+**Status (OUT-OF-SCOPE):** bsrs has no Python bindings by design.
 
 **bsrs-py:** `lib.rs` — only Rust-registered plan factories can be run. No mechanism for
 Python generator plans.
@@ -590,7 +756,9 @@ objects and executing them via the existing bsrs device dispatch. This requires 
 
 ---
 
-#### PY-06 — RunEngine metadata not accessible from Python
+#### PY-06 — RunEngine metadata not accessible from Python — **OUT-OF-SCOPE**
+
+**Status (OUT-OF-SCOPE):** bsrs has no Python bindings by design.
 
 **bsrs-py:** `lib.rs` — no `RE.md` accessor.
 
@@ -602,7 +770,9 @@ objects and executing them via the existing bsrs device dispatch. This requires 
 
 ---
 
-#### PY-07 — No `async` RunEngine integration
+#### PY-07 — No `async` RunEngine integration — **OUT-OF-SCOPE**
+
+**Status (OUT-OF-SCOPE):** bsrs has no Python bindings by design.
 
 **bsrs-py:** `lib.rs:120–138` — `run()` is blocking (releases GIL via `allow_threads`).
 
@@ -616,7 +786,9 @@ objects and executing them via the existing bsrs device dispatch. This requires 
 
 ---
 
-#### PY-08 — No RemoteDispatcher / pub-sub document stream
+#### PY-08 — No RemoteDispatcher / pub-sub document stream — **OUT-OF-SCOPE**
+
+**Status (OUT-OF-SCOPE):** bsrs has no Python bindings by design.
 
 **bsrs-py:** no pub-sub mechanism.
 
@@ -634,37 +806,41 @@ the bsrs document PUB socket and calls `subscribe(cb)` callbacks on received doc
 
 | ID | Title | Priority | Effort |
 |----|-------|----------|--------|
-| QS-01 | Wire envelope: plain `{method,params}` vs JSON-RPC 2.0 | P0 | M |
-| QS-02 | `ping` must return status dict | P0 | S |
-| QS-03 | `plans_allowed`/`devices_allowed` must return rich dict, not name list | P0 | L |
-| QS-04 | `queue_item_add` response must include full `item`, not bare `item_uid` | P0 | S |
-| QS-05 | `queue_item_add_batch` key `items_added` → `items` + add `results` | P0 | S |
-| QS-06 | `re_metadata` response key `metadata` → `re_metadata` | P0 | S |
-| QS-07 | `manager_state` missing transitional states | P0 | M |
-| QS-08 | `pause_pending` missing from status | P1 | S |
-| QS-09 | Positional insertion (`pos`, `before_uid`, `after_uid`) in `queue_item_add` | P1 | M |
-| QS-10 | `function_execute` not implemented | P1 | M |
-| QS-11 | `instruction` item_type not supported | P1 | M |
-| QS-12 | Msgpack encoding not supported | P1 | M |
-| QS-13 | `manager_stop` returns NOT_IMPLEMENTED | P1 | S |
-| QS-14 | `plans_allowed` ignores `user_group` param | P1 | S/M |
-| QS-15 | Queue items missing `user`/`user_group` attribution | P1 | S |
-| QS-16 | `status_uid` missing from status | P2 | S |
-| QS-17 | `time` missing from status | P2 | S |
-| QS-18 | `worker_background_tasks` missing from status | P2 | S |
-| QS-19 | `config_get` response shape mismatch | P2 | S |
-| QS-20 | `queue_item_move*` missing `before_uid`/`after_uid` | P2 | S |
-| QS-21 | `queue_item_update` missing `replace` param | P2 | S |
-| QS-22 | `re_runs` `option` ignored; `is_open` always false | P2 | S |
-| QS-23 | ZMQ CURVE encryption not supported | P2 | M |
-| QS-24 | `environment_destroy` is alias for `environment_close` | P2 | S |
-| PY-01 | No document subscription callback | P0 | M |
-| PY-02 | No EPICS-backed device bindings | P1 | L |
-| PY-03 | Device protocol methods not callable from Python | P1 | S |
-| PY-04 | Minimal plan set (missing grid_scan, rel_scan, mv, etc.) | P1 | M |
-| PY-05 | No user-defined Python plan execution (generator plans) | P1 | L |
-| PY-06 | RunEngine metadata not accessible from Python | P2 | S |
-| PY-07 | No async RunEngine integration | P2 | M |
-| PY-08 | No RemoteDispatcher / pub-sub document stream | P2 | M |
+| ~~QS-01~~ | ~~Wire envelope: plain `{method,params}` vs JSON-RPC 2.0~~ **DONE** | P0 | M |
+| ~~QS-02~~ | ~~`ping` must return status dict~~ **DONE** | P0 | S |
+| QS-03 | `plans_allowed`/`devices_allowed` must return rich dict, not name list **PARTIAL** | P0 | L |
+| ~~QS-04~~ | ~~`queue_item_add` response must include full `item`, not bare `item_uid`~~ **DONE** | P0 | S |
+| ~~QS-05~~ | ~~`queue_item_add_batch` key `items_added` → `items` + add `results`~~ **DONE** | P0 | S |
+| ~~QS-06~~ | ~~`re_metadata` response key `metadata` → `re_metadata`~~ **DONE** | P0 | S |
+| ~~QS-07~~ | ~~`manager_state` missing transitional states~~ **DONE** | P0 | M |
+| ~~QS-08~~ | ~~`pause_pending` missing from status~~ **DONE** | P1 | S |
+| QS-09 | Positional insertion (`pos`, `before_uid`, `after_uid`) in `queue_item_add` **PARTIAL** | P1 | M |
+| ~~QS-10~~ | ~~`function_execute` not implemented~~ **DONE** | P1 | M |
+| ~~QS-11~~ | ~~`instruction` item_type not supported~~ **DONE** | P1 | M |
+| ~~QS-12~~ | ~~Msgpack encoding not supported~~ **DONE** | P1 | M |
+| ~~QS-13~~ | ~~`manager_stop` returns NOT_IMPLEMENTED~~ **DONE** | P1 | S |
+| QS-14 | `plans_allowed` ignores `user_group` param **PARTIAL** | P1 | S/M |
+| ~~QS-15~~ | ~~Queue items missing `user`/`user_group` attribution~~ **DONE** | P1 | S |
+| ~~QS-16~~ | ~~`status_uid` missing from status~~ **DONE** | P2 | S |
+| ~~QS-17~~ | ~~`time` missing from status~~ **DONE** | P2 | S |
+| ~~QS-18~~ | ~~`worker_background_tasks` missing from status~~ **DONE** | P2 | S |
+| ~~QS-19~~ | ~~`config_get` response shape mismatch~~ **DONE** | P2 | S |
+| QS-20 | `queue_item_move*` missing `before_uid`/`after_uid` **PARTIAL** | P2 | S |
+| ~~QS-21~~ | ~~`queue_item_update` missing `replace` param~~ **DONE** | P2 | S |
+| ~~QS-22~~ | ~~`re_runs` `option` ignored; `is_open` always false~~ **DONE** | P2 | S |
+| ~~QS-23~~ | ~~ZMQ CURVE encryption not supported~~ **DONE** | P2 | M |
+| ~~QS-24~~ | ~~`environment_destroy` is alias for `environment_close`~~ **DONE** | P2 | S |
+| PY-01 | No document subscription callback **OUT-OF-SCOPE** | P0 | M |
+| PY-02 | No EPICS-backed device bindings **OUT-OF-SCOPE** | P1 | L |
+| PY-03 | Device protocol methods not callable from Python **OUT-OF-SCOPE** | P1 | S |
+| PY-04 | Minimal plan set (missing grid_scan, rel_scan, mv, etc.) **OUT-OF-SCOPE** | P1 | M |
+| PY-05 | No user-defined Python plan execution (generator plans) **OUT-OF-SCOPE** | P1 | L |
+| PY-06 | RunEngine metadata not accessible from Python **OUT-OF-SCOPE** | P2 | S |
+| PY-07 | No async RunEngine integration **OUT-OF-SCOPE** | P2 | M |
+| PY-08 | No RemoteDispatcher / pub-sub document stream **OUT-OF-SCOPE** | P2 | M |
 
-**Counts:** P0: 8, P1: 10, P2: 12 (total: 30)
+**Counts (original):** P0: 8, P1: 10, P2: 12 (total: 30)
+
+**Counts (reconciled 2026-07-05):** QS-*: 20 DONE, 4 PARTIAL (QS-03, QS-09, QS-14, QS-20),
+0 OPEN (of 24). PY-*: 8 OUT-OF-SCOPE (of 8). Total 30: 20 DONE, 4 PARTIAL, 0 OPEN,
+8 OUT-OF-SCOPE (using project scope rule — bsrs has no Python bindings by design).

@@ -16,11 +16,47 @@
 
 Where bsrs already matches the reference, a one-line note appears under each heading.
 
+### Reconciliation (2026-07-05)
+
+Reconciled against `crates/bsrs/src/` (single consolidated crate; the original
+`bsrs-callbacks`/`bsrs-event-model`/`bsrs-stream` crate paths now live under
+`callbacks/`, `event_model/`, `stream/`). Of the 21 items: **14 DONE,
+1 PARTIAL, 5 OPEN, 1 OUT-OF-SCOPE.**
+
+| ID | Status | Evidence / anchor |
+|---|---|---|
+| ~~CBEM-01~~ | ~~Kafka/JSONL serialize the tagged `Document` wrapper~~ **DONE** | `callbacks/doc_encode.rs:21-48`, `kafka_sink.rs:93-103`; JSONL tagged is intentional |
+| ~~CBEM-02~~ | ~~`EventPage.uid` is `String`~~ **DONE** | `event_model/documents.rs:448` (`Vec<String>`) |
+| ~~CBEM-03~~ | ~~`Resource.path_semantics` required~~ **DONE** | `event_model/documents.rs:481-482` (`Option<String>`) |
+| CBEM-04 | No `DocumentRouter` | OPEN — no `DocumentRouter` type in `callbacks/` |
+| CBEM-05 | No `RunRouter` | OPEN — no `RunRouter` type |
+| ~~CBEM-06~~ | ~~No `pack_event_page` / datum equivalents~~ **DONE** | `event_model/page.rs:25,66,103,128` (+merge/rechunk) |
+| ~~CBEM-07~~ | ~~`RunBundle` missing `compose_resource`/`compose_datum`~~ **DONE** | `event_model/compose.rs:360,401-435` |
+| CBEM-08 | `RunStart` missing optional fields incl. `projections` **PARTIAL** | six fields done `event_model/documents.rs:78-98`; typed Projections union not modeled `:44-58` |
+| ~~CBEM-09~~ | ~~`EventPage` missing `filled`~~ **DONE** | `event_model/documents.rs:462-463` |
+| ~~CBEM-10~~ | ~~`DataKey` missing `choices`~~ **DONE** | `event_model/documents.rs:300-301` |
+| ~~CBEM-11~~ | ~~`Limits` missing `rds`~~ **DONE** | `event_model/documents.rs:206-212,233-234` |
+| CBEM-12 | `TiledSink` drops all non-Start/Stop | OPEN — `callbacks/tiled_sink.rs:149-157` still drops them |
+| ~~CBEM-13~~ | ~~`StreamDatum.descriptor` always empty~~ **DONE** | `stream/sinks/hdf5.rs:232,262`, `binary.rs:140,164`, `engine/run_engine.rs:1372-1376` |
+| ~~CBEM-14~~ | ~~`Event.filled` `bool`-only~~ **DONE** | `event_model/documents.rs:440-441` (`HashMap<String, Value>`) |
+| CBEM-15 | No `Filler` | OPEN — no `Filler`/`fill_event`/`handler_registry` |
+| ~~CBEM-16~~ | ~~`RunStop.exit_status` untyped~~ **DONE** | `event_model/documents.rs:108-118,160` (`ExitStatus` enum) |
+| ~~CBEM-17~~ | ~~`dtype_numpy` no structured dtypes~~ **DONE** | `event_model/documents.rs:246-253,279` |
+| ~~CBEM-18~~ | ~~`Hints.dimensions` no mixed inner type~~ **DONE** | `event_model/documents.rs:18-25,33-34` |
+| CBEM-19 | No ZMQ `Proxy` (forwarder) | OPEN — only connect-to-Python-proxy `callbacks/zmq_sink.rs:75` |
+| CBEM-20 | No `BestEffortCallback` / `LiveTable` **OUT-OF-SCOPE** | Python-side live callback; bsrs emits the documents it consumes |
+| ~~CBEM-21~~ | ~~stale descriptor UID on re-compose~~ **DONE** | `event_model/compose.rs:89-119,142-174` |
+
+**Genuinely-open in-scope items:** CBEM-04 (P1), CBEM-05 (P1), CBEM-12 (P1),
+CBEM-15 (P2), CBEM-19 (P2).
+
 ---
 
 ## P0 — Correctness / Protocol Divergence
 
-### CBEM-01 — KafkaDocumentSink and JsonlSink serialize the tagged `Document` enum wrapper, not the raw document dict
+### CBEM-01 — KafkaDocumentSink and JsonlSink serialize the tagged `Document` enum wrapper, not the raw document dict — **DONE**
+
+**Resolution:** A shared owner `callbacks/doc_encode.rs:21-48` (`encode_inner!` macro + `encode_inner_json`/`encode_inner_msgpack`) now does the per-variant match over `Document`, and `KafkaDocumentSink::encode_body` routes through it (`callbacks/kafka_sink.rs:93-103`) so the Kafka value is the raw document dict, not the `{"name":…,"doc":…}` wrapper (test `encode_body_json_round_trips` asserts no `name`/`doc` keys). The JSONL half is **not** a bug: `JsonlSink::dispatch` deliberately keeps the tagged wrapper (`callbacks/basic.rs:32-40`) because a `.jsonl` line has no out-of-band channel for the document kind, matching bluesky's `JSONLinesWriter` (`callbacks/json_writer.py:62`); the out-of-band sinks (ZMQ/Kafka) are the ones that must ship the raw inner dict.
 
 **bsrs:** `crates/bsrs-callbacks/src/kafka_sink.rs:93–97`, `crates/bsrs-callbacks/src/basic.rs:33`
 **ref:** `daq/bluesky/src/bluesky/callbacks/zmq.py:120` (`self._serializer(doc)` where `doc` is the raw Python dict); NSLS-II bluesky-kafka envelope uses the raw dict as body.
@@ -44,7 +80,9 @@ The **ZMQ sink** is correct: it per-arm matches `rmp_serde::to_vec_named(d)` on 
 
 ---
 
-### CBEM-02 — `EventPage.uid` is `String`; schema requires `Vec<String>`
+### CBEM-02 — `EventPage.uid` is `String`; schema requires `Vec<String>` — **DONE**
+
+**Resolution:** `EventPage.uid` is now `Vec<String>` (`event_model/documents.rs:448`), one UID per row, and `RunBundle::event_page` / `pack_event_page` build the per-row UID list (`event_model/compose.rs:216`, `event_model/page.rs:34,41`).
 
 **bsrs:** `crates/bsrs-event-model/src/documents.rs:229`
 **ref:** `daq/event-model/src/event_model/documents/event_page.py:44` (`uid: list[str]`); `daq/event-model/src/event_model/__init__.py:2655` (`uid_list` in `pack_event_page`).
@@ -55,7 +93,9 @@ The **ZMQ sink** is correct: it per-arm matches `rmp_serde::to_vec_named(d)` on 
 
 ---
 
-### CBEM-03 — `Resource.path_semantics` is required in bsrs; Python schema marks it `NotRequired`
+### CBEM-03 — `Resource.path_semantics` is required in bsrs; Python schema marks it `NotRequired` — **DONE**
+
+**Resolution:** `Resource.path_semantics` is now `Option<String>` with `#[serde(skip_serializing_if = "Option::is_none", default)]` (`event_model/documents.rs:481-482`), so a Python Resource that omits the field deserializes cleanly.
 
 **bsrs:** `crates/bsrs-event-model/src/documents.rs:257`
 **ref:** `daq/event-model/src/event_model/documents/resource.py:41` (`path_semantics: NotRequired[Literal["posix","windows"]]`).
@@ -90,7 +130,9 @@ The **ZMQ sink** is correct: it per-arm matches `rmp_serde::to_vec_named(d)` on 
 
 ---
 
-### CBEM-06 — No `pack_event_page` / `unpack_event_page` / datum equivalents
+### CBEM-06 — No `pack_event_page` / `unpack_event_page` / datum equivalents — **DONE**
+
+**Resolution:** `event_model/page.rs` implements `pack_event_page`/`unpack_event_page` (`:25,66`) and `pack_datum_page`/`unpack_datum_page` (`:103,128`), plus the reference's `merge_*`/`rechunk_*` (`:153,226,258,294`); all are re-exported from `event_model/mod.rs:20-23`. Empty-pack is rejected with `EventModelError::EmptyPack` mirroring the reference `ValueError`.
 
 **bsrs:** absent.
 **ref:** `daq/event-model/src/event_model/__init__.py:2620–2751` (`pack_event_page`, `unpack_event_page`, `pack_datum_page`, `unpack_datum_page`).
@@ -104,7 +146,9 @@ The **ZMQ sink** is correct: it per-arm matches `rmp_serde::to_vec_named(d)` on 
 
 ---
 
-### CBEM-07 — `RunBundle` missing `compose_resource` / `compose_datum` / `compose_datum_page`
+### CBEM-07 — `RunBundle` missing `compose_resource` / `compose_datum` / `compose_datum_page` — **DONE**
+
+**Resolution:** `RunBundle::resource(spec, root, resource_path, path_semantics, resource_kwargs)` (`event_model/compose.rs:360`) back-fills `run_start`, defaults `path_semantics` to `posix`, and returns a `ResourceComposer` (`:401-435`) whose `datum(datum_kwargs)` / `datum_page(cols, n)` mint `datum_id`s of the form `<resource_uid>/<counter>`. The stream side (`stream_resource` + `StreamResourceComposer::stream_datum`, `:334,442`) mirrors this for `StreamResource`/`StreamDatum`.
 
 **bsrs:** `crates/bsrs-event-model/src/compose.rs` — no Resource/Datum compose methods.
 **ref:** `daq/event-model/src/event_model/__init__.py:2554–2617` (`ComposeRunBundle` has `compose_resource`, which returns a `ComposeResourceBundle` with `compose_datum` and `compose_datum_page`).
@@ -115,7 +159,9 @@ The **ZMQ sink** is correct: it per-arm matches `rmp_serde::to_vec_named(d)` on 
 
 ---
 
-### CBEM-08 — `RunStart` missing commonly-used optional fields: `data_session`, `data_groups`, `group`, `owner`, `project`, `projections`
+### CBEM-08 — `RunStart` missing commonly-used optional fields: `data_session`, `data_groups`, `group`, `owner`, `project`, `projections` — **PARTIAL**
+
+**Status (PARTIAL):** All six named metadata fields are now typed on `RunStart`, each skip-if-empty: `data_groups: Vec<String>`, `data_session: String`, `group: String`, `owner: String`, `project: String`, `projections: Vec<Projections>` (`event_model/documents.rs:78-98`; round-trip test `run_start_data_management_fields_round_trip`). **Missing:** the `Projections` struct (`:44-58`) keeps each per-field `projection` entry as free-form `serde_json::Value`; the typed four-variant union (`LinkedEventProjection` / `StaticProjection` / `CalculatedEventProjection`, discriminated by `location`+`type`) is deliberately *not* modeled, so callers still cannot build a projection through typed structs — only pass-through raw `Value`.
 
 **bsrs:** `crates/bsrs-event-model/src/documents.rs:19–36`
 **ref:** `daq/event-model/src/event_model/documents/run_start.py:127–164` (`data_groups`, `data_session`, `group`, `owner`, `project`, `projections`).
@@ -126,7 +172,9 @@ The **ZMQ sink** is correct: it per-arm matches `rmp_serde::to_vec_named(d)` on 
 
 ---
 
-### CBEM-09 — `EventPage` missing `filled` column-store field
+### CBEM-09 — `EventPage` missing `filled` column-store field — **DONE**
+
+**Resolution:** `EventPage.filled: HashMap<String, Vec<Value>>` with `#[serde(skip_serializing_if = "HashMap::is_empty", default)]` (`event_model/documents.rs:462-463`), each entry a per-row `bool | str` column; `pack_event_page`/`unpack_event_page` transpose it (`event_model/page.rs:39,50,79`).
 
 **bsrs:** `crates/bsrs-event-model/src/documents.rs:227–241`
 **ref:** `daq/event-model/src/event_model/documents/event_page.py:17` (`filled: NotRequired[dict[str, list[bool | str]]]`).
@@ -137,7 +185,9 @@ The **ZMQ sink** is correct: it per-arm matches `rmp_serde::to_vec_named(d)` on 
 
 ---
 
-### CBEM-10 — `DataKey` missing `choices` field for enum/mbbo records
+### CBEM-10 — `DataKey` missing `choices` field for enum/mbbo records — **DONE**
+
+**Resolution:** `DataKey.choices: Option<Vec<String>>` with `skip_serializing_if = "Option::is_none"` (`event_model/documents.rs:300-301`); it is a first-class slot in `SignalMetadata` and `make_datakey` (`:317,350`) so every backend lands enum choices in the same field.
 
 **bsrs:** `crates/bsrs-event-model/src/documents.rs:107–136`
 **ref:** `daq/event-model/src/event_model/documents/event_descriptor.py:108` (`choices: NotRequired[list[str]]`).
@@ -148,7 +198,9 @@ The **ZMQ sink** is correct: it per-arm matches `rmp_serde::to_vec_named(d)` on 
 
 ---
 
-### CBEM-11 — `Limits` missing `rds` field (Tango RDS parameters)
+### CBEM-11 — `Limits` missing `rds` field (Tango RDS parameters) — **DONE**
+
+**Resolution:** `RdsRange { time_difference: f64, value_difference: f64 }` (`event_model/documents.rs:206-212`) and `Limits.rds: Option<RdsRange>` with `skip_serializing_if = "Option::is_none"` (`:233-234`); `RdsRange` is re-exported from `event_model/mod.rs:17`.
 
 **bsrs:** `crates/bsrs-event-model/src/documents.rs:87–104`
 **ref:** `daq/event-model/src/event_model/documents/event_descriptor.py:52–99` (`rds: NotRequired[RdsRange | None]` with `time_difference`, `value_difference`).
@@ -170,7 +222,9 @@ The **ZMQ sink** is correct: it per-arm matches `rmp_serde::to_vec_named(d)` on 
 
 ---
 
-### CBEM-13 — `StreamDatum.descriptor` is always empty string in `Hdf5FrameSink` and `BinaryFrameSink`
+### CBEM-13 — `StreamDatum.descriptor` is always empty string in `Hdf5FrameSink` and `BinaryFrameSink` — **DONE**
+
+**Resolution:** The `DetectorWriter::collect_stream_docs` signature now takes `descriptor: &str` (`protocols_async/mod.rs:380`), and both sinks stamp `descriptor: descriptor.to_string()` on each `StreamDatum` (`stream/sinks/hdf5.rs:232,262`, `stream/sinks/binary.rs:140,164`). The RunEngine drains through `collect_stream_docs_dyn(&descriptor_uid)` with the bundler's real descriptor UID (`engine/run_engine.rs:1372-1376`); `seq_nums` are engine-owned and filled from the run's counter at the drain (`:641`, `pack_external_asset` cross-check `:611-641`), so writers correctly emit `seq_nums {0,0}`.
 
 **bsrs:** `crates/bsrs-stream/src/sinks/hdf5.rs:263`, `crates/bsrs-stream/src/sinks/binary.rs:164`
 **ref:** `daq/event-model/src/event_model/documents/stream_datum.py:11` (`descriptor: str` — UID of the EventDescriptor).
@@ -181,7 +235,9 @@ The **ZMQ sink** is correct: it per-arm matches `rmp_serde::to_vec_named(d)` on 
 
 ---
 
-### CBEM-14 — `Event.filled` restricted to `bool`; Python allows `bool | str`
+### CBEM-14 — `Event.filled` restricted to `bool`; Python allows `bool | str` — **DONE**
+
+**Resolution:** `Event.filled: HashMap<String, Value>` with `skip_serializing_if = "HashMap::is_empty"` (`event_model/documents.rs:440-441`), representing both the pre-fill `false` and the post-fill foreign-key `str`, matching the schema's `bool | str` union.
 
 **bsrs:** `crates/bsrs-event-model/src/documents.rs:221–224`
 **ref:** `daq/event-model/src/event_model/documents/event.py:18` (`filled: NotRequired[dict[str, bool | str]]`).
@@ -205,7 +261,9 @@ The **ZMQ sink** is correct: it per-arm matches `rmp_serde::to_vec_named(d)` on 
 
 ---
 
-### CBEM-16 — `RunStop.exit_status` is untyped `String`; should be an enum
+### CBEM-16 — `RunStop.exit_status` is untyped `String`; should be an enum — **DONE**
+
+**Resolution:** `ExitStatus { Success, Abort, Fail }` with `#[serde(rename_all = "snake_case")]` (`event_model/documents.rs:108-118`), and `RunStop.exit_status` is that enum (`:160`); `FromStr`/`Display`/`as_str` are provided (`:120-148`) and round-trip is tested (`exit_status_serde_round_trip`).
 
 **bsrs:** `crates/bsrs-event-model/src/documents.rs:50`
 **ref:** `daq/event-model/src/event_model/documents/run_stop.py:24` (`exit_status: Literal["success", "abort", "fail"]`).
@@ -216,7 +274,9 @@ The **ZMQ sink** is correct: it per-arm matches `rmp_serde::to_vec_named(d)` on 
 
 ---
 
-### CBEM-17 — `DataKey.dtype_numpy` cannot represent structured numpy dtypes
+### CBEM-17 — `DataKey.dtype_numpy` cannot represent structured numpy dtypes — **DONE**
+
+**Resolution:** `#[serde(untagged)] enum DtypeNumpy { Scalar(String), Structured(Vec<(String, String)>) }` (`event_model/documents.rs:246-253`) with `DataKey.dtype_numpy: Option<DtypeNumpy>` (`:279`); the untagged union tries the scalar string then the array-of-pairs, matching the schema `anyOf` (test `dtype_numpy_serde_round_trip_scalar_and_structured`).
 
 **bsrs:** `crates/bsrs-event-model/src/documents.rs:117`
 **ref:** `daq/event-model/src/event_model/documents/event_descriptor.py:119` (`dtype_numpy: NotRequired[DtypeNumpy | list[DtypeNumpyItem]]` where `DtypeNumpyItem = tuple[str, str]`).
@@ -227,7 +287,9 @@ The **ZMQ sink** is correct: it per-arm matches `rmp_serde::to_vec_named(d)` on 
 
 ---
 
-### CBEM-18 — `Hints.dimensions` cannot represent mixed `str | list[str]` inner type
+### CBEM-18 — `Hints.dimensions` cannot represent mixed `str | list[str]` inner type — **DONE**
+
+**Resolution:** `#[serde(untagged)] enum DimensionItem { Name(String), Fields(Vec<String>) }` (`event_model/documents.rs:18-25`) with `Hints.dimensions: Option<Vec<Vec<DimensionItem>>>` (`:33-34`), so the canonical `[[["x"], "primary"]]` (a field-name list paired with a bare stream name) round-trips (test `hints_dimensions_round_trip_mixed_list_and_bare_name`).
 
 **bsrs:** `crates/bsrs-event-model/src/documents.rs:14`
 **ref:** `daq/event-model/src/event_model/documents/run_start.py:17` (`dimensions: NotRequired[list[list[list[str] | str]]]`).
@@ -249,7 +311,9 @@ The **ZMQ sink** is correct: it per-arm matches `rmp_serde::to_vec_named(d)` on 
 
 ---
 
-### CBEM-20 — No `BestEffortCallback` / `LiveTable` equivalent in Rust
+### CBEM-20 — No `BestEffortCallback` / `LiveTable` equivalent in Rust — **OUT-OF-SCOPE**
+
+**Status (OUT-OF-SCOPE):** BEC / LiveTable / LiveFit / LivePlot / PeakStats are Python-side live callback *consumers* that render the document stream; bsrs has no Python bindings by design and owns only document *emission*. bsrs emits the documents these classes consume and relays them via `ZmqDocumentSink` → `RemoteDispatcher` → `BestEffortCallback` (`callbacks/zmq_sink.rs:9-17`).
 
 **bsrs:** absent.
 **ref:** `daq/bluesky/src/bluesky/callbacks/best_effort.py`, `daq/bluesky/src/bluesky/callbacks/core.py` (`LiveTable`, `CallbackBase`, `make_class_safe`).
@@ -260,7 +324,9 @@ The **ZMQ sink** is correct: it per-arm matches `rmp_serde::to_vec_named(d)` on 
 
 ---
 
-### CBEM-21 — `RunBundle::descriptor` silently returns stale UID on re-compose for existing stream
+### CBEM-21 — `RunBundle::descriptor` silently returns stale UID on re-compose for existing stream — **DONE**
+
+**Resolution:** `RunBundle::descriptor` no longer mints a fresh UID on re-compose: the first call caches the descriptor and every later call returns the *same* cached descriptor with `is_new == false` (`event_model/compose.rs:89-119`), so the UID `event()`/`descriptor_uid_for()`/`stop()` stamp always matches the emitted descriptor (first-definition-wins on `data_keys`; a different schema requires a different stream name). The only sanctioned live mutation is a configuration change, via `compose_redescribe` (build + broadcast) followed by `install_descriptor` (`:142-174`), which keeps the stream's `seq_num` — tests `first_compose_is_new_recompose_returns_cached_uid`, `recompose_keeps_original_schema_and_seq_num`, `compose_redescribe_leaves_current_generation_until_install`.
 
 **bsrs:** `crates/bsrs-event-model/src/compose.rs:83–90`
 **ref:** `daq/event-model/src/event_model/__init__.py` (Python compose raises `InvalidData` / `MismatchedDataKeys` on key mismatch).
