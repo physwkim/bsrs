@@ -2881,3 +2881,31 @@ async fn run_async_rejects_concurrent_plan_and_releases_after() {
     // The claim was released — a fresh run now succeeds.
     re.run_async(one_count_plan()).await.unwrap();
 }
+
+/// The plan↔engine response channel: a plan yields a `Respond(Wait)` item and
+/// receives the engine's `MsgResult` back inline. On an empty group the Wait
+/// completes immediately, so the plan must observe `WaitComplete { done: true }`.
+/// This is the primitive `collect_while_completing` loops on.
+#[tokio::test]
+async fn respond_channel_delivers_wait_done_to_plan() {
+    let captured: Arc<StdMutex<Option<bool>>> = Arc::new(StdMutex::new(None));
+    let cap = captured.clone();
+    let plan = bsrs::core::plan::plan_items(async_stream::stream! {
+        let (item, rx) = bsrs::core::plan::respond(Msg::Wait {
+            group: "empty".into(),
+            error_on_timeout: false,
+            timeout: None,
+        });
+        yield item;
+        if let Ok(bsrs::engine::MsgResult::WaitComplete { done }) = rx.await {
+            *cap.lock().unwrap() = Some(done);
+        }
+    });
+    let re = RunEngine::new(vec![]);
+    re.run_async(plan).await.unwrap();
+    assert_eq!(
+        *captured.lock().unwrap(),
+        Some(true),
+        "Respond(Wait) on an empty group must deliver WaitComplete {{ done: true }} to the plan"
+    );
+}

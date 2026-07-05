@@ -10,7 +10,7 @@ use crate::core::msg::{
     MonitorableObj, MovableObj, Msg, PreparableObj, ReadableObj, RunMetadata, StageableObj,
     StoppableObj, TriggerableObj,
 };
-use crate::core::plan::{plan_box, Plan};
+use crate::core::plan::{plan_box, plan_items, Plan, PlanItem};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -602,7 +602,8 @@ pub mod stubs {
             );
             let mut guarded = guarded;
             while let Some(item) = futures::StreamExt::next(&mut guarded).await {
-                let crate::core::plan::PlanItem::Bare(m) = item;
+                // Internal Bare-only sub-plan: no `Respond` item to preserve.
+                let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
                 yield m;
             }
         })
@@ -624,7 +625,8 @@ pub mod stubs {
             yield Msg::Checkpoint;
             let mut inner = trigger_and_read(triggerables, readables, "primary");
             while let Some(item) = futures::StreamExt::next(&mut inner).await {
-                let crate::core::plan::PlanItem::Bare(m) = item;
+                // Internal Bare-only sub-plan: no `Respond` item to preserve.
+                let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
                 yield m;
             }
         })
@@ -636,12 +638,14 @@ pub mod stubs {
     where
         F: FnMut() -> Plan + Send + 'static,
     {
-        plan_box(async_stream::stream! {
+        plan_items(async_stream::stream! {
             for _ in 0..n {
                 let mut p = plan_fn();
                 while let Some(item) = futures::StreamExt::next(&mut p).await {
-                    let crate::core::plan::PlanItem::Bare(m) = item;
-                    yield m;
+                    // User-supplied plan: preserve whole items so a `Respond`
+                    // (e.g. `repeater(n, || collect_while_completing(...))`) keeps
+                    // its response channel across repetitions.
+                    yield item;
                 }
             }
         })
@@ -666,7 +670,7 @@ pub mod stubs {
     where
         F: FnMut() -> Plan + Send + 'static,
     {
-        plan_box(async_stream::stream! {
+        plan_items(async_stream::stream! {
             let mut i: usize = 0;
             loop {
                 if let Some(n) = num {
@@ -679,16 +683,17 @@ pub mod stubs {
                 // includes the engine's processing of this iteration's messages
                 // (matching bluesky's `now = time.time()` span).
                 let start = std::time::Instant::now();
-                yield Msg::Checkpoint;
+                yield PlanItem::from(Msg::Checkpoint);
                 let mut p = plan_fn();
                 while let Some(item) = futures::StreamExt::next(&mut p).await {
-                    let crate::core::plan::PlanItem::Bare(m) = item;
-                    yield m;
+                    // User-supplied plan: preserve whole items so a `Respond`
+                    // survives repetition (see `repeater`).
+                    yield item;
                 }
                 if !delay.is_zero() {
                     let elapsed = start.elapsed();
                     if delay > elapsed {
-                        yield Msg::Sleep(delay - elapsed);
+                        yield PlanItem::from(Msg::Sleep(delay - elapsed));
                     }
                 }
                 i += 1;
@@ -727,7 +732,8 @@ pub mod stubs {
         plan_box(async_stream::stream! {
             let mut mv = move_per_step(motors.clone());
             while let Some(item) = futures::StreamExt::next(&mut mv).await {
-                let crate::core::plan::PlanItem::Bare(m) = item;
+                // Internal Bare-only sub-plan: no `Respond` item to preserve.
+                let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
                 yield m;
             }
             yield Msg::Create { stream_name: "primary".into() };
@@ -907,7 +913,8 @@ pub fn count_ext(
             let start = std::time::Instant::now();
             let mut shot = per_shot(detectors.clone());
             while let Some(item) = futures::StreamExt::next(&mut shot).await {
-                let crate::core::plan::PlanItem::Bare(m) = item;
+                // Internal Bare-only sub-plan: no `Respond` item to preserve.
+                let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
                 yield m;
             }
             // Next inter-shot delay. `None` from a Sequence means it is exhausted
@@ -1058,7 +1065,8 @@ pub fn scan_1d_per_step(
             let motors: Vec<StepMotor> = vec![(motor.clone(), motor_reader.clone(), Some(pos))];
             let mut sub = per_step(detectors.clone(), motors);
             while let Some(item) = futures::StreamExt::next(&mut sub).await {
-                let crate::core::plan::PlanItem::Bare(m) = item;
+                // Internal Bare-only sub-plan: no `Respond` item to preserve.
+                let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
                 yield m;
             }
         }
@@ -1107,7 +1115,8 @@ pub fn list_scan_per_step(
             let motors: Vec<StepMotor> = vec![(motor.clone(), motor_reader.clone(), Some(pos))];
             let mut sub = per_step(detectors.clone(), motors);
             while let Some(item) = futures::StreamExt::next(&mut sub).await {
-                let crate::core::plan::PlanItem::Bare(m) = item;
+                // Internal Bare-only sub-plan: no `Respond` item to preserve.
+                let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
                 yield m;
             }
         }
@@ -1148,7 +1157,8 @@ pub fn rel_scan(
     plan_box(async_stream::stream! {
         let mut inner = inner;
         while let Some(item) = futures::StreamExt::next(&mut inner).await {
-            let crate::core::plan::PlanItem::Bare(m) = item;
+            // Internal Bare-only sub-plan: no `Respond` item to preserve.
+            let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
             yield m;
         }
         // `current` is the readback the caller snapshotted before the scan;
@@ -1367,7 +1377,8 @@ fn inner_product_core(
                 .collect();
             let mut sub = per_step(detectors.clone(), motors);
             while let Some(item) = futures::StreamExt::next(&mut sub).await {
-                let crate::core::plan::PlanItem::Bare(m) = item;
+                // Internal Bare-only sub-plan: no `Respond` item to preserve.
+                let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
                 yield m;
             }
         }
@@ -1500,7 +1511,8 @@ fn scan_nd_with_md(
                 .collect();
             let mut sub = per_step(detectors.clone(), step_motors);
             while let Some(item) = futures::StreamExt::next(&mut sub).await {
-                let crate::core::plan::PlanItem::Bare(m) = item;
+                // Internal Bare-only sub-plan: no `Respond` item to preserve.
+                let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
                 yield m;
             }
         }
@@ -1598,7 +1610,8 @@ pub fn rel_list_grid_scan(
         }
         let mut inner = list_grid_scan(detectors, abs_axes);
         while let Some(item) = futures::StreamExt::next(&mut inner).await {
-            let crate::core::plan::PlanItem::Bare(m) = item;
+            // Internal Bare-only sub-plan: no `Respond` item to preserve.
+            let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
             yield m;
         }
     });
@@ -1739,14 +1752,16 @@ pub fn ramp_plan(
         if take_pre_data {
             let mut pre = inner();
             while let Some(item) = pre.next().await {
-                let crate::core::plan::PlanItem::Bare(m) = item;
+                // Internal Bare-only sub-plan: no `Respond` item to preserve.
+                let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
                 yield m;
             }
         }
         // Start the ramp (go_plan issues its Set(s) without waiting).
         let mut go = go_plan;
         while let Some(item) = go.next().await {
-            let crate::core::plan::PlanItem::Bare(m) = item;
+            // Internal Bare-only sub-plan: no `Respond` item to preserve.
+            let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
             yield m;
         }
         // Sample until the ramp lands (bluesky `while not status.done`).
@@ -1758,7 +1773,8 @@ pub fn ramp_plan(
             let start = std::time::Instant::now();
             let mut p = inner();
             while let Some(item) = p.next().await {
-                let crate::core::plan::PlanItem::Bare(m) = item;
+                // Internal Bare-only sub-plan: no `Respond` item to preserve.
+                let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
                 yield m;
             }
             if let Some(ft) = fail_time {
@@ -1784,7 +1800,8 @@ pub fn ramp_plan(
         // Post-sample, after completion.
         let mut post = inner();
         while let Some(item) = post.next().await {
-            let crate::core::plan::PlanItem::Bare(m) = item;
+            // Internal Bare-only sub-plan: no `Respond` item to preserve.
+            let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
             yield m;
         }
         yield Msg::CloseRun { exit_status: "success".into(), reason: None };
@@ -1810,7 +1827,8 @@ pub fn rel_list_scan(
         let mv: Arc<dyn MovableObj> = motor;
         let mut inner = list_scan(detectors, mv, motor_reader, abs_points);
         while let Some(item) = futures::StreamExt::next(&mut inner).await {
-            let crate::core::plan::PlanItem::Bare(m) = item;
+            // Internal Bare-only sub-plan: no `Respond` item to preserve.
+            let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
             yield m;
         }
     });
@@ -1849,7 +1867,8 @@ pub fn rel_grid_scan(
             s2 + b2, e2 + b2, n2,
         );
         while let Some(item) = futures::StreamExt::next(&mut inner).await {
-            let crate::core::plan::PlanItem::Bare(m) = item;
+            // Internal Bare-only sub-plan: no `Respond` item to preserve.
+            let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
             yield m;
         }
     });
@@ -2066,12 +2085,14 @@ pub fn fly(flyers: Vec<Flyer>) -> Plan {
                 flyers.iter().map(|(f, _)| f.clone()).collect();
             let mut kick = stubs::kickoff_all(objs.clone(), Some("kick".into()), true);
             while let Some(item) = futures::StreamExt::next(&mut kick).await {
-                let crate::core::plan::PlanItem::Bare(m) = item;
+                // Internal Bare-only sub-plan: no `Respond` item to preserve.
+                let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
                 yield m;
             }
             let mut done = stubs::complete_all(objs, Some("complete".into()), true);
             while let Some(item) = futures::StreamExt::next(&mut done).await {
-                let crate::core::plan::PlanItem::Bare(m) = item;
+                // Internal Bare-only sub-plan: no `Respond` item to preserve.
+                let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
                 yield m;
             }
         }
@@ -2393,7 +2414,8 @@ pub fn rel_adaptive_scan(
         );
         use futures::StreamExt;
         while let Some(item) = inner.next().await {
-            let crate::core::plan::PlanItem::Bare(m) = item;
+            // Internal Bare-only sub-plan: no `Respond` item to preserve.
+            let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
             yield m;
         }
     });
@@ -2486,7 +2508,7 @@ mod tests {
     async fn drain(mut plan: Plan) -> Vec<Msg> {
         let mut out = Vec::new();
         while let Some(item) = plan.next().await {
-            let PlanItem::Bare(m) = item;
+            let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
             out.push(m);
         }
         out
@@ -3786,7 +3808,7 @@ mod tests {
         let mut got = Vec::new();
         for _ in 0..20 {
             match plan.next().await {
-                Some(PlanItem::Bare(m)) => got.push(m),
+                Some(PlanItem::Bare(m) | PlanItem::Respond(m, _)) => got.push(m),
                 None => break,
             }
         }

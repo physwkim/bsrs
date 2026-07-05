@@ -2287,6 +2287,7 @@ fn msg_result_to_lua(lua: &Lua, r: crate::engine::MsgResult) -> LuaValue {
             .create_string(&group)
             .map(LuaValue::String)
             .unwrap_or(LuaValue::Nil),
+        MsgResult::WaitComplete { done } => LuaValue::Boolean(done),
         MsgResult::CloseRun { exit_status } => lua
             .create_string(&exit_status)
             .map(LuaValue::String)

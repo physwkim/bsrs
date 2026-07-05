@@ -7,7 +7,7 @@ use crate::core::msg::{
     CollectableObj, FlyableObj, LocatableObj, MonitorableObj, Msg, ReadableObj, RunMetadata,
     StageableObj,
 };
-use crate::core::plan::{plan_box, Plan, PlanItem};
+use crate::core::plan::{plan_items, Plan, PlanItem};
 use futures::StreamExt;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 async fn drain(mut plan: Plan) -> Vec<Msg> {
     let mut out = Vec::new();
     while let Some(item) = plan.next().await {
-        let PlanItem::Bare(m) = item;
+        let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
         out.push(m);
     }
     out
@@ -34,18 +34,19 @@ pub fn plan_mutator<F>(inner: Plan, mut f: F) -> Plan
 where
     F: FnMut(&Msg) -> Option<Plan> + Send + 'static,
 {
-    plan_box(async_stream::stream! {
+    plan_items(async_stream::stream! {
         let mut inner = inner;
         while let Some(item) = inner.next().await {
-            let PlanItem::Bare(m) = item;
-            if let Some(repl) = f(&m) {
+            if let Some(repl) = f(item.msg()) {
+                // The replacement plan may itself carry `Respond` items; pass
+                // them through unchanged. The replaced item's own response
+                // channel (if any) is dropped — the replacement owns the flow.
                 let mut r = repl;
                 while let Some(it) = r.next().await {
-                    let PlanItem::Bare(rm) = it;
-                    yield rm;
+                    yield it;
                 }
             } else {
-                yield m;
+                yield item;
             }
         }
     })
@@ -57,11 +58,10 @@ pub fn msg_mutator<F>(inner: Plan, mut f: F) -> Plan
 where
     F: FnMut(Msg) -> Msg + Send + 'static,
 {
-    plan_box(async_stream::stream! {
+    plan_items(async_stream::stream! {
         let mut inner = inner;
         while let Some(item) = inner.next().await {
-            let PlanItem::Bare(m) = item;
-            yield f(m);
+            yield item.map_msg(&mut f);
         }
     })
 }
@@ -69,12 +69,11 @@ where
 /// `pchain(plans...)` — chain a sequence of plans, yielding each
 /// inner plan's messages in order.
 pub fn pchain(plans: Vec<Plan>) -> Plan {
-    plan_box(async_stream::stream! {
+    plan_items(async_stream::stream! {
         for plan in plans {
             let mut p = plan;
             while let Some(item) = p.next().await {
-                let PlanItem::Bare(m) = item;
-                yield m;
+                yield item;
             }
         }
     })
@@ -85,14 +84,13 @@ pub fn pchain(plans: Vec<Plan>) -> Plan {
 /// open/close (e.g. it was the body of a higher-level plan), this will
 /// emit nested run messages — caller's responsibility.
 pub fn run_wrapper(inner: Plan, md: RunMetadata) -> Plan {
-    plan_box(async_stream::stream! {
-        yield Msg::OpenRun(md);
+    plan_items(async_stream::stream! {
+        yield PlanItem::from(Msg::OpenRun(md));
         let mut inner = inner;
         while let Some(item) = inner.next().await {
-            let PlanItem::Bare(m) = item;
-            yield m;
+            yield item;
         }
-        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+        yield PlanItem::from(Msg::CloseRun { exit_status: "success".into(), reason: None });
     })
 }
 
@@ -114,14 +112,13 @@ pub fn inject_md_wrapper(inner: Plan, md_extra: HashMap<String, Value>) -> Plan 
 /// at the start and `Rewindable(prev)` at the end. The "previous" state
 /// is unknown to the wrapper so we restore to `true` (the default).
 pub fn rewindable_wrapper(inner: Plan, on: bool) -> Plan {
-    plan_box(async_stream::stream! {
-        yield Msg::Rewindable(on);
+    plan_items(async_stream::stream! {
+        yield PlanItem::from(Msg::Rewindable(on));
         let mut inner = inner;
         while let Some(item) = inner.next().await {
-            let PlanItem::Bare(m) = item;
-            yield m;
+            yield item;
         }
-        yield Msg::Rewindable(true);
+        yield PlanItem::from(Msg::Rewindable(true));
     })
 }
 
@@ -144,22 +141,21 @@ where
     FA: FnMut() -> Vec<Msg> + Send + 'static,
     FB: FnMut() -> Vec<Msg> + Send + 'static,
 {
-    plan_box(async_stream::stream! {
+    plan_items(async_stream::stream! {
         let mut inner = inner;
         while let Some(item) = inner.next().await {
-            let PlanItem::Bare(m) = item;
-            if matches!(m, Msg::OpenRun(_)) {
-                yield m;
+            if matches!(item.msg(), Msg::OpenRun(_)) {
+                yield item;
                 for msg in after_open() {
-                    yield msg;
+                    yield PlanItem::from(msg);
                 }
-            } else if matches!(m, Msg::CloseRun { .. }) {
+            } else if matches!(item.msg(), Msg::CloseRun { .. }) {
                 for msg in before_close() {
-                    yield msg;
+                    yield PlanItem::from(msg);
                 }
-                yield m;
+                yield item;
             } else {
-                yield m;
+                yield item;
             }
         }
     })
@@ -202,17 +198,16 @@ pub fn monitor_during_wrapper(inner: Plan, signals: Vec<Arc<dyn MonitorableObj>>
 /// `stage_wrapper(plan, devices)` — `Stage` each device before the inner
 /// plan, `Unstage` (LIFO) after. Same envelope contract as bluesky.
 pub fn stage_wrapper(inner: Plan, devices: Vec<Arc<dyn StageableObj>>) -> Plan {
-    plan_box(async_stream::stream! {
+    plan_items(async_stream::stream! {
         for d in &devices {
-            yield Msg::Stage(d.clone());
+            yield PlanItem::from(Msg::Stage(d.clone()));
         }
         let mut inner = inner;
         while let Some(item) = inner.next().await {
-            let PlanItem::Bare(m) = item;
-            yield m;
+            yield item;
         }
         for d in devices.into_iter().rev() {
-            yield Msg::Unstage(d);
+            yield PlanItem::from(Msg::Unstage(d));
         }
     })
 }
@@ -257,16 +252,14 @@ pub fn baseline_wrapper(
 /// catch panics or engine-side aborts on its own. The engine's own
 /// cleanup chain — unstage / stop_movables — runs separately.)
 pub fn finalize_wrapper(inner: Plan, final_plan: Plan) -> Plan {
-    plan_box(async_stream::stream! {
+    plan_items(async_stream::stream! {
         let mut inner = inner;
         while let Some(item) = inner.next().await {
-            let PlanItem::Bare(m) = item;
-            yield m;
+            yield item;
         }
         let mut fin = final_plan;
         while let Some(item) = fin.next().await {
-            let PlanItem::Bare(m) = item;
-            yield m;
+            yield item;
         }
     })
 }
@@ -296,7 +289,7 @@ where
 /// first moved, and a listed motor the plan never sets is never located. After
 /// the inner plan, no automatic restore; pair with `reset_positions_wrapper`.
 pub fn relative_set_wrapper(inner: Plan, motors: Vec<Arc<dyn LocatableObj>>) -> Plan {
-    plan_box(async_stream::stream! {
+    plan_items(async_stream::stream! {
         // Motors eligible for relative rewriting, indexed by name.
         let by_name: HashMap<String, Arc<dyn LocatableObj>> =
             motors.iter().map(|m| (m.name().to_string(), m.clone())).collect();
@@ -304,28 +297,38 @@ pub fn relative_set_wrapper(inner: Plan, motors: Vec<Arc<dyn LocatableObj>>) -> 
         let mut bases: HashMap<String, f64> = HashMap::new();
         let mut inner = inner;
         while let Some(item) = inner.next().await {
-            let PlanItem::Bare(m) = item;
-            let m = match m {
-                Msg::Set { obj, value, group } if by_name.contains_key(obj.name()) => {
-                    let bias = match bases.get(obj.name()) {
+            // Compute the bias for an eligible-motor `Set` (lazily locating on
+            // first touch); everything else — including any `Respond` item —
+            // passes through with its channel intact.
+            let bias = match item.msg() {
+                Msg::Set { obj, .. } if by_name.contains_key(obj.name()) => {
+                    let name = obj.name().to_string();
+                    let base = match bases.get(&name) {
                         Some(b) => *b,
                         None => {
-                            let base = by_name
-                                .get(obj.name())
+                            let b = by_name
+                                .get(&name)
                                 .expect("guard ensures the motor is eligible")
                                 .locate_dyn()
                                 .await
                                 .map(|loc| loc.setpoint)
                                 .unwrap_or(0.0);
-                            bases.insert(obj.name().to_string(), base);
-                            base
+                            bases.insert(name, b);
+                            b
                         }
                     };
-                    Msg::Set { obj, value: value + bias, group }
+                    Some(base)
                 }
-                other => other,
+                _ => None,
             };
-            yield m;
+            let item = match bias {
+                Some(base) => item.map_msg(|m| match m {
+                    Msg::Set { obj, value, group } => Msg::Set { obj, value: value + base, group },
+                    other => other,
+                }),
+                None => item,
+            };
+            yield item;
         }
     })
 }
@@ -336,14 +339,13 @@ pub fn relative_set_wrapper(inner: Plan, motors: Vec<Arc<dyn LocatableObj>>) -> 
 /// `print_summary_wrapper` in spirit (bsrs emits each line eagerly
 /// rather than first collecting the full plan).
 pub fn print_summary_wrapper(inner: Plan) -> Plan {
-    plan_box(async_stream::stream! {
+    plan_items(async_stream::stream! {
         let mut inner = inner;
         let mut idx = 0usize;
         while let Some(item) = inner.next().await {
-            let PlanItem::Bare(m) = item;
-            eprintln!("[plan {idx:04}] {m:?}");
+            eprintln!("[plan {idx:04}] {:?}", item.msg());
             idx += 1;
-            yield m;
+            yield item;
         }
     })
 }
@@ -355,15 +357,14 @@ pub fn suspend_wrapper(inner: Plan, suspender: Arc<dyn crate::core::Suspender>) 
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(1);
     let id = SEQ.fetch_add(1, Ordering::Relaxed);
-    plan_box(async_stream::stream! {
+    plan_items(async_stream::stream! {
         let any: Arc<dyn std::any::Any + Send + Sync> = Arc::new(suspender.clone());
-        yield Msg::InstallSuspender { id, suspender: any };
+        yield PlanItem::from(Msg::InstallSuspender { id, suspender: any });
         let mut inner = inner;
         while let Some(item) = inner.next().await {
-            let PlanItem::Bare(m) = item;
-            yield m;
+            yield item;
         }
-        yield Msg::RemoveSuspender { id };
+        yield PlanItem::from(Msg::RemoveSuspender { id });
     })
 }
 
@@ -464,9 +465,9 @@ pub fn contingency_wrapper(
     final_plan: Option<Plan>,
     auto_raise: bool,
 ) -> Plan {
-    plan_box(async_stream::stream! {
+    plan_items(async_stream::stream! {
         let sink: crate::core::msg::ContingencySink = Arc::new(Mutex::new(None));
-        yield Msg::PushContingency(sink.clone());
+        yield PlanItem::from(Msg::PushContingency(sink.clone()));
 
         // try: forward `inner`. A message error under this contingency is
         // written into `sink` by the engine (which keeps running); we detect it
@@ -474,8 +475,7 @@ pub fn contingency_wrapper(
         let mut errored: Option<String> = None;
         let mut inner = inner;
         while let Some(item) = inner.next().await {
-            let PlanItem::Bare(m) = item;
-            yield m;
+            yield item;
             if let Some(e) = sink.lock().unwrap().take() {
                 errored = Some(e);
                 break;
@@ -485,7 +485,7 @@ pub fn contingency_wrapper(
         // Leave our contingency region before running recovery, so an error in
         // the except/else/finally plans propagates outward (to an enclosing
         // contingency, or fails the run) rather than looping back into us.
-        yield Msg::PopContingency;
+        yield PlanItem::from(Msg::PopContingency);
 
         // except / else — mutually exclusive.
         let mut reraise: Option<String> = None;
@@ -494,8 +494,7 @@ pub fn contingency_wrapper(
                 Some(ep) => {
                     let mut ep = ep;
                     while let Some(item) = ep.next().await {
-                        let PlanItem::Bare(m) = item;
-                        yield m;
+                        yield item;
                     }
                     if auto_raise {
                         reraise = Some(reason);
@@ -507,8 +506,7 @@ pub fn contingency_wrapper(
                 if let Some(ep) = else_plan {
                     let mut ep = ep;
                     while let Some(item) = ep.next().await {
-                        let PlanItem::Bare(m) = item;
-                        yield m;
+                        yield item;
                     }
                 }
             }
@@ -518,13 +516,12 @@ pub fn contingency_wrapper(
         if let Some(fp) = final_plan {
             let mut fp = fp;
             while let Some(item) = fp.next().await {
-                let PlanItem::Bare(m) = item;
-                yield m;
+                yield item;
             }
         }
 
         if let Some(reason) = reraise {
-            yield Msg::Fail(reason);
+            yield PlanItem::from(Msg::Fail(reason));
         }
     })
 }
@@ -544,7 +541,7 @@ pub fn contingency_wrapper(
 /// so an engine-side abort skips the reset (unlike bluesky's `finalize_wrapper`
 /// composition). That gap is a property of the stream model, not this capture.
 pub fn reset_positions_wrapper(inner: Plan, motors: Vec<Arc<dyn LocatableObj>>) -> Plan {
-    plan_box(async_stream::stream! {
+    plan_items(async_stream::stream! {
         let by_name: HashMap<String, Arc<dyn LocatableObj>> =
             motors.iter().map(|m| (m.name().to_string(), m.clone())).collect();
         // Positions to restore, captured lazily at first `Set`, in first-moved
@@ -553,8 +550,7 @@ pub fn reset_positions_wrapper(inner: Plan, motors: Vec<Arc<dyn LocatableObj>>) 
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut inner = inner;
         while let Some(item) = inner.next().await {
-            let PlanItem::Bare(m) = item;
-            if let Msg::Set { obj, .. } = &m {
+            if let Msg::Set { obj, .. } = item.msg() {
                 if by_name.contains_key(obj.name()) && seen.insert(obj.name().to_string()) {
                     let motor = by_name
                         .get(obj.name())
@@ -567,12 +563,12 @@ pub fn reset_positions_wrapper(inner: Plan, motors: Vec<Arc<dyn LocatableObj>>) 
                     }
                 }
             }
-            yield m;
+            yield item;
         }
         for (mv_obj, val) in initial {
-            yield Msg::Set { obj: mv_obj, value: val, group: Some("reset".into()) };
+            yield PlanItem::from(Msg::Set { obj: mv_obj, value: val, group: Some("reset".into()) });
         }
-        yield Msg::Wait { group: "reset".into(), error_on_timeout: true, timeout: None };
+        yield PlanItem::from(Msg::Wait { group: "reset".into(), error_on_timeout: true, timeout: None });
     })
 }
 
@@ -591,20 +587,19 @@ pub fn configure_count_time_wrapper(
     time: f64,
     detectors: Vec<Arc<dyn crate::core::msg::ConfigurableObj>>,
 ) -> Plan {
-    plan_box(async_stream::stream! {
+    plan_items(async_stream::stream! {
         for d in &detectors {
             let mut values = HashMap::new();
             values.insert("count_time".to_string(), Value::from(time));
-            yield Msg::Configure {
+            yield PlanItem::from(Msg::Configure {
                 obj: d.clone(),
                 args: crate::core::msg::ConfigureArgs { values },
-            };
+            });
         }
         let mut inner = inner;
         use futures::StreamExt;
         while let Some(item) = inner.next().await {
-            let crate::core::plan::PlanItem::Bare(m) = item;
-            yield m;
+            yield item;
         }
     })
 }
@@ -620,15 +615,14 @@ pub fn configure_count_time_wrapper(
 /// set per run is sparse.
 pub fn lazily_stage_wrapper(inner: Plan, devices: Vec<Arc<dyn StageableObj>>) -> Plan {
     use std::collections::HashSet;
-    plan_box(async_stream::stream! {
+    plan_items(async_stream::stream! {
         let by_name: HashMap<String, Arc<dyn StageableObj>> =
             devices.into_iter().map(|d| (d.name().to_string(), d)).collect();
         let mut staged: Vec<Arc<dyn StageableObj>> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         let mut inner = inner;
         while let Some(item) = inner.next().await {
-            let PlanItem::Bare(m) = item;
-            let touched: Option<&str> = match &m {
+            let touched: Option<&str> = match item.msg() {
                 Msg::Read(o)            => Some(o.name()),
                 Msg::Set { obj, .. }    => Some(obj.name()),
                 Msg::Trigger { obj, .. } => Some(obj.name()),
@@ -638,15 +632,15 @@ pub fn lazily_stage_wrapper(inner: Plan, devices: Vec<Arc<dyn StageableObj>>) ->
             if let Some(name) = touched {
                 if seen.insert(name.to_string()) {
                     if let Some(d) = by_name.get(name) {
-                        yield Msg::Stage(d.clone());
+                        yield PlanItem::from(Msg::Stage(d.clone()));
                         staged.push(d.clone());
                     }
                 }
             }
-            yield m;
+            yield item;
         }
         for d in staged.into_iter().rev() {
-            yield Msg::Unstage(d);
+            yield PlanItem::from(Msg::Unstage(d));
         }
     })
 }
@@ -683,26 +677,25 @@ pub fn set_run_key_wrapper(inner: Plan, run_key: impl Into<String>) -> Plan {
 /// constraint via the engine's `Msg::Fail` handler, which aborts the
 /// run with the supplied reason.
 pub fn stub_wrapper(inner: Plan) -> Plan {
-    plan_box(async_stream::stream! {
+    plan_items(async_stream::stream! {
         let mut inner = inner;
         while let Some(item) = inner.next().await {
-            let PlanItem::Bare(m) = item;
-            match &m {
+            match item.msg() {
                 Msg::OpenRun(_) => {
-                    yield Msg::Fail(
+                    yield PlanItem::from(Msg::Fail(
                         "stub_wrapper: inner plan must not emit OpenRun".into(),
-                    );
+                    ));
                     return;
                 }
                 Msg::CloseRun { .. } => {
-                    yield Msg::Fail(
+                    yield PlanItem::from(Msg::Fail(
                         "stub_wrapper: inner plan must not emit CloseRun".into(),
-                    );
+                    ));
                     return;
                 }
                 _ => {}
             }
-            yield m;
+            yield item;
         }
     })
 }

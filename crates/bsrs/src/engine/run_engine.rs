@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use crate::core::error::{BsrsError, Result};
-use crate::core::msg::{Msg, RunMetadata};
+use crate::core::msg::{Msg, MsgResult, RunMetadata, SubscriptionId};
 use crate::core::plan::{Plan, PlanItem};
 use crate::core::status::{Status, StatusError};
 use crate::event_model::compose::RunBundle;
@@ -72,8 +72,9 @@ pub enum EngineRunState {
 /// `sinks`). They must be quick — slow callbacks back the engine up.
 pub type DocumentCallback = Arc<dyn Fn(&Document) + Send + Sync + 'static>;
 
-/// Stable identifier returned by [`RunEngine::subscribe`].
-pub type SubscriptionId = u64;
+/// Channel a plan's [`PlanItem::Respond`] carries so the engine can hand the
+/// [`MsgResult`] back into the plan. `None` for a plain `Bare` message.
+type PlanResponder = Option<tokio::sync::oneshot::Sender<MsgResult>>;
 
 /// Custom-command handler signature. The engine downcasts the
 /// `Msg::Custom` payload itself before invoking, so handlers receive a
@@ -152,70 +153,6 @@ pub type CheckpointHook = Arc<dyn Fn(CheckpointSnapshot) + Send + Sync + 'static
 /// `_input` which routes through `AsyncInput`.
 pub type InputHandler =
     Arc<dyn Fn(String) -> BoxFuture<'static, Result<String>> + Send + Sync + 'static>;
-
-/// Side-channel result from the most recently-processed `Msg`. Producers
-/// that yield `Msg`s (Lua coroutines, future async-fn plans) can poll
-/// `RunEngine::take_msg_result` after each yield to see what the engine
-/// did with the Msg.
-///
-/// `MsgResult` reflects the *engine's* observable effect — it is not a
-/// promise that the operation has fully completed. For grouped
-/// Set/Trigger/Kickoff/Complete, the `Status` is added to the named
-/// wait group; the result reports that group name. For ungrouped
-/// (synchronous) variants, the engine has already awaited completion
-/// before writing the result.
-#[derive(Debug, Clone)]
-pub enum MsgResult {
-    /// No useful result for this Msg kind.
-    None,
-    /// `OpenRun` produced a fresh run-start UID.
-    OpenRun {
-        /// Run-start UID.
-        uid: String,
-    },
-    /// `Set` / `Trigger` / `Kickoff` / `Complete` issued a Status that
-    /// was added to the given wait group. Plans pair this with a
-    /// matching `Msg::Wait { group }`.
-    Status {
-        /// Wait group the Status was added to.
-        group: String,
-    },
-    /// `Read` produced a reading per signal. Same shape as the engine
-    /// stored into the bundler.
-    Reading {
-        /// `field_name` → `ReadingValue`.
-        data: HashMap<String, crate::core::reading::ReadingValue>,
-    },
-    /// `Locate` produced a setpoint + readback pair.
-    Location {
-        /// Where the device was last requested to move.
-        setpoint: f64,
-        /// Where the device currently is.
-        readback: f64,
-    },
-    /// `CloseRun` finished. Engine reports the exit status it just
-    /// emitted in the RunStop document.
-    CloseRun {
-        /// `success` / `abort` / `fail` / etc.
-        exit_status: String,
-    },
-    /// `Msg::Input` produced a string from the configured handler.
-    Input {
-        /// The user's response.
-        text: String,
-    },
-    /// `Msg::ReClass` — the engine identifies itself.
-    EngineClass {
-        /// Stable identifier — `"bsrs.RunEngine"`.
-        name: &'static str,
-    },
-    /// `Msg::Subscribe` returned an id; pair with `Msg::Unsubscribe`
-    /// to remove early. Otherwise the engine drops it at run end.
-    SubscriptionId {
-        /// Stable subscription id.
-        id: SubscriptionId,
-    },
-}
 
 /// Final state of a finished run — bsrs's analogue of bluesky's
 /// `RunEngineResult` (run_engine.py:92). bluesky's `plan_result` (the value the
@@ -1540,8 +1477,8 @@ impl RunEngine {
         };
 
         loop {
-            let msg = match self.next_msg(&plan).await {
-                Some(m) => m,
+            let (msg, responder) = match self.next_msg(&plan).await {
+                Some(pair) => pair,
                 None => {
                     resolve_exit(self, &mut exit_status);
                     break;
@@ -1597,6 +1534,14 @@ impl RunEngine {
                     return Ok(self.build_result(run_uids, exit_status, Some(e)));
                 }
             }
+            // Hand the engine's result back to a `Respond`-issuing plan so it can
+            // branch on it inline (e.g. `collect_while_completing` looping on the
+            // `Wait` done-flag). Reached only after a successful `handle`; on
+            // error the sender is dropped and the plan observes `Err(RecvError)`.
+            // A dropped receiver (plan already advanced) is equally fine to drop.
+            if let Some(tx) = responder {
+                let _ = tx.send(self.take_msg_result());
+            }
         }
 
         // Close the open run with the right status. `stop` and the natural-end
@@ -1629,7 +1574,7 @@ impl RunEngine {
     }
 
     /// Pull the next message: handle pause gating, replay queue, then plan.
-    async fn next_msg(&self, plan: &Mutex<Plan>) -> Option<Msg> {
+    async fn next_msg(&self, plan: &Mutex<Plan>) -> Option<(Msg, PlanResponder)> {
         // Pause gate
         while self.is_paused.load(Ordering::SeqCst) && !self.is_aborting.load(Ordering::SeqCst) {
             // Arm the resume notification BEFORE the (possibly slow)
@@ -1671,7 +1616,7 @@ impl RunEngine {
         {
             let mut state = self.state.lock().await;
             if let Some(m) = state.replay_queue.pop_front() {
-                return Some(m);
+                return Some((m, None));
             }
         }
         // Plan stream
@@ -1679,8 +1624,13 @@ impl RunEngine {
             let mut p = plan.lock().await;
             p.next().await
         };
-        let item = item?;
-        let PlanItem::Bare(m) = item;
+        let m = match item? {
+            PlanItem::Bare(m) => m,
+            // A `Respond` item carries a oneshot the engine fulfills after
+            // handling. It is never cached for rewind: the sender can't be
+            // cloned, and a resumed replay would have no channel to answer.
+            PlanItem::Respond(m, tx) => return Some((m, Some(tx))),
+        };
         // Cache if rewindable
         {
             let mut state = self.state.lock().await;
@@ -1688,7 +1638,7 @@ impl RunEngine {
                 state.msg_cache.push_back(m.clone());
             }
         }
-        Some(m)
+        Some((m, None))
     }
 
     /// Drive an injected suspender plan (`pre_plan` / `post_plan`) through the
@@ -1701,12 +1651,20 @@ impl RunEngine {
     /// pre/post_plan messages through the same `_run` loop.
     async fn run_injected_plan(&self, mut plan: Plan) {
         while !self.is_aborting.load(Ordering::SeqCst) {
-            let Some(PlanItem::Bare(m)) = plan.next().await else {
-                break;
+            // Injected plans may also issue `Respond` items; carry the sender so
+            // an inline-result plan (e.g. a suspender that waits with a done-flag)
+            // works here too, mirroring the main loop's fulfillment.
+            let (m, responder) = match plan.next().await {
+                Some(PlanItem::Bare(m)) => (m, None),
+                Some(PlanItem::Respond(m, tx)) => (m, Some(tx)),
+                None => break,
             };
             if let Err(e) = self.handle(m).await {
                 tracing::warn!("suspender injected plan message failed: {e}");
                 break;
+            }
+            if let Some(tx) = responder {
+                let _ = tx.send(self.take_msg_result());
             }
         }
     }
@@ -2251,7 +2209,10 @@ impl RunEngine {
                 error_on_timeout,
                 timeout,
             } => {
-                self.wait_group(&group, error_on_timeout, timeout).await?;
+                // `done` is false only on a move-on timeout with members still
+                // pending; plans that `Respond` on this loop until it's true.
+                let done = self.wait_group(&group, error_on_timeout, timeout).await?;
+                *self.last_msg_result.lock().unwrap() = MsgResult::WaitComplete { done };
             }
             Msg::Sleep(d) => {
                 let token = self.cancel.lock().unwrap().clone();
@@ -2948,12 +2909,16 @@ impl RunEngine {
         }
     }
 
+    /// Await a status group. Returns `Ok(true)` when every member completed,
+    /// `Ok(false)` when a move-on timeout (`error_on_timeout=false`) elapsed with
+    /// members still pending (they are restored to the group). Propagates `Err`
+    /// on member failure, or on a hard timeout when `error_on_timeout` is true.
     async fn wait_group(
         &self,
         group: &str,
         error_on_timeout: bool,
         timeout: Option<Duration>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let members = {
             let mut state = self.state.lock().await;
             state
@@ -2963,7 +2928,7 @@ impl RunEngine {
                 .unwrap_or_default()
         };
         if members.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
         // Await *clones* of the members so the originals survive a move-on
         // timeout and can be restored to the group below. A clone shares the
@@ -2993,7 +2958,7 @@ impl RunEngine {
         };
         match timeout {
             Some(d) => match tokio::time::timeout(d, fut).await {
-                Ok(r) => r,
+                Ok(r) => r.map(|_| true),
                 Err(_) => {
                     if error_on_timeout {
                         Err(BsrsError::Timeout(d))
@@ -3016,11 +2981,11 @@ impl RunEngine {
                                 .members
                                 .extend(members);
                         }
-                        Ok(())
+                        Ok(false)
                     }
                 }
             },
-            None => fut.await,
+            None => fut.await.map(|_| true),
         }
     }
 }
@@ -3272,8 +3237,9 @@ mod tests {
             .wait_group("g", false, Some(Duration::from_millis(50)))
             .await;
         assert!(
-            r.is_ok(),
-            "error_on_timeout=false must not fail the run on timeout, got {r:?}"
+            matches!(r, Ok(false)),
+            "error_on_timeout=false must not fail the run on timeout and must \
+             report not-done (Ok(false)) with members still pending, got {r:?}"
         );
         let restored = {
             let state = re.state.lock().await;

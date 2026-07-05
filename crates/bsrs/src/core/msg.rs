@@ -884,3 +884,79 @@ pub trait ConfigurableObj: NamedObj {
     async fn configure_dyn(&self, args: ConfigureArgs)
         -> Result<(), crate::core::error::BsrsError>;
 }
+
+/// Stable identifier returned by `RunEngine::subscribe`.
+pub type SubscriptionId = u64;
+
+/// Side-channel result from the most recently-processed `Msg`. Producers
+/// that yield `Msg`s (Lua coroutines, async-fn plans) can poll
+/// `RunEngine::take_msg_result` after each yield to see what the engine
+/// did with the Msg. Plans that need the result inline receive it through
+/// [`PlanItem::Respond`](crate::core::plan::PlanItem::Respond).
+///
+/// `MsgResult` reflects the *engine's* observable effect — it is not a
+/// promise that the operation has fully completed. For grouped
+/// Set/Trigger/Kickoff/Complete, the `Status` is added to the named
+/// wait group; the result reports that group name. For ungrouped
+/// (synchronous) variants, the engine has already awaited completion
+/// before writing the result.
+#[derive(Debug, Clone)]
+pub enum MsgResult {
+    /// No useful result for this Msg kind.
+    None,
+    /// `OpenRun` produced a fresh run-start UID.
+    OpenRun {
+        /// Run-start UID.
+        uid: String,
+    },
+    /// `Set` / `Trigger` / `Kickoff` / `Complete` issued a Status that
+    /// was added to the given wait group. Plans pair this with a
+    /// matching `Msg::Wait { group }`.
+    Status {
+        /// Wait group the Status was added to.
+        group: String,
+    },
+    /// `Wait` finished. `done` is true when every member of the group
+    /// completed, false when a move-on timeout (`error_on_timeout=false`)
+    /// elapsed with members still pending. Plans loop on this — e.g.
+    /// `collect_while_completing` collects each period until `done`.
+    WaitComplete {
+        /// Whether the whole group completed (vs. a move-on timeout).
+        done: bool,
+    },
+    /// `Read` produced a reading per signal. Same shape as the engine
+    /// stored into the bundler.
+    Reading {
+        /// `field_name` → `ReadingValue`.
+        data: HashMap<String, crate::core::reading::ReadingValue>,
+    },
+    /// `Locate` produced a setpoint + readback pair.
+    Location {
+        /// Where the device was last requested to move.
+        setpoint: f64,
+        /// Where the device currently is.
+        readback: f64,
+    },
+    /// `CloseRun` finished. Engine reports the exit status it just
+    /// emitted in the RunStop document.
+    CloseRun {
+        /// `success` / `abort` / `fail` / etc.
+        exit_status: String,
+    },
+    /// `Msg::Input` produced a string from the configured handler.
+    Input {
+        /// The user's response.
+        text: String,
+    },
+    /// `Msg::ReClass` — the engine identifies itself.
+    EngineClass {
+        /// Stable identifier — `"bsrs.RunEngine"`.
+        name: &'static str,
+    },
+    /// `Msg::Subscribe` returned an id; pair with `Msg::Unsubscribe`
+    /// to remove early. Otherwise the engine drops it at run end.
+    SubscriptionId {
+        /// Stable subscription id.
+        id: SubscriptionId,
+    },
+}
