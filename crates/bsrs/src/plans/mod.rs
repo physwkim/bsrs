@@ -59,22 +59,35 @@ fn motor_hint_fields(reader: &Arc<dyn ReadableObj>) -> Vec<String> {
 /// Assemble the RunStart metadata bluesky's scan-family plans inject so a
 /// consumer (BEC / LiveTable / LiveFit) can label axes and size the scan:
 /// the device-name lists (`detectors`, `motors`), the point counts
-/// (`num_points`, `num_intervals`), and the `dimensions` hint grouped per
-/// [`AxisGrouping`]. Rides the same `RunMetadata::extra` -> `RunStart` path as
-/// `plan_name`/`scan_id`, so every key lands as a top-level RunStart field.
-/// Ports the `_md` dicts in bluesky/plans.py (count 104-116, outer_product
-/// 336-352) plus `derive_default_hints` (plans.py:58-63).
+/// (`num_points`, `num_intervals`), the `dimensions` hint grouped per
+/// [`AxisGrouping`], and the plan's call arguments (`plan_args`) so a catalog
+/// (Tiled / Databroker) can reconstruct the scan. Rides the same
+/// `RunMetadata::extra` -> `RunStart` path as `plan_name`/`scan_id`, so every
+/// key lands as a top-level RunStart field. Ports the `_md` dicts in
+/// bluesky/plans.py (count 104-116, outer_product 336-352) plus
+/// `derive_default_hints` (plans.py:58-63).
+///
+/// `plan_args` is the caller-built JSON object of the plan's arguments,
+/// mirroring bluesky's per-plan `plan_args` dict. bluesky stores each device
+/// as its Python `repr()`; bsrs has no such repr, so device arguments are
+/// captured by `name()` (the reconstruction-relevant token, and the same
+/// spelling used in the `detectors`/`motors` lists). A `Value::Null` is
+/// omitted so a plan with no meaningful args leaves the key absent.
 fn scan_run_md(
     plan_name: &str,
     detectors: &[Arc<dyn ReadableObj>],
     motors: &[Arc<dyn ReadableObj>],
     num_points: Option<usize>,
     grouping: AxisGrouping,
+    plan_args: serde_json::Value,
 ) -> RunMetadata {
     use crate::event_model::{DimensionItem, Hints};
     use serde_json::Value;
 
     let mut extra: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    if !plan_args.is_null() {
+        extra.insert("plan_args".into(), plan_args);
+    }
     extra.insert(
         "detectors".into(),
         Value::from(
@@ -133,6 +146,41 @@ fn scan_run_md(
         plan_name: Some(plan_name.to_string()),
         extra,
         ..Default::default()
+    }
+}
+
+/// Device names for a `plan_args` argument list — bsrs's stand-in for the
+/// Python `repr()` bluesky stores per device (see [`scan_run_md`]).
+fn arg_names<T: ?Sized + crate::core::msg::NamedObj>(objs: &[Arc<T>]) -> Vec<String> {
+    objs.iter().map(|o| o.name().to_string()).collect()
+}
+
+/// A `RunMetadata` carrying only `plan_name` and `plan_args`, for the plans that
+/// build their own RunStart without [`scan_run_md`]'s axis/hint machinery
+/// (`ramp_plan`, `fly`, `adaptive_scan`, `tune_centroid`). A `Value::Null`
+/// `plan_args` leaves the key absent, matching [`scan_run_md`].
+fn run_md_with_args(plan_name: &str, plan_args: serde_json::Value) -> RunMetadata {
+    let mut extra = std::collections::HashMap::new();
+    if !plan_args.is_null() {
+        extra.insert("plan_args".into(), plan_args);
+    }
+    RunMetadata {
+        plan_name: Some(plan_name.to_string()),
+        extra,
+        ..Default::default()
+    }
+}
+
+/// A `count` `delay` argument as JSON for `plan_args`: `None` (no delay,
+/// bluesky's default `delay=None`) → `null`, a constant → seconds, a sequence →
+/// an array of seconds.
+fn count_delay_json(delay: &CountDelay) -> serde_json::Value {
+    match delay {
+        CountDelay::None => serde_json::Value::Null,
+        CountDelay::Every(d) => serde_json::json!(d.as_secs_f64()),
+        CountDelay::Sequence(seq) => {
+            serde_json::json!(seq.iter().map(|d| d.as_secs_f64()).collect::<Vec<_>>())
+        }
     }
 }
 
@@ -983,7 +1031,18 @@ pub fn count_ext(
     // has no motors. Non-stageable detectors contribute nothing.
     let staged = stageables_for(&detectors, &[]);
     let inner = plan_box(async_stream::stream! {
-        yield Msg::OpenRun(scan_run_md("count", &detectors, &[], num, AxisGrouping::Time));
+        yield Msg::OpenRun(scan_run_md(
+            "count",
+            &detectors,
+            &[],
+            num,
+            AxisGrouping::Time,
+            serde_json::json!({
+                "detectors": arg_names(&detectors),
+                "num": num,
+                "delay": count_delay_json(&delay),
+            }),
+        ));
         let mut i: usize = 0;
         loop {
             if let Some(n) = num {
@@ -1041,6 +1100,11 @@ pub fn count_with_trigger(
             &[],
             Some(num),
             AxisGrouping::Time,
+            serde_json::json!({
+                "detectors": arg_names(&detectors),
+                "triggerables": arg_names(&triggerables),
+                "num": num,
+            }),
         ));
         for _ in 0..num {
             // Per-shot rewind boundary (bluesky count == repeat(one_shot):
@@ -1132,6 +1196,13 @@ pub fn scan_1d_per_step(
     } else {
         0.0
     };
+    let custom_per_step = per_step.is_some();
+    let plan_args = serde_json::json!({
+        "detectors": arg_names(&detectors),
+        "num": num,
+        "args": [motor.name(), start, stop],
+        "per_step": if custom_per_step { "custom" } else { "default" },
+    });
     let per_step = per_step.unwrap_or_else(|| Arc::new(stubs::one_nd_step) as PerStep);
     // Stage detectors + the motor before the run, unstage after (PLAN-09).
     let staged = stageables_for(&detectors, std::slice::from_ref(&motor));
@@ -1142,6 +1213,7 @@ pub fn scan_1d_per_step(
             std::slice::from_ref(&motor_reader),
             Some(num),
             AxisGrouping::Coupled,
+            plan_args,
         ));
         for i in 0..num {
             let pos = start + step * (i as f64);
@@ -1183,6 +1255,12 @@ pub fn list_scan_per_step(
     points: Vec<f64>,
     per_step: Option<PerStep>,
 ) -> Plan {
+    let custom_per_step = per_step.is_some();
+    let plan_args = serde_json::json!({
+        "detectors": arg_names(&detectors),
+        "args": [serde_json::json!(motor.name()), serde_json::json!(points)],
+        "per_step": if custom_per_step { "custom" } else { "default" },
+    });
     let per_step = per_step.unwrap_or_else(|| Arc::new(stubs::one_nd_step) as PerStep);
     // Stage detectors + the motor before the run, unstage after (PLAN-09).
     let staged = stageables_for(&detectors, std::slice::from_ref(&motor));
@@ -1193,6 +1271,7 @@ pub fn list_scan_per_step(
             std::slice::from_ref(&motor_reader),
             Some(points.len()),
             AxisGrouping::Coupled,
+            plan_args,
         ));
         for pos in points {
             let motors: Vec<StepMotor> = vec![(motor.clone(), motor_reader.clone(), Some(pos))];
@@ -1253,6 +1332,15 @@ pub fn list_scan_nd(
             });
         }
     }
+    // Flattened `[motor, points, …]`, mirroring bluesky list_scan's `md_args`.
+    let plan_args = serde_json::json!({
+        "detectors": arg_names(&detectors),
+        "args": axes
+            .iter()
+            .flat_map(|(m, _, pts)| [serde_json::json!(m.name()), serde_json::json!(pts)])
+            .collect::<Vec<_>>(),
+        "per_step": if per_step.is_some() { "custom" } else { "default" },
+    });
     let lists: Vec<Vec<f64>> = axes.iter().map(|(_, _, l)| l.clone()).collect();
     let pts = patterns::inner_list_product(&lists);
     let motors: Vec<(Arc<dyn MovableObj>, Arc<dyn ReadableObj>)> =
@@ -1267,6 +1355,7 @@ pub fn list_scan_nd(
         &motor_readers,
         Some(pts.len()),
         AxisGrouping::Coupled,
+        plan_args,
     );
     scan_nd_with_md(detectors, motors, pts, md, per_step)
 }
@@ -1386,6 +1475,11 @@ pub fn grid_scan_snake(
             &[motor1_reader.clone(), motor2_reader.clone()],
             Some(n1 * n2),
             AxisGrouping::Grid,
+            serde_json::json!({
+                "detectors": arg_names(&detectors),
+                "args": [motor1.name(), s1, e1, n1, motor2.name(), s2, e2, n2],
+                "snake_axes": snake,
+            }),
         ));
         for i in 0..n1 {
             // Row-change rewind boundary: a pause during the slow-axis move
@@ -1501,6 +1595,18 @@ fn inner_product_core(
 ) -> Plan {
     let bounds: Vec<(f64, f64)> = axes.iter().map(|(_, _, s, e)| (*s, *e)).collect();
     let pts = patterns::inner_product(num, &bounds);
+    // Flattened `[motor, start, stop, …]`, mirroring bluesky scan's `md_args`.
+    let plan_args = serde_json::json!({
+        "detectors": arg_names(&detectors),
+        "num": num,
+        "args": axes
+            .iter()
+            .flat_map(|(m, _, s, e)| {
+                [serde_json::json!(m.name()), serde_json::json!(s), serde_json::json!(e)]
+            })
+            .collect::<Vec<_>>(),
+        "per_step": if per_step.is_some() { "custom" } else { "default" },
+    });
     let per_step = per_step.unwrap_or_else(|| Arc::new(stubs::one_nd_step) as PerStep);
     // Stage detectors + every axis motor before the run, unstage after (PLAN-09).
     let stage_motors: Vec<Arc<dyn MovableObj>> =
@@ -1515,6 +1621,7 @@ fn inner_product_core(
             &motor_readers,
             Some(num),
             AxisGrouping::Coupled,
+            plan_args,
         ));
         for row in pts {
             // Every axis is commanded each point (Some), matching the previous
@@ -1598,12 +1705,19 @@ pub fn scan_nd_per_step(
 ) -> Plan {
     let motor_readers: Vec<Arc<dyn ReadableObj>> =
         motors.iter().map(|(_, mr)| mr.clone()).collect();
+    let plan_args = serde_json::json!({
+        "detectors": arg_names(&detectors),
+        "args": motors.iter().map(|(m, _)| m.name().to_string()).collect::<Vec<_>>(),
+        "num_points": points.len(),
+        "per_step": if per_step.is_some() { "custom" } else { "default" },
+    });
     let md = scan_run_md(
         "scan_nd",
         &detectors,
         &motor_readers,
         Some(points.len()),
         AxisGrouping::Coupled,
+        plan_args,
     );
     scan_nd_with_md(detectors, motors, points, md, per_step)
 }
@@ -1723,12 +1837,22 @@ pub fn list_grid_scan_snake(
     // default.
     let motor_readers: Vec<Arc<dyn ReadableObj>> =
         motors.iter().map(|(_, mr)| mr.clone()).collect();
+    let plan_args = serde_json::json!({
+        "detectors": arg_names(&detectors),
+        "args": motors
+            .iter()
+            .zip(lists.iter())
+            .flat_map(|((m, _), pts)| [serde_json::json!(m.name()), serde_json::json!(pts)])
+            .collect::<Vec<_>>(),
+        "snake_axes": snake_axes.to_flags(lists.len()),
+    });
     let md = scan_run_md(
         "list_grid_scan",
         &detectors,
         &motor_readers,
         Some(pts.len()),
         AxisGrouping::Grid,
+        plan_args,
     );
     // grid-family per_step is deferred: grid_scan_snake settles the slow axis
     // in a separate "set1" group per row, which does not match one_nd_step's
@@ -1792,6 +1916,17 @@ pub fn spiral_square(
             &[x_reader.clone(), y_reader.clone()],
             None,
             AxisGrouping::Grid,
+            serde_json::json!({
+                "detectors": arg_names(&detectors),
+                "x_motor": x_motor.name(),
+                "y_motor": y_motor.name(),
+                "x_center": x_center,
+                "y_center": y_center,
+                "x_range": x_range,
+                "y_range": y_range,
+                "x_num": x_num,
+                "y_num": y_num,
+            }),
         ));
         for (x, y) in pts {
             // Per-point rewind boundary (bluesky move_per_step, :1695).
@@ -1840,6 +1975,19 @@ pub fn spiral(
             &[x_reader.clone(), y_reader.clone()],
             None,
             AxisGrouping::Grid,
+            serde_json::json!({
+                "detectors": arg_names(&detectors),
+                "x_motor": x_motor.name(),
+                "y_motor": y_motor.name(),
+                "x_start": x_start,
+                "y_start": y_start,
+                "x_range": x_range,
+                "y_range": y_range,
+                "dr": dr,
+                "nth": nth,
+                "dr_y": dr_y,
+                "tilt": tilt,
+            }),
         ));
         for (x, y) in pts {
             // Per-point rewind boundary (bluesky move_per_step, :1695).
@@ -1893,12 +2041,20 @@ pub fn ramp_plan(
     timeout: Option<Duration>,
     period: Option<Duration>,
 ) -> Plan {
+    // Snapshot the monitor's name for `plan_args` before the stream captures
+    // `monitor_sig` by move (it is handed to `monitor_during_wrapper` below).
+    let monitor_name = monitor_sig.name().to_string();
     let body = plan_box(async_stream::stream! {
         use futures::StreamExt;
-        yield Msg::OpenRun(RunMetadata {
-            plan_name: Some("ramp_plan".into()),
-            ..Default::default()
-        });
+        yield Msg::OpenRun(run_md_with_args(
+            "ramp_plan",
+            serde_json::json!({
+                "monitor": monitor_name,
+                "take_pre_data": take_pre_data,
+                "timeout": timeout.map(|t| t.as_secs_f64()),
+                "period": period.map(|t| t.as_secs_f64()),
+            }),
+        ));
         // Watch the clock only if a timeout was given (bluesky `fail_time`).
         let fail_time = timeout.map(|t| std::time::Instant::now() + t);
         // Pre-sample, before the ramp starts.
@@ -2110,6 +2266,19 @@ pub fn spiral_fermat(
             &[x_reader.clone(), y_reader.clone()],
             None,
             AxisGrouping::Grid,
+            serde_json::json!({
+                "detectors": arg_names(&detectors),
+                "x_motor": x_motor.name(),
+                "y_motor": y_motor.name(),
+                "x_start": x_start,
+                "y_start": y_start,
+                "x_range": x_range,
+                "y_range": y_range,
+                "dr": dr,
+                "factor": factor,
+                "dr_y": dr_y,
+                "tilt": tilt,
+            }),
         ));
         for (x, y) in pts {
             // Per-point rewind boundary (bluesky move_per_step, :1695).
@@ -2235,10 +2404,12 @@ pub type Flyer = (Arc<dyn FlyableObj>, Arc<dyn CollectableObj>);
 /// devices need staging.
 pub fn fly(flyers: Vec<Flyer>) -> Plan {
     plan_box(async_stream::stream! {
-        yield Msg::OpenRun(RunMetadata {
-            plan_name: Some("fly".into()),
-            ..Default::default()
-        });
+        yield Msg::OpenRun(run_md_with_args(
+            "fly",
+            serde_json::json!({
+                "flyers": flyers.iter().map(|(f, _)| f.name().to_string()).collect::<Vec<_>>(),
+            }),
+        ));
         // Kick off every flyer under one group and wait, then tell every flyer
         // to complete under one group and wait — reusing the canonical
         // `kickoff_all` / `complete_all` stubs (bluesky's helpers of the same
@@ -2313,10 +2484,21 @@ pub fn adaptive_scan(
             ));
             return;
         }
-        yield Msg::OpenRun(RunMetadata {
-            plan_name: Some("adaptive_scan".into()),
-            ..Default::default()
-        });
+        yield Msg::OpenRun(run_md_with_args(
+            "adaptive_scan",
+            serde_json::json!({
+                "detectors": arg_names(&detectors),
+                "target_field": signal_field.clone(),
+                "motor": motor.name(),
+                "start": start,
+                "stop": stop,
+                "min_step": min_step,
+                "max_step": max_step,
+                "target_delta": target_delta,
+                "backstep": backstep,
+                "threshold": threshold,
+            }),
+        ));
         let direction = if stop >= start { 1.0_f64 } else { -1.0 };
         let mut pos = start;
         let mut past_i: Option<f64> = None;
@@ -2443,10 +2625,20 @@ pub fn tune_centroid(
             yield Msg::Fail("tune_centroid: step_factor must be greater than 1.0".into());
             return;
         }
-        yield Msg::OpenRun(RunMetadata {
-            plan_name: Some("tune_centroid".into()),
-            ..Default::default()
-        });
+        yield Msg::OpenRun(run_md_with_args(
+            "tune_centroid",
+            serde_json::json!({
+                "detectors": arg_names(&detectors),
+                "signal": signal_field.clone(),
+                "motor": motor.name(),
+                "start": start,
+                "stop": stop,
+                "min_step": min_step,
+                "num": num,
+                "step_factor": step_factor,
+                "snake": snake,
+            }),
+        ));
         // Global bounds are fixed; the per-pass window shrinks inside them.
         let low_limit = start.min(stop);
         let high_limit = start.max(stop);
@@ -4322,6 +4514,49 @@ mod tests {
         assert_eq!(set_targets(&msgs, "m1"), vec![0.0, 1.0]);
         // m2 changes each point → commanded each point.
         assert_eq!(set_targets(&msgs, "m2"), vec![5.0, 6.0, 7.0]);
+    }
+
+    // PLAN-25: a step scan captures its call arguments into RunStart's
+    // `plan_args` (device names for bluesky's Python reprs).
+    #[tokio::test]
+    async fn scan_1d_captures_plan_args_into_runstart() {
+        let m = Arc::new(FakeMotor {
+            name: "m".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let det = SequenceDetector::new("d", "sig", vec![1.0, 2.0, 3.0]) as Arc<dyn ReadableObj>;
+        let msgs = drain(scan_1d(vec![det], m, rdr("mr"), 0.0, 2.0, 3)).await;
+        let md = match &msgs[0] {
+            Msg::OpenRun(md) => md,
+            other => panic!("expected OpenRun, got {other:?}"),
+        };
+        let pa = md.extra.get("plan_args").expect("plan_args present");
+        assert_eq!(pa["detectors"], serde_json::json!(["d"]));
+        assert_eq!(pa["num"], serde_json::json!(3));
+        // args carry the motor's name (not the reader's), then start/stop.
+        assert_eq!(pa["args"], serde_json::json!(["m", 0.0, 2.0]));
+        assert_eq!(pa["per_step"], serde_json::json!("default"));
+    }
+
+    // PLAN-25: `count` records num and the delay (in seconds) in plan_args.
+    #[tokio::test]
+    async fn count_captures_num_and_delay_in_plan_args() {
+        let det = SequenceDetector::new("d", "sig", vec![1.0]) as Arc<dyn ReadableObj>;
+        let msgs = drain(count_ext(
+            vec![det],
+            Some(2),
+            CountDelay::Every(Duration::from_millis(500)),
+            None,
+        ))
+        .await;
+        let md = match &msgs[0] {
+            Msg::OpenRun(md) => md,
+            other => panic!("expected OpenRun, got {other:?}"),
+        };
+        let pa = md.extra.get("plan_args").expect("plan_args present");
+        assert_eq!(pa["detectors"], serde_json::json!(["d"]));
+        assert_eq!(pa["num"], serde_json::json!(2));
+        assert_eq!(pa["delay"], serde_json::json!(0.5));
     }
 
     // A delegating rel_ plan inherits the base plan's per-step checkpoints.
