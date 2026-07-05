@@ -1718,8 +1718,10 @@ pub fn spiral_square(
 }
 
 /// `spiral(dets, x_motor, y_motor, x_start, y_start, x_range, y_range, dr,
-/// nth)` — Archimedean spiral through `(x, y)` until the spiral exits the
-/// bounding rect. `dr` is radial increment / turn; `nth` is points / turn.
+/// nth, dr_y, tilt)` — Archimedean spiral through `(x, y)` (bluesky
+/// `plans.spiral`). `dr` is the minor-axis radial step, `nth` the base angular
+/// steps per ring; `dr_y` (`None` ⇒ circular) is the major-axis radial step and
+/// `tilt` (radians) shears the clip box. See [`patterns::spiral`].
 #[allow(clippy::too_many_arguments)]
 pub fn spiral(
     detectors: Vec<Arc<dyn ReadableObj>>,
@@ -1733,8 +1735,10 @@ pub fn spiral(
     y_range: f64,
     dr: f64,
     nth: usize,
+    dr_y: Option<f64>,
+    tilt: f64,
 ) -> Plan {
-    let pts = patterns::spiral(x_start, y_start, x_range, y_range, dr, nth);
+    let pts = patterns::spiral(x_start, y_start, x_range, y_range, dr, nth, dr_y, tilt);
     plan_box(async_stream::stream! {
         yield Msg::OpenRun(scan_run_md(
             "spiral",
@@ -1982,9 +1986,11 @@ pub fn rel_log_scan(
 }
 
 /// `spiral_fermat(detectors, x_motor, x_reader, y_motor, y_reader,
-/// x_start, y_start, x_range, y_range, dr, factor)` —
-/// Fermat (sunflower) spiral via golden-angle increments. See
-/// `patterns::spiral_fermat_pattern`.
+/// x_start, y_start, x_range, y_range, dr, factor, dr_y, tilt)` —
+/// Fermat (sunflower) spiral via golden-angle increments (bluesky
+/// `plans.spiral_fermat`). `dr_y` (`None` ⇒ circular) is the major-axis radial
+/// step and `tilt` (radians) shears the clip box. See
+/// [`patterns::spiral_fermat_pattern`].
 #[allow(clippy::too_many_arguments)]
 pub fn spiral_fermat(
     detectors: Vec<Arc<dyn ReadableObj>>,
@@ -1998,8 +2004,11 @@ pub fn spiral_fermat(
     y_range: f64,
     dr: f64,
     factor: f64,
+    dr_y: Option<f64>,
+    tilt: f64,
 ) -> Plan {
-    let pts = patterns::spiral_fermat_pattern(x_start, y_start, x_range, y_range, dr, factor);
+    let pts =
+        patterns::spiral_fermat_pattern(x_start, y_start, x_range, y_range, dr, factor, dr_y, tilt);
     plan_box(async_stream::stream! {
         yield Msg::OpenRun(scan_run_md(
             "spiral_fermat",
@@ -2046,11 +2055,14 @@ pub fn rel_spiral(
     y_range: f64,
     dr: f64,
     nth: usize,
+    dr_y: Option<f64>,
+    tilt: f64,
 ) -> Plan {
     let xm: Arc<dyn MovableObj> = x_motor.clone();
     let ym: Arc<dyn MovableObj> = y_motor.clone();
     let inner = spiral(
-        detectors, xm, x_reader, ym, y_reader, x_start, y_start, x_range, y_range, dr, nth,
+        detectors, xm, x_reader, ym, y_reader, x_start, y_start, x_range, y_range, dr, nth, dr_y,
+        tilt,
     );
     let rel = preprocessors::relative_set_wrapper(inner, vec![x_motor.clone(), y_motor.clone()]);
     preprocessors::reset_positions_wrapper(rel, vec![x_motor, y_motor])
@@ -2100,11 +2112,14 @@ pub fn rel_spiral_fermat(
     y_range: f64,
     dr: f64,
     factor: f64,
+    dr_y: Option<f64>,
+    tilt: f64,
 ) -> Plan {
     let xm: Arc<dyn MovableObj> = x_motor.clone();
     let ym: Arc<dyn MovableObj> = y_motor.clone();
     let inner = spiral_fermat(
         detectors, xm, x_reader, ym, y_reader, x_start, y_start, x_range, y_range, dr, factor,
+        dr_y, tilt,
     );
     let rel = preprocessors::relative_set_wrapper(inner, vec![x_motor.clone(), y_motor.clone()]);
     preprocessors::reset_positions_wrapper(rel, vec![x_motor, y_motor])
@@ -3598,6 +3613,8 @@ mod tests {
             2.0,
             0.5,
             8,
+            None,
+            0.0,
         );
         let (xm, ym) = motor_xy(5.0, 7.0);
         let rel = rel_spiral(
@@ -3612,6 +3629,8 @@ mod tests {
             2.0,
             0.5,
             8,
+            None,
+            0.0,
         );
         assert_xy_relative_offsets(abs, rel, 5.0, 7.0).await;
     }
@@ -3664,6 +3683,8 @@ mod tests {
             2.0,
             0.5,
             1.0,
+            None,
+            0.0,
         );
         let (xm, ym) = motor_xy(5.0, 7.0);
         let rel = rel_spiral_fermat(
@@ -3678,6 +3699,8 @@ mod tests {
             2.0,
             0.5,
             1.0,
+            None,
+            0.0,
         );
         assert_xy_relative_offsets(abs, rel, 5.0, 7.0).await;
     }

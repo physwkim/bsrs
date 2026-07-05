@@ -2513,6 +2513,38 @@ fn register_bluesky_namespaces(lua: &Lua) -> mlua::Result<()> {
     Ok(())
 }
 
+/// Lua arg tuple for `bp.spiral` — dets table, x/y motors, the six spiral
+/// scalars, then optional `dr_y`/`tilt` (nil ⇒ circular/untilted).
+type SpiralPlanArgs = (
+    mlua::Table,
+    mlua::AnyUserData,
+    mlua::AnyUserData,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    usize,
+    Option<f64>,
+    Option<f64>,
+);
+
+/// Lua arg tuple for `bp.spiral_fermat` — as [`SpiralPlanArgs`] but the sixth
+/// scalar is `factor` (f64), not `nth`.
+type SpiralFermatPlanArgs = (
+    mlua::Table,
+    mlua::AnyUserData,
+    mlua::AnyUserData,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    Option<f64>,
+    Option<f64>,
+);
+
 fn register_bp(lua: &Lua) -> mlua::Result<()> {
     let bp = lua.create_table()?;
 
@@ -2704,39 +2736,29 @@ fn register_bp(lua: &Lua) -> mlua::Result<()> {
     // spiral / spiral_square / spiral_fermat — same arg shape.
     bp.set(
         "spiral",
-        lua.create_function(
-            |_,
-             (dt, xm, ym, x_start, y_start, x_range, y_range, dr, nth): (
-                mlua::Table,
-                mlua::AnyUserData,
-                mlua::AnyUserData,
-                f64,
-                f64,
-                f64,
-                f64,
-                f64,
-                usize,
-            )| {
-                let (xmv, xrd, _) = motor_movable_readable(&xm)?;
-                let (ymv, yrd, _) = motor_movable_readable(&ym)?;
-                Ok(wrap_prebuilt(
-                    "spiral",
-                    crate::plans::spiral(
-                        dets(&dt)?,
-                        xmv,
-                        xrd,
-                        ymv,
-                        yrd,
-                        x_start,
-                        y_start,
-                        x_range,
-                        y_range,
-                        dr,
-                        nth,
-                    ),
-                ))
-            },
-        )?,
+        lua.create_function(|_, args: SpiralPlanArgs| {
+            let (dt, xm, ym, x_start, y_start, x_range, y_range, dr, nth, dr_y, tilt) = args;
+            let (xmv, xrd, _) = motor_movable_readable(&xm)?;
+            let (ymv, yrd, _) = motor_movable_readable(&ym)?;
+            Ok(wrap_prebuilt(
+                "spiral",
+                crate::plans::spiral(
+                    dets(&dt)?,
+                    xmv,
+                    xrd,
+                    ymv,
+                    yrd,
+                    x_start,
+                    y_start,
+                    x_range,
+                    y_range,
+                    dr,
+                    nth,
+                    dr_y,
+                    tilt.unwrap_or(0.0),
+                ),
+            ))
+        })?,
     )?;
     bp.set(
         "spiral_square",
@@ -2776,39 +2798,29 @@ fn register_bp(lua: &Lua) -> mlua::Result<()> {
     )?;
     bp.set(
         "spiral_fermat",
-        lua.create_function(
-            |_,
-             (dt, xm, ym, x_start, y_start, x_range, y_range, dr, factor): (
-                mlua::Table,
-                mlua::AnyUserData,
-                mlua::AnyUserData,
-                f64,
-                f64,
-                f64,
-                f64,
-                f64,
-                f64,
-            )| {
-                let (xmv, xrd, _) = motor_movable_readable(&xm)?;
-                let (ymv, yrd, _) = motor_movable_readable(&ym)?;
-                Ok(wrap_prebuilt(
-                    "spiral_fermat",
-                    crate::plans::spiral_fermat(
-                        dets(&dt)?,
-                        xmv,
-                        xrd,
-                        ymv,
-                        yrd,
-                        x_start,
-                        y_start,
-                        x_range,
-                        y_range,
-                        dr,
-                        factor,
-                    ),
-                ))
-            },
-        )?,
+        lua.create_function(|_, args: SpiralFermatPlanArgs| {
+            let (dt, xm, ym, x_start, y_start, x_range, y_range, dr, factor, dr_y, tilt) = args;
+            let (xmv, xrd, _) = motor_movable_readable(&xm)?;
+            let (ymv, yrd, _) = motor_movable_readable(&ym)?;
+            Ok(wrap_prebuilt(
+                "spiral_fermat",
+                crate::plans::spiral_fermat(
+                    dets(&dt)?,
+                    xmv,
+                    xrd,
+                    ymv,
+                    yrd,
+                    x_start,
+                    y_start,
+                    x_range,
+                    y_range,
+                    dr,
+                    factor,
+                    dr_y,
+                    tilt.unwrap_or(0.0),
+                ),
+            ))
+        })?,
     )?;
     // NOTE: `bp.ramp_plan` is intentionally not bound. The status-driven
     // `plans::ramp_plan` takes Rust closures (an `is_complete` predicate and an
@@ -3288,8 +3300,18 @@ fn register_bpt(lua: &Lua) -> mlua::Result<()> {
     bpt.set(
         "spiral",
         lua.create_function(
-            |lua, (xs, ys, xr, yr, dr, nth): (f64, f64, f64, f64, f64, usize)| {
-                let pts = patterns::spiral(xs, ys, xr, yr, dr, nth);
+            |lua,
+             (xs, ys, xr, yr, dr, nth, dr_y, tilt): (
+                f64,
+                f64,
+                f64,
+                f64,
+                f64,
+                usize,
+                Option<f64>,
+                Option<f64>,
+            )| {
+                let pts = patterns::spiral(xs, ys, xr, yr, dr, nth, dr_y, tilt.unwrap_or(0.0));
                 pairs_to_lua_table(lua, &pts)
             },
         )?,
@@ -3306,8 +3328,27 @@ fn register_bpt(lua: &Lua) -> mlua::Result<()> {
     bpt.set(
         "spiral_fermat",
         lua.create_function(
-            |lua, (xs, ys, xr, yr, dr, factor): (f64, f64, f64, f64, f64, f64)| {
-                let pts = patterns::spiral_fermat_pattern(xs, ys, xr, yr, dr, factor);
+            |lua,
+             (xs, ys, xr, yr, dr, factor, dr_y, tilt): (
+                f64,
+                f64,
+                f64,
+                f64,
+                f64,
+                f64,
+                Option<f64>,
+                Option<f64>,
+            )| {
+                let pts = patterns::spiral_fermat_pattern(
+                    xs,
+                    ys,
+                    xr,
+                    yr,
+                    dr,
+                    factor,
+                    dr_y,
+                    tilt.unwrap_or(0.0),
+                );
                 pairs_to_lua_table(lua, &pts)
             },
         )?,

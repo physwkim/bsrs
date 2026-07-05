@@ -77,8 +77,6 @@ PLAN-34 `wait_for` + `Msg::WaitFor` (mod.rs:368); PLAN-35 `prepare` + `Msg::Prep
   (lua_env.rs:1955) exist; missing only a Rust `stubs::locate` plan helper.
 
 **OPEN, IN-SCOPE** (changes emitted documents):
-- **PLAN-20** — `spiral`/`spiral_fermat` ignore `dr_y` (ellipse aspect) + `tilt`
-  (patterns.rs:151); both change per-step motor positions emitted into Events.
 - **PLAN-27** — no plan-level `rd` single-scalar read stub (weak: emits nothing itself).
 - **PLAN-29** — `broadcast_msg` absent; fans Trigger/Stage across objects (gates
   Resource/Datum + staging).
@@ -95,9 +93,10 @@ PLAN-34 `wait_for` + `Msg::WaitFor` (mod.rs:368); PLAN-35 `prepare` + `Msg::Prep
   wrappers already provide the behavior), PLAN-31 (`classify`/`chunk_outer_product`
   arg-parsing helpers), PLAN-36 (`caching_repeater`, deprecated).
 
-**Genuine in-scope backlog from doc 02** (implement in this order): PLAN-20, PLAN-29,
+**Genuine in-scope backlog from doc 02** (implement in this order): PLAN-29,
 PLAN-28, PLAN-25, PLAN-32, PLAN-27. (PLAN-08 done — the `wait` done-flag it needed is
-`MsgResult::WaitComplete`, delivered via the plan↔engine response channel.)
+`MsgResult::WaitComplete`, delivered via the plan↔engine response channel. PLAN-20 done —
+faithful ring-based spiral/fermat rewrite with `dr_y`+`tilt`.)
 
 ---
 
@@ -546,18 +545,43 @@ PLAN-28, PLAN-25, PLAN-32, PLAN-27. (PLAN-08 done — the `wait` done-flag it ne
 
 ---
 
-### PLAN-20 — `spiral` and `spiral_fermat` patterns missing `dr_y` (ellipse aspect) and `tilt` — **OPEN (in-scope)**
+### ~~PLAN-20~~ — `spiral` and `spiral_fermat` patterns missing `dr_y` (ellipse aspect) and `tilt` — **DONE**
 
-- **bsrs:** `patterns.rs:102–133` (spiral), `220–250` (spiral_fermat)
+- **bsrs:** `patterns::spiral(.., dr_y, tilt)`, `patterns::spiral_fermat_pattern(.., dr_y, tilt)`
 - **ref:** `plan_patterns.py:18–77` (spiral has `dr_y=None`, `tilt=0.0`), `200–257`
   (spiral_fermat same)
-- **Gap:** Bluesky supports elliptical spirals (`dr_y` changes radial step in y) and
-  tilted spirals (`tilt` rotates the coordinate frame).  Bsrs spirals are circular,
-  untilted only.
-- **Fix sketch:** Add `dr_y: Option<f64>` (default to `dr`), `tilt: f64 = 0.0` to both
-  pattern functions.  Apply `dr_aspect = dr_y / dr` scaling to `y`; apply rotation
-  matrix `(cos(tilt), sin(tilt); -sin(tilt), cos(tilt))` to final `(x, y)`.
-- **Effort:** S
+- **Gap:** Bluesky supports elliptical spirals (`dr_y` changes the y radial step) and
+  tilted spirals (`tilt`). Bsrs spirals were circular, untilted only.
+- **Resolution:** This was not a param add — bsrs's spiral used a *divergent*
+  algorithm (continuous-`t`, constant angular density, early-break at the first
+  out-of-box point) and its fermat *inverted* `factor` (`dr*factor*√n` instead of
+  `√n*dr/factor`). `dr_y`/`tilt` are defined against bluesky's ring structure, so
+  they can't be grafted onto the divergent version faithfully. Replaced both with
+  the exact bluesky algorithms:
+  - **spiral** now walks concentric rings (`radius = i·dr`, `i·nth` angular steps per
+    ring, so density grows with radius) over a fixed `1+int(r_max/dr)` ring count,
+    clipping each candidate to the box (box-fill, not early-break).
+  - **fermat** uses `radius = √i·dr/factor`, golden angle `137.508°` (the degree
+    constant, not `π(3−√5)`), and ring count `int((1.5·diag·factor/dr)²)`.
+  - `dr_aspect = dr_y/dr` stretches y and shrinks `half_y` to `y_range/(2·dr_aspect)`.
+  - **`tilt` shears the *clip box*, it does not rotate coordinates** — `tilt_tan =
+    tan(tilt+π/2)`, test `|x − (y/dr_aspect)/tilt_tan| ≤ half_x`. (The original fix
+    sketch above proposed a coordinate rotation matrix — that is **wrong** per the
+    bluesky source; corrected here.) At `tilt=0`, `tilt_tan` is a huge finite number
+    so the shear vanishes, matching numpy rather than special-casing.
+  - One deliberate bluesky asymmetry preserved: fermat's y-clip is `|y| ≤ half_y`
+    while spiral's is `|y/dr_aspect| ≤ half_y`.
+  - **Behavioral change (signed off):** emitted positions now differ for *every*
+    spiral/fermat caller — even without `dr_y`/`tilt` — because the base algorithm
+    changed. Public signatures of `spiral`/`spiral_fermat`/`rel_spiral`/
+    `rel_spiral_fermat` (and the Lua bindings) gain trailing `dr_y: Option<f64>` +
+    `tilt: f64` (Lua: optional, nil ⇒ circular / 0.0).
+- **Tests:** parity against fixtures emitted by the verbatim bluesky bodies under
+  numpy — `spiral_matches_bluesky_circular`, `spiral_matches_bluesky_elliptical_dr_y`,
+  `spiral_tilt_shears_clip_box_not_ignored` (tilt clips off-axis points the untilted
+  spiral keeps), `spiral_fermat_matches_bluesky`,
+  `spiral_fermat_matches_bluesky_dr_y_and_tilt`.
+- **Effort:** S (as scoped) → M (actual: algorithm replacement + API/Lua threading).
 
 ---
 
