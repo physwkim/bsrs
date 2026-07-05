@@ -1144,38 +1144,129 @@ fn queue_item_move(queue: &Arc<StdMutex<PlanQueue>>, params: &Value) -> Value {
 }
 
 fn queue_item_move_batch(queue: &Arc<StdMutex<PlanQueue>>, params: &Value) -> Value {
-    let uids = match params.get("uids").and_then(|v| v.as_array()) {
+    let uids: Vec<String> = match params.get("uids").and_then(|v| v.as_array()) {
         Some(a) => a
             .iter()
             .filter_map(|v| v.as_str().map(String::from))
-            .collect::<Vec<_>>(),
+            .collect(),
         None => return err("missing 'uids' array"),
     };
-    let dest = resolve_pos(params.get("pos_dest"), queue);
-    let mut moved = Vec::new();
-    {
-        let mut q = queue.lock().unwrap();
-        for (i, uid) in uids.iter().enumerate() {
-            if let Some(it) = q.move_to(uid, dest + i) {
-                moved.push(it);
-            }
+
+    // Destination — exactly one of pos_dest / before_uid / after_uid (JSON null
+    // counts as unspecified). Mirrors `plan_queue_ops.py::_move_batch`.
+    let pos_dest = params.get("pos_dest").filter(|v| !v.is_null());
+    let before_uid = params.get("before_uid").and_then(|v| v.as_str());
+    let after_uid = params.get("after_uid").and_then(|v| v.as_str());
+    let n_dest = pos_dest.is_some() as u8 + before_uid.is_some() as u8 + after_uid.is_some() as u8;
+    if n_dest < 1 {
+        return err("destination not specified: use 'pos_dest', 'before_uid', or 'after_uid'");
+    }
+    if n_dest > 1 {
+        return err("ambiguous: only one of 'pos_dest', 'before_uid', 'after_uid'");
+    }
+    let reorder = params
+        .get("reorder")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let mut q = queue.lock().unwrap();
+
+    // Atomic pre-validation — on any failure nothing is moved (ref: _move_batch).
+    // uids unique.
+    let mut seen = std::collections::HashSet::new();
+    for u in &uids {
+        if !seen.insert(u.as_str()) {
+            return err(format!("duplicate uid in batch: {u}"));
         }
     }
-    let q = queue.lock().unwrap();
+    // Every uid exists in the queue.
+    let missing: Vec<&str> = uids
+        .iter()
+        .filter(|u| q.get_by_uid(u).is_none())
+        .map(String::as_str)
+        .collect();
+    if !missing.is_empty() {
+        return err(format!("uids not in queue: {}", missing.join(", ")));
+    }
+    // The reference uid must exist and must NOT be a member of the batch.
+    if let Some(b) = before_uid {
+        if uids.iter().any(|u| u == b) {
+            return err(format!("before_uid is in the batch: {b}"));
+        }
+        if q.get_by_uid(b).is_none() {
+            return err(format!("before_uid not found: {b}"));
+        }
+    }
+    if let Some(a) = after_uid {
+        if uids.iter().any(|u| u == a) {
+            return err(format!("after_uid is in the batch: {a}"));
+        }
+        if q.get_by_uid(a).is_none() {
+            return err(format!("after_uid not found: {a}"));
+        }
+    }
+
+    // reorder=false → move in the order given in `uids`; reorder=true → move in
+    // the items' original queue order (sort uids by current index).
+    let ordered: Vec<String> = if reorder {
+        let mut with_idx: Vec<(usize, String)> = uids
+            .iter()
+            .map(|u| (q.index_of_uid(u).unwrap(), u.clone()))
+            .collect();
+        with_idx.sort_by_key(|(i, _)| *i);
+        with_idx.into_iter().map(|(_, u)| u).collect()
+    } else {
+        uids.clone()
+    };
+
+    // Block move — first item to the destination, each subsequent item
+    // immediately after the previous, preserving `ordered`.
+    let mut moved: Vec<Value> = Vec::with_capacity(ordered.len());
+    let mut prev_uid: Option<String> = None;
+    for uid in &ordered {
+        let placed = match &prev_uid {
+            None => {
+                if let Some(b) = before_uid {
+                    q.move_before_uid(uid, b)
+                } else if let Some(a) = after_uid {
+                    q.move_after_uid(uid, a)
+                } else {
+                    let dest = resolve_pos_q(pos_dest, &q);
+                    q.move_to(uid, dest)
+                }
+            }
+            Some(p) => q.move_after_uid(uid, p.as_str()),
+        };
+        match placed {
+            Some(it) => moved.push(serde_json::to_value(&it).unwrap()),
+            // Unreachable after validation (uid + ref both proven present).
+            None => return err(format!("move failed for uid: {uid}")),
+        }
+        prev_uid = Some(uid.clone());
+    }
+
     json!({
         "success": true,
         "msg": "",
         "items_moved": moved,
+        "qsize": q.len(),
         "plan_queue_uid": q.queue_uid(),
     })
 }
 
 fn resolve_pos(p: Option<&Value>, queue: &Arc<StdMutex<PlanQueue>>) -> usize {
+    resolve_pos_q(p, &queue.lock().unwrap())
+}
+
+/// Lock-free `pos_dest` resolution against an already-held queue. Callers that
+/// hold the queue lock (e.g. `queue_item_move_batch`) must use this — the
+/// lock-taking [`resolve_pos`] would deadlock.
+fn resolve_pos_q(p: Option<&Value>, q: &PlanQueue) -> usize {
     match p {
         Some(Value::String(s)) if s == "front" => 0,
-        Some(Value::String(s)) if s == "back" => queue.lock().unwrap().len(),
+        Some(Value::String(s)) if s == "back" => q.len(),
         Some(Value::Number(n)) => n.as_u64().unwrap_or(0) as usize,
-        _ => queue.lock().unwrap().len(),
+        _ => q.len(),
     }
 }
 

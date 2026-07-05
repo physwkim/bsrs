@@ -1421,6 +1421,166 @@ async fn queue_item_add_batch_atomic_reject_on_unknown_plan() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
 
+/// Build a server with `count` and add `n` count items; return (shutdown, req,
+/// uids) with the queue = [uids[0], uids[1], ...] in add order.
+#[cfg(test)]
+async fn move_batch_fixture(n: usize) -> (ServerShutdown, zmq::Socket, Vec<String>) {
+    let det = SoftDetector::new("det1");
+    let mut reg = Registry::new();
+    reg.register_readable("det1", det as Arc<dyn ReadableObj>);
+    reg.register_plan_count("count");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+    let mut uids = Vec::with_capacity(n);
+    for i in 0..n {
+        let r = rpc(
+            &req,
+            "queue_item_add",
+            json!({"item": {"name": "count", "args": ["det1", i]}}),
+        );
+        uids.push(r["item"]["item_uid"].as_str().unwrap().to_string());
+    }
+    (shutdown, req, uids)
+}
+
+#[cfg(test)]
+fn queue_order(req: &zmq::Socket) -> Vec<String> {
+    let q = rpc(req, "queue_get", json!({}));
+    q["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["item_uid"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// QS-20: `queue_item_move_batch` moves the batch as a contiguous block to
+/// `before_uid`, preserving the `uids` order (reorder default false).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_item_move_batch_before_uid_block() {
+    let (shutdown, req, u) = move_batch_fixture(5).await; // [0,1,2,3,4]
+
+    // Move [0, 2] before uid 4 → [1, 3, 0, 2, 4].
+    let r = rpc(
+        &req,
+        "queue_item_move_batch",
+        json!({"uids": [u[0], u[2]], "before_uid": u[4]}),
+    );
+    assert_eq!(r["success"], true, "{r}");
+    assert_eq!(
+        queue_order(&req),
+        vec![
+            u[1].clone(),
+            u[3].clone(),
+            u[0].clone(),
+            u[2].clone(),
+            u[4].clone()
+        ]
+    );
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+/// QS-20: `reorder=false` (default) moves items in `uids` order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_item_move_batch_reorder_false_uses_uids_order() {
+    let (shutdown, req, u) = move_batch_fixture(5).await; // [0,1,2,3,4]
+
+    // Move [2, 0] to front, reorder false → block in uids order [2, 0].
+    let r = rpc(
+        &req,
+        "queue_item_move_batch",
+        json!({"uids": [u[2], u[0]], "pos_dest": "front"}),
+    );
+    assert_eq!(r["success"], true, "{r}");
+    assert_eq!(
+        queue_order(&req),
+        vec![
+            u[2].clone(),
+            u[0].clone(),
+            u[1].clone(),
+            u[3].clone(),
+            u[4].clone()
+        ]
+    );
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+/// QS-20: `reorder=true` moves items in their original queue order regardless of
+/// the order given in `uids`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_item_move_batch_reorder_true_uses_queue_order() {
+    let (shutdown, req, u) = move_batch_fixture(5).await; // [0,1,2,3,4]
+
+    // Move [2, 0] to front, reorder true → sorted by index [0, 2].
+    let r = rpc(
+        &req,
+        "queue_item_move_batch",
+        json!({"uids": [u[2], u[0]], "pos_dest": "front", "reorder": true}),
+    );
+    assert_eq!(r["success"], true, "{r}");
+    assert_eq!(
+        queue_order(&req),
+        vec![
+            u[0].clone(),
+            u[2].clone(),
+            u[1].clone(),
+            u[3].clone(),
+            u[4].clone()
+        ]
+    );
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+/// QS-20: `queue_item_move_batch` is atomic — a destination uid inside the
+/// batch, a missing uid, or a duplicate uid rejects the whole move and leaves
+/// the queue untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_item_move_batch_rejects_invalid_and_leaves_queue() {
+    let (shutdown, req, u) = move_batch_fixture(5).await; // [0,1,2,3,4]
+    let original = queue_order(&req);
+
+    // before_uid is a member of the batch → rejected.
+    let r = rpc(
+        &req,
+        "queue_item_move_batch",
+        json!({"uids": [u[0], u[1]], "before_uid": u[1]}),
+    );
+    assert_eq!(r["success"], false, "dest-in-batch must reject: {r}");
+    assert_eq!(queue_order(&req), original, "queue unchanged after reject");
+
+    // A uid not in the queue → rejected.
+    let r = rpc(
+        &req,
+        "queue_item_move_batch",
+        json!({"uids": [u[0], "nonexistent-uid"], "pos_dest": "front"}),
+    );
+    assert_eq!(r["success"], false, "missing uid must reject: {r}");
+    assert_eq!(queue_order(&req), original, "queue unchanged after reject");
+
+    // Duplicate uid in the batch → rejected.
+    let r = rpc(
+        &req,
+        "queue_item_move_batch",
+        json!({"uids": [u[0], u[0]], "pos_dest": "front"}),
+    );
+    assert_eq!(r["success"], false, "duplicate uid must reject: {r}");
+    assert_eq!(queue_order(&req), original, "queue unchanged after reject");
+
+    // No destination specified → rejected.
+    let r = rpc(&req, "queue_item_move_batch", json!({"uids": [u[0]]}));
+    assert_eq!(r["success"], false, "no destination must reject: {r}");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
 // -- lua_eval async RPC -----------------------------------------------------
 
 /// Mock LuaEvaluator: echoes the source as stdout, parses a leading

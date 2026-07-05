@@ -131,6 +131,11 @@ impl PlanQueue {
     pub fn get_by_uid(&self, uid: &str) -> Option<&QueuedItem> {
         self.items.iter().find(|i| i.item_uid == uid)
     }
+    /// 0-based index of the item with `uid`, or `None` if absent. Used by
+    /// `queue_item_move_batch`'s `reorder` to sort a batch into queue order.
+    pub fn index_of_uid(&self, uid: &str) -> Option<usize> {
+        self.items.iter().position(|i| i.item_uid == uid)
+    }
     /// Update an item by UID, preserving the UID. Returns the new item if found.
     pub fn update(&mut self, uid: &str, replacement: QueuedItem) -> Option<QueuedItem> {
         let pos = self.items.iter().position(|i| i.item_uid == uid)?;

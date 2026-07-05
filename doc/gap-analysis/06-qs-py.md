@@ -545,14 +545,24 @@ the config dict for compatibility.
 
 ---
 
-#### QS-20 — `queue_item_move` and `queue_item_move_batch` missing `before_uid` / `after_uid` / `reorder` — **PARTIAL**
+#### QS-20 — `queue_item_move` and `queue_item_move_batch` missing `before_uid` / `after_uid` / `reorder` — **DONE**
 
-**Status (PARTIAL):** Single-item `queue_item_move` now reads `before_uid` / `after_uid` and
-dispatches to `PlanQueue::move_before_uid` / `move_after_uid`
-(`crates/bsrs/src/qs/dispatch.rs:1042-1076`, `crates/bsrs/src/qs/queue.rs:171-188`), falling
-back to `pos_dest`. **Missing:** `queue_item_move_batch` (dispatch.rs:1078-1103) still reads
-only `pos_dest` — no `before_uid` / `after_uid` for batch; and the `reorder` parameter is not
-implemented anywhere (`rg reorder` in `qs/` returns nothing).
+**Resolution:** Single-item `queue_item_move` already read `before_uid` / `after_uid`
+(→ `PlanQueue::move_before_uid` / `move_after_uid`), falling back to `pos_dest`.
+`queue_item_move_batch` (`crates/bsrs/src/qs/dispatch.rs`) now ports
+`plan_queue_ops.py::_move_batch` faithfully: it accepts `pos_dest` **or** `before_uid`
+**or** `after_uid` (exactly one required; JSON null counts as unspecified) and honors
+`reorder`. It is **atomic** — pre-validates that `uids` are unique, all present, and the
+destination uid (`before_uid`/`after_uid`) is not itself a batch member, moving nothing on
+any failure. It moves the batch as a **contiguous block** (first item to the destination,
+each subsequent item after the previous). `reorder=false` (default) preserves the `uids`
+order; `reorder=true` sorts the batch into its original queue order via the new
+`PlanQueue::index_of_uid`. `pos_dest` resolution is shared with single-move through the
+lock-free `resolve_pos_q` (the batch holds the queue lock, so the lock-taking `resolve_pos`
+would deadlock). Tests: `queue_item_move_batch_before_uid_block`,
+`queue_item_move_batch_reorder_false_uses_uids_order`,
+`queue_item_move_batch_reorder_true_uses_queue_order`,
+`queue_item_move_batch_rejects_invalid_and_leaves_queue` in `qs_round_trip.rs`.
 
 **bsrs:** `dispatch.rs:869–925` — only `uid` + `pos_dest` (front/back/int).
 
@@ -841,7 +851,7 @@ the bsrs document PUB socket and calls `subscribe(cb)` callbacks on received doc
 | ~~QS-17~~ | ~~`time` missing from status~~ **DONE** | P2 | S |
 | ~~QS-18~~ | ~~`worker_background_tasks` missing from status~~ **DONE** | P2 | S |
 | ~~QS-19~~ | ~~`config_get` response shape mismatch~~ **DONE** | P2 | S |
-| QS-20 | `queue_item_move*` missing `before_uid`/`after_uid` **PARTIAL** | P2 | S |
+| ~~QS-20~~ | ~~`queue_item_move_batch` missing `before_uid`/`after_uid`/`reorder`~~ **DONE** | P2 | S |
 | ~~QS-21~~ | ~~`queue_item_update` missing `replace` param~~ **DONE** | P2 | S |
 | ~~QS-22~~ | ~~`re_runs` `option` ignored; `is_open` always false~~ **DONE** | P2 | S |
 | ~~QS-23~~ | ~~ZMQ CURVE encryption not supported~~ **DONE** | P2 | M |
@@ -857,7 +867,7 @@ the bsrs document PUB socket and calls `subscribe(cb)` callbacks on received doc
 
 **Counts (original):** P0: 8, P1: 10, P2: 12 (total: 30)
 
-**Counts (reconciled 2026-07-05; QS-03 + QS-14 + QS-09 closed 2026-07-05):** QS-*: 23 DONE,
-1 PARTIAL (QS-20), 0 OPEN (of 24). PY-*: 8 OUT-OF-SCOPE (of 8). Total 32: 23 DONE,
-1 PARTIAL, 0 OPEN, 8 OUT-OF-SCOPE (using project scope rule — bsrs-py PyO3 crate exists
-but is out of parity scope by design).
+**Counts (reconciled 2026-07-05; QS-03 + QS-14 + QS-09 + QS-20 closed 2026-07-05):** QS-*:
+24 DONE, 0 PARTIAL, 0 OPEN (of 24). PY-*: 8 OUT-OF-SCOPE (of 8). Total 32: 24 DONE,
+0 PARTIAL, 0 OPEN, 8 OUT-OF-SCOPE (using project scope rule — bsrs-py PyO3 crate exists
+but is out of parity scope by design). **All in-scope QS-* items are now DONE.**
