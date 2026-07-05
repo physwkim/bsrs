@@ -46,7 +46,7 @@ All 30 public bluesky verbs map to a handled bsrs `Msg` arm.
 | `stage` / `unstage` | `Msg::Stage` / `Msg::Unstage` | ✓ |
 | `stop` | `Msg::Stop` | ✓ |
 | `subscribe` / `unsubscribe` | `Msg::Subscribe` / `Msg::Unsubscribe` | ✓ (filter gap — ENG-06) |
-| `open_run` / `close_run` | `Msg::OpenRun` / `Msg::CloseRun` | ✓ (multi-run gap — ENG-04) |
+| `open_run` / `close_run` | `Msg::OpenRun` / `Msg::CloseRun` | ✓ (multi-run: ENG-04 DONE) |
 | `declare_stream` | `Msg::DeclareStream` | ✓ |
 | `monitor` / `unmonitor` | `Msg::Monitor` / `Msg::Unmonitor` | ✓ |
 | `wait_for` | `Msg::WaitFor` | ✓ |
@@ -145,7 +145,7 @@ Without it, plan debugging requires re-implementing instrumentation outside the 
 
 ---
 
-### ENG-04 Multi-run per call not supported (Msg.run key) (P1)
+### ENG-04 Multi-run per call not supported (Msg.run key) (P1) — **DONE**
 
 **bsrs:** `EngineState` has `bundler: Option<RunBundler>` — exactly one open run at a time.
 `open_run()` (`engine.rs:1584`) errors if `state.bundler.is_some()`.
@@ -166,6 +166,27 @@ All routing to the right bundler is impossible.
 by key. `None` key = the single-run default (fully backward-compatible).
 
 **Effort:** L
+
+**Resolution:** Implemented as a *wrapper* rather than a per-variant field. A new
+`Msg::InRun { run: String, inner: Box<Msg> }` (constructed via `Msg::in_run(run, inner)`)
+carries the run key for any bundler-touching verb; `handle()` unwraps it once at the top into
+`(run_key: Option<String>, msg)` — `None` for an unwrapped message (the default run). This keeps
+every existing plan/test construction site zero-churn (no `run:` field threaded through ~150
+call sites) while expressing the key uniformly in one place. `EngineState.bundler:
+Option<RunBundler>` plus its four sibling per-run registries (`bundle_asset_objs`,
+`monitor_tasks`, `monitored`, `uncollected`) are replaced by `runs: HashMap<Option<String>,
+RunSlot>`, where `RunSlot` groups all per-run state so one run's documents, monitors, flyers and
+asset cache never bleed into another. Bundler-touching verbs (OpenRun/CloseRun/Create/Save/Drop/
+DeclareStream/Read/Kickoff/Collect/Monitor/Unmonitor/Configure) route by `run_key`; broadcast
+operations (checkpoint reset, ClearCheckpoint, pause-suspend/resume-restore of monitors, rewind,
+`record_interruption`, and the run-end `backstop_collect` + `drain_and_close`) iterate every open
+run — mirroring bluesky's `self._run_bundlers.values()`. `open_run` rejects only a *same-key*
+re-open, so distinct keys open concurrently; `close_run_if_open` removes one slot (dropping it
+tears down that run's monitor pumps by RAII). `is_cacheable`/replay preserve the `InRun` wrapper,
+so a rewind restores each run's key. `InRun` is not nestable (rejected in `handle`). Test:
+`interleaved_multi_run_routes_documents_by_run_key` opens runs A and B, interleaves their event
+bundles A,B,A,B, and asserts 2 RunStart / 2 RunStop / 2 Descriptor / 2 Event with each event
+bound to its own run's descriptor.
 
 ---
 
@@ -656,7 +677,7 @@ collects exceptions and either swallows them (if `ignore_exceptions=True`) or wa
 | ENG-01 | `Msg::Configure` does not invalidate/re-emit EventDescriptor | P0 | M |
 | ENG-02 | External-asset documents (Resource/Datum/StreamResource/StreamDatum) absent | P0 | L |
 | ENG-03 | `msg_hook` not exposed | P1 | S |
-| ENG-04 | Multi-run per call not supported (Msg.run key) | P1 | L |
+| ~~ENG-04~~ | ~~Multi-run per call not supported (Msg.run key)~~ **DONE** | P1 | L |
 | ENG-05 | `RunResult` missing plan_result, interrupted, reason, exception; one uid only | P1 | M |
 | ENG-06 | `Msg::Subscribe` has no document-type filter | P1 | S |
 | ENG-07 | `read_configuration`/`describe_configuration` absent from descriptors | P1 | M |

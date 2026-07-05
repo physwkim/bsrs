@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use bsrs::backends::soft::SoftDetector;
 use bsrs::callbacks::CapturingSink;
-use bsrs::core::msg::Msg;
+use bsrs::core::msg::{Msg, ReadableObj};
 use bsrs::core::plan::{plan_box, Plan};
 use bsrs::engine::EngineRunState;
 use bsrs::event_model::{DocFilter, Document};
@@ -2719,4 +2719,120 @@ async fn contingency_wrapper_auto_raise_false_swallows_error() {
     // auto_raise=false swallows the error: the run continues to a clean close.
     assert_eq!(result.exit_status, "success");
     assert_eq!(except_ran.load(Ordering::SeqCst), 1, "except branch ran");
+}
+
+// -- ENG-04: multiple runs open at once, routed by run key -------------------
+
+/// Two runs (A and B) open concurrently and interleaved: every bundler verb
+/// carries its run key via `Msg::in_run` (bluesky's `msg.run`). The engine
+/// keeps one `RunSlot` per key, so each run's documents — RunStart, Descriptor,
+/// Event, RunStop — stay in that run and never cross into the other. This is the
+/// core ENG-04 invariant: routing by key, not a single shared bundler.
+#[tokio::test]
+async fn interleaved_multi_run_routes_documents_by_run_key() {
+    use std::collections::{HashMap, HashSet};
+
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+
+    let det_a = SoftDetector::new("det_a");
+    let det_b = SoftDetector::new("det_b");
+
+    // Open both runs first, then interleave their event bundles A,B,A,B so a
+    // shared-bundler implementation (the pre-ENG-04 behaviour) could not keep
+    // them apart — the second OpenRun would have been rejected as "a previous
+    // run is still open".
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::in_run("A", Msg::OpenRun(Default::default()));
+        yield Msg::in_run("B", Msg::OpenRun(Default::default()));
+        yield Msg::in_run("A", Msg::Create { stream_name: "primary".into() });
+        yield Msg::in_run("B", Msg::Create { stream_name: "primary".into() });
+        yield Msg::in_run("A", Msg::Read(det_a.clone() as Arc<dyn ReadableObj>));
+        yield Msg::in_run("B", Msg::Read(det_b.clone() as Arc<dyn ReadableObj>));
+        yield Msg::in_run("A", Msg::Save);
+        yield Msg::in_run("B", Msg::Save);
+        yield Msg::in_run("A", Msg::CloseRun { exit_status: "success".into(), reason: None });
+        yield Msg::in_run("B", Msg::CloseRun { exit_status: "success".into(), reason: None });
+    });
+    re.run_async(plan).await.unwrap();
+
+    let docs = sink.snapshot().await;
+
+    let starts: Vec<_> = docs
+        .iter()
+        .filter_map(|d| match d {
+            Document::Start(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    let stops: Vec<_> = docs
+        .iter()
+        .filter_map(|d| match d {
+            Document::Stop(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    let descriptors: Vec<_> = docs
+        .iter()
+        .filter_map(|d| match d {
+            Document::Descriptor(d) => Some(d),
+            _ => None,
+        })
+        .collect();
+    let events: Vec<_> = docs
+        .iter()
+        .filter_map(|d| match d {
+            Document::Event(e) => Some(e),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(starts.len(), 2, "one RunStart per open run");
+    assert_eq!(stops.len(), 2, "one RunStop per open run");
+    assert_eq!(
+        descriptors.len(),
+        2,
+        "one descriptor per run's primary stream"
+    );
+    assert_eq!(events.len(), 2, "one event per run");
+
+    // The two runs have distinct start uids.
+    let start_uids: HashSet<String> = starts.iter().map(|s| s.uid.clone()).collect();
+    assert_eq!(start_uids.len(), 2, "the two runs have distinct uids");
+
+    // Each run closed exactly once, success — the stop set covers both starts
+    // (no double-close of one run, no run left open).
+    let stop_starts: HashSet<String> = stops.iter().map(|s| s.run_start.clone()).collect();
+    assert_eq!(stop_starts, start_uids, "each run closed exactly once");
+    for s in &stops {
+        assert_eq!(s.exit_status, ExitStatus::Success);
+    }
+
+    // Each run's stream got its own descriptor (descriptor.run_start covers both
+    // starts, one each).
+    let desc_runs: HashSet<String> = descriptors.iter().map(|d| d.run_start.clone()).collect();
+    assert_eq!(
+        desc_runs, start_uids,
+        "each run's stream got its own descriptor"
+    );
+
+    // The routing invariant: each run's event landed on that run's descriptor.
+    // A's read must never have bundled into B's descriptor, and vice versa.
+    let desc_run_by_uid: HashMap<String, String> = descriptors
+        .iter()
+        .map(|d| (d.uid.clone(), d.run_start.clone()))
+        .collect();
+    let event_runs: HashSet<String> = events
+        .iter()
+        .map(|e| {
+            desc_run_by_uid
+                .get(&e.descriptor)
+                .cloned()
+                .expect("event references a descriptor emitted this session")
+        })
+        .collect();
+    assert_eq!(
+        event_runs, start_uids,
+        "each run's event stayed within that run's descriptor"
+    );
 }

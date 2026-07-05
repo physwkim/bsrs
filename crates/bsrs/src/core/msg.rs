@@ -63,6 +63,26 @@ pub enum Msg {
         reason: Option<String>,
     },
 
+    /// Route a bundler-touching message to a *named* run, so several runs can
+    /// be open at once (a fly scan with a `primary` and a `diagnostics` run, an
+    /// outer run wrapping per-point sub-runs). The bsrs analogue of bluesky's
+    /// `msg.run` field (`run_engine.py:504` `_run_bundlers: dict`): every
+    /// message carries an implicit run key, `None` (an unwrapped message) being
+    /// the single default run. Wrapping `inner` in `InRun` sets that key to
+    /// `Some(run)`, so the engine dispatches it to the run's own [`RunBundler`],
+    /// monitors, uncollected flyers and asset cache. Only the bundler-touching
+    /// verbs (`OpenRun`/`CloseRun`/`Create`/`Save`/`Drop`/`DeclareStream`/
+    /// `Read`/`Collect`/`Monitor`/`Unmonitor`/`Configure`/`Kickoff`) consult the
+    /// key; wrapping any other verb runs it unchanged (the key is ignored,
+    /// matching bluesky, which ignores `msg.run` outside the bundler path).
+    /// Not nestable — an `InRun` inside an `InRun` is rejected by the engine.
+    InRun {
+        /// The run key this message targets.
+        run: String,
+        /// The bundler-touching message to dispatch under `run`.
+        inner: Box<Msg>,
+    },
+
     /// Open a new event bundle for a stream.
     Create {
         /// Stream name (e.g. `primary`).
@@ -309,6 +329,16 @@ pub enum Msg {
 }
 
 impl Msg {
+    /// Wrap `inner` so the engine routes it to the run named `run` (see
+    /// [`Msg::InRun`]). Convenience for multi-run plans:
+    /// `Msg::in_run("diag", Msg::Create { stream_name: "primary".into() })`.
+    pub fn in_run(run: impl Into<String>, inner: Msg) -> Msg {
+        Msg::InRun {
+            run: run.into(),
+            inner: Box::new(inner),
+        }
+    }
+
     /// Whether this message should be added to the rewind cache when the
     /// engine is in a rewindable region (between `Checkpoint` and the next
     /// `ClearCheckpoint` / non-rewindable command).
@@ -330,6 +360,12 @@ impl Msg {
     /// re-issued acquisition ran under whatever configuration the device had
     /// drifted to during the pause instead of the one the plan requested.
     pub fn is_cacheable(&self) -> bool {
+        // A run-routed message caches exactly as its inner verb would, so a
+        // rewind replays `InRun`-wrapped Set/Read/Save into the same run. (A
+        // wrapped OpenRun/CloseRun/Monitor stays uncacheable via the inner.)
+        if let Msg::InRun { inner, .. } = self {
+            return inner.is_cacheable();
+        }
         !matches!(
             self,
             Msg::OpenRun(_)
@@ -364,6 +400,7 @@ impl Msg {
     /// build `objs_seen` / `movable_objs_touched` registers.
     pub fn obj_name(&self) -> Option<&str> {
         match self {
+            Msg::InRun { inner, .. } => inner.obj_name(),
             Msg::Read(o) => Some(o.name()),
             Msg::Set { obj, .. } => Some(obj.name()),
             Msg::Trigger { obj, .. } => Some(obj.name()),
@@ -395,6 +432,10 @@ impl Clone for Msg {
             } => Msg::CloseRun {
                 exit_status: exit_status.clone(),
                 reason: reason.clone(),
+            },
+            Msg::InRun { run, inner } => Msg::InRun {
+                run: run.clone(),
+                inner: Box::new((**inner).clone()),
             },
             Msg::Create { stream_name } => Msg::Create {
                 stream_name: stream_name.clone(),
@@ -506,6 +547,7 @@ impl std::fmt::Debug for Msg {
         match self {
             Msg::OpenRun(_) => write!(f, "OpenRun"),
             Msg::CloseRun { exit_status, .. } => write!(f, "CloseRun({exit_status})"),
+            Msg::InRun { run, inner } => write!(f, "InRun({run}, {inner:?})"),
             Msg::Create { stream_name } => write!(f, "Create({stream_name})"),
             Msg::Save => write!(f, "Save"),
             Msg::Drop => write!(f, "Drop"),
