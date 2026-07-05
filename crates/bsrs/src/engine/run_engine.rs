@@ -752,12 +752,32 @@ impl RunEngine {
 
     /// Async entry point — drive a plan to completion.
     pub async fn run_async(&self, plan: Plan) -> Result<RunResult> {
-        // before_plan hook — runs before is_running flips on, so it sees
-        // EngineRunState::Idle.
+        // Enforce the single-plan invariant by construction: at most one plan
+        // runs on a RunEngine at a time. `compare_exchange(false → true)` both
+        // claims the engine and rejects a *concurrent* `run_async` — e.g. a
+        // local console `RE:run` firing while the qs queue worker is mid-plan
+        // (or vice versa), which would otherwise corrupt the single shared run
+        // loop (pause gate, permit, replay queue, `runs` map). The claim is
+        // released at run end (`is_running.store(false)` below); there is no
+        // early return between claim and release, so the flag never leaks. A
+        // rejection here has zero side effects: the `before_plan` hook and every
+        // state reset are skipped, so a rejected caller leaves the in-flight
+        // run untouched.
+        if self
+            .is_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(BsrsError::State(
+                "a plan is already running on this RunEngine".into(),
+            ));
+        }
+        // before_plan hook — fires only once the engine has claimed the run, so
+        // it never fires for a rejected concurrent call. `state()` reports
+        // `Running` during the hook.
         if let Some(h) = self.before_plan.lock().unwrap().clone() {
             h();
         }
-        self.is_running.store(true, Ordering::SeqCst);
         // Reset abort/halt/stop flags from a previous (terminated) run so
         // `RunEngine` is reusable across plans.
         self.is_aborting.store(false, Ordering::SeqCst);

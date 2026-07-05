@@ -2836,3 +2836,48 @@ async fn interleaved_multi_run_routes_documents_by_run_key() {
         "each run's event stayed within that run's descriptor"
     );
 }
+
+// -- Single-plan invariant: run_async rejects a concurrent plan --------------
+
+/// A `RunEngine` runs at most one plan at a time. A second `run_async` issued
+/// while the first is still in flight is rejected (not silently interleaved
+/// into the one shared run loop), and the claim is released when the first plan
+/// finishes so the engine is reusable. This is the enforcement point behind the
+/// fused console+qserver guard: a local `RE:run` and the qs queue worker can
+/// never both drive the engine at once.
+#[tokio::test]
+async fn run_async_rejects_concurrent_plan_and_releases_after() {
+    use tokio::sync::Notify;
+
+    let re = Arc::new(RunEngine::new(vec![]));
+    let gate = Arc::new(Notify::new());
+
+    // Opens a run, parks until `gate` fires, then closes — so the engine is
+    // provably mid-plan while the second run_async is attempted.
+    let gate_for_plan = gate.clone();
+    let blocking = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        gate_for_plan.notified().await;
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+
+    let re_run = re.clone();
+    let task = tokio::spawn(async move { re_run.run_async(blocking).await });
+
+    // First plan has claimed the engine.
+    wait_for_state(&re, EngineRunState::Running).await;
+
+    // Concurrent run is rejected, in-flight run untouched.
+    let err = re.run_async(one_count_plan()).await.unwrap_err();
+    assert!(
+        err.to_string().contains("already running"),
+        "expected a single-plan rejection, got: {err}"
+    );
+
+    // Release the first plan; it completes and frees the claim.
+    gate.notify_one();
+    task.await.unwrap().unwrap();
+
+    // The claim was released — a fresh run now succeeds.
+    re.run_async(one_count_plan()).await.unwrap();
+}
