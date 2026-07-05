@@ -9,7 +9,8 @@
 //! learns the globals and table fields you define, fish-style history
 //! autosuggestion, reverse history search (Ctrl-R), and true in-place
 //! multi-line editing — an incomplete Lua chunk drops to a `... `
-//! continuation line.
+//! continuation line. `name?` / `name??` introspect a value the way IPython's
+//! `obj?` does (type, signature, fields / methods).
 //!
 //! Built-ins available at the prompt:
 //!
@@ -30,6 +31,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -904,6 +906,11 @@ pub(crate) fn interactive_loop(lua: &mlua::Lua) -> i32 {
                 if trimmed.is_empty() {
                     continue;
                 }
+                // IPython-style introspection: `name?` / `name??`.
+                if let Some((target, verbose)) = parse_introspect(trimmed) {
+                    print!("{}", introspect_report(lua, &target, verbose));
+                    continue;
+                }
                 // Slash-style commands.
                 match trimmed {
                     ":help" => {
@@ -962,12 +969,209 @@ fn eval_line(lua: &mlua::Lua, src: &str) {
     }
 }
 
+/// Parse an IPython-style introspection request. `name?` / `?name` → brief,
+/// `name??` / `??name` → verbose. Returns `(target, verbose)` or `None` if the
+/// line is not an introspection request. `?` is not a Lua operator, so any
+/// stray `?` at either end is unambiguous.
+fn parse_introspect(trimmed: &str) -> Option<(String, bool)> {
+    if let Some(t) = trimmed.strip_suffix("??") {
+        return Some((t.trim().to_string(), true));
+    }
+    if let Some(t) = trimmed.strip_prefix("??") {
+        return Some((t.trim().to_string(), true));
+    }
+    if let Some(t) = trimmed.strip_suffix('?') {
+        return Some((t.trim().to_string(), false));
+    }
+    if let Some(t) = trimmed.strip_prefix('?') {
+        return Some((t.trim().to_string(), false));
+    }
+    None
+}
+
+/// Curated `(signature, summary)` for the well-known bsrs names — Lua carries
+/// no signature/docstring metadata, so this is our stand-in for IPython's
+/// `obj?` docstring panel.
+fn doc_for(name: &str) -> Option<(&'static str, &'static str)> {
+    let entry = match name {
+        "count" => (
+            "count(detectors, num=1, delay=nil)",
+            "Plan: read `detectors` `num` times into one run.",
+        ),
+        "scan" => (
+            "scan(detectors, motor, start, stop, num)",
+            "Plan: step `motor` start→stop over `num` points, reading `detectors`.",
+        ),
+        "mvr" => (
+            "mvr(motor, delta)",
+            "Plan: move `motor` by a relative `delta`.",
+        ),
+        "sleep" => ("sleep(seconds)", "Plan: pause the plan for `seconds`."),
+        "null" => ("null()", "Plan: a no-op (emits no Msg)."),
+        "plan" => ("plan(fn, ...)", "Wrap a Lua coroutine `fn` into a Plan."),
+        "print" => ("print(...)", "Print values to stdout (Lua base library)."),
+        "soft_detector" => (
+            "soft_detector(name)",
+            "Create an in-memory detector device.",
+        ),
+        "soft_motor" => (
+            "soft_motor(name, initial=0.0)",
+            "Create an in-memory motor device.",
+        ),
+        "soft_pausable" => ("soft_pausable(name)", "Create a pausable suspender source."),
+        "RE" => (
+            "RE:run(plan) / RE:pause() / RE:resume() / RE:abort() / RE:state()",
+            "The RunEngine handle. Use `RE??` to list the method surface.",
+        ),
+        "msg" => (
+            "msg.<verb>(...)",
+            "Coroutine-plan Msg constructors (open_run, read, set, ...). `msg??` lists them.",
+        ),
+        "bp" => (
+            "bp.<plan>(...)",
+            "Compound plans (count, scan, grid_scan, spiral, ...).",
+        ),
+        "bps" => (
+            "bps.<stub>(...)",
+            "Plan stubs (open_run, mv, trigger, read, ...).",
+        ),
+        "bpt" => (
+            "bpt.<gen>(...)",
+            "Coordinate generators returning Lua tables.",
+        ),
+        "bpp" => (
+            "bpp.<wrapper>(plan, ...)",
+            "Plan preprocessors (run_wrapper, monitor_during, ...).",
+        ),
+        "tiled" => ("tiled.<fn>(...)", "Tiled document-sink helpers."),
+        _ => return None,
+    };
+    Some(entry)
+}
+
+/// Member names of `base` drawn from the curated token list (`base:member` /
+/// `base.member`). Used to describe userdata like `RE` whose methods mlua
+/// cannot enumerate at runtime.
+fn curated_members(base: &str) -> Vec<String> {
+    let mut out: Vec<String> = base_keywords()
+        .into_iter()
+        .filter(|tok| !tok.starts_with(':'))
+        .filter_map(|tok| {
+            let idx = tok.find([':', '.'])?;
+            (&tok[..idx] == base).then(|| tok[idx + 1..].to_string())
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Append a `label (n): a  b  c ...` block, wrapping at 4 per line and (unless
+/// `verbose`) truncating long lists with a `?? for all` hint.
+fn write_names(report: &mut String, label: &str, names: &[String], verbose: bool) {
+    if names.is_empty() {
+        return;
+    }
+    let limit = if verbose {
+        names.len()
+    } else {
+        names.len().min(12)
+    };
+    let _ = writeln!(report, "  {label} ({}):", names.len());
+    for chunk in names[..limit].chunks(4) {
+        let _ = writeln!(report, "    {}", chunk.join("  "));
+    }
+    if limit < names.len() {
+        let _ = writeln!(
+            report,
+            "    ... (+{} more; use `??` for all)",
+            names.len() - limit
+        );
+    }
+}
+
+/// Build the `obj?` / `obj??` report: runtime type from the live Lua value,
+/// curated signature/summary, plus fields (tables) or methods (userdata).
+fn introspect_report(lua: &mlua::Lua, target: &str, verbose: bool) -> String {
+    let target = target.trim();
+    let mut report = String::new();
+    if target.is_empty() {
+        return "usage: `name?` shows a summary, `name??` shows fields / methods too\n".to_string();
+    }
+    let _ = writeln!(report, "{target}");
+
+    let evaluated = lua.load(format!("return {target}")).eval::<mlua::Value>();
+    match evaluated {
+        // A real live value (not nil).
+        Ok(value) if !matches!(value, mlua::Value::Nil) => {
+            let _ = writeln!(report, "  Type:      {}", value.type_name());
+            if let Some((sig, summary)) = doc_for(target) {
+                let _ = writeln!(report, "  Signature: {sig}");
+                let _ = writeln!(report, "  Summary:   {summary}");
+            }
+            match &value {
+                mlua::Value::Table(t) => {
+                    let mut keys: Vec<String> = Vec::new();
+                    for pair in t.pairs::<mlua::String, mlua::Value>() {
+                        let Ok((k, _)) = pair else { continue };
+                        if let Ok(s) = k.to_str() {
+                            if !s.starts_with('_') {
+                                keys.push(s.to_string());
+                            }
+                        }
+                    }
+                    keys.sort();
+                    keys.dedup();
+                    write_names(&mut report, "Fields", &keys, verbose);
+                }
+                mlua::Value::UserData(_) => {
+                    let methods = curated_members(target);
+                    if methods.is_empty() {
+                        let _ = writeln!(report, "  (userdata methods are not introspectable)");
+                    } else {
+                        write_names(&mut report, "Methods", &methods, verbose);
+                    }
+                }
+                mlua::Value::Function(_) => {
+                    if doc_for(target).is_none() {
+                        let _ = writeln!(report, "  (a function; no signature metadata)");
+                    }
+                }
+                mlua::Value::String(s) => {
+                    let _ = writeln!(
+                        report,
+                        "  Value:     {:?}",
+                        s.to_str().map(|c| c.to_string()).unwrap_or_default()
+                    );
+                }
+                other => {
+                    let _ = writeln!(report, "  Value:     {other:?}");
+                }
+            }
+        }
+        // No live value: an undefined global is `nil` (not an error) in Lua, and
+        // a malformed target is a syntax error — both mean "nothing to reflect".
+        // Fall back to the curated doc if we carry one.
+        _ => match doc_for(target) {
+            Some((sig, summary)) => {
+                let _ = writeln!(report, "  Signature: {sig}");
+                let _ = writeln!(report, "  Summary:   {summary}");
+            }
+            None => {
+                let _ = writeln!(report, "  (not defined)");
+            }
+        },
+    }
+    report
+}
+
 fn print_help() {
     println!(
         r#"bsrs REPL commands:
   :help              show this help
   :quit / :exit      leave the REPL
   :script <path>     load and run a Lua file
+  name? / name??     introspect: type, signature, fields / methods
   Tab                open the completion menu; Ctrl-R searches history
 
 Lua globals registered:
@@ -1245,5 +1449,63 @@ mod tests {
         let toks = assert_covers(&h, "-- c\nlocal y");
         assert!(has(&toks, TokKind::Comment, "-- c"));
         assert!(has(&toks, TokKind::Keyword, "local"));
+    }
+
+    #[test]
+    fn parse_introspect_recognizes_both_forms() {
+        assert_eq!(parse_introspect("det1?"), Some(("det1".to_string(), false)));
+        assert_eq!(parse_introspect("det1??"), Some(("det1".to_string(), true)));
+        assert_eq!(parse_introspect("?det1"), Some(("det1".to_string(), false)));
+        assert_eq!(parse_introspect("??det1"), Some(("det1".to_string(), true)));
+        // `??` wins over `?` (checked first).
+        assert_eq!(parse_introspect("RE??"), Some(("RE".to_string(), true)));
+        // No `?` → not an introspection request.
+        assert_eq!(parse_introspect("count({det1}, 5)"), None);
+        assert_eq!(parse_introspect("x = 1"), None);
+    }
+
+    #[test]
+    fn curated_members_lists_re_methods() {
+        let m = curated_members("RE");
+        assert!(m.iter().any(|s| s == "run"));
+        assert!(m.iter().any(|s| s == "pause"));
+        // `msg` members come from the `msg.<verb>` tokens.
+        assert!(curated_members("msg").iter().any(|s| s == "open_run"));
+        // Sorted + deduped.
+        let mut sorted = m.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(m, sorted);
+    }
+
+    #[test]
+    fn introspect_report_reflects_runtime_value() {
+        let lua = mlua::Lua::new();
+        lua.load("greeting = \"hi\"\nnums = { a = 1, b = 2 }")
+            .exec()
+            .unwrap();
+
+        // A live string shows its type and value.
+        let r = introspect_report(&lua, "greeting", false);
+        assert!(r.contains("Type:      string"));
+        assert!(r.contains("\"hi\""));
+
+        // A live table lists its fields.
+        let r = introspect_report(&lua, "nums", false);
+        assert!(r.contains("Type:      table"));
+        assert!(r.contains("Fields"));
+        assert!(r.contains('a') && r.contains('b'));
+
+        // A curated name that is not a live global still shows its doc.
+        let r = introspect_report(&lua, "count", false);
+        assert!(r.contains("Signature: count("));
+        assert!(r.contains("Summary:"));
+
+        // An unknown, undefined name says so.
+        let r = introspect_report(&lua, "nope_not_here", false);
+        assert!(r.contains("(not defined)"));
+
+        // Empty target → usage hint.
+        assert!(introspect_report(&lua, "", false).contains("usage:"));
     }
 }
