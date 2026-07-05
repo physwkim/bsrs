@@ -1,7 +1,7 @@
 # Gap Analysis 02 — Plans, Plan Stubs, Plan Patterns, Preprocessors
 
 **Date:** 2026-06-14  
-**Scope:** `crates/bsrs-plans/src/` (lib.rs, patterns.rs, preprocessors.rs)  
+**Scope:** `crates/bsrs/src/plans/` (mod.rs, patterns.rs, preprocessors.rs) — consolidated from the former `crates/bsrs-plans/src/`  
 **Reference:** `daq/bluesky/src/bluesky/{plans,plan_stubs,plan_patterns,preprocessors}.py`
 
 ---
@@ -32,8 +32,8 @@ The primary gaps are:
 - ~~**`scan` is 1D only**; bluesky's is N-D (P0, PLAN-03).~~ **DONE** — `scan(dets,
   axes: Vec<ScanAxis>, num)` is now the canonical N-motor inner-product form
   (plan_name "scan"); `scan_1d` is the 1-D convenience.
-- **`mv`/`mvr` are single-motor only**; bluesky accepts parallel multi-motor pairs (P1,
-  PLAN-10).
+- ~~**`mv`/`mvr` are single-motor only**; bluesky accepts parallel multi-motor pairs (P1,
+  PLAN-10).~~ **DONE** — `mv_many`/`mvr_many` (one group, one wait).
 - ~~**Snake traversal absent** from all N-D grid scans and pattern generators (P1,
   PLAN-19).~~ **DONE** — `outer_product_snake` / `list_grid_scan_snake` /
   `grid_scan_snake` + `SnakeAxes`.
@@ -43,6 +43,63 @@ The primary gaps are:
   `trigger_and_read` (P1, PLAN-21).
 
 Priority counts: **P0: 9 · P1: 19 · P2: 10**
+
+---
+
+## Reconciliation (2026-07-05)
+
+Every PLAN-* item re-verified against the consolidated code
+(`crates/bsrs/src/plans/{mod,patterns,preprocessors}.rs`, `crates/bsrs/src/core/msg.rs`).
+The header's `crates/bsrs-plans/src/...` paths are pre-consolidation. **Scope overlay**
+(authoritative, from the project scope rule): bsrs owns document-emission + qs-wire
+correctness only; barrier/`wait` choreography, interactive/console plans, and
+subscribe/unsubscribe callback plumbing are consumer-/device-side → OUT-OF-SCOPE. This
+block is authoritative where a per-heading tag below still lags.
+
+**DONE** (implemented; several headings below were stale): PLAN-01, 02, 03, 04, 05, 06,
+07, 09, 10, 14, 15, 16, 17, 18, 19, 22, 26, 34, 35. Evidence for the newly-confirmed:
+PLAN-10 `mv_many`/`mvr_many` (mod.rs:242/266); PLAN-14 `kickoff_all`/`complete_all`
+(mod.rs:459/483); PLAN-15 `rel_spiral*` (mod.rs:1963/1990/2017); PLAN-16 `rel_log_scan`
+(mod.rs:1896); PLAN-17 `rel_list_grid_scan` (mod.rs:1586); PLAN-18 `x2x_scan`
+(mod.rs:1390); PLAN-22 `contingency_wrapper` with real except/else/finally
+(preprocessors.rs:460); PLAN-26 `repeat` incl. `num=None` infinite (mod.rs:665);
+PLAN-34 `wait_for` + `Msg::WaitFor` (mod.rs:368); PLAN-35 `prepare` + `Msg::Prepare`
+(mod.rs:420).
+
+**PARTIAL, IN-SCOPE** (emission-relevant remainder):
+- **PLAN-25** — `scan_run_md` already emits `detectors`/`motors`/`num_points`/
+  `num_intervals`/`hints.dimensions` into RunStart via `extra` (mod.rs:67 →
+  run_engine.rs:2761/2811), with a per-call `md` override at `run_async_with`. Missing:
+  RunStart `plan_args`, and a per-plan `md:` argument on the compound plans.
+- **PLAN-28** — `list_scan_per_step` adds the `per_step` hook (mod.rs:1088); still
+  single-motor — no multi-motor inner-list-product at the public API.
+- **PLAN-32** — `Msg::Locate` + engine handler (run_engine.rs:2065) + Lua `locate()`
+  (lua_env.rs:1955) exist; missing only a Rust `stubs::locate` plan helper.
+
+**OPEN, IN-SCOPE** (changes emitted documents):
+- **PLAN-08** — `collect_while_completing` absent; its collect loop emits
+  StreamResource/StreamDatum/Event from flyers + collectables. Depends on a done-flag
+  from `wait` (PLAN-24).
+- **PLAN-20** — `spiral`/`spiral_fermat` ignore `dr_y` (ellipse aspect) + `tilt`
+  (patterns.rs:151); both change per-step motor positions emitted into Events.
+- **PLAN-27** — no plan-level `rd` single-scalar read stub (weak: emits nothing itself).
+- **PLAN-29** — `broadcast_msg` absent; fans Trigger/Stage across objects (gates
+  Resource/Datum + staging).
+
+**OUT-OF-SCOPE** (verified absent/partial, outside parity scope):
+- Barrier/`wait` choreography (append `Msg::Wait`, no document effect): PLAN-11
+  (`abs_set` wait), PLAN-12 (`trigger`/`kickoff`/`complete` wait), PLAN-13
+  (`stage`/`unstage` group/wait), PLAN-24 (`wait` watch / error_on_timeout).
+- Consumer-side callback plumbing (live callbacks run Python-side off emitted docs):
+  PLAN-23 (subscribe/unsubscribe), PLAN-38 (`subs_wrapper` no-op).
+- Interactive/console plans: PLAN-33 (`tweak`), PLAN-37 (`input_plan`).
+- Ergonomics / deprecated, no emission effect: PLAN-21 (`plan_mutator` head/tail —
+  superseded by PLAN-22's drop-on-error path), PLAN-30 (`*_decorator` variants —
+  wrappers already provide the behavior), PLAN-31 (`classify`/`chunk_outer_product`
+  arg-parsing helpers), PLAN-36 (`caching_repeater`, deprecated).
+
+**Genuine in-scope backlog from doc 02** (implement in this order): PLAN-20, PLAN-29,
+PLAN-28, PLAN-25, PLAN-32, PLAN-27, PLAN-08 (dep. PLAN-24 done-flag).
 
 ---
 
@@ -276,7 +333,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-08 — `collect_while_completing` stub missing
+### PLAN-08 — `collect_while_completing` stub missing — **OPEN (in-scope)**
 
 - **bsrs:** not present
 - **ref:** `plan_stubs.py:1013–1046` — `collect_while_completing(flyers, dets, flush_period, stream_name, watch)`
@@ -342,7 +399,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ## P1 — Meaningful Completeness Gaps
 
-### PLAN-10 — `mv` and `mvr` are single-motor only
+### PLAN-10 — `mv` and `mvr` are single-motor only — **DONE**
 
 - **bsrs:** `lib.rs:94–123`
 - **ref:** `plan_stubs.py:357–446` — `mv(*args)` accepts `(motor1, val1, motor2, val2, …)` pairs, all in one group
@@ -388,7 +445,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-14 — `kickoff_all` / `complete_all` stubs missing
+### PLAN-14 — `kickoff_all` / `complete_all` stubs missing — **DONE**
 
 - **bsrs:** not present
 - **ref:** `plan_stubs.py:837–973`
@@ -400,7 +457,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-15 — `rel_spiral`, `rel_spiral_fermat`, `rel_spiral_square` missing
+### PLAN-15 — `rel_spiral`, `rel_spiral_fermat`, `rel_spiral_square` missing — **DONE**
 
 - **bsrs:** not present
 - **ref:** `plans.py:1972–2043, 1791–1865, 2144–2211`
@@ -410,7 +467,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-16 — `rel_log_scan` missing
+### PLAN-16 — `rel_log_scan` missing — **DONE**
 
 - **bsrs:** not present
 - **ref:** `plans.py:626–670`
@@ -420,7 +477,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-17 — `rel_list_grid_scan` missing
+### PLAN-17 — `rel_list_grid_scan` missing — **DONE**
 
 - **bsrs:** not present
 - **ref:** `plans.py:359–418`
@@ -430,7 +487,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-18 — `x2x_scan` (theta-2theta) missing
+### PLAN-18 — `x2x_scan` (theta-2theta) missing — **DONE**
 
 - **bsrs:** not present
 - **ref:** `plans.py:2341–2400`
@@ -473,7 +530,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-20 — `spiral` and `spiral_fermat` patterns missing `dr_y` (ellipse aspect) and `tilt`
+### PLAN-20 — `spiral` and `spiral_fermat` patterns missing `dr_y` (ellipse aspect) and `tilt` — **OPEN (in-scope)**
 
 - **bsrs:** `patterns.rs:102–133` (spiral), `220–250` (spiral_fermat)
 - **ref:** `plan_patterns.py:18–77` (spiral has `dr_y=None`, `tilt=0.0`), `200–257`
@@ -506,7 +563,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-22 — `contingency_wrapper` is `finalize_wrapper` alias; missing `except_plan`/`else_plan`
+### PLAN-22 — `contingency_wrapper` is `finalize_wrapper` alias; missing `except_plan`/`else_plan` — **DONE** (stale: real except/else/finally landed `c902bbc`)
 
 - **bsrs:** `preprocessors.rs:349–351`
 - **ref:** `preprocessors.py:508–` (finalize_wrapper uses contingency internally);
@@ -542,7 +599,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-25 — No `md` parameter on any compound plan; minimal RunMetadata
+### PLAN-25 — No `md` parameter on any compound plan; minimal RunMetadata — **PARTIAL (in-scope)**
 
 - **bsrs:** `lib.rs:322–1155` — only `plan_name` is set in `RunMetadata`
 - **ref:** `plans.py:66,107–116` — every plan builds a `_md` dict with `detectors`,
@@ -556,7 +613,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-26 — `repeat` stub (checkpoint + delay loop) missing; `repeater` has no `n=None` infinite mode
+### PLAN-26 — `repeat` stub (checkpoint + delay loop) missing; `repeater` has no `n=None` infinite mode — **DONE**
 
 - **bsrs:** `lib.rs:299–315` — `repeater(n, plan_fn)` — no checkpoint, no delay
 - **ref:** `plan_stubs.py:1746–1825` — `repeat(plan_fn, num, delay)` — emits
@@ -568,7 +625,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-27 — `rd` stub missing — no plan-level single-scalar read
+### PLAN-27 — `rd` stub missing — no plan-level single-scalar read — **OPEN (in-scope)**
 
 - **bsrs:** not present
 - **ref:** `plan_stubs.py:453–552`
@@ -579,7 +636,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-28 — `list_scan` is single-motor only; bluesky supports multi-motor inner-list-product
+### PLAN-28 — `list_scan` is single-motor only; bluesky supports multi-motor inner-list-product — **PARTIAL (in-scope)**
 
 - **bsrs:** `lib.rs:423–457`
 - **ref:** `plans.py:132–222` — `list_scan(dets, motor1, [pts1], motor2, [pts2], …, per_step=…)`
@@ -592,7 +649,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ## P2 — Nice to Have
 
-### PLAN-29 — `broadcast_msg` missing
+### PLAN-29 — `broadcast_msg` missing — **OPEN (in-scope)**
 
 - **bsrs:** not present
 - **ref:** `plan_stubs.py:1488–1520`
@@ -628,7 +685,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-32 — `locate` plan stub missing
+### PLAN-32 — `locate` plan stub missing — **PARTIAL (in-scope)**
 
 - **bsrs:** `LocatableObj` is used internally in `mvr`, `rel_list_scan`, etc., but
   no `Msg::Locate` exists
@@ -649,7 +706,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-34 — `wait_for` (asyncio Future) stub missing
+### PLAN-34 — `wait_for` (asyncio Future) stub missing — **DONE**
 
 - **bsrs:** not present
 - **ref:** `plan_stubs.py:1399–1419`
@@ -659,7 +716,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-35 — `prepare` stub (Preparable protocol) missing
+### PLAN-35 — `prepare` stub (Preparable protocol) missing — **DONE**
 
 - **bsrs:** not present
 - **ref:** `plan_stubs.py:757–788`
