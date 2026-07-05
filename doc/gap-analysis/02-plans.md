@@ -78,8 +78,6 @@ PLAN-34 `wait_for` + `Msg::WaitFor` (mod.rs:368); PLAN-35 `prepare` + `Msg::Prep
 
 **OPEN, IN-SCOPE** (changes emitted documents):
 - **PLAN-27** — no plan-level `rd` single-scalar read stub (weak: emits nothing itself).
-- **PLAN-29** — `broadcast_msg` absent; fans Trigger/Stage across objects (gates
-  Resource/Datum + staging).
 
 **OUT-OF-SCOPE** (verified absent/partial, outside parity scope):
 - Barrier/`wait` choreography (append `Msg::Wait`, no document effect): PLAN-11
@@ -93,10 +91,11 @@ PLAN-34 `wait_for` + `Msg::WaitFor` (mod.rs:368); PLAN-35 `prepare` + `Msg::Prep
   wrappers already provide the behavior), PLAN-31 (`classify`/`chunk_outer_product`
   arg-parsing helpers), PLAN-36 (`caching_repeater`, deprecated).
 
-**Genuine in-scope backlog from doc 02** (implement in this order): PLAN-29,
+**Genuine in-scope backlog from doc 02** (implement in this order):
 PLAN-28, PLAN-25, PLAN-32, PLAN-27. (PLAN-08 done — the `wait` done-flag it needed is
 `MsgResult::WaitComplete`, delivered via the plan↔engine response channel. PLAN-20 done —
-faithful ring-based spiral/fermat rewrite with `dr_y`+`tilt`.)
+faithful ring-based spiral/fermat rewrite with `dr_y`+`tilt`. PLAN-29 done — typed
+`broadcast_msg` fan.)
 
 ---
 
@@ -689,12 +688,25 @@ faithful ring-based spiral/fermat rewrite with `dr_y`+`tilt`.)
 
 ## P2 — Nice to Have
 
-### PLAN-29 — `broadcast_msg` missing — **OPEN (in-scope)**
+### ~~PLAN-29~~ — `broadcast_msg` missing — **DONE**
 
-- **bsrs:** not present
+- **bsrs:** `plans::stubs::broadcast_msg(objs, make)`
 - **ref:** `plan_stubs.py:1488–1520`
 - **Gap:** Fan out a single command (e.g. `Trigger`, `Stage`) to multiple objects.
-- **Fix sketch:** Simple iterator over objects emitting `Msg(command, obj)`.
+- **Resolution:** Added as a typed fan. bluesky's `broadcast_msg(command, objs,
+  *args, **kwargs)` builds `Msg(command, obj, ...)` per object from a runtime
+  command *string*; bsrs's `Msg` is a typed enum, so the port takes a per-object
+  message builder closure `make: Fn(Arc<T>) -> Msg` instead. The existing
+  `stage_all`/`unstage_all`/`kickoff_all`/`complete_all` fans are fixed-command
+  specializations of this shape, and stage/unstage are the only commands bluesky
+  actually broadcasts (`cntx.py:169,173`) — both already exposed on the Lua side as
+  `bps.stage_all`/`unstage_all`, so no string-dispatch Lua binding was added (that
+  would be ceremony for a helper whose real uses are already reachable). bluesky's
+  collected per-object return values do not port to a value-less `Plan`; use the
+  `respond` channel when a per-object result is genuinely needed.
+- **Tests:** `broadcast_msg_fans_builder_across_objects_in_order` (Trigger fanned
+  across three objects, in order, carrying a shared group),
+  `broadcast_msg_empty_objects_yields_no_messages` (empty-list boundary).
 - **Effort:** S
 
 ---

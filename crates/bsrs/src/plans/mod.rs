@@ -586,6 +586,34 @@ pub mod stubs {
         })
     }
 
+    /// `broadcast_msg(objs, make)` — fan one command across many objects,
+    /// yielding `make(obj)` for each. bsrs's typed analog of bluesky's
+    /// `broadcast_msg(command, objs, *args, **kwargs)` (plan_stubs.py:1489),
+    /// which builds `Msg(command, obj, ...)` per object.
+    ///
+    /// bsrs's `Msg` is a typed enum, not a `(command_str, obj)` pair, so the
+    /// caller supplies the per-object message builder rather than a command
+    /// string. The fixed-command fans above (`stage_all`, `unstage_all`,
+    /// `kickoff_all`, `complete_all`) are specializations of this shape — and
+    /// stage/unstage are exactly what bluesky uses `broadcast_msg` for
+    /// (`cntx.py:169,173`). bluesky also collects each message's engine return
+    /// value; a bsrs `Plan` yields into the engine with no caller-visible
+    /// return, so only the fan-out is ported (use [`respond`] when a per-object
+    /// result is actually needed).
+    pub fn broadcast_msg<T>(
+        objs: Vec<Arc<T>>,
+        make: impl Fn(Arc<T>) -> Msg + Send + 'static,
+    ) -> Plan
+    where
+        T: ?Sized + Send + Sync + 'static,
+    {
+        plan_box(async_stream::stream! {
+            for o in objs {
+                yield make(o);
+            }
+        })
+    }
+
     /// `configure(obj, args)`.
     pub fn configure(obj: Arc<dyn ConfigurableObj>, args: ConfigureArgs) -> Plan {
         plan_box(async_stream::stream! {
@@ -4645,6 +4673,40 @@ mod tests {
         assert!(g.starts_with("complete_all-"), "got {g:?}");
         assert!(msgs.iter().all(|m| complete_group(m) == Some(g.as_str())));
         assert!(!msgs.iter().any(|m| matches!(m, Msg::Wait { .. })));
+    }
+
+    // broadcast_msg (PLAN-29): the generic typed fan applies the per-object
+    // builder to each object, in list order, and to nothing else.
+    #[tokio::test]
+    async fn broadcast_msg_fans_builder_across_objects_in_order() {
+        let objs: Vec<Arc<dyn crate::core::msg::TriggerableObj>> = (0..3)
+            .map(|i| {
+                Arc::new(FakeTriggerable(format!("t{i}")))
+                    as Arc<dyn crate::core::msg::TriggerableObj>
+            })
+            .collect();
+        let msgs = drain(stubs::broadcast_msg(objs, |o| Msg::Trigger {
+            obj: o,
+            group: Some("g".into()),
+        }))
+        .await;
+        assert_eq!(msgs.len(), 3, "one message per object, got {msgs:#?}");
+        for (i, m) in msgs.iter().enumerate() {
+            assert!(
+                matches!(m, Msg::Trigger { obj, group }
+                    if obj.name() == format!("t{i}") && group.as_deref() == Some("g")),
+                "message {i} must Trigger t{i} in group g, got {m:?}"
+            );
+        }
+    }
+
+    // broadcast_msg over an empty list yields nothing (the `for` runs zero
+    // times) — the boundary bluesky's generator also produces.
+    #[tokio::test]
+    async fn broadcast_msg_empty_objects_yields_no_messages() {
+        let objs: Vec<Arc<dyn crate::core::msg::StageableObj>> = Vec::new();
+        let msgs = drain(stubs::broadcast_msg(objs, Msg::Stage)).await;
+        assert!(msgs.is_empty(), "empty object list fans no messages");
     }
 
     // fly over several flyers kicks each off under one "kick" group and waits,
