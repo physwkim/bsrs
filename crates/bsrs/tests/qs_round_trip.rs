@@ -255,6 +255,58 @@ async fn plans_existing_matches_plans_allowed() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
 
+/// QS-03: `plans_allowed` must surface each plan's real parameter schema
+/// (name/kind/annotation/description), not empty stubs — clients build
+/// parameter-entry forms and validate submissions from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn plans_allowed_count_carries_parameter_schema() {
+    let mut reg = Registry::new();
+    reg.register_plan_count("count");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    let r = rpc(&req, "plans_allowed", json!({}));
+    let count = &r["plans_allowed"]["count"];
+
+    // Plan-level schema: non-empty description, generator property, module.
+    assert!(
+        count["description"].as_str().map(|s| !s.is_empty()) == Some(true),
+        "count.description must be populated: {r}"
+    );
+    assert_eq!(count["properties"]["is_generator"], true, "{r}");
+    assert_eq!(count["module"], "bsrs_qs", "{r}");
+
+    // Parameter schema: `detectors` then `num`, each with an inspect-style
+    // `kind` dict and a type annotation.
+    let params = count["parameters"].as_array().expect("parameters array");
+    assert_eq!(params.len(), 2, "count has two params: {r}");
+
+    assert_eq!(params[0]["name"], "detectors", "{r}");
+    assert_eq!(params[0]["kind"]["name"], "POSITIONAL_OR_KEYWORD", "{r}");
+    assert_eq!(params[0]["kind"]["value"], 1, "{r}");
+    assert_eq!(
+        params[0]["annotation"]["type"], "typing.List[Readable]",
+        "{r}"
+    );
+    assert!(
+        params[0]["description"].as_str().map(|s| !s.is_empty()) == Some(true),
+        "detectors.description must be populated: {r}"
+    );
+
+    assert_eq!(params[1]["name"], "num", "{r}");
+    assert_eq!(params[1]["kind"]["value"], 1, "{r}");
+    assert_eq!(params[1]["annotation"]["type"], "int", "{r}");
+    // `num` is required in bsrs → no default advertised.
+    assert!(
+        params[1].get("default").is_none(),
+        "num has no default: {r}"
+    );
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn queue_clear_empties_queue() {
     let det = SoftDetector::new("det1");

@@ -91,18 +91,24 @@ one-liner, or make `"ping"` call `"status"` internally.
 
 ---
 
-#### QS-03 — `plans_allowed` / `devices_allowed` return list of names, not rich dict — **PARTIAL**
+#### QS-03 — `plans_allowed` / `devices_allowed` return list of names, not rich dict — **DONE**
 
-**Status (PARTIAL):** The wire *shape* is now a rich dict keyed by name. `plans_allowed`
-(`crates/bsrs/src/qs/dispatch.rs:89-99`) returns `build_plan_dict(...)` →
-`{name: {name, description, parameters, module}}`; `devices_allowed` / `*_existing`
-(dispatch.rs:100-117) return `registry.plan_dict()` / `registry.device_dict()`
-(`crates/bsrs/src/qs/registry.rs:173-204`) with the same dict shape. **Missing:** the
-per-plan schema is a stub — `description` is always `""` and `parameters` is always `[]`
-(dispatch.rs:519-533, registry.rs:178-186). Clients that read `.description` or iterate
-`.parameters` for each plan get empty values, not the real parameter types / defaults /
-docstrings that `manager.py:1927-1955` supplies. (`user_group` group-filtering for
-`plans_allowed` is now honoured — see QS-14.)
+**Resolution:** Each registered plan now carries a `PlanMeta` (description + ordered
+`ParamSpec` schema) alongside its factory in one `RegisteredPlan` map entry
+(`crates/bsrs/src/qs/registry.rs`), so a factory can never exist without a (possibly
+empty) schema. `plans_allowed` routes through `Registry::plans_dict_subset` and
+`plans_existing` through `Registry::plan_dict`; both render bluesky-queueserver's
+`_process_plan` shape — `{name, module, description, properties:{is_generator},
+parameters:[{name, description, kind:{name,value}, annotation:{type}, default?}]}` —
+verbatim from the meta (`kind` mirrors `inspect.Parameter.kind`; ported against
+`profile_ops.py::_process_plan`). The duplicate stub builder `build_plan_dict` in
+`dispatch.rs` was removed (the registry is the single owner of the dict shape).
+`register_plan_count` supplies `count`'s real schema (`detectors: List[Readable]`,
+`num: int`, both `POSITIONAL_OR_KEYWORD`; `num` advertises no default, matching the
+factory's required-arg contract). Test: `plans_allowed_count_carries_parameter_schema`
+in `qs_round_trip.rs`. `user_group` group-filtering for `plans_allowed` was already
+honoured (QS-14 tracks the residual `devices_allowed` filter). Device dicts stay
+`{name, description:"", module}` — soft devices carry no docstring source.
 
 **bsrs:** `dispatch.rs:87–122`  
 `"plans_allowed": registry.plan_names()` → `Vec<String>` (JSON array of strings)  
@@ -808,7 +814,7 @@ the bsrs document PUB socket and calls `subscribe(cb)` callbacks on received doc
 |----|-------|----------|--------|
 | ~~QS-01~~ | ~~Wire envelope: plain `{method,params}` vs JSON-RPC 2.0~~ **DONE** | P0 | M |
 | ~~QS-02~~ | ~~`ping` must return status dict~~ **DONE** | P0 | S |
-| QS-03 | `plans_allowed`/`devices_allowed` must return rich dict, not name list **PARTIAL** | P0 | L |
+| ~~QS-03~~ | ~~`plans_allowed`/`devices_allowed` must return rich dict, not name list~~ **DONE** | P0 | L |
 | ~~QS-04~~ | ~~`queue_item_add` response must include full `item`, not bare `item_uid`~~ **DONE** | P0 | S |
 | ~~QS-05~~ | ~~`queue_item_add_batch` key `items_added` → `items` + add `results`~~ **DONE** | P0 | S |
 | ~~QS-06~~ | ~~`re_metadata` response key `metadata` → `re_metadata`~~ **DONE** | P0 | S |
@@ -841,6 +847,7 @@ the bsrs document PUB socket and calls `subscribe(cb)` callbacks on received doc
 
 **Counts (original):** P0: 8, P1: 10, P2: 12 (total: 30)
 
-**Counts (reconciled 2026-07-05):** QS-*: 20 DONE, 4 PARTIAL (QS-03, QS-09, QS-14, QS-20),
-0 OPEN (of 24). PY-*: 8 OUT-OF-SCOPE (of 8). Total 30: 20 DONE, 4 PARTIAL, 0 OPEN,
-8 OUT-OF-SCOPE (using project scope rule — bsrs has no Python bindings by design).
+**Counts (reconciled 2026-07-05; QS-03 closed 2026-07-05):** QS-*: 21 DONE, 3 PARTIAL
+(QS-09, QS-14, QS-20), 0 OPEN (of 24). PY-*: 8 OUT-OF-SCOPE (of 8). Total 32: 21 DONE,
+3 PARTIAL, 0 OPEN, 8 OUT-OF-SCOPE (using project scope rule — bsrs-py PyO3 crate exists
+but is out of parity scope by design).

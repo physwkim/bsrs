@@ -25,6 +25,142 @@ pub struct LuaExposedEntry {
 pub type PlanFactory =
     Arc<dyn Fn(&Registry, &Value) -> Result<Plan, String> + Send + Sync + 'static>;
 
+/// Parameter kind, mirroring Python's `inspect.Parameter.kind` so the
+/// `plans_allowed` / `plans_existing` wire dict matches bluesky-queueserver's
+/// `_process_plan` output (`kind: {name, value}`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParamKind {
+    /// `0` — positional only.
+    PositionalOnly,
+    /// `1` — positional or keyword (the common case).
+    PositionalOrKeyword,
+    /// `2` — `*args`.
+    VarPositional,
+    /// `3` — keyword only (after a bare `*`).
+    KeywordOnly,
+    /// `4` — `**kwargs`.
+    VarKeyword,
+}
+
+impl ParamKind {
+    fn wire_name(self) -> &'static str {
+        match self {
+            ParamKind::PositionalOnly => "POSITIONAL_ONLY",
+            ParamKind::PositionalOrKeyword => "POSITIONAL_OR_KEYWORD",
+            ParamKind::VarPositional => "VAR_POSITIONAL",
+            ParamKind::KeywordOnly => "KEYWORD_ONLY",
+            ParamKind::VarKeyword => "VAR_KEYWORD",
+        }
+    }
+    fn wire_value(self) -> u8 {
+        match self {
+            ParamKind::PositionalOnly => 0,
+            ParamKind::PositionalOrKeyword => 1,
+            ParamKind::VarPositional => 2,
+            ParamKind::KeywordOnly => 3,
+            ParamKind::VarKeyword => 4,
+        }
+    }
+}
+
+/// One plan parameter's schema — the subset of bluesky-queueserver's
+/// `_process_plan` parameter dict that bsrs populates. Rendered to
+/// `{name, description?, kind:{name,value}, annotation?:{type}, default?}`.
+#[derive(Clone, Debug)]
+pub struct ParamSpec {
+    /// Parameter name (REQUIRED on the wire).
+    pub name: String,
+    /// Human description (from the plan docstring's parameter section).
+    pub description: Option<String>,
+    /// Positional/keyword kind.
+    pub kind: ParamKind,
+    /// Type string rendered into `annotation: {type: <this>}`.
+    pub annotation_type: Option<String>,
+    /// String representation of the default value; `None` = required.
+    pub default: Option<String>,
+}
+
+impl ParamSpec {
+    /// A required, untyped parameter of the given kind.
+    pub fn new(name: impl Into<String>, kind: ParamKind) -> Self {
+        Self {
+            name: name.into(),
+            description: None,
+            kind,
+            annotation_type: None,
+            default: None,
+        }
+    }
+    /// Attach a human description.
+    pub fn with_description(mut self, d: impl Into<String>) -> Self {
+        self.description = Some(d.into());
+        self
+    }
+    /// Attach a type annotation string.
+    pub fn with_type(mut self, t: impl Into<String>) -> Self {
+        self.annotation_type = Some(t.into());
+        self
+    }
+    /// Attach a default value (string representation); marks it optional.
+    pub fn with_default(mut self, d: impl Into<String>) -> Self {
+        self.default = Some(d.into());
+        self
+    }
+
+    fn to_json(&self) -> Value {
+        let mut m = serde_json::Map::new();
+        m.insert("name".into(), Value::String(self.name.clone()));
+        if let Some(d) = &self.description {
+            m.insert("description".into(), Value::String(d.clone()));
+        }
+        m.insert(
+            "kind".into(),
+            serde_json::json!({ "name": self.kind.wire_name(), "value": self.kind.wire_value() }),
+        );
+        if let Some(t) = &self.annotation_type {
+            m.insert("annotation".into(), serde_json::json!({ "type": t }));
+        }
+        if let Some(d) = &self.default {
+            m.insert("default".into(), Value::String(d.clone()));
+        }
+        Value::Object(m)
+    }
+}
+
+/// A registered plan's schema — bluesky-queueserver's `_process_plan` dict,
+/// restricted to the fields bsrs can supply. Empty by default: a plan
+/// registered without metadata renders `description: ""`, `parameters: []`
+/// (the pre-metadata behavior).
+#[derive(Clone, Debug, Default)]
+pub struct PlanMeta {
+    /// Multi-line plan description (docstring summary).
+    pub description: Option<String>,
+    /// Ordered parameter schema.
+    pub parameters: Vec<ParamSpec>,
+}
+
+impl PlanMeta {
+    fn to_json(&self, name: &str) -> Value {
+        serde_json::json!({
+            "name": name,
+            "module": "bsrs_qs",
+            "description": self.description.clone().unwrap_or_default(),
+            "properties": { "is_generator": true },
+            "parameters": self.parameters.iter().map(ParamSpec::to_json).collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// A plan factory paired with its schema. One map entry per plan, so a
+/// factory can never exist without a (possibly empty) `PlanMeta` — the
+/// `plans_allowed` shape is always derivable, never a separate lookup that
+/// can fall out of sync.
+#[derive(Clone)]
+struct RegisteredPlan {
+    factory: PlanFactory,
+    meta: PlanMeta,
+}
+
 /// Registered devices, indexed by string name. The same physical device
 /// usually appears under more than one trait — register each role explicitly.
 ///
@@ -34,7 +170,7 @@ pub type PlanFactory =
 /// state.
 #[derive(Clone, Default)]
 pub struct Registry {
-    plans: HashMap<String, PlanFactory>,
+    plans: HashMap<String, RegisteredPlan>,
     readables: HashMap<String, Arc<dyn ReadableObj>>,
     movables: HashMap<String, Arc<dyn MovableObj>>,
     locatables: HashMap<String, Arc<dyn LocatableObj>>,
@@ -54,9 +190,30 @@ impl Registry {
         Self::default()
     }
 
-    /// Register a plan factory.
+    /// Register a plan factory with no schema — `plans_allowed` reports it
+    /// with an empty parameter list and description. Prefer
+    /// [`Registry::register_plan_with_meta`] so clients receive real
+    /// parameter types/defaults.
     pub fn register_plan(&mut self, name: impl Into<String>, factory: PlanFactory) {
-        self.plans.insert(name.into(), factory);
+        self.plans.insert(
+            name.into(),
+            RegisteredPlan {
+                factory,
+                meta: PlanMeta::default(),
+            },
+        );
+    }
+
+    /// Register a plan factory together with its schema ([`PlanMeta`]),
+    /// surfaced verbatim by `plans_allowed` / `plans_existing`.
+    pub fn register_plan_with_meta(
+        &mut self,
+        name: impl Into<String>,
+        factory: PlanFactory,
+        meta: PlanMeta,
+    ) {
+        self.plans
+            .insert(name.into(), RegisteredPlan { factory, meta });
     }
 
     /// Register a `ReadableObj` device under a name.
@@ -158,7 +315,7 @@ impl Registry {
 
     /// Look up a registered plan factory by name.
     pub fn plan(&self, name: &str) -> Option<&PlanFactory> {
-        self.plans.get(name)
+        self.plans.get(name).map(|r| &r.factory)
     }
 
     /// All plan names.
@@ -168,20 +325,22 @@ impl Registry {
         v
     }
 
-    /// Plans as a rich dict `{name: {name, description, parameters, module}}`
-    /// matching the bluesky `plans_allowed` / `plans_existing` wire shape.
+    /// Plans as a rich dict `{name: {name, module, description, properties,
+    /// parameters}}` matching bluesky-queueserver's `_process_plan` wire shape.
+    /// Used by `plans_existing` (every registered plan).
     pub fn plan_dict(&self) -> serde_json::Value {
+        self.plans_dict_subset(&self.plan_names())
+    }
+
+    /// Rich plan dict for a subset of names (e.g. a group-filtered
+    /// `plans_allowed` list). Each value is the plan's `_process_plan`-shaped
+    /// schema drawn from its [`PlanMeta`]; names not registered are skipped.
+    pub fn plans_dict_subset(&self, names: &[String]) -> serde_json::Value {
         let mut map = serde_json::Map::new();
-        for name in self.plan_names() {
-            map.insert(
-                name.clone(),
-                serde_json::json!({
-                    "name": name,
-                    "description": "",
-                    "parameters": [],
-                    "module": "bsrs_qs",
-                }),
-            );
+        for name in names {
+            if let Some(r) = self.plans.get(name) {
+                map.insert(name.clone(), r.meta.to_json(name));
+            }
         }
         serde_json::Value::Object(map)
     }
@@ -278,7 +437,21 @@ impl Registry {
             }
             Ok(crate::plans::count(dets, num))
         });
-        self.register_plan(name, factory);
+        let meta = PlanMeta {
+            description: Some("Trigger and read a list of detectors `num` times.".to_string()),
+            parameters: vec![
+                ParamSpec::new("detectors", ParamKind::PositionalOrKeyword)
+                    .with_type("typing.List[Readable]")
+                    .with_description("Readable device names to trigger and read at each point."),
+                // `num` is required in bsrs (the factory errors when absent),
+                // so no default is advertised — a divergence from bluesky's
+                // `num=1`, matching this factory's actual contract.
+                ParamSpec::new("num", ParamKind::PositionalOrKeyword)
+                    .with_type("int")
+                    .with_description("Number of readings to take."),
+            ],
+        };
+        self.register_plan_with_meta(name, factory, meta);
     }
 }
 

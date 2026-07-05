@@ -104,7 +104,7 @@ pub use lua_eval::LuaEvaluator;
 pub use methods::QsRequest;
 pub use permissions::{MethodClass, Permissions};
 pub use queue::{PlanQueue, QueuedItem};
-pub use registry::{LuaExposedEntry, PlanFactory, Registry};
+pub use registry::{LuaExposedEntry, ParamKind, ParamSpec, PlanFactory, PlanMeta, Registry};
 pub use server::{Server, ServerBuilder, ServerShutdown};
 pub use state::{EState, EngineState, LockInfo};
 pub use tasks::{EvalResult, TaskTracker};
