@@ -269,17 +269,24 @@ Paused. Emit `"pause_pending": st.pause_pending` in `status_response`.
 
 ---
 
-#### QS-09 — `queue_item_add` / `queue_item_add_batch` missing positional insertion (`pos`, `before_uid`, `after_uid`) — **PARTIAL**
+#### QS-09 — `queue_item_add` / `queue_item_add_batch` missing positional insertion (`pos`, `before_uid`, `after_uid`) — **DONE**
 
-**Status (PARTIAL):** `queue_item_add` now reads `pos` (string `"front"`/`"back"` or
-signed integer index, with the negative-index / clamp arithmetic of
-`plan_queue_ops.py`), `before_uid`, and `after_uid`, and rejects ambiguous combinations
-(`crates/bsrs/src/qs/dispatch.rs:787-865`), backed by
-`PlanQueue::insert_at` / `insert_before_uid` / `insert_after_uid`
-(`crates/bsrs/src/qs/queue.rs:195-223`). **Missing:** `queue_item_add_batch` still
-unconditionally `push_back`s every item (dispatch.rs:906) and reads no `pos` /
-`before_uid` / `after_uid` — the batch positional-insertion half of this item is not
-implemented.
+**Resolution:** Both add paths resolve position through one shared helper,
+`insert_positioned` (`crates/bsrs/src/qs/dispatch.rs`), which honors `pos` (string
+`"front"`/`"back"` or signed integer index with the reference's negative-index / clamp
+arithmetic), `before_uid`, `after_uid`, and returns an error **without mutating the
+queue** when a referenced uid is absent — backed by `PlanQueue::insert_at` /
+`insert_before_uid` / `insert_after_uid`. `queue_item_add` and `queue_item_add_batch`
+both use it, and both apply the same ambiguity rejection (`pos` + `before_uid`/`after_uid`,
+or both uids). `queue_item_add_batch` now ports `plan_queue_ops.py::_add_batch_to_queue`
+faithfully: it is **atomic** (validate every item first; if any is rejected nothing is
+added, `items` returns the submitted list unchanged, `qsize` is unchanged) and inserts the
+accepted items as a **contiguous block** — first item at the batch position, each
+subsequent item immediately after the previous, order preserved. Tests:
+`queue_item_add_batch_inserts_block_at_position`, `queue_item_add_batch_after_uid`,
+`queue_item_add_batch_atomic_reject_on_unknown_plan` in `qs_round_trip.rs` (plus the
+existing single-add `queue_item_add_positional_insertion`, which the shared helper leaves
+green).
 
 **bsrs:** `dispatch.rs:668–739` — `queue_item_add` always calls `q.push_back(queued)`;
 `queue_item_add_batch` always appends. No `pos`, `before_uid`, or `after_uid` param read.
@@ -823,7 +830,7 @@ the bsrs document PUB socket and calls `subscribe(cb)` callbacks on received doc
 | ~~QS-06~~ | ~~`re_metadata` response key `metadata` → `re_metadata`~~ **DONE** | P0 | S |
 | ~~QS-07~~ | ~~`manager_state` missing transitional states~~ **DONE** | P0 | M |
 | ~~QS-08~~ | ~~`pause_pending` missing from status~~ **DONE** | P1 | S |
-| QS-09 | Positional insertion (`pos`, `before_uid`, `after_uid`) in `queue_item_add` **PARTIAL** | P1 | M |
+| ~~QS-09~~ | ~~Positional insertion (`pos`, `before_uid`, `after_uid`) in `queue_item_add`/`_batch`~~ **DONE** | P1 | M |
 | ~~QS-10~~ | ~~`function_execute` not implemented~~ **DONE** | P1 | M |
 | ~~QS-11~~ | ~~`instruction` item_type not supported~~ **DONE** | P1 | M |
 | ~~QS-12~~ | ~~Msgpack encoding not supported~~ **DONE** | P1 | M |
@@ -850,7 +857,7 @@ the bsrs document PUB socket and calls `subscribe(cb)` callbacks on received doc
 
 **Counts (original):** P0: 8, P1: 10, P2: 12 (total: 30)
 
-**Counts (reconciled 2026-07-05; QS-03 + QS-14 closed 2026-07-05):** QS-*: 22 DONE,
-2 PARTIAL (QS-09, QS-20), 0 OPEN (of 24). PY-*: 8 OUT-OF-SCOPE (of 8). Total 32: 22 DONE,
-2 PARTIAL, 0 OPEN, 8 OUT-OF-SCOPE (using project scope rule — bsrs-py PyO3 crate exists
+**Counts (reconciled 2026-07-05; QS-03 + QS-14 + QS-09 closed 2026-07-05):** QS-*: 23 DONE,
+1 PARTIAL (QS-20), 0 OPEN (of 24). PY-*: 8 OUT-OF-SCOPE (of 8). Total 32: 23 DONE,
+1 PARTIAL, 0 OPEN, 8 OUT-OF-SCOPE (using project scope rule — bsrs-py PyO3 crate exists
 but is out of parity scope by design).

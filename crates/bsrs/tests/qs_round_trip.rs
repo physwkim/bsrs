@@ -1261,6 +1261,166 @@ async fn queue_item_add_positional_insertion() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
 
+/// QS-09: `queue_item_add_batch` inserts the batch as a contiguous block at the
+/// requested position (first item at `pos`, the rest immediately after it,
+/// order preserved) — not an unconditional append.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_item_add_batch_inserts_block_at_position() {
+    let det = SoftDetector::new("det1");
+    let mut reg = Registry::new();
+    reg.register_readable("det1", det as Arc<dyn ReadableObj>);
+    reg.register_plan_count("count");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    // Baseline: single item X.
+    let rx = rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": ["det1", 1]}}),
+    );
+    let uid_x = rx["item"]["item_uid"].as_str().unwrap().to_string();
+
+    // Batch [A, B] at pos="front" → queue becomes [A, B, X].
+    let rb = rpc(
+        &req,
+        "queue_item_add_batch",
+        json!({"items": [
+            {"name": "count", "args": ["det1", 2]},
+            {"name": "count", "args": ["det1", 3]},
+        ], "pos": "front"}),
+    );
+    assert_eq!(rb["success"], true, "{rb}");
+    assert_eq!(rb["qsize"], 3, "{rb}");
+    let added = rb["items"].as_array().unwrap();
+    assert_eq!(added.len(), 2);
+    let uid_a = added[0]["item_uid"].as_str().unwrap().to_string();
+    let uid_b = added[1]["item_uid"].as_str().unwrap().to_string();
+    // results mirror items: both success.
+    let results = rb["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|r| r["success"] == true), "{rb}");
+
+    // Verify contiguous-block order A, B, X.
+    let q = rpc(&req, "queue_get", json!({}));
+    let items = q["items"].as_array().unwrap();
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0]["item_uid"], uid_a, "block first: {q}");
+    assert_eq!(items[1]["item_uid"], uid_b, "block second: {q}");
+    assert_eq!(items[2]["item_uid"], uid_x, "baseline last: {q}");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+/// QS-09: `queue_item_add_batch` honors `after_uid` for the whole block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_item_add_batch_after_uid() {
+    let det = SoftDetector::new("det1");
+    let mut reg = Registry::new();
+    reg.register_readable("det1", det as Arc<dyn ReadableObj>);
+    reg.register_plan_count("count");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    // Baseline X, Y → [X, Y].
+    let rx = rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": ["det1", 1]}}),
+    );
+    let uid_x = rx["item"]["item_uid"].as_str().unwrap().to_string();
+    let ry = rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": ["det1", 2]}}),
+    );
+    let uid_y = ry["item"]["item_uid"].as_str().unwrap().to_string();
+
+    // Batch [A, B] after_uid=X → [X, A, B, Y].
+    let rb = rpc(
+        &req,
+        "queue_item_add_batch",
+        json!({"items": [
+            {"name": "count", "args": ["det1", 3]},
+            {"name": "count", "args": ["det1", 4]},
+        ], "after_uid": uid_x}),
+    );
+    assert_eq!(rb["success"], true, "{rb}");
+    let added = rb["items"].as_array().unwrap();
+    let uid_a = added[0]["item_uid"].as_str().unwrap().to_string();
+    let uid_b = added[1]["item_uid"].as_str().unwrap().to_string();
+
+    let q = rpc(&req, "queue_get", json!({}));
+    let items = q["items"].as_array().unwrap();
+    assert_eq!(items.len(), 4);
+    assert_eq!(items[0]["item_uid"], uid_x, "{q}");
+    assert_eq!(items[1]["item_uid"], uid_a, "{q}");
+    assert_eq!(items[2]["item_uid"], uid_b, "{q}");
+    assert_eq!(items[3]["item_uid"], uid_y, "{q}");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+/// QS-09: `queue_item_add_batch` is atomic — if any item is rejected, the whole
+/// batch is rejected and nothing is added (ref: `_add_batch_to_queue`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_item_add_batch_atomic_reject_on_unknown_plan() {
+    let det = SoftDetector::new("det1");
+    let mut reg = Registry::new();
+    reg.register_readable("det1", det as Arc<dyn ReadableObj>);
+    reg.register_plan_count("count");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    // Baseline X so we can prove the batch left the queue untouched.
+    let rx = rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": ["det1", 1]}}),
+    );
+    let uid_x = rx["item"]["item_uid"].as_str().unwrap().to_string();
+
+    // Batch [valid, unknown] → rejected in full, nothing added.
+    let rb = rpc(
+        &req,
+        "queue_item_add_batch",
+        json!({"items": [
+            {"name": "count", "args": ["det1", 2]},
+            {"name": "does_not_exist", "args": []},
+        ]}),
+    );
+    assert_eq!(rb["success"], false, "batch must be rejected: {rb}");
+    assert_eq!(rb["qsize"], 1, "queue size unchanged: {rb}");
+    let results = rb["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2, "results mirror items: {rb}");
+    assert_eq!(
+        results[0]["success"], true,
+        "valid item ok in results: {rb}"
+    );
+    assert_eq!(results[1]["success"], false, "unknown item failed: {rb}");
+    assert!(
+        results[1]["msg"]
+            .as_str()
+            .unwrap_or("")
+            .contains("unknown plan"),
+        "failure names the plan: {rb}"
+    );
+
+    // Queue still holds only the baseline — the valid batch item was NOT added.
+    let q = rpc(&req, "queue_get", json!({}));
+    let items = q["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "nothing added on rejection: {q}");
+    assert_eq!(items[0]["item_uid"], uid_x, "{q}");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
 // -- lua_eval async RPC -----------------------------------------------------
 
 /// Mock LuaEvaluator: echoes the source as stdout, parses a leading
