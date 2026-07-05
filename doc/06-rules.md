@@ -133,8 +133,12 @@ GIL-holding scope deadlocks when the joined task itself wants to acquire the GIL
 
 Origin: rogue update H4 (memory::TcpClient/Server: GIL-released join).
 
-Fix: every long-running call from PyO3 wraps in `Python::allow_threads(|| ...)`. The
-`bsrs-py` crate enforces this with a macro-generated wrapper.
+Fix: every long-running call from PyO3 wraps in `Python::allow_threads(|| ...)`.
+
+> **Retired 2026-07-06.** The `bsrs-py` crate was removed and in-process Python
+> bindings are cancelled — bsrs is Rust-only (Python interop is via the Document
+> wire protocol, D17). No code has a PyO3 surface, so this rule binds nothing;
+> kept only as a general concurrency lesson.
 
 ## K11. ZMQ messages are RAII only
 
@@ -171,6 +175,6 @@ and commits.
 | K7 | reap on subscribe | Slot-based subscriber lists |
 | K8 | single CancellationToken | All RunEngine-owned tasks |
 | K9 | spawn after commit | Every builder |
-| K10 | `allow_threads` | `bsrs-py` |
+| K10 | `allow_threads` | (retired — `bsrs-py` removed, bindings cancelled) |
 | K11 | RAII zmq_msg | `bsrs-backends/rogue` (Phase 2) |
 | K12 | bind/connect last | Every backend constructor |

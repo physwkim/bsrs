@@ -1,4 +1,4 @@
-# Gap Analysis: bsrs-qs vs bluesky-queueserver + bsrs-py vs ophyd-async/bluesky
+# Gap Analysis: bsrs-qs vs bluesky-queueserver (+ bsrs-py — OBSOLETE, crate removed 2026-07-06)
 
 **Date:** 2026-06-14  
 **bsrs ref:** `crates/bsrs-qs/src/` (dispatch.rs, methods.rs, state.rs, queue.rs, registry.rs, transport.rs)  
@@ -655,6 +655,16 @@ or directly aborts the running queue task before dropping the engine.
 ---
 
 ## Part B — bsrs-py vs bluesky / ophyd-async Python API
+
+> **OBSOLETE (2026-07-06).** The `crates/bsrs-py` PyO3 crate was **removed** from
+> the workspace. bsrs is Rust-native by design and Python bindings were out of
+> parity scope (M7 → **cancelled**). In-process Python bindings are not a goal:
+> the bsrs/Python boundary is the Document, not the RunEngine (D17), so Python
+> consumers connect via the wire protocol (Part A: queueserver + `ZmqDocumentSink`
+> → `RemoteDispatcher`). The gaps below described the now-deleted crate; this
+> section is retained only as the decision record for why bsrs ships no Python
+> bindings. All `lib.rs:NN` line references are dead. Git history (up to commit
+> `9fe9545`) preserves the removed crate.
 
 ### What exists
 

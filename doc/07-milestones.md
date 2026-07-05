@@ -11,7 +11,7 @@
 | M4 | ✅ done | pause / resume / checkpoint / suspender + SIGINT 3-tap |
 | M5 | ✅ done | `bsrs-backends/epics-pva` real impl + `PvaMonitorSource` (NTNDArray zero-copy) + `BinaryFrameSink` |
 | M6 | 🔄 in progress | Document sinks for the bluesky Python ecosystem (Zmq, Tiled, …) |
-| M7 | ⏸ deferred | (optional) `bsrs-py` PyO3 plan generator |
+| M7 | ❌ cancelled | ~~(optional) `bsrs-py` PyO3 plan generator~~ — removed 2026-07-06; bsrs is Rust-only (Python interop via wire protocol: M6 `ZmqDocumentSink` + M8 queueserver) |
 | M8 | ⏸ planned | `bsrs-qs` queueserver worker (drop-in replacement) |
 
 ## Phase 1 (Rust-native)
@@ -29,7 +29,7 @@ Phase 2 will plug into.
 | **M4** | pause / resume / checkpoint / suspender + SIGINT 3-tap | Three integration tests cover {pause→resume, abort→close-run, suspender auto-resume}. |
 | **M5** | `bsrs-backends/epics-pva` + `PvaMonitorSource` (NTNDArray zero-copy) | NTNDArray decode emits Frames whose `Bytes` share the PVA decode buffer's refcount (verified by unit tests). |
 | **M6** | **Document sinks for the Python ecosystem** | `ZmqDocumentSink` round-trips with bluesky `RemoteDispatcher` (msgpack envelope, prefix, name, body). `TiledSink` (minimal) registers runs in a Tiled HTTP catalog. `JsonlSink` already in M1. |
-| **M7** | (deferred) `bsrs-py` PyO3 plan generator | A Python `def my_plan(): yield from ...` generator drives the bsrs RunEngine through a thin PyO3 plan adapter. |
+| **M7** | ~~`bsrs-py` PyO3 plan generator~~ (cancelled) | Removed 2026-07-06. **In-process Python bindings are cancelled — bsrs is Rust-only.** Python interop is via the Document wire protocol (`ZmqDocumentSink` / queueserver worker, D17), not PyO3. |
 | **M8** | **`bsrs-qs` queueserver worker** | bsrs implements the `bluesky-queueserver` worker protocol (Pipe + JSON-RPC). queueserver manager / 0MQ API / web UI / queue management unchanged. |
 
 ### M6 sub-deliverables (this PR)

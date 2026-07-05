@@ -85,9 +85,8 @@ deployable in production.
 ```
 Phase 1: pure bsrs                       Phase 2: optional integrations
    M0 ─► M1 ─► M2 ─► M3 ─► M4 ─► M5         + rogue ZMQ / DMA backends
-                                             + bsrs-py PyO3 plan generator
    M6 = Document sinks (Zmq, Tiled, ...)     + bsrs-qs queueserver worker (M8)
-   M7 = (deferred) PyO3 plan authoring
+   (M7 PyO3 plan authoring — cancelled; bsrs is Rust-only)
 ```
 
 Detailed breakdown in [`07-milestones.md`](07-milestones.md).

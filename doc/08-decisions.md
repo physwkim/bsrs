@@ -13,7 +13,7 @@ Open questions need an answer before the milestone that depends on them.
 | **D4** | Document fan-out via `tokio::sync::broadcast::Sender<Document>`; lagged drops counted in atomic. | K6 enforced at design time. |
 | **D5** | Bulk-data path uses `bytes::Bytes` for zero-copy fan-out + downstream-allocator trait. | rogue Pool semantics; cheap clones; works for both PVA monitor and rogue DMA. |
 | **D6** | tokio multi-thread runtime is required; current-thread is rejected at startup. | kodex precedent: `block_in_place` panics on current-thread runtimes. |
-| **D7** | The `bsrs-py` PyO3 adapter is M7 (deferred); core is Rust-first. | Q1 answer: Rust-first user population. |
+| **D7** | **Cancelled 2026-07-06:** in-process Python bindings (the `bsrs-py` PyO3 adapter) are dropped; bsrs is Rust-only. Python interop is via the Document wire protocol (D17: `ZmqDocumentSink` / queueserver), not PyO3. | Q1 answer: Rust-first user population; the Document boundary (D17) already covers Python consumers, so an in-process binding adds cost without reach. |
 | **D8** | Phase 1 DET data path is PVA monitor (areaDetector). rogue is Phase 2. | Q2 answer: typical beamline data rate is ~few hundred MB/s, well within PVA's range; rogue is reserved for direct-attached hardware that genuinely cannot be reached over EPICS. |
 | **D9** | Backends bind directly to `epics-rs/crates/epics-ca-rs` and `epics-rs/crates/epics-pva-rs`. | No Python shim; no C library FFI; lives in the same Rust workspace as the user's IOC stack. |
 | **D10** | Subscriptions return `SubToken` (RAII). Drop removes the backend slot. | K2 enforced at design time. |
@@ -46,7 +46,7 @@ Open questions need an answer before the milestone that depends on them.
 | **O3** | ~~`bsrs-tiled` callback~~ — superseded by D19 (minimal `TiledSink` in M6, full path via Python relay). | resolved |
 | **O4** | Should `Wait` group bookkeeping use `JoinSet` or a hand-rolled `HashMap<GroupId, Vec<Status>>`? | `JoinSet` — gets cancellation semantics for free. |
 | **O5** | Do we support nested runs (ophyd-async multi-run plans)? | Defer to M4. The pattern is rare and complicates the bundler. |
-| **O6** | Should `bsrs-py` expose `RunEngine` as a Python-callable, or only the device classes? | Both — match bluesky's `RE(plan)` call pattern. M7. |
+| **O6** | ~~Should `bsrs-py` expose `RunEngine` as a Python-callable, or only the device classes?~~ | Resolved 2026-07-06: moot — in-process Python bindings cancelled (D7). |
 | **O7** | Cargo features for opt-in backends (e.g. `default-features = ["epics-ca", "epics-pva"]`)? | Yes — soft and mock are always on; epics backends gated for users who do not want EPICS as a dep. |
 
 ## Rejected

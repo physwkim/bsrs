@@ -29,11 +29,13 @@ bottom for reference.
 
 ## Tier 2 — ecosystem residue
 
-### 2.1 PyO3 layer (M7)
-- **Status**: deferred per doc 07 milestone table.
-- **Plan**: a thin `bsrs-py` crate that exposes `bsrs.RunEngine`,
-  device factories, and a yield-to-Rust plan adapter. Multi-day
-  effort; depends on which subset of ophyd-async API to mirror.
+### 2.1 PyO3 layer (M7) — cancelled
+- **Status**: **cancelled 2026-07-06.** The `bsrs-py` crate was removed;
+  bsrs is Rust-only. In-process Python bindings are not a goal.
+- **Rationale**: the bsrs/Python boundary is the Document, not the
+  RunEngine (D17). Python consumers connect via the wire protocol
+  (`ZmqDocumentSink` → `RemoteDispatcher`) and the queueserver worker
+  (M8), which need no PyO3 surface.
 
 ### 2.2 More plan-library leaves
 - **Status**: count, scan, list_scan, log_scan, grid_scan, scan_nd,

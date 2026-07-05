@@ -6,8 +6,8 @@
 # Nextest marks a passing test "leaky" when its stdout/stderr pipes are still
 # open past this window after the test process exits — i.e. a spawned child
 # inherited them and is still alive. No test in this workspace can leave such
-# a child: the only process-spawning tests (cli_round_trip, repl_script,
-# bsrs-py python_smoke) kill+wait their children before returning, and the
+# a child: the only process-spawning tests (cli_round_trip, repl_script)
+# kill+wait their children before returning, and the
 # deps' one spawn path (epics-ca-rs spawn_repeater) nulls all stdio and only
 # fires when a ca-repeater-rs binary sits next to the test executable, which
 # cargo never builds for a dependency. A leak report is therefore either a
