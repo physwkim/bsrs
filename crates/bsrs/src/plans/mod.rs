@@ -7,10 +7,10 @@ pub mod preprocessors;
 
 use crate::core::msg::{
     AwaitableFactory, CollectableObj, ConfigurableObj, ConfigureArgs, FlyableObj, LocatableObj,
-    MonitorableObj, MovableObj, Msg, PreparableObj, ReadableObj, RunMetadata, StageableObj,
-    StoppableObj, TriggerableObj,
+    MonitorableObj, MovableObj, Msg, MsgResult, PreparableObj, ReadableObj, RunMetadata,
+    StageableObj, StoppableObj, TriggerableObj,
 };
-use crate::core::plan::{plan_box, plan_items, Plan, PlanItem};
+use crate::core::plan::{plan_box, plan_items, respond, Plan, PlanItem};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -500,6 +500,61 @@ pub mod stubs {
     pub fn collect(obj: Arc<dyn CollectableObj>, stream_name: Option<String>) -> Plan {
         plan_box(async_stream::stream! {
             yield Msg::Collect { obj, stream_name };
+        })
+    }
+
+    /// `collect_while_completing(flyers, dets, flush_period, stream_name)`.
+    ///
+    /// Kicks off `complete` on every flyer without waiting, then repeatedly
+    /// `Wait`s on the group for up to `flush_period` (move-on:
+    /// `error_on_timeout = false`) and `collect`s every detector once, until the
+    /// group reports done. With `flush_period = None` the `Wait` blocks until the
+    /// flyers finish, yielding a single terminal collect; with `Some(period)` the
+    /// detectors are flushed each period while the flyers run. Mirrors bluesky's
+    /// `collect_while_completing` (plan_stubs.py). bluesky's `watch` groups are
+    /// consumer-side progress reporting and have no bsrs equivalent, so they are
+    /// omitted.
+    ///
+    /// This is the canonical consumer of the plan↔engine response channel: each
+    /// loop turn yields a [`respond`]-carrying `Wait` and awaits the engine's
+    /// [`MsgResult::WaitComplete`] to decide whether to iterate again.
+    pub fn collect_while_completing(
+        flyers: Vec<Arc<dyn FlyableObj>>,
+        dets: Vec<Arc<dyn CollectableObj>>,
+        flush_period: Option<Duration>,
+        stream_name: Option<String>,
+    ) -> Plan {
+        let group = short_uid("complete");
+        plan_items(async_stream::stream! {
+            // complete_all(flyers, group, wait=false): kick every flyer off
+            // against the shared group, do not block here.
+            for f in flyers {
+                yield PlanItem::from(Msg::Complete { obj: f, group: Some(group.clone()) });
+            }
+            loop {
+                let (item, rx) = respond(Msg::Wait {
+                    group: group.clone(),
+                    error_on_timeout: false,
+                    timeout: flush_period,
+                });
+                yield item;
+                let done = match rx.await {
+                    Ok(MsgResult::WaitComplete { done }) => done,
+                    // Sender dropped (the engine failed the `Wait` and tore the
+                    // run down) or an unexpected result: stop instead of looping
+                    // forever. No further collect — the engine is done with us.
+                    _ => break,
+                };
+                for d in &dets {
+                    yield PlanItem::from(Msg::Collect {
+                        obj: d.clone(),
+                        stream_name: stream_name.clone(),
+                    });
+                }
+                if done {
+                    break;
+                }
+            }
         })
     }
 
@@ -2553,6 +2608,50 @@ mod tests {
         }
     }
 
+    fn wait_group_name(m: &Msg) -> Option<&str> {
+        match m {
+            Msg::Wait { group, .. } => Some(group.as_str()),
+            _ => None,
+        }
+    }
+
+    fn colls(n: usize) -> Vec<Arc<dyn CollectableObj>> {
+        (0..n)
+            .map(|i| Arc::new(FakeCollectable(format!("det{i}"))) as Arc<dyn CollectableObj>)
+            .collect()
+    }
+
+    fn msg_kind(m: &Msg) -> &'static str {
+        match m {
+            Msg::Complete { .. } => "complete",
+            Msg::Wait { .. } => "wait",
+            Msg::Collect { .. } => "collect",
+            _ => "other",
+        }
+    }
+
+    /// Drive a `collect_while_completing`-style plan to completion, answering
+    /// each `Respond`-carried `Wait` with the next scripted `done` flag. This
+    /// substitutes for the engine (which is what fulfills a `Respond`), so the
+    /// plan's response loop runs deterministically with no real flyers/timing.
+    /// Panics if the plan issues more `Wait`s than there are scripted flags.
+    async fn drain_completing(mut plan: Plan, mut dones: std::vec::IntoIter<bool>) -> Vec<Msg> {
+        let mut out = Vec::new();
+        while let Some(item) = plan.next().await {
+            match item {
+                PlanItem::Bare(m) => out.push(m),
+                PlanItem::Respond(m, tx) => {
+                    out.push(m);
+                    let done = dones
+                        .next()
+                        .expect("plan issued more Wait responses than were scripted");
+                    let _ = tx.send(MsgResult::WaitComplete { done });
+                }
+            }
+        }
+        out
+    }
+
     use crate::core::msg::{DynLocation, MovableObj, NamedObj, ReadableObj};
     use crate::core::reading::ReadingValue;
     use std::collections::HashMap;
@@ -4579,6 +4678,111 @@ mod tests {
         assert_eq!(msgs.len(), 2, "got {msgs:#?}");
         assert!(matches!(&msgs[0], Msg::OpenRun(_)));
         assert!(matches!(&msgs[1], Msg::CloseRun { .. }));
+    }
+
+    // collect_while_completing (PLAN-08). Boundary: the group reports done on the
+    // very first Wait (flush_period=None, flyers already finished). Every flyer is
+    // completed up front against one shared group, then a single Wait/Collect
+    // cycle runs — one collect per detector — and the loop stops. All Completes
+    // and the Wait must share the minted "complete-N" group.
+    #[tokio::test]
+    async fn collect_while_completing_single_cycle_when_done_immediately() {
+        let msgs = drain_completing(
+            stubs::collect_while_completing(flyers(2), colls(2), None, None),
+            vec![true].into_iter(),
+        )
+        .await;
+
+        // Complete×2 (shared group); Wait (same group); Collect×2 (det0, det1).
+        assert_eq!(
+            msgs.iter().map(msg_kind).collect::<Vec<_>>(),
+            vec!["complete", "complete", "wait", "collect", "collect"],
+            "got {msgs:#?}"
+        );
+        let g = complete_group(&msgs[0])
+            .expect("complete group")
+            .to_string();
+        assert!(
+            g.starts_with("complete-"),
+            "group is short_uid-minted: {g:?}"
+        );
+        assert_eq!(complete_group(&msgs[1]), Some(g.as_str()));
+        assert_eq!(
+            wait_group_name(&msgs[2]),
+            Some(g.as_str()),
+            "the Wait must target the same group the flyers complete against"
+        );
+        assert_eq!(collect_name(&msgs[3]), Some("det0"));
+        assert_eq!(collect_name(&msgs[4]), Some("det1"));
+    }
+
+    // collect_while_completing (PLAN-08). Boundary: the group is NOT done on the
+    // first two Waits (move-on flushes) and done on the third. Each Wait — the
+    // terminal one included — is followed by one collect per detector, matching
+    // bluesky's `while not done: done = wait(...); collect(...)` (the collect runs
+    // after the wait that reports done, then the loop exits).
+    #[tokio::test]
+    async fn collect_while_completing_flushes_each_period_until_done() {
+        let flush = Some(Duration::from_millis(5));
+        let msgs = drain_completing(
+            stubs::collect_while_completing(flyers(1), colls(1), flush, Some("primary".into())),
+            vec![false, false, true].into_iter(),
+        )
+        .await;
+
+        // Complete×1; then 3× (Wait, Collect) — two move-on flushes plus the
+        // terminal cycle. No extra Wait or Collect after done.
+        assert_eq!(
+            msgs.iter().map(msg_kind).collect::<Vec<_>>(),
+            vec!["complete", "wait", "collect", "wait", "collect", "wait", "collect",],
+            "got {msgs:#?}"
+        );
+        // Named-stream collects carry the requested stream name.
+        for m in msgs.iter().filter(|m| matches!(m, Msg::Collect { .. })) {
+            assert!(matches!(m, Msg::Collect { stream_name: Some(n), .. } if n == "primary"));
+        }
+    }
+
+    // collect_while_completing (PLAN-08). Boundary: the engine drops the Wait
+    // responder (the run failed before answering). The plan must stop rather than
+    // await a response that will never arrive, and must NOT emit a trailing
+    // collect after the failure.
+    #[tokio::test]
+    async fn collect_while_completing_stops_when_wait_responder_dropped() {
+        let mut plan = stubs::collect_while_completing(flyers(1), colls(1), None, None);
+        let mut kinds = Vec::new();
+        while let Some(item) = plan.next().await {
+            match item {
+                PlanItem::Bare(m) => kinds.push(msg_kind(&m)),
+                PlanItem::Respond(m, tx) => {
+                    kinds.push(msg_kind(&m));
+                    drop(tx); // engine failed the Wait: no response will come.
+                }
+            }
+        }
+        assert_eq!(
+            kinds,
+            vec!["complete", "wait"],
+            "a dropped Wait responder stops the loop with no trailing collect"
+        );
+    }
+
+    // collect_while_completing (PLAN-08). Boundary: no flyers. bluesky's
+    // `for flyer in flyers` loops zero times, so nothing is completed; the first
+    // Wait on the (empty) group reports done immediately and one flush of each
+    // detector still runs.
+    #[tokio::test]
+    async fn collect_while_completing_with_no_flyers_still_collects_once() {
+        let msgs = drain_completing(
+            stubs::collect_while_completing(Vec::new(), colls(2), None, None),
+            vec![true].into_iter(),
+        )
+        .await;
+        assert_eq!(
+            msgs.iter().map(msg_kind).collect::<Vec<_>>(),
+            vec!["wait", "collect", "collect"],
+            "no flyers: one Wait then one collect per detector, got {msgs:#?}"
+        );
     }
 
     fn preparable(name: &str) -> Arc<dyn PreparableObj> {

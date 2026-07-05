@@ -77,9 +77,6 @@ PLAN-34 `wait_for` + `Msg::WaitFor` (mod.rs:368); PLAN-35 `prepare` + `Msg::Prep
   (lua_env.rs:1955) exist; missing only a Rust `stubs::locate` plan helper.
 
 **OPEN, IN-SCOPE** (changes emitted documents):
-- **PLAN-08** — `collect_while_completing` absent; its collect loop emits
-  StreamResource/StreamDatum/Event from flyers + collectables. Depends on a done-flag
-  from `wait` (PLAN-24).
 - **PLAN-20** — `spiral`/`spiral_fermat` ignore `dr_y` (ellipse aspect) + `tilt`
   (patterns.rs:151); both change per-step motor positions emitted into Events.
 - **PLAN-27** — no plan-level `rd` single-scalar read stub (weak: emits nothing itself).
@@ -99,7 +96,8 @@ PLAN-34 `wait_for` + `Msg::WaitFor` (mod.rs:368); PLAN-35 `prepare` + `Msg::Prep
   arg-parsing helpers), PLAN-36 (`caching_repeater`, deprecated).
 
 **Genuine in-scope backlog from doc 02** (implement in this order): PLAN-20, PLAN-29,
-PLAN-28, PLAN-25, PLAN-32, PLAN-27, PLAN-08 (dep. PLAN-24 done-flag).
+PLAN-28, PLAN-25, PLAN-32, PLAN-27. (PLAN-08 done — the `wait` done-flag it needed is
+`MsgResult::WaitComplete`, delivered via the plan↔engine response channel.)
 
 ---
 
@@ -333,19 +331,37 @@ PLAN-28, PLAN-25, PLAN-32, PLAN-27, PLAN-08 (dep. PLAN-24 done-flag).
 
 ---
 
-### PLAN-08 — `collect_while_completing` stub missing — **OPEN (in-scope)**
+### ~~PLAN-08~~ — `collect_while_completing` stub missing — **DONE**
 
-- **bsrs:** not present
+- **bsrs:** `plans::stubs::collect_while_completing(flyers, dets, flush_period, stream_name)`
 - **ref:** `plan_stubs.py:1013–1046` — `collect_while_completing(flyers, dets, flush_period, stream_name, watch)`
 - **Gap:** This is the idiomatic bluesky pattern for streaming flyers: call
   `complete_all`, then loop `wait(timeout=flush_period, error_on_timeout=False) →
   collect(dets)` until all flyers are done.  Without it, streaming flyer data must be
   collected in a single bulk call after completion, which can accumulate unbounded
   in-memory data.
-- **Fix sketch:** Add stub that issues `Msg::Complete` for each flyer into a group,
-  then loops emitting `Msg::Wait(error_on_timeout=false, timeout=flush_period)` and
-  `Msg::Collect` until done.  Requires `Msg::Wait` to return a "done" flag (see PLAN-24).
-- **Effort:** S
+- **Resolution:** Implemented faithfully. The blocker was that a bsrs plan is a
+  *stream* of messages and could not read a message's result — bluesky's
+  `done = yield from wait(...)` had no equivalent. Added a plan↔engine response
+  channel (`PlanItem::Respond(Msg, oneshot::Sender<MsgResult>)`); `wait_group` now
+  returns a done/move-on flag surfaced as `MsgResult::WaitComplete { done }`, and the
+  stub loops on it: `Complete` every flyer into one `short_uid("complete")` group,
+  then `Wait(error_on_timeout=false, timeout=flush_period)` → `Collect` each detector,
+  until `done`. `flush_period = None` waits to completion (single terminal collect);
+  `Some(period)` flushes each period. bluesky's `watch` groups are consumer-side
+  progress reporting with no bsrs equivalent, so they are omitted.
+  - Defense: if the engine drops the `Wait` responder (the run failed before
+    answering), the loop stops instead of awaiting a response that never comes, and
+    emits no trailing collect.
+  - Tests (boundary, not narrative): `collect_while_completing_single_cycle_when_done_immediately`
+    (done on first Wait → one Complete/flyer, one Wait, one Collect/det, shared group),
+    `collect_while_completing_flushes_each_period_until_done` (done=false,false,true →
+    Wait/Collect each period, terminal cycle included, named stream honoured),
+    `collect_while_completing_stops_when_wait_responder_dropped` (dropped sender →
+    stop, no trailing collect), `collect_while_completing_with_no_flyers_still_collects_once`
+    (zero flyers → one Wait then one collect/det). Response-channel round-trip through
+    the real engine covered by `respond_channel_delivers_wait_done_to_plan`.
+- **Effort:** S (channel infrastructure was the real cost; the stub itself is small)
 
 ---
 
