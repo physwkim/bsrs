@@ -173,6 +173,35 @@ fn base_keywords() -> Vec<&'static str> {
     ]
 }
 
+/// Reflect the method names of a `UserData` value (`det1:read`, `RE:run`, ...).
+///
+/// bsrs's `impl UserData` types register methods with `add_method` and add no
+/// fields or custom `__index`, so mlua stores the methods in an enumerable
+/// `__index` *table* on the metatable (see mlua `raw.rs`). We read it through
+/// the sanctioned `UserDataMetatable` API — no `getmetatable`, no host-side
+/// method list to keep in sync. A userdata whose `__index` is a function
+/// (field-based) yields nothing here and falls back to curated names.
+fn userdata_methods(ud: &mlua::AnyUserData) -> Vec<String> {
+    let Ok(metatable) = ud.metatable() else {
+        return Vec::new();
+    };
+    let Ok(index) = metatable.get::<mlua::Table>("__index") else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = Vec::new();
+    for pair in index.pairs::<mlua::String, mlua::Value>() {
+        let Ok((k, _)) = pair else { continue };
+        if let Ok(s) = k.to_str() {
+            if !s.starts_with('_') {
+                names.push(s.to_string());
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// Completion candidates: top-level names (no separator) plus per-container
 /// members reached via `base.field` / `base:method`.
 ///
@@ -215,12 +244,10 @@ impl CompletionModel {
         m
     }
 
-    /// Fold live Lua state on top: every non-`_` global name, and one level of
-    /// fields for table-valued globals (`msg.*`, `string.*`, user tables, ...).
-    ///
-    /// Userdata methods (e.g. `det1:trigger`) are not reflected here — mlua
-    /// exposes no stable member enumeration for `UserData` — so `RE:*` still
-    /// comes from the curated list and other userdata complete by name only.
+    /// Fold live Lua state on top: every non-`_` global name, one level of
+    /// fields for table-valued globals (`msg.*`, `string.*`, user tables, ...),
+    /// and the methods of userdata globals (`det1:trigger`, `RE:run`, ...) via
+    /// [`userdata_methods`].
     fn add_live(&mut self, lua: &mlua::Lua) {
         for pair in lua.globals().pairs::<mlua::String, mlua::Value>() {
             let Ok((k, v)) = pair else { continue };
@@ -230,16 +257,25 @@ impl CompletionModel {
                 continue;
             }
             self.globals.push(name.clone());
-            if let mlua::Value::Table(t) = &v {
-                let entry = self.members.entry(name).or_default();
-                for sub in t.pairs::<mlua::String, mlua::Value>() {
-                    let Ok((sk, _sv)) = sub else { continue };
-                    if let Ok(field) = sk.to_str() {
-                        if !field.starts_with('_') {
-                            entry.push(field.to_string());
+            match &v {
+                mlua::Value::Table(t) => {
+                    let entry = self.members.entry(name).or_default();
+                    for sub in t.pairs::<mlua::String, mlua::Value>() {
+                        let Ok((sk, _sv)) = sub else { continue };
+                        if let Ok(field) = sk.to_str() {
+                            if !field.starts_with('_') {
+                                entry.push(field.to_string());
+                            }
                         }
                     }
                 }
+                mlua::Value::UserData(ud) => {
+                    let methods = userdata_methods(ud);
+                    if !methods.is_empty() {
+                        self.members.entry(name).or_default().extend(methods);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -1124,10 +1160,15 @@ fn introspect_report(lua: &mlua::Lua, target: &str, verbose: bool) -> String {
                     keys.dedup();
                     write_names(&mut report, "Fields", &keys, verbose);
                 }
-                mlua::Value::UserData(_) => {
-                    let methods = curated_members(target);
+                mlua::Value::UserData(ud) => {
+                    // Prefer live reflection; fall back to curated names for a
+                    // userdata whose `__index` is field-based (not a table).
+                    let mut methods = userdata_methods(ud);
                     if methods.is_empty() {
-                        let _ = writeln!(report, "  (userdata methods are not introspectable)");
+                        methods = curated_members(target);
+                    }
+                    if methods.is_empty() {
+                        let _ = writeln!(report, "  (no methods found)");
                     } else {
                         write_names(&mut report, "Methods", &methods, verbose);
                     }
@@ -1507,5 +1548,61 @@ mod tests {
 
         // Empty target → usage hint.
         assert!(introspect_report(&lua, "", false).contains("usage:"));
+    }
+
+    #[test]
+    fn userdata_methods_reflect_device_and_engine() {
+        // A real bsrs Lua environment so `soft_detector` / `RE` are registered.
+        let sinks: Vec<Arc<dyn bsrs::engine::DocumentSink>> = Vec::new();
+        let re = Arc::new(RunEngine::new(sinks));
+        let lua = build_lua(re).expect("build_lua");
+        lua.load("det1 = soft_detector('det1')").exec().unwrap();
+
+        // The device userdata reflects its `add_method` surface.
+        let det1: mlua::Value = lua.globals().get("det1").unwrap();
+        let mlua::Value::UserData(ud) = det1 else {
+            panic!("det1 should be userdata");
+        };
+        let methods = userdata_methods(&ud);
+        for m in ["read", "trigger", "describe", "set"] {
+            assert!(
+                methods.iter().any(|x| x == m),
+                "device method `{m}` missing from {methods:?}"
+            );
+        }
+        // `_`-prefixed metamethods are filtered.
+        assert!(!methods.iter().any(|m| m.starts_with('_')));
+
+        // The RunEngine handle reflects too (previously curated-only).
+        let re_val: mlua::Value = lua.globals().get("RE").unwrap();
+        let mlua::Value::UserData(re_ud) = re_val else {
+            panic!("RE should be userdata");
+        };
+        let re_methods = userdata_methods(&re_ud);
+        for m in ["run", "pause", "resume", "state"] {
+            assert!(
+                re_methods.iter().any(|x| x == m),
+                "engine method `{m}` missing"
+            );
+        }
+
+        // …and it flows into completion: `det1:re`<Tab> → `det1:read`.
+        let mut model = CompletionModel::with_static();
+        model.add_live(&lua);
+        model.finish();
+        assert!(model
+            .candidates_for("det1:re")
+            .iter()
+            .any(|c| c == "det1:read"));
+        assert!(model
+            .candidates_for("det1:tr")
+            .iter()
+            .any(|c| c == "det1:trigger"));
+
+        // …and into introspection.
+        let report = introspect_report(&lua, "det1", true);
+        assert!(report.contains("Type:      userdata"));
+        assert!(report.contains("Methods"));
+        assert!(report.contains("trigger"));
     }
 }
