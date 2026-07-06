@@ -4,6 +4,76 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-07-06
+
+Feature release on top of the consolidated single-crate workspace: a much
+larger plan/engine surface closer to bluesky, an IOC-backed areaDetector
+writer, queue-server batch operations, and an IPython-level interactive REPL.
+In-process Python bindings are cancelled — bsrs is Rust-only.
+
+### Added
+
+- **IPython-level interactive REPL** (`bsrs repl`), migrated to the `reedline`
+  line editor: live Lua syntax highlighting; a completion menu (Tab) that
+  learns your globals, table fields, and `UserData` methods (`det1:read`,
+  `RE:run`); fish-style history autosuggestion; Ctrl-R history search; true
+  in-place multi-line editing; and `name?` / `name??` value introspection
+  (type, signature, fields / methods).
+- **`bsrs console`** — a fused local Lua REPL and queue-server sharing one
+  engine.
+- **Plans**: N-motor inner-product `scan` / `list_scan_nd` (PLAN-28), multi-motor
+  `mv` / `mvr` (single barrier), `snake` (boustrophedon) N-D grid traversal,
+  ring-based `spiral` / `spiral_fermat` with `dr_y` + tilt (PLAN-20),
+  slope-normalised `adaptive_scan`, multi-pass `tune_centroid`, status-driven
+  `ramp_plan`, `fly` over a list of flyers, `collect_while_completing`
+  (PLAN-08), typed `broadcast_msg` fan (PLAN-29), `count` delay + infinite
+  (`num=None`) mode, `per_step` / `per_shot` hooks, `SupplementalData`
+  preprocessor, and a real `contingency_wrapper`.
+- **Engine**: a plan↔engine response channel (`Respond` / `MsgResult`) for
+  value-returning messages; multiple concurrent runs keyed by run (ENG-04);
+  richer `RunResult` (all run uids, interrupted, reason, exception); suspender
+  `pre_plan` / `post_plan` injection; plan start gated on already-tripped
+  suspenders; `plan_type`, scan metadata, and `plan_args` stamped into
+  RunStart; external-asset documents emitted on step-scan save (ENG-02).
+- **Queue server**: positional + atomic batch `queue_item_add_batch` (QS-09)
+  and `queue_item_move_batch` / reorder (QS-20); populated `plans_allowed`
+  parameter schema (QS-03); caller-group-filtered `devices_allowed` (QS-14);
+  queue-item metadata forwarded into the run (PLAN-25).
+- **areaDetector / host**: an IOC-backed areaDetector HDF writer and composite
+  `AreaDetector` (DB-19); NDAttribute dataset discovery + emission; a
+  JPEG/TIFF multipart writer; frame shape/dtype discovery from RBVs;
+  `chunk_shape` StreamResource parameters; ophyd `stage_sigs` and AD
+  plugin-selection staging.
+
+### Changed
+
+- **BREAKING: `scan` is now N-motor (inner product).** The single-motor form
+  is `scan_1d`.
+- The REPL line editor moved from `rustyline` to `reedline`.
+- `run_async` now rejects a concurrent call, enforcing the single-plan
+  invariant.
+
+### Removed
+
+- **`bsrs-py` removed; in-process Python bindings cancelled** — bsrs is
+  Rust-only. Python consumers connect over the wire protocol
+  (`ZmqDocumentSink` → `RemoteDispatcher`) and the queue-server worker; the
+  bsrs/Python boundary is the Document, not the RunEngine, so no PyO3 surface
+  is needed.
+
+### Fixed
+
+- Engine: re-emit a stream's descriptor when a member object is reconfigured;
+  the engine (not the writers) owns `StreamDatum` seq_nums; stamp
+  `StreamResource.run_start` on the emission path; backstop-collect
+  uncollected flyers before RunStop; validate asset drains like bluesky.
+- Host: `FlushNow` is NDFileHDF5-only; treat Acquire/Capture as busy records
+  (watch RBVs, not callbacks); file URIs carry the localhost authority; AD
+  DataKeys carry the shape prefix and `uri` source; read frame shape in
+  `[Z, Y, X]` order + ColorMode.
+- Tests deflaked and Windows CI enabled (ephemeral TCP instead of unix IPC;
+  unified OS matrix).
+
 ## [0.2.0] - 2026-07-02
 
 Workspace consolidation and EPICS backend modernization. The 18-crate
