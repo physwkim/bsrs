@@ -134,8 +134,7 @@ bsrs/
 │   ├── bsrs-stream/                 # FrameSource/Sink + PvaMonitorSource + Hdf5Sink
 │   ├── bsrs-callbacks/              # JsonlSink, TiledSink, BestEffortCallback
 │   ├── bsrs/                        # facade crate, re-exports bsrs::ophyd_async, bsrs::ophyd
-│   ├── bsrs-cli/                    # bsui-equivalent REPL
-│   └── bsrs-py/                     # (optional, M7) PyO3 adapter
+│   └── bsrs-cli/                    # bsui-equivalent REPL
 └── examples/
     ├── async_count.rs                 # ophyd-async style
     ├── sync_count.rs                  # ophyd style (same plan)

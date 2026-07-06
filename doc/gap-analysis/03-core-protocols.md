@@ -15,7 +15,7 @@
 
 ## P0 — Correctness / Protocol Divergence / Commonly-Used Feature Entirely Missing
 
-### CP-01 · No access-role split: SignalR / SignalW / SignalRW / SignalX are all one type
+### CP-01 · No access-role split: SignalR / SignalW / SignalRW / SignalX are all one type — **DONE**
 
 **bsrs:** `crates/bsrs-devices/src/signal.rs:34` — `Signal<T, B>` is a
 single struct with both `get()` / `read()` and `put()` / `put_no_wait()` methods.
@@ -44,9 +44,20 @@ then parses `#[signal(ro, …)]` / `#[signal(rw, …)]` / `#[signal(wo, …)]` /
 
 **Effort:** M
 
+**Resolution:** The type-level access-role split exists. `crates/bsrs/src/devices/signal.rs:28-69`
+defines a sealed `access` module with unit markers `Read` / `Write` / `ReadWrite` / `Execute`
+and the `Readable` / `Writable` sub-traits; `Signal<T, B, A = ReadWrite>` (signal.rs:98) gates its
+method surface on `A` — `get`/`read`/`subscribe`/`stage` live in the `A: Readable` impl
+(signal.rs:156-236), `put` in the `A: Writable` impl (signal.rs:240-256), so a `SignalR::put`
+or `SignalW::get` fails to compile (test signal.rs:442-473). The aliases `SignalR` / `SignalW` /
+`SignalRW` / `SignalX` are exported at signal.rs:73-81. (Minor unclosed item: the
+`#[derive(Device)]` role-emission from `#[signal(ro/wo/x, …)]` is not wired — the derive parses
+only the PV template and `kind`, and the role is carried by the field's type annotation, not the
+attribute; see `crates/bsrs-derive/src/lib.rs:87-120`.)
+
 ---
 
-### CP-02 · SignalX (executable signal) entirely absent
+### CP-02 · SignalX (executable signal) entirely absent — **DONE**
 
 **bsrs:** No SignalX anywhere in `crates/bsrs-*`.
 
@@ -74,9 +85,16 @@ CP-03 (put-None semantics in the backend trait).
 
 **Effort:** S (depends on CP-01 and CP-03)
 
+**Resolution:** `SignalX<T, B> = Signal<T, B, Execute>` (`crates/bsrs/src/devices/signal.rs:81`).
+The `Execute`-only inherent impl gives it `trigger()`, which writes the backend default via
+`backend.put(None)` (signal.rs:276-291), and it implements the `Triggerable` protocol trait the
+same way (signal.rs:293-305). Backed by CP-11's put-None semantics: `SoftSignalBackend::put(None)`
+writes the configured initial value (`crates/bsrs/src/backends/soft/signal.rs:162-165`). Tested at
+signal.rs:478-506.
+
 ---
 
-### CP-03 · StandardReadable + StandardReadableFormat absent
+### CP-03 · StandardReadable + StandardReadableFormat absent — **DONE**
 
 **bsrs:** `crates/bsrs-core/src/kind.rs:6` has `Kind { Normal, Config,
 Hinted, Omitted }` for document routing.  `crates/bsrs-devices/src/signal.rs:
@@ -113,9 +131,22 @@ on it, and add `add_readables(devices, format: StandardReadableFormat)`.  The
 
 **Effort:** M
 
+**Resolution:** `StandardReadable` (`crates/bsrs/src/devices/standard_readable.rs:46-108`) holds
+`read` / `config` / `stageables` / `hints` accumulators; `add_readables(child, format)`
+(standard_readable.rs:75-94) routes a child to its buckets, and `add_stageable`
+(standard_readable.rs:100-102) registers staging. It implements `AsyncReadable` /
+`AsyncConfigurable` / `Stageable` plus the engine-facing `ReadableObj` / `ConfigurableObj` /
+`StageableObj` bridges by delegating to its children (standard_readable.rs:112-241). The
+`StandardReadableFormat` enum (standard_readable.rs:24-38) has all five variants
+(`Child` / `ConfigSignal` / `HintedSignal` / `UncachedSignal` / `HintedUncachedSignal`). Note: the
+`Uncached*` variants currently route identically to their cached counterparts (add_readables
+treats `UncachedSignal` like a plain read; comment at standard_readable.rs:33-34) — the uncached
+read path is not yet distinguished now that CP-08's cache exists. Tested at
+standard_readable.rs:265-308.
+
 ---
 
-### CP-04 · connect(mock=True) / MockSignalBackend / mock mode — zero testing surface
+### CP-04 · connect(mock=True) / MockSignalBackend / mock mode — zero testing surface — **DONE**
 
 **bsrs:** No `MockSignalBackend`, no `SoftSignalBackend`, no `connect_all(mock=true)`,
 no `set_mock_value`, no `get_mock_put`, no `callback_on_mock_put`.
@@ -146,11 +177,23 @@ an `Arc<Mutex<Vec<T>>>` put-history.  (c) Add `connect_mock(timeout)` to
 
 **Effort:** M
 
+**Resolution:** Both backends exist. `SoftSignalBackend<T>`
+(`crates/bsrs/src/backends/soft/signal.rs:42`, see CP-10) is the in-process store;
+`MockSignalBackend<T>` (`crates/bsrs/src/backends/mock/mock_signal.rs:37`) wraps it and adds the
+ophyd-async testing surface: `set_value` (= `set_mock_value`, mock_signal.rs:82), `put_calls` /
+`put_count` (= `get_mock_put`, mock_signal.rs:100-107), `set_put_callback` (= `callback_on_mock_put`,
+mock_signal.rs:94), `set_put_proceeds` + `mock_puts_blocked` RAII guard (mock_signal.rs:88-116),
+and a `put` that records the arg, applies the callback, writes through the soft backend, and gates
+completion on the proceeds flag (mock_signal.rs:161-175). There is no runtime `connect(mock=true)`
+backend swap (bsrs fixes the backend type on the `Signal` at compile time); a device is built over
+the mock backend directly instead. Tested mock_signal.rs:201-259. A trivial fixed-value
+`MockBackend` also exists (mock/mod.rs:20-74).
+
 ---
 
 ## P1 — Meaningful Completeness Gap
 
-### CP-05 · WatchableAsyncStatus + Watcher protocol missing
+### CP-05 · WatchableAsyncStatus + Watcher protocol missing — **DONE**
 
 **bsrs:** `crates/bsrs-core/src/status.rs:44` — `Inner.progress:
 watch::Sender<f64>` and `Status::watch() -> watch::Receiver<f64>`.  Only a single
@@ -173,9 +216,17 @@ Also add `Watcher` as a trait or function-pointer type to `bsrs-protocols-async`
 
 **Effort:** S
 
+**Resolution:** `WatcherUpdate<T = f64>` (`crates/bsrs/src/core/status.rs:49-86`) carries
+`current` / `initial` / `target` / `name` / `unit` / `precision` / `fraction` / `time_elapsed` /
+`time_remaining`. The `Watcher` trait (status.rs:93-96, re-exported from `protocols_async`) is the
+structured-callback sink. `Status` holds a `watch::Sender<Option<WatcherUpdate>>` (status.rs:104);
+`StatusSetter::update_watcher` posts an update (back-filling `time_elapsed`, status.rs:430-438) and
+`Status::observe_watcher` drives a `Watcher` immediately with the last update then on every change
+until completion (status.rs:340-371). Tested status.rs:570-616, 737-780.
+
 ---
 
-### CP-06 · Device hierarchy: parent / children / set_name propagation absent
+### CP-06 · Device hierarchy: parent / children / set_name propagation — **DONE** (naming) · remainder **OUT-OF-SCOPE**
 
 **bsrs:** `#[derive(Device)]` (`crates/bsrs-derive/src/lib.rs:36`) generates
 `name() -> &str` returning the stored prefix string.  No `parent` field, no
@@ -202,9 +253,34 @@ Option<Arc<dyn Any + Send + Sync>>` or a weak-ref field for the parent link.
 
 **Effort:** M
 
+**Status (PARTIAL):** Name propagation — the headline capability — is implemented. The
+`#[derive(Device)]` macro emits `new_named(prefix, dev_name)`
+(`crates/bsrs-derive/src/lib.rs:193-195`) that names each `#[signal]` field
+`{dev_name}-{field}` (lib.rs:101-112) and recursively calls `Sub::new_named` on each `#[device]`
+sub-device (lib.rs:127-132), so a motor built with `new_named("BL:T1X", "t1x")` yields
+`setpoint.name == "t1x-setpoint"` — the bluesky naming convention. bsrs devices are immutable
+`Arc<Self>`, so names are fixed at construction rather than mutated via a post-hoc `set_name`.
+Still missing: (1) no `parent` back-link field on any device; (2) no uniform `children()` iterator
+over an arbitrary `Device`'s sub-devices/signals — `children()` exists only on `DeviceVector`
+(`crates/bsrs/src/devices/device.rs:165`), not on the general `Device` trait (device.rs:22-41,
+which exposes only `name` / `connect_all_boxed` / `walk_signal_sources`).
+
+**Scope (2026-07-05):** The remaining two pieces are device-model navigation API, not
+document emission or qs wire protocol, and are therefore **OUT-OF-SCOPE** for the parity
+effort (bsrs owns document-emission + qs-wire correctness only; consumer-side / device-model
+navigation is out — same class as DB-14/15/16/17, CBEM-04/05/12). Evidence: `rg '\bparent\b'`
+across the crate finds no device `parent` in document emission — only `Resource.parent` /
+`StreamResource.parent` UIDs (an unrelated resource concept) and `checkpoint_store` /
+`areadetector` path/XML uses; `plans/mod.rs:153` states outright "bsrs has no device
+parent/child hierarchy." Descriptor / event assembly is driven by `StandardReadable`'s
+explicit child buckets + `walk_signal_sources`, never a general `Device::children()`. The
+document-emission-relevant capability of CP-06 — name propagation into descriptor `data_keys`
+(`t1x-setpoint`) — is **DONE**; the parent/children remainder does not change any emitted
+document.
+
 ---
 
-### CP-07 · DeviceVector absent
+### CP-07 · DeviceVector absent — **DONE**
 
 **bsrs:** No DeviceVector anywhere in bsrs.
 
@@ -223,9 +299,15 @@ that yields `("1", child1), ("2", child2), ...`.  Wire into `connect_all` and
 
 **Effort:** M
 
+**Resolution:** `DeviceVector<D>` (`crates/bsrs/src/devices/device.rs:83-181`) is a `BTreeMap<u32, D>`
+of child devices with `insert` / `get` / `iter` / `values` / `Index<u32>` and a bluesky-style
+`children()` yielding `("1", &child)`, `("2", &child)`, … in ascending key order (device.rs:165-167).
+For `D: Device` it participates in the device tree via `connect_all(timeout)`, which connects every
+child concurrently (device.rs:170-180). Tested device.rs:215-240.
+
 ---
 
-### CP-08 · Signal caching layer (_SignalCache / staged flag / read(cached)) absent
+### CP-08 · Signal caching layer (_SignalCache / staged flag / read(cached)) absent — **DONE**
 
 **bsrs:** `crates/bsrs-devices/src/signal.rs:84` — `Signal::read()` always
 calls `backend.get_reading()`.  `subscribe()` creates a fresh `watch::channel` and
@@ -252,9 +334,19 @@ creates a new CA/PVA monitor.  Stage semantics don't persist the subscription.
 
 **Effort:** M
 
+**Resolution:** `SignalCache<T, B>` (`crates/bsrs/src/devices/signal_cache.rs:49-178`) fires
+`backend.set_callback` exactly once and fans updates to N listeners over a `watch` channel; its
+documented invariant is "backend monitor alive ⟺ `staged || listeners > 0`" (signal_cache.rs:40-46),
+enforced by `ensure_token` / `maybe_teardown` under the state lock (signal_cache.rs:99-152). A
+`Signal` lazily holds one cache (`crates/bsrs/src/devices/signal.rs:107,168-176`); `read_cached(cached)`
+implements ophyd's `read(cached=)` — `Some(false)` hits the backend, `Some(true)`/`None` return the
+cached value when present (signal.rs:196-207); `stage()` / `unstage()` hold and release the monitor
+(signal.rs:210-218), and `subscribe()` demultiplexes the one shared monitor (signal.rs:335-343).
+Tested signal.rs:511-558 and signal_cache.rs:193-272.
+
 ---
 
-### CP-09 · observe_value / wait_for_value helpers absent
+### CP-09 · observe_value / wait_for_value helpers absent — **DONE**
 
 **bsrs:** No equivalent of `observe_value`, `observe_signals_value`, or
 `wait_for_value` anywhere in bsrs.  Users can manually watch a `Subscription`
@@ -279,9 +371,18 @@ as standalone async functions in `bsrs-devices` or a new `bsrs-plans` module.
 
 **Effort:** S
 
+**Resolution:** `crates/bsrs/src/devices/observe.rs` provides `observe_value(sub) -> impl Stream`
+(observe.rs:28-45, current value first then every change), `observe_signals_value(subs)` merging N
+subscriptions tagged by input index (observe.rs:63-72), and `wait_for_value(sub, predicate, timeout)`
+returning the first matching reading or `BsrsError::Timeout` (observe.rs:80-113). These operate on
+JSON-erased `ReadingValue`; `timeout`/`done_status` compose at the call site (tokio) rather than as
+parameters. Re-exported at devices/mod.rs:16. Tested observe.rs:131-240. (The `set_and_wait_for_value`
+/ `set_and_wait_for_other_value` convenience wrappers are not standalone helpers — that set+monitor
+pattern is inlined in the areadetector driver, e.g. `crates/bsrs/src/host/areadetector.rs:2390`.)
+
 ---
 
-### CP-10 · SoftSignalBackend absent
+### CP-10 · SoftSignalBackend absent — **DONE**
 
 **bsrs:** No in-process, non-I/O `SignalBackend<T>` implementation.  Building an
 internal state signal (e.g. `acquiring: Signal<bool, _>`) requires either an EPICS
@@ -301,9 +402,16 @@ the channel and fires the stored callback, `connect()` → `Ok(())`.
 
 **Effort:** S
 
+**Resolution:** `SoftSignalBackend<T>` (`crates/bsrs/src/backends/soft/signal.rs:42-234`) stores the
+value/setpoint/timestamp in-memory, `connect()` is a no-op (signal.rs:159), `put(Some(v))` writes and
+fires the registered callbacks (signal.rs:162-182), `put(None)` writes the configured `initial`
+(signal.rs:165), `get_reading()` returns the value's last-change timestamp rather than a fresh
+read-time stamp (signal.rs:195-207), and `source()` returns `"soft://{name}"` (signal.rs:231). It
+also backs `MockSignalBackend` (CP-04). Tested signal.rs:244-289.
+
 ---
 
-### CP-11 · SignalBackend::put takes non-None T only; no put-default semantics
+### CP-11 · SignalBackend::put takes non-None T only; no put-default semantics — **DONE**
 
 **bsrs:** `crates/bsrs-protocols-async/src/lib.rs:38` —
 `async fn put(&self, value: T, wait: bool, timeout: Option<Duration>) -> Status`
@@ -327,9 +435,18 @@ wraps the result in a `Status` and applies the timeout.  `SignalX` calls
 
 **Effort:** S (breaking change to the backend trait)
 
+**Resolution:** The backend trait now reads
+`async fn put(&self, value: Option<T>) -> Result<()>` with no `wait`/`timeout`
+(`crates/bsrs/src/protocols_async/mod.rs:46`): `None` is the put-default sentinel, waiting-for-completion
+is implicit, and any timeout lives on the `Signal` layer. `Signal::put` (writable roles) wraps the
+result in a `Status` (`crates/bsrs/src/devices/signal.rs:250-255`); `SignalX::trigger` calls
+`backend.put(None)` (signal.rs:285-290). Every backend implements the new shape (soft signal.rs:162,
+mock mock_signal.rs:161, plus the CA/PVA backends). Boundary-tested at
+backends/soft/signal.rs:244-260.
+
 ---
 
-### CP-12 · HasHints trait not formalized
+### CP-12 · HasHints trait not formalized — **DONE** (document hints) · trait formalization **OUT-OF-SCOPE**
 
 **bsrs:** `crates/bsrs-core/src/msg.rs:562` — `ReadableObj::hint_fields() ->
 Option<Vec<String>>` returns hinted field names as strings.  No `Hints` struct,
@@ -348,9 +465,20 @@ Implement it on `Signal` when `kind == Kind::Hinted` and on `StandardReadable` (
 
 **Effort:** S
 
+**Status (2026-07-05):** The document-emission-relevant hints capability is **DONE**.
+`ReadableObj::hint_fields()` (on `Signal` at `signal.rs:387`, `Detector` at `detector.rs:402`,
+and `StandardReadable` at `standard_readable.rs:208`) is collected by the RunEngine
+(`run_engine.rs:2042`) and emitted into the descriptor's per-object hints
+(`bundler.rs:231` → `Descriptor.hints: Option<HashMap<String, PerObjectHint>>`,
+`event_model/documents.rs:397-399`) and the `RunStart.hints` dimensions
+(`documents.rs:70-72`). A formalized `HasHints` protocol trait + `Hints` struct is
+device-model / consumer API surface whose named ref consumers — LiveTable, LivePlot — are
+out-of-scope live callbacks (per the parity-scope rule). The emitted document content is
+already correct; the trait formalization is **OUT-OF-SCOPE** for the parity effort.
+
 ---
 
-### CP-13 · SignalMetadata helper (make_datakey / limits / choices / units) absent
+### CP-13 · SignalMetadata helper (make_datakey / limits / choices / units) absent — **DONE**
 
 **bsrs:** `DataKey` construction is entirely left to each backend implementation.
 No shared helper ensures that `limits`, `choices`, `precision`, `units` fields are
@@ -372,9 +500,18 @@ constructor in `bsrs-event-model` or `bsrs-devices`.
 
 **Effort:** S
 
+**Resolution:** `SignalMetadata { limits, choices, precision, units }`
+(`crates/bsrs/src/event_model/documents.rs:313-322`) is the canonical vocabulary, and
+`make_datakey(source, dtype, shape, dtype_numpy, meta)` (documents.rs:332-352) builds a `DataKey`
+from the transport-known shape plus that metadata, defaulting the six non-metadata fields
+(`external` / `object_name` / `dims`) in one place so backends stop re-spelling them. `Limits` /
+`LimitsRange` / `RdsRange` (documents.rs:196-235) and the `choices` field on `DataKey`
+(documents.rs:298-301) supply the full vocabulary. Every backend routes through `make_datakey`
+(soft signal.rs:183-193, mock mod.rs:45-52, CA/PVA backends). Tested documents.rs:694-752.
+
 ---
 
-### CP-14 · AsyncStatus cancel context-manager semantics absent
+### CP-14 · AsyncStatus cancel context-manager semantics absent — **DONE**
 
 **bsrs:** `crates/bsrs-core/src/status.rs` — `Status` is a `Future` returning
 `Result<(), StatusError>`.  There is no cancellation path and no async context manager.
@@ -399,6 +536,15 @@ uses `Drop` with a tokio oneshot channel.
 
 **Effort:** M
 
+**Resolution:** `Status` gained a distinct `CANCELLED` state (`crates/bsrs/src/core/status.rs:16`) and
+a shared `CancellationToken` (status.rs:110). `Status::cancel()` signals the producer and transitions a
+still-pending status to `CANCELLED` — its `Future` then resolves to `Err(StatusError::Cancelled)`
+(status.rs:222-234, `Future::poll` at status.rs:472-492); it is idempotent and a no-op after
+completion (test status.rs:674-683). The producer observes the request via
+`StatusSetter::cancelled()` / `is_cancelled()` (status.rs:407-414) to abort in-flight work.
+`Status::cancel_on_drop()` returns a `CancelGuard` (status.rs:239-241, 450-470) that cancels on
+scope exit — the Rust analogue of ophyd-async's `async with status:`. Tested status.rs:633-719.
+
 ---
 
 ## P2 — Nice to Have
@@ -422,7 +568,7 @@ protocol gaps above.
 
 ---
 
-### CP-16 · SignalBackend::source lacks read/write distinction flag
+### CP-16 · SignalBackend::source lacks read/write distinction flag — **DONE**
 
 **bsrs:** `crates/bsrs-protocols-async/src/lib.rs:50` —
 `fn source(&self, name: &str) -> String`
@@ -436,6 +582,15 @@ report different source strings for read vs write contexts.
 backend implementations (epics-ca, epics-pva) to pass through the flag.
 
 **Effort:** S
+
+**Resolution:** The trait method is now `fn source(&self, name: &str, read: bool) -> String`
+(`crates/bsrs/src/protocols_async/mod.rs:57-62`; `read=true` = read-back URI, `read=false` = write
+URI), and every backend implements the new signature — CA (`crates/bsrs/src/backends/epics_ca/real.rs:540`
+and five more sites), PVA (`crates/bsrs/src/backends/epics_pva/real.rs:454` and four more), soft
+(soft/signal.rs:231), mock (mock/mock_signal.rs:191). `Signal::source()` passes `read=true`
+(devices/signal.rs:149-151). The API surface the gap named is closed; the CA/PVA/soft backends here
+each carry a single PV per signal so they currently ignore the flag (`_read`), while the seam for a
+distinct write URI now exists.
 
 ---
 
@@ -488,7 +643,7 @@ devices would be ergonomic but is not blocking.
 
 ---
 
-### CP-20 · walk_rw_signals / walk_devices / walk_signal_sources absent
+### CP-20 · walk_rw_signals / walk_devices / walk_signal_sources absent — **PARTIAL**
 
 **bsrs:** No device-tree traversal utilities.
 
@@ -500,6 +655,14 @@ and configuration introspection.
 `walk_devices(root: &dyn Device)` that traverses `children()` recursively.
 
 **Effort:** S (depends on CP-06)
+
+**Status (PARTIAL):** `walk_signal_sources(root)` is implemented — it collects `(dotted_path, source)`
+for every signal in a device tree (`crates/bsrs/src/devices/device.rs:67-71`), backed by a
+`Device::walk_signal_sources` trait method the `#[derive(Device)]` macro emits from the same field
+walk as `connect_all` (device.rs:26-41; `crates/bsrs-derive/src/lib.rs:116-142, 229-235`). Tested at
+devices/device.rs via the derive. Still missing: `walk_devices`, `walk_rw_signals`, and
+`walk_config_signals` — none exist (these need CP-06's general `children()` iterator and CP-01's
+role marker on trait objects, which are not yet available for tree traversal).
 
 ---
 
@@ -531,25 +694,34 @@ and configuration introspection.
 
 | ID | Title | Priority | Effort |
 |---|---|---|---|
-| CP-01 | SignalR/W/RW/X access-role split absent | P0 | M |
-| CP-02 | SignalX (executable signal) absent | P0 | S |
-| CP-03 | StandardReadable + StandardReadableFormat absent | P0 | M |
-| CP-04 | Mock mode / MockSignalBackend absent | P0 | M |
-| CP-05 | WatchableAsyncStatus + Watcher protocol | P1 | S |
-| CP-06 | Device parent/children/set_name propagation | P1 | M |
-| CP-07 | DeviceVector absent | P1 | M |
-| CP-08 | Signal caching layer (_SignalCache / staged) | P1 | M |
-| CP-09 | observe_value / wait_for_value helpers | P1 | S |
-| CP-10 | SoftSignalBackend absent | P1 | S |
-| CP-11 | backend.put(None) / put-default semantics | P1 | S |
-| CP-12 | HasHints trait not formalized | P1 | S |
-| CP-13 | SignalMetadata / make_datakey helper | P1 | S |
-| CP-14 | AsyncStatus cancel / context-manager | P1 | M |
+| ~~CP-01~~ | ~~SignalR/W/RW/X access-role split absent~~ **DONE** | P0 | M |
+| ~~CP-02~~ | ~~SignalX (executable signal) absent~~ **DONE** | P0 | S |
+| ~~CP-03~~ | ~~StandardReadable + StandardReadableFormat absent~~ **DONE** | P0 | M |
+| ~~CP-04~~ | ~~Mock mode / MockSignalBackend absent~~ **DONE** | P0 | M |
+| ~~CP-05~~ | ~~WatchableAsyncStatus + Watcher protocol~~ **DONE** | P1 | S |
+| ~~CP-06~~ | ~~Device set_name/naming propagation~~ **DONE**; parent/children **OUT-OF-SCOPE** | P1 | M |
+| ~~CP-07~~ | ~~DeviceVector absent~~ **DONE** | P1 | M |
+| ~~CP-08~~ | ~~Signal caching layer (_SignalCache / staged)~~ **DONE** | P1 | M |
+| ~~CP-09~~ | ~~observe_value / wait_for_value helpers~~ **DONE** | P1 | S |
+| ~~CP-10~~ | ~~SoftSignalBackend absent~~ **DONE** | P1 | S |
+| ~~CP-11~~ | ~~backend.put(None) / put-default semantics~~ **DONE** | P1 | S |
+| ~~CP-12~~ | ~~HasHints: document hints emitted~~ **DONE**; trait formalization **OUT-OF-SCOPE** | P1 | S |
+| ~~CP-13~~ | ~~SignalMetadata / make_datakey helper~~ **DONE** | P1 | S |
+| ~~CP-14~~ | ~~AsyncStatus cancel / context-manager~~ **DONE** | P1 | M |
 | CP-15 | DerivedSignal absent | P2 | L |
-| CP-16 | source(read: bool) flag absent | P2 | S |
+| ~~CP-16~~ | ~~source(read: bool) flag absent~~ **DONE** | P2 | S |
 | CP-17 | soft_signal_rw factories absent | P2 | S |
 | CP-18 | set() retry on timeout absent | P2 | S |
 | CP-19 | init_devices context manager absent | P2 | M |
-| CP-20 | walk_devices / walk_rw_signals absent | P2 | S |
+| CP-20 | walk_devices / walk_rw_signals absent **PARTIAL** | P2 | S |
 
 **Counts:** P0 = 4, P1 = 10, P2 = 6
+
+**Reconciliation (as of 2026-07-05):** 13 DONE; plus CP-06 and CP-12, whose
+document-emission-relevant parts are DONE (name propagation into descriptor `data_keys`;
+per-object hints emitted into descriptor + `RunStart`) and whose remaining device-model API
+pieces (device `parent` back-link + general `Device::children()`; the `HasHints` protocol
+trait) are OUT-OF-SCOPE per the parity-scope rule (consumer-side / device-model navigation).
+1 PARTIAL (CP-20). 4 OPEN (CP-15, CP-17, CP-18, CP-19). Source paths in the older entries reference the pre-consolidation
+crate names (`bsrs-core`, `bsrs-devices`, …); the code now lives in the single `bsrs` crate under
+`crates/bsrs/src/{core,devices,protocols_async,event_model}/` plus the companion `bsrs-derive` crate.

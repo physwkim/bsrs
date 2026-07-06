@@ -202,6 +202,9 @@ impl GroupPolicy {
     fn plan_allowed(&self, name: &str) -> bool {
         self.allowed_plans.iter().any(|r| r.is_match(name))
     }
+    fn device_allowed(&self, name: &str) -> bool {
+        self.allowed_devices.iter().any(|r| r.is_match(name))
+    }
 }
 
 /// Live RBAC state. Hot-reloadable via [`Permissions::reload`].
@@ -374,6 +377,29 @@ impl Permissions {
                 .filter(|n| policy.plan_allowed(n))
                 .collect(),
             None => plan_names.iter().collect(), // unknown group → return all
+        }
+    }
+
+    /// Filter `device_names` to those allowed for `group`.
+    /// Returns `device_names` unchanged when RBAC is not enforced or the group
+    /// is not found (tolerates absent / unknown user_group). Mirrors
+    /// [`Permissions::filter_plans_for_group`] against the group's
+    /// `allowed_devices` regex set.
+    pub fn filter_devices_for_group<'a>(
+        &self,
+        group: &str,
+        device_names: &'a [String],
+    ) -> Vec<&'a String> {
+        let g = self.inner.read().unwrap();
+        if !g.enforced {
+            return device_names.iter().collect();
+        }
+        match g.groups.get(group) {
+            Some(policy) => device_names
+                .iter()
+                .filter(|n| policy.device_allowed(n))
+                .collect(),
+            None => device_names.iter().collect(), // unknown group → return all
         }
     }
 

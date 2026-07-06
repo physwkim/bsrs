@@ -6,8 +6,7 @@ use std::sync::Mutex as StdMutex;
 
 use crate::callbacks::ZmqDocumentSink;
 use crate::core::error::{BsrsError, Result};
-use crate::core::msg::RunMetadata;
-use crate::engine::{DocumentSink, RunEngine};
+use crate::engine::{DocumentSink, RunEngine, RunOptions};
 use tokio::sync::Mutex;
 use tokio::task::AbortHandle;
 
@@ -81,6 +80,15 @@ impl ServerBuilder {
     /// Override (or disable, via `None`) the Document PUB address.
     pub fn document_address(mut self, addr: impl Into<String>) -> Self {
         self.document_address = Some(addr.into());
+        self
+    }
+    /// Do not bind a Document PUB socket. The server's document sink is used
+    /// only when `environment_open` creates the engine; a caller that
+    /// *pre-opens* the engine (seeding `engine_slot` itself, with its own
+    /// document sink already attached) must call this so the server does not
+    /// contend for the same PUB address. Used by the fused console.
+    pub fn without_document_socket(mut self) -> Self {
+        self.document_address = None;
         self
     }
     /// Set the registered plans + devices.
@@ -460,18 +468,29 @@ pub(crate) async fn execute_queue_loop(
                 continue;
             }
         };
-        let _ = item.meta;
-        let _meta = RunMetadata {
-            scan_id: None,
-            plan_name: Some(item.name.clone()),
-            extra: Default::default(),
+        // Forward the queue item's submitter metadata into the run as per-call
+        // md (bluesky's `_metadata_per_call`, the highest-precedence merge
+        // layer), so keys the submitter attached land in RunStart. A non-object
+        // `meta` (or JSON null) contributes nothing. The plan supplies its own
+        // plan_name/plan_args at OpenRun, so md carries only the submitter keys.
+        let md: std::collections::HashMap<String, serde_json::Value> = item
+            .meta
+            .as_object()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
+        let opts = RunOptions {
+            md,
+            subs: Vec::new(),
         };
-        let run_result = re.run_async(plan).await;
+        let run_result = re.run_async_with(plan, opts).await;
         let exit_status = match &run_result {
             Ok(r) => r.exit_status.clone(),
             Err(_) => "fail".to_string(),
         };
-        let run_uid = run_result.as_ref().ok().and_then(|r| r.run_uid.clone());
+        let run_uid = run_result
+            .as_ref()
+            .ok()
+            .and_then(|r| r.run_uids.last().cloned());
         // Bookkeeping after the run.
         {
             let mut s = state.lock().unwrap();
@@ -530,5 +549,60 @@ struct ClearOnDrop(Arc<StdMutex<Option<AbortHandle>>>);
 impl Drop for ClearOnDrop {
     fn drop(&mut self) {
         *self.0.lock().unwrap() = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::msg::Msg;
+    use crate::core::plan::plan_box;
+    use crate::event_model::Document;
+    use crate::qs::queue::QueuedItem;
+    use crate::qs::registry::PlanFactory;
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    // PLAN-25 (part 2): a queued plan's submitter `meta` is forwarded into the
+    // run as per-call md (bluesky's `_metadata_per_call`), so its keys land in
+    // the RunStart document. Regression for the previously-dropped `item.meta`
+    // (the queue loop ran the plan with no md).
+    #[tokio::test]
+    async fn queue_item_meta_reaches_runstart() {
+        let re = Arc::new(RunEngine::new(vec![]));
+        let seen: Arc<StdMutex<Vec<HashMap<String, serde_json::Value>>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let seen_c = seen.clone();
+        re.subscribe(Arc::new(move |d: &Document| {
+            if let Document::Start(s) = d {
+                seen_c.lock().unwrap().push(s.extra.clone());
+            }
+        }));
+
+        let mut reg = Registry::new();
+        let factory: PlanFactory = Arc::new(|_reg, _args| {
+            Ok(plan_box(async_stream::stream! {
+                yield Msg::OpenRun(Default::default());
+                yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+            }))
+        });
+        reg.register_plan("noop", factory);
+        let registry = Arc::new(reg);
+
+        let queue = Arc::new(StdMutex::new(PlanQueue::new()));
+        let mut item = QueuedItem::plan("noop", json!({ "args": [] }));
+        // Keys chosen to avoid RunStart's typed fields (sample/group/owner/…),
+        // so they surface in `extra`.
+        item.meta = json!({ "purpose": "alignment", "operator": "sang" });
+        queue.lock().unwrap().push_back(item);
+
+        let state = Arc::new(StdMutex::new(EngineState::default()));
+        let task_slot = Arc::new(StdMutex::new(None));
+        execute_queue_loop(re.clone(), registry, queue, state, task_slot).await;
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "exactly one run opened");
+        assert_eq!(seen[0].get("purpose"), Some(&json!("alignment")));
+        assert_eq!(seen[0].get("operator"), Some(&json!("sang")));
     }
 }

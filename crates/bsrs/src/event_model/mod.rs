@@ -22,6 +22,38 @@ pub use page::{
     rechunk_event_pages, unpack_datum_page, unpack_event_page,
 };
 
+/// Compose a `file://` URI for an emitted document (`StreamResource.uri`,
+/// external `DataKey.source`). Absolute paths get the explicit `localhost`
+/// authority — `file://localhost/data/x.h5` — matching ophyd-async's
+/// `PathInfo.directory_uri` convention so downstream consumers see one form.
+/// A relative path (no leading `/`) cannot take an authority without
+/// corrupting its first segment, so it keeps the bare `file://` form.
+pub fn file_uri(path: &str) -> String {
+    if path.starts_with('/') {
+        format!("file://localhost{path}")
+    } else {
+        format!("file://{path}")
+    }
+}
+
+#[cfg(test)]
+mod file_uri_tests {
+    use super::file_uri;
+
+    #[test]
+    fn absolute_path_gets_localhost_authority() {
+        assert_eq!(
+            file_uri("/data/scans/scan.h5"),
+            "file://localhost/data/scans/scan.h5"
+        );
+    }
+
+    #[test]
+    fn relative_path_keeps_bare_form() {
+        assert_eq!(file_uri("scans/scan.h5"), "file://scans/scan.h5");
+    }
+}
+
 /// Errors when composing or routing documents.
 #[derive(Debug, thiserror::Error)]
 pub enum EventModelError {

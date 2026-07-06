@@ -33,8 +33,8 @@ pub(crate) struct SuspenderHandle {
     /// Stable id used by `RemoveSuspender` Msg.
     #[allow(dead_code)]
     pub(crate) id: u64,
-    /// Underlying suspender (kept alive while the registration exists).
-    #[allow(dead_code)]
+    /// Underlying suspender (kept alive while the registration exists). Also
+    /// queried at plan start via [`Suspender::tripped`] for the ENG-12 gate.
     pub(crate) inner: Arc<dyn Suspender>,
     /// The watcher task — drop / abort on Drop.
     pub(crate) abort: AbortHandle,

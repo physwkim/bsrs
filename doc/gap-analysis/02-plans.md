@@ -1,7 +1,7 @@
 # Gap Analysis 02 — Plans, Plan Stubs, Plan Patterns, Preprocessors
 
 **Date:** 2026-06-14  
-**Scope:** `crates/bsrs-plans/src/` (lib.rs, patterns.rs, preprocessors.rs)  
+**Scope:** `crates/bsrs/src/plans/` (mod.rs, patterns.rs, preprocessors.rs) — consolidated from the former `crates/bsrs-plans/src/`  
 **Reference:** `daq/bluesky/src/bluesky/{plans,plan_stubs,plan_patterns,preprocessors}.py`
 
 ---
@@ -13,18 +13,33 @@ bsrs-plans covers roughly 60% of the bluesky surface area.  The core compound pl
 `spiral_*`, `fly`, `ramp_plan`) are present.  All preprocessor wrappers are present.
 The primary gaps are:
 
-- **No `per_step`/`per_shot` hooks** in any plan — the inner loop is hardcoded and
-  cannot be customized (P0, PLAN-01).
-- **No staging** inside any compound plan — devices are never armed (P0, PLAN-09).
-- **Three core plans have divergent algorithms** from bluesky: `ramp_plan`,
-  `tune_centroid`, `adaptive_scan` (P0, PLAN-04/05/06).
-- **`scan` is 1D only**; bluesky's is N-D (P0, PLAN-03).
-- **`mv`/`mvr` are single-motor only**; bluesky accepts parallel multi-motor pairs (P1,
-  PLAN-10).
-- **Snake traversal absent** from all N-D grid scans and pattern generators (P1,
-  PLAN-19).
-- **No `md` parameter** on any plan — downstream tools cannot identify scan types or
-  motors (P1, PLAN-25).
+- ~~**No `per_step`/`per_shot` hooks** in any plan — the inner loop is hardcoded and
+  cannot be customized (P0, PLAN-01).~~ **DONE** — `PerStep`/`PerShot`/`StepMotor`
+  + `count_per_shot`/`scan_per_step`/`list_scan_per_step`/`inner_product_scan_per_step`/`scan_nd_per_step`
+  (grid family deferred pending a settle-semantics decision).
+- ~~**No staging** inside any compound plan — devices are never armed (P0, PLAN-09).~~
+  **DONE** — the six OpenRun cores (`count_ext`, `scan_1d_per_step`,
+  `list_scan_per_step`, `inner_product_core`, `scan_nd_with_md`,
+  `grid_scan_snake`) wrap their body with `stage_wrapper`; opt-in via
+  `as_stageable` on `ReadableObj`/`MovableObj`. Specialized plans
+  (`spiral*`/`adaptive_scan`/`ramp_plan`/`fly`/`tune_centroid`) tracked as
+  follow-up.
+- ~~**Three core plans have divergent algorithms** from bluesky: `ramp_plan`,
+  `tune_centroid`, `adaptive_scan` (P0, PLAN-04/05/06).~~ **ALL DONE**:
+  `adaptive_scan` (slope-normalised + threshold + smoothing), `tune_centroid`
+  (multi-pass refinement), `ramp_plan` (completion-predicate polling +
+  monitor/timeout/period; Lua binding removed pending a Lua completion design).
+- ~~**`scan` is 1D only**; bluesky's is N-D (P0, PLAN-03).~~ **DONE** — `scan(dets,
+  axes: Vec<ScanAxis>, num)` is now the canonical N-motor inner-product form
+  (plan_name "scan"); `scan_1d` is the 1-D convenience.
+- ~~**`mv`/`mvr` are single-motor only**; bluesky accepts parallel multi-motor pairs (P1,
+  PLAN-10).~~ **DONE** — `mv_many`/`mvr_many` (one group, one wait).
+- ~~**Snake traversal absent** from all N-D grid scans and pattern generators (P1,
+  PLAN-19).~~ **DONE** — `outer_product_snake` / `list_grid_scan_snake` /
+  `grid_scan_snake` + `SnakeAxes`.
+- ~~**No `md` parameter** on any plan — downstream tools cannot identify scan types or
+  motors (P1, PLAN-25).~~ **DONE** — RunStart `plan_args` on every plan + qs queue-item
+  `meta` forwarded to per-call md.
 - `plan_mutator` lacks the (head, tail) insertion pair that bluesky uses in
   `trigger_and_read` (P1, PLAN-21).
 
@@ -32,9 +47,74 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
+## Reconciliation (2026-07-05)
+
+Every PLAN-* item re-verified against the consolidated code
+(`crates/bsrs/src/plans/{mod,patterns,preprocessors}.rs`, `crates/bsrs/src/core/msg.rs`).
+The header's `crates/bsrs-plans/src/...` paths are pre-consolidation. **Scope overlay**
+(authoritative, from the project scope rule): bsrs owns document-emission + qs-wire
+correctness only; barrier/`wait` choreography, interactive/console plans, and
+subscribe/unsubscribe callback plumbing are consumer-/device-side → OUT-OF-SCOPE. This
+block is authoritative where a per-heading tag below still lags.
+
+**DONE** (implemented; several headings below were stale): PLAN-01, 02, 03, 04, 05, 06,
+07, 09, 10, 14, 15, 16, 17, 18, 19, 22, 26, 34, 35. Evidence for the newly-confirmed:
+PLAN-10 `mv_many`/`mvr_many` (mod.rs:242/266); PLAN-14 `kickoff_all`/`complete_all`
+(mod.rs:459/483); PLAN-15 `rel_spiral*` (mod.rs:1963/1990/2017); PLAN-16 `rel_log_scan`
+(mod.rs:1896); PLAN-17 `rel_list_grid_scan` (mod.rs:1586); PLAN-18 `x2x_scan`
+(mod.rs:1390); PLAN-22 `contingency_wrapper` with real except/else/finally
+(preprocessors.rs:460); PLAN-26 `repeat` incl. `num=None` infinite (mod.rs:665);
+PLAN-34 `wait_for` + `Msg::WaitFor` (mod.rs:368); PLAN-35 `prepare` + `Msg::Prepare`
+(mod.rs:420).
+
+**OUT-OF-SCOPE** (verified absent/partial, outside parity scope):
+- Barrier/`wait` choreography (append `Msg::Wait`, no document effect): PLAN-11
+  (`abs_set` wait), PLAN-12 (`trigger`/`kickoff`/`complete` wait), PLAN-13
+  (`stage`/`unstage` group/wait), PLAN-24 (`wait` watch / error_on_timeout).
+- Consumer-side callback plumbing (live callbacks run Python-side off emitted docs):
+  PLAN-23 (subscribe/unsubscribe), PLAN-38 (`subs_wrapper` no-op).
+- Interactive/console plans: PLAN-33 (`tweak`), PLAN-37 (`input_plan`).
+- Ergonomics / deprecated, no emission effect: PLAN-21 (`plan_mutator` head/tail —
+  superseded by PLAN-22's drop-on-error path), PLAN-30 (`*_decorator` variants —
+  wrappers already provide the behavior), PLAN-31 (`classify`/`chunk_outer_product`
+  arg-parsing helpers), PLAN-36 (`caching_repeater`, deprecated).
+
+**Genuine in-scope backlog from doc 02: empty — all in-scope items resolved.**
+(PLAN-08 done — the `wait` done-flag it needed is `MsgResult::WaitComplete`,
+delivered via the plan↔engine response channel. PLAN-20 done — faithful ring-based
+spiral/fermat rewrite with `dr_y`+`tilt`. PLAN-25 done — RunStart `plan_args` on
+every plan + qs queue-item `meta` forwarded to per-call md. PLAN-29 done — typed
+`broadcast_msg` fan. PLAN-28 done — multi-motor inner-product `list_scan_nd`.
+PLAN-32 / PLAN-27 done — `locate` / `rd` value-return resolved by the response
+channel (`respond(Msg::Locate)` / `respond(Msg::Read)`); neither warrants a
+non-faithful `-> Plan` stub, and neither emits documents.)
+
+---
+
 ## P0 — Correctness / Protocol Divergence / Commonly-Used Feature Entirely Missing
 
-### PLAN-01 — No `per_step`/`per_shot` hooks; no `Checkpoint` in scan inner loops
+### PLAN-01 — No `per_step`/`per_shot` hooks; no `Checkpoint` in scan inner loops — **DONE (grid-family deferred)**
+
+- **Resolution:** Added the `PerStep` / `PerShot` hook types and a `StepMotor`
+  (`(Movable, Readable, Option<f64>)`, `None` = at-position/skip) in
+  `plans/mod.rs`, plus stubs `move_per_step`, `one_nd_step` (default `PerStep`),
+  and `read_shot` (default read-only `PerShot`; the existing `one_shot` stays the
+  trigger-and-read variant). The public plans keep their signatures and delegate
+  to new hook-taking forms — `count`→`count_per_shot`, `scan`→`scan_per_step`,
+  `list_scan`→`list_scan_per_step`, `inner_product_scan`→`inner_product_scan_per_step`,
+  `scan_nd`→`scan_nd_per_step` (convenience-delegator, so no caller churned). The
+  `None` path reproduces each plan's previous per-step/per-shot Msg sequence
+  byte-for-byte (all 78 plans unit tests unchanged and green), including
+  `scan_nd`'s `pos_cache` skip, which now surfaces as `StepMotor::None` at the
+  hook. The step-boundary `Checkpoint` gap noted below (b) was already closed in
+  bsrs; this change moves that Checkpoint into the default stub. **Deferred:**
+  `grid_scan` / `grid_scan_snake` (and `list_grid_scan`, which shares
+  `scan_nd_with_md`) route through the default only — the grid family settles the
+  slow axis in a separate `"set1"` group per row, which does not match
+  `one_nd_step`'s single-group move; unifying it is a settle-semantics change that
+  needs sign-off (tracked here). Tests: `count_per_shot_uses_custom_hook_verbatim`,
+  `scan_per_step_uses_custom_hook_and_threads_targets`,
+  `scan_nd_per_step_marks_unchanged_motor_none`.
 
 - **bsrs:** `lib.rs:322–1155` — all plans hardcode `Create → Read* → Save` per step
 - **ref:** `plans.py:66,130,484,1026` — every plan accepts `per_step: PerStep | None`
@@ -57,7 +137,27 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-02 — `count` missing `delay`, `per_shot`, and `num=None` infinite mode
+### PLAN-02 — `count` missing `delay`, `per_shot`, and `num=None` infinite mode — **DONE**
+
+- **Resolution:** Added `count_ext(dets, num: Option<usize>, delay: CountDelay,
+  per_shot: Option<PerShot>)` — the full bluesky `count`. `num = None` acquires
+  indefinitely (the stream never self-closes; the engine bounds it); `delay` is a
+  new `CountDelay { None, Every(Duration), Sequence(Vec<Duration>) }`, applied
+  time-compensated after each shot (the emitted `Sleep` is target minus the shot's
+  own elapsed). A finite `num` with a too-short `Sequence` (`< num-1` entries)
+  fails upfront with `Msg::Fail` before the run opens (bluesky's `ValueError`); an
+  exhausted `Sequence` ends the run with no trailing sleep (bluesky's
+  `StopIteration → break`). `count` and `count_per_shot` (PLAN-01) are now thin
+  convenience delegators to `count_ext`, so no caller churned and the finite/no-delay
+  path is byte-for-byte unchanged (all count tests green). **Deviation from the fix
+  sketch:** does *not* route through `stubs::repeat` — `repeat` emits its own
+  `Checkpoint` per iteration, which combined with `read_shot`'s Checkpoint would
+  double-checkpoint each shot (bluesky's `count == repeat(one_shot)` in fact does);
+  bsrs keeps its established single per-shot Checkpoint instead. per_shot itself was
+  delivered in PLAN-01. Tests: `count_ext_scalar_delay_sleeps_after_every_shot`,
+  `count_ext_num_none_acquires_indefinitely`,
+  `count_ext_short_delay_sequence_fails_before_open`,
+  `count_ext_delay_sequence_applies_per_interval`.
 
 - **bsrs:** `lib.rs:322–341`
 - **ref:** `plans.py:66–129` — `num: int | None = 1`, `delay: ScalarOrIterableFloat = 0.0`,
@@ -72,7 +172,23 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-03 — `scan` is 1D single-motor; bluesky `scan` accepts N motors (inner product)
+### PLAN-03 — `scan` is 1D single-motor; bluesky `scan` accepts N motors (inner product) — **DONE**
+
+- **Resolution:** Renamed the 1-D `scan` to `scan_1d` (+ `scan_1d_per_step`) and
+  made `scan(dets, axes: Vec<ScanAxis>, num)` the canonical N-motor inner-product
+  form (all axes moved together each point), matching bluesky's `scan`
+  (plans.py:1185). Both emit `plan_name = "scan"`. `scan`/`scan_per_step` share
+  the traversal with `inner_product_scan` through a new private
+  `inner_product_core(..., plan_name)` — the only difference between them is the
+  emitted name, so it is a parameter and the loop lives in one place;
+  `inner_product_scan` is kept as a back-compat alias (its own `plan_name`). All
+  ~10 old `scan(...)` call sites (rel_scan, examples, end_to_end, plans tests, and
+  both Lua `scan`/`bp.scan` bindings) were updated to `scan_1d`; the Lua bindings
+  stay 1-D (Lua does not construct `Vec<ScanAxis>`), so existing Lua scripts are
+  unaffected. Document emission is unchanged for every existing caller (they now
+  go through `scan_1d`, which emits the same "scan" run as before). Tests:
+  `scan_moves_all_axes_together_and_opens_run_named_scan`,
+  `scan_single_axis_matches_scan_1d_shape`.
 
 - **bsrs:** `lib.rs:377–419` — `scan(dets, motor, reader, start, stop, num)`
 - **ref:** `plans.py:1185–1291` — `scan(dets, *args, num=N)` where `args` is
@@ -88,7 +204,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-04 — `ramp_plan` algorithm divergence — status-driven vs fixed-sample-count
+### PLAN-04 — `ramp_plan` algorithm divergence — status-driven vs fixed-sample-count — **DONE**
 
 - **bsrs:** `lib.rs:729–757` — runs `go_plan` then loops `samples` times, sleeping
   `period` each iteration
@@ -101,10 +217,25 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
   stops before completion.
 - **Fix sketch:** Return a `StatusHandle` from `go_plan`; loop on `Msg::Wait(timeout=period, error_on_timeout=false)` until status completes; add `take_pre_data: bool`, `timeout: Option<Duration>`, `period: Option<Duration>`.  Wrap body with `monitor_during_wrapper([monitor_sig])`.
 - **Effort:** L
+- **Resolution:** `ramp_plan` rewritten to bluesky's `polling_plan`. Because bsrs
+  plans receive no Status back from the engine (no Msg→result channel), the
+  completion query is a caller-supplied predicate — chosen design: `is_complete:
+  Arc<dyn Fn() -> BoxFuture<bool>>`, polled between samples (the bsrs stand-in
+  for `status.done`). The per-sample body is a caller-supplied inner-plan factory
+  `inner: Arc<dyn Fn() -> Plan>` (bluesky's `inner_plan_func`, typically
+  `trigger_and_read`). Flow: optional pre-sample → forward `go_plan` (start the
+  ramp) → poll/sample loop → post-sample; `timeout` fails the run with a
+  RampFail-style `Msg::Fail`, `period` rate-limits via `Msg::Sleep`. The body is
+  wrapped with `monitor_during_wrapper([monitor_sig])`. Tests: completion
+  predicate controls the in-loop sample count (pre + N + post), the
+  `take_pre_data` toggle, and a zero-timeout RampFail.
+- **Follow-up:** the Lua `bp.ramp_plan` binding was **removed** (per user decision)
+  — the Rust closures have no faithful Lua representation. A Lua completion
+  condition (e.g. readback-within-tolerance) is a separate small design.
 
 ---
 
-### PLAN-05 — `tune_centroid` is single-pass; bluesky iteratively refines with shrinking range
+### PLAN-05 — `tune_centroid` is single-pass; bluesky iteratively refines with shrinking range — **DONE**
 
 - **bsrs:** `lib.rs:1037–1100` — one uniform scan, one centroid computed, one final move
 - **ref:** `plans.py:873–1023` — loops `while abs(step) >= min_step`, re-centers range
@@ -119,10 +250,23 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
   `sum_I`/`sum_xI` per pass and computing `new_start = centroid - new_range/2`.  Add
   `min_step: f64`, `step_factor: f64 = 3.0`, `snake: bool = false`.
 - **Effort:** M
+- **Resolution:** `tune_centroid` rewritten to bluesky's multi-pass loop:
+  each pass scans `num` points, accumulates `ΣI`/`ΣxI`, and on leaving the
+  window computes the centroid, re-centers a `step_factor`-narrowed window
+  (clamped to the global bounds) on it, and rescans — until `|step| < min_step`.
+  `snake` swaps the pass endpoints so the direction alternates.  A pass with
+  `ΣI == 0` stops without a final move (bluesky's early `return`); otherwise the
+  motor moves to the converged centroid.  Added `min_step`, `step_factor`,
+  `snake` parameters and fail-fast guards (`min_step > 0`, `step_factor > 1`).
+  `step_factor > 1` guarantees termination, so no iteration cap is needed.
+  Signal re-read plan-side via `read_dyn`; commanded position used for the
+  abscissa (unchanged from the prior bsrs version).  Tests: flat signal → three
+  passes / 15 points converging to 2.0 (proves multi-pass), and a peaked
+  single-pass signal `[0,1,3,0,0]` → weighted centroid 1.75 ≠ mean 2.0.
 
 ---
 
-### PLAN-06 — `adaptive_scan` step-sizing algorithm diverges from bluesky
+### PLAN-06 — `adaptive_scan` step-sizing algorithm diverges from bluesky — **DONE**
 
 - **bsrs:** `lib.rs:945–1027` — halves step on `|delta| > target * 1.5`, doubles on
   `|delta| < target * 0.5`; no slope, no smoothing, no `threshold`
@@ -136,10 +280,21 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
   also emits `Msg("checkpoint")` before each step (via `bps.mv`); bsrs does not.
 - **Fix sketch:** Replace halving/doubling with `slope = (n - p).abs() / step; new_step = clip(target_delta / slope, min_step, max_step)` (guarded for slope=0).  Add `threshold: f64 = 0.8` param.  Apply exponential smoothing.  Emit `Checkpoint` before each position.
 - **Effort:** M
+- **Resolution:** `adaptive_scan` / `rel_adaptive_scan` rewritten to bluesky's
+  slope-normalised algorithm: initial step is the half-range `(max-min)/2`;
+  strict boundary `pos*dir < stop*dir`; first point seeds the reference with no
+  adaptation; `slope = |ΔI|/step`, `new_step = clip(target_delta/slope, min,
+  max)` (or `min(step*1.1, max)` when the slope is flat); backstep over the
+  overshot region when `new_step < step*threshold`; exponential smoothing
+  `0.2·new + 0.8·old`.  Added the `threshold: f64` parameter and a fail-fast
+  guard for `0 < min_step < max_step` (bluesky's `ValueError`).  `Checkpoint`
+  was already emitted per step.  Tests: invalid-bounds fail-before-run,
+  initial-step = half-range (catches the old midpoint bug), and a
+  backstep-past-threshold trajectory asserted to the exact position.
 
 ---
 
-### PLAN-07 — `fly` handles only single flyer; bluesky `fly` handles a list of flyers
+### PLAN-07 — `fly` handles only single flyer; bluesky `fly` handles a list of flyers — **DONE**
 
 - **bsrs:** `lib.rs:889–927` — single `FlyableObj` + single `CollectableObj`
 - **ref:** `plans.py:2305–2338` — `fly(flyers: list[Flyable])`, kicks off all, completes
@@ -151,26 +306,56 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
   `Kickoff` for each into group "kick", wait; fan out `Complete` for each into group
   "done", wait; then collect each.  Remove inline staging (see PLAN-09).
 - **Effort:** S
+- **Resolution:** `plans::fly` now takes `Vec<Flyer>` (`Flyer = (Arc<dyn FlyableObj>,
+  Arc<dyn CollectableObj>)`) and delegates to the canonical `stubs::kickoff_all(objs,
+  "kick", wait=true)` / `stubs::complete_all(objs, "complete", wait=true)` helpers (one
+  group + one barrier each, running the flyers concurrently), then collects each
+  collectable in order.  Inline staging was removed — as in bluesky, `fly` does not
+  stage; callers wrap with `preprocessors::stage_wrapper` (bluesky's `stage_decorator`).
+  An empty flyer list opens and closes the run with nothing between (no spurious
+  kickoff/wait/collect).  The Lua `bp.fly` binding is unchanged (still the
+  not-yet-wired stub).  Tests: `fly_kicks_completes_then_collects_each_flyer` asserts the
+  full 10-message sequence and grouping; `fly_with_no_flyers_only_opens_and_closes`
+  covers the empty case; `end_to_end::fly_plan_drives_standard_detector_to_completion`
+  now stages externally via `stage_wrapper`.
 
 ---
 
-### PLAN-08 — `collect_while_completing` stub missing
+### ~~PLAN-08~~ — `collect_while_completing` stub missing — **DONE**
 
-- **bsrs:** not present
+- **bsrs:** `plans::stubs::collect_while_completing(flyers, dets, flush_period, stream_name)`
 - **ref:** `plan_stubs.py:1013–1046` — `collect_while_completing(flyers, dets, flush_period, stream_name, watch)`
 - **Gap:** This is the idiomatic bluesky pattern for streaming flyers: call
   `complete_all`, then loop `wait(timeout=flush_period, error_on_timeout=False) →
   collect(dets)` until all flyers are done.  Without it, streaming flyer data must be
   collected in a single bulk call after completion, which can accumulate unbounded
   in-memory data.
-- **Fix sketch:** Add stub that issues `Msg::Complete` for each flyer into a group,
-  then loops emitting `Msg::Wait(error_on_timeout=false, timeout=flush_period)` and
-  `Msg::Collect` until done.  Requires `Msg::Wait` to return a "done" flag (see PLAN-24).
-- **Effort:** S
+- **Resolution:** Implemented faithfully. The blocker was that a bsrs plan is a
+  *stream* of messages and could not read a message's result — bluesky's
+  `done = yield from wait(...)` had no equivalent. Added a plan↔engine response
+  channel (`PlanItem::Respond(Msg, oneshot::Sender<MsgResult>)`); `wait_group` now
+  returns a done/move-on flag surfaced as `MsgResult::WaitComplete { done }`, and the
+  stub loops on it: `Complete` every flyer into one `short_uid("complete")` group,
+  then `Wait(error_on_timeout=false, timeout=flush_period)` → `Collect` each detector,
+  until `done`. `flush_period = None` waits to completion (single terminal collect);
+  `Some(period)` flushes each period. bluesky's `watch` groups are consumer-side
+  progress reporting with no bsrs equivalent, so they are omitted.
+  - Defense: if the engine drops the `Wait` responder (the run failed before
+    answering), the loop stops instead of awaiting a response that never comes, and
+    emits no trailing collect.
+  - Tests (boundary, not narrative): `collect_while_completing_single_cycle_when_done_immediately`
+    (done on first Wait → one Complete/flyer, one Wait, one Collect/det, shared group),
+    `collect_while_completing_flushes_each_period_until_done` (done=false,false,true →
+    Wait/Collect each period, terminal cycle included, named stream honoured),
+    `collect_while_completing_stops_when_wait_responder_dropped` (dropped sender →
+    stop, no trailing collect), `collect_while_completing_with_no_flyers_still_collects_once`
+    (zero flyers → one Wait then one collect/det). Response-channel round-trip through
+    the real engine covered by `respond_channel_delivers_wait_done_to_plan`.
+- **Effort:** S (channel infrastructure was the real cost; the stub itself is small)
 
 ---
 
-### PLAN-09 — No staging in any compound plan — devices never armed/configured
+### ~~PLAN-09~~ — No staging in any compound plan — devices never armed/configured — **DONE**
 
 - **bsrs:** `lib.rs:322–1155` — no plan emits `Stage`/`Unstage`
 - **ref:** `plans.py:489,614,748,etc.` — every compound plan wraps body with
@@ -179,14 +364,48 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
   unstages in LIFO order after.  Staging is where detectors arm, motors enable limits,
   etc.  Bsrs plans never stage/unstage.  Any device that requires staging to function
   correctly will fail silently when used in a bsrs plan.
-- **Fix sketch:** Either (a) wrap each compound plan body with `stage_wrapper(inner, devices + motors)`, or (b) document explicitly that callers are responsible for staging via `stage_wrapper`.  Option (b) is simpler and keeps plan composition clean; add a top-level note and a test.
+- **Resolution:** Took option (a) — every compound plan now stages its own
+  devices, matching bluesky's `stage_decorator`; callers stay staging-agnostic.
+  - New `plans::stageables_for(detectors, motors)` collects the distinct
+    `StageableObj` devices among the detectors + motors, deduplicated by
+    identity. It is *opt-in by type*: a new `as_stageable(self: Arc<Self>) ->
+    Option<Arc<dyn StageableObj>>` on `ReadableObj`/`MovableObj` defaults to
+    `None`, so only devices that override it (`StandardReadable`,
+    `StandardDetector`) are staged. This is the static-typing analogue of
+    ophyd-async probing a device for a `stage()` method — Rust trait objects
+    can't be capability-probed, so the object exposes the capability itself.
+  - The six independent-OpenRun cores — `count_ext`, `scan_1d_per_step`,
+    `list_scan_per_step`, `inner_product_core`, `scan_nd_with_md`,
+    `grid_scan_snake` — wrap their body with `preprocessors::stage_wrapper`,
+    emitting `Stage(each)` before `OpenRun` and `Unstage(each, LIFO)` after
+    `CloseRun`. All higher-level plans delegate into these cores, so `scan`,
+    `rel_scan`, `grid_scan`, `list_scan`, `scan_nd`, `inner_product_scan`,
+    `list_grid_scan`, etc. inherit staging with no per-plan change.
+  - `count_ext`'s delay-length validation now runs *before* staging, so an
+    invalid `count` arms nothing and leaks no partial run.
+  - When nothing is stageable (all sim/test devices) the wrapper emits no
+    `Stage`/`Unstage`, so existing plan message streams are byte-for-byte
+    unchanged — verified by `count_does_not_stage_non_stageable_detector`.
+  - Engine already auto-unstages tracked `staged` devices at run-end (a
+    finalizer even if the wrapper's `Unstage` is skipped on abort), so the
+    wrapper adds the happy-path bracket without weakening abort cleanup.
+  - Tests: `count_stages_stageable_detector_around_the_run` (Stage→OpenRun…
+    CloseRun→Unstage bracket), `scan_1d_stages_stageable_detector_before_open`
+    (scan family stages too), `count_does_not_stage_non_stageable_detector`
+    (opt-in honoured).
+  - **Follow-up (out of this finding):** the specialized plans `spiral*`,
+    `adaptive_scan`, `ramp_plan`, `fly`, and `tune_centroid` build their own
+    runs and are not yet wrapped. `fly` in particular stages *flyers*, not
+    step detectors, so it has distinct staging semantics; the others are step
+    plans that could reuse `stageables_for`. Tracked separately, not folded in
+    here to keep the finding scoped to the shared step-plan cores.
 - **Effort:** M
 
 ---
 
 ## P1 — Meaningful Completeness Gaps
 
-### PLAN-10 — `mv` and `mvr` are single-motor only
+### PLAN-10 — `mv` and `mvr` are single-motor only — **DONE**
 
 - **bsrs:** `lib.rs:94–123`
 - **ref:** `plan_stubs.py:357–446` — `mv(*args)` accepts `(motor1, val1, motor2, val2, …)` pairs, all in one group
@@ -232,7 +451,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-14 — `kickoff_all` / `complete_all` stubs missing
+### PLAN-14 — `kickoff_all` / `complete_all` stubs missing — **DONE**
 
 - **bsrs:** not present
 - **ref:** `plan_stubs.py:837–973`
@@ -244,7 +463,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-15 — `rel_spiral`, `rel_spiral_fermat`, `rel_spiral_square` missing
+### PLAN-15 — `rel_spiral`, `rel_spiral_fermat`, `rel_spiral_square` missing — **DONE**
 
 - **bsrs:** not present
 - **ref:** `plans.py:1972–2043, 1791–1865, 2144–2211`
@@ -254,7 +473,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-16 — `rel_log_scan` missing
+### PLAN-16 — `rel_log_scan` missing — **DONE**
 
 - **bsrs:** not present
 - **ref:** `plans.py:626–670`
@@ -264,7 +483,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-17 — `rel_list_grid_scan` missing
+### PLAN-17 — `rel_list_grid_scan` missing — **DONE**
 
 - **bsrs:** not present
 - **ref:** `plans.py:359–418`
@@ -274,7 +493,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-18 — `x2x_scan` (theta-2theta) missing
+### PLAN-18 — `x2x_scan` (theta-2theta) missing — **DONE**
 
 - **bsrs:** not present
 - **ref:** `plans.py:2341–2400`
@@ -285,7 +504,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-19 — Snake (boustrophedon) traversal absent from all N-D scans and patterns
+### PLAN-19 — Snake (boustrophedon) traversal absent from all N-D scans and patterns — **DONE**
 
 - **bsrs:** `patterns.rs:39–94` (`outer_product`, `outer_list_product` — no snake);
   `lib.rs:484–644` (`grid_scan`, `list_grid_scan` — no snake)
@@ -299,21 +518,61 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
   snaked rows, reverse every other fast-axis pass.  Propagate `snake_axes: bool |
   Vec<usize>` to `grid_scan` and `list_grid_scan`.
 - **Effort:** M
+- **Resolution:** Ported bluesky's `snake_cyclers` index math directly.
+  `patterns.rs` gains `outer_product_snake(axes, snaking: &[bool])` and
+  `outer_list_product_snake(axes, snaking)`; the original one-arg functions
+  delegate with an empty (all-natural) flag slice, so existing callers are
+  unchanged.  Axis `i`'s value index becomes `(k / num_repeats[i]) % period`
+  with `period = 2L` (fold back down on the second half) when snaked — the
+  exact effect of `np.concatenate([v, v[::-1]])`.  `grid_scan_snake(…, snake:
+  bool)` reverses the fast axis on odd slow-axis rows; `list_grid_scan_snake(…,
+  snake_axes: SnakeAxes)` resolves the bluesky `bool | list` spec via
+  `SnakeAxes::{None, All, Axes(Vec<usize>)}`.  Lua `bp.grid_scan` /
+  `bp.list_grid_scan` accept an optional trailing snake arg (backward
+  compatible).  Tests: per-axis snake on 2-D and a 3-D continuous-walk
+  invariant (one axis changes per step), delegation equivalence, slowest-axis
+  no-op, `SnakeAxes::to_flags` boundaries, a `grid_scan_snake` position-order
+  integration test, and Lua smoke coverage.
 
 ---
 
-### PLAN-20 — `spiral` and `spiral_fermat` patterns missing `dr_y` (ellipse aspect) and `tilt`
+### ~~PLAN-20~~ — `spiral` and `spiral_fermat` patterns missing `dr_y` (ellipse aspect) and `tilt` — **DONE**
 
-- **bsrs:** `patterns.rs:102–133` (spiral), `220–250` (spiral_fermat)
+- **bsrs:** `patterns::spiral(.., dr_y, tilt)`, `patterns::spiral_fermat_pattern(.., dr_y, tilt)`
 - **ref:** `plan_patterns.py:18–77` (spiral has `dr_y=None`, `tilt=0.0`), `200–257`
   (spiral_fermat same)
-- **Gap:** Bluesky supports elliptical spirals (`dr_y` changes radial step in y) and
-  tilted spirals (`tilt` rotates the coordinate frame).  Bsrs spirals are circular,
-  untilted only.
-- **Fix sketch:** Add `dr_y: Option<f64>` (default to `dr`), `tilt: f64 = 0.0` to both
-  pattern functions.  Apply `dr_aspect = dr_y / dr` scaling to `y`; apply rotation
-  matrix `(cos(tilt), sin(tilt); -sin(tilt), cos(tilt))` to final `(x, y)`.
-- **Effort:** S
+- **Gap:** Bluesky supports elliptical spirals (`dr_y` changes the y radial step) and
+  tilted spirals (`tilt`). Bsrs spirals were circular, untilted only.
+- **Resolution:** This was not a param add — bsrs's spiral used a *divergent*
+  algorithm (continuous-`t`, constant angular density, early-break at the first
+  out-of-box point) and its fermat *inverted* `factor` (`dr*factor*√n` instead of
+  `√n*dr/factor`). `dr_y`/`tilt` are defined against bluesky's ring structure, so
+  they can't be grafted onto the divergent version faithfully. Replaced both with
+  the exact bluesky algorithms:
+  - **spiral** now walks concentric rings (`radius = i·dr`, `i·nth` angular steps per
+    ring, so density grows with radius) over a fixed `1+int(r_max/dr)` ring count,
+    clipping each candidate to the box (box-fill, not early-break).
+  - **fermat** uses `radius = √i·dr/factor`, golden angle `137.508°` (the degree
+    constant, not `π(3−√5)`), and ring count `int((1.5·diag·factor/dr)²)`.
+  - `dr_aspect = dr_y/dr` stretches y and shrinks `half_y` to `y_range/(2·dr_aspect)`.
+  - **`tilt` shears the *clip box*, it does not rotate coordinates** — `tilt_tan =
+    tan(tilt+π/2)`, test `|x − (y/dr_aspect)/tilt_tan| ≤ half_x`. (The original fix
+    sketch above proposed a coordinate rotation matrix — that is **wrong** per the
+    bluesky source; corrected here.) At `tilt=0`, `tilt_tan` is a huge finite number
+    so the shear vanishes, matching numpy rather than special-casing.
+  - One deliberate bluesky asymmetry preserved: fermat's y-clip is `|y| ≤ half_y`
+    while spiral's is `|y/dr_aspect| ≤ half_y`.
+  - **Behavioral change (signed off):** emitted positions now differ for *every*
+    spiral/fermat caller — even without `dr_y`/`tilt` — because the base algorithm
+    changed. Public signatures of `spiral`/`spiral_fermat`/`rel_spiral`/
+    `rel_spiral_fermat` (and the Lua bindings) gain trailing `dr_y: Option<f64>` +
+    `tilt: f64` (Lua: optional, nil ⇒ circular / 0.0).
+- **Tests:** parity against fixtures emitted by the verbatim bluesky bodies under
+  numpy — `spiral_matches_bluesky_circular`, `spiral_matches_bluesky_elliptical_dr_y`,
+  `spiral_tilt_shears_clip_box_not_ignored` (tilt clips off-axis points the untilted
+  spiral keeps), `spiral_fermat_matches_bluesky`,
+  `spiral_fermat_matches_bluesky_dr_y_and_tilt`.
+- **Effort:** S (as scoped) → M (actual: algorithm replacement + API/Lua threading).
 
 ---
 
@@ -335,7 +594,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-22 — `contingency_wrapper` is `finalize_wrapper` alias; missing `except_plan`/`else_plan`
+### PLAN-22 — `contingency_wrapper` is `finalize_wrapper` alias; missing `except_plan`/`else_plan` — **DONE** (stale: real except/else/finally landed `c902bbc`)
 
 - **bsrs:** `preprocessors.rs:349–351`
 - **ref:** `preprocessors.py:508–` (finalize_wrapper uses contingency internally);
@@ -371,21 +630,41 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-25 — No `md` parameter on any compound plan; minimal RunMetadata
+### ~~PLAN-25~~ — RunStart metadata (`plan_args`) + submitter `md` — **DONE**
 
-- **bsrs:** `lib.rs:322–1155` — only `plan_name` is set in `RunMetadata`
+- **bsrs:** `plans::scan_run_md` / `run_md_with_args` (mod.rs); `qs::server::execute_queue_loop`
 - **ref:** `plans.py:66,107–116` — every plan builds a `_md` dict with `detectors`,
   `motors`, `num_points`, `num_intervals`, `plan_args`, `plan_name`, `hints`
 - **Gap:** Bluesky run metadata is consumed by the Best-Effort Callback (auto-plots),
-  data catalogs (Tiled, Databroker), and the queue server.  Without `detectors`,
-  `motors`, `num_points`, and `hints.dimensions`, downstream tools cannot label axes,
-  route documents, or reconstruct scans.  This affects every plan.
-- **Fix sketch:** Extend `RunMetadata` with `detectors: Vec<String>`, `motors: Vec<String>`, `num_points: Option<usize>`, `plan_args: HashMap<String, Value>`, `hints: HashMap<String, Value>`.  Populate each plan's `_md` equivalent.  Add optional `md: Option<RunMetadata>` parameter to every plan that merges user overrides.
+  data catalogs (Tiled, Databroker), and the queue server. `detectors`/`motors`/
+  `num_points`/`num_intervals`/`hints.dimensions` were already emitted (prior work);
+  the remainder was RunStart `plan_args` and an `md` override path.
+- **Resolution (2 commits):**
+  1. **`plan_args`** — `scan_run_md` gained a `plan_args: Value` param inserted into
+     the RunStart `extra`; every run-opening plan (12 scan-family callers + the 4
+     that build their own RunStart via the new `run_md_with_args`) now emits a
+     per-plan args object mirroring bluesky's `_md["plan_args"]` keys. bluesky stores
+     each device as its Python `repr()`; bsrs has no repr, so device args are
+     captured by `name()` (the reconstruction token, same spelling as the
+     `detectors`/`motors` lists). `per_step` is reported `"default"`/`"custom"`;
+     `count` delay serializes to seconds (`None`→null).
+  2. **submitter `md`** — the qs queue loop dropped each item's `meta` (bare
+     `run_async(plan)` with a dead `_meta` placeholder). It now forwards
+     `item.meta` (object) into `RunOptions.md` and runs via `run_async_with`, so
+     submitter metadata lands in RunStart as bluesky's highest-precedence
+     `_metadata_per_call` layer.
+- **Scope note:** a per-plan `md:` *argument* on every compound plan was
+  **not** added — it duplicates the existing per-call md (`run_async_with`, the
+  operator-override channel the Lua REPL already uses) for bsrs's single-run
+  plans, and would churn ~20 signatures for no new document content. Confirmed
+  with the user.
+- **Tests:** `scan_1d_captures_plan_args_into_runstart`,
+  `count_captures_num_and_delay_in_plan_args`, `queue_item_meta_reaches_runstart`.
 - **Effort:** M
 
 ---
 
-### PLAN-26 — `repeat` stub (checkpoint + delay loop) missing; `repeater` has no `n=None` infinite mode
+### PLAN-26 — `repeat` stub (checkpoint + delay loop) missing; `repeater` has no `n=None` infinite mode — **DONE**
 
 - **bsrs:** `lib.rs:299–315` — `repeater(n, plan_fn)` — no checkpoint, no delay
 - **ref:** `plan_stubs.py:1746–1825` — `repeat(plan_fn, num, delay)` — emits
@@ -397,36 +676,82 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-27 — `rd` stub missing — no plan-level single-scalar read
+### ~~PLAN-27~~ — `rd` single-scalar read — **DONE (resolved by the response channel; no standalone stub)**
 
-- **bsrs:** not present
+- **bsrs:** `Msg::Read(Arc<dyn ReadableObj>)` → `MsgResult::Reading { data }`; Lua
+  `read()` (lua_env.rs); inline value-return via `respond(Msg::Read(obj))` + `rx.await`,
+  the caller selecting the hinted/sole field.
 - **ref:** `plan_stubs.py:453–552`
-- **Gap:** `rd(obj)` reads a single scalar from a `Readable`, using hints or `Locatable`
-  protocol.  Used in plan bodies that need the current detector/motor value inline.
-- **Fix sketch:** Add `rd(obj: Arc<dyn ReadableObj>) -> Plan` that calls `read_dyn`, extracts the hint field or single field, and returns the value via a `Msg::ReadScalar` or by updating a shared cell.
-- **Effort:** S
+- **Reassessment:** identical to PLAN-32. bluesky's `rd(obj)` is a *value-returning
+  generator* (`v = yield from rd(det)`) — read one scalar from a `Readable`, picking
+  the hinted (or sole) field, falling back to `Locatable`. bsrs plans compose by
+  stream concatenation, so a `rd(obj) -> Plan` has no channel to return the scalar;
+  the fix sketch's "update a shared cell" is strictly more indirect than the inline
+  `respond` the caller (already inside an `async_stream` body) would write. The
+  faithful equivalent is the **response channel**: yield `respond(Msg::Read(obj))`,
+  await `MsgResult::Reading`, pick the field. `rd` emits **no documents** (a bare
+  `Read` outside a `Create`/`Save` bundle produces no Event), so it is outside the
+  document-emission parity scope regardless. Field-selection is a one-line caller
+  concern, not a stub. The engine handler + Lua `read()` already provide the
+  round-trip.
+- **Test:** `respond_channel_delivers_reading_to_plan` (a plan receives a device's
+  reading inline through `Msg::Read`).
+- **Effort:** S — closed by existing infra.
 
 ---
 
-### PLAN-28 — `list_scan` is single-motor only; bluesky supports multi-motor inner-list-product
+### ~~PLAN-28~~ — `list_scan` is single-motor only; bluesky supports multi-motor inner-list-product — **DONE**
 
-- **bsrs:** `lib.rs:423–457`
+- **bsrs:** `plans::list_scan_nd(dets, axes, per_step)` (`ListScanAxis` = `(motor,
+  reader, points)`), plus Lua `bp.list_scan_nd(dets, {{motor=, points=}, …})`.
 - **ref:** `plans.py:132–222` — `list_scan(dets, motor1, [pts1], motor2, [pts2], …, per_step=…)`
 - **Gap:** Bluesky `list_scan` zips multiple motor position lists (inner product) and
-  can accept a `per_step` callback.  Bsrs takes one motor and one `Vec<f64>`.
-- **Fix sketch:** Accept `Vec<(Arc<dyn MovableObj>, Arc<dyn ReadableObj>, Vec<f64>)>` and call `inner_list_product`; add `per_step` hook.
+  can accept a `per_step` callback. Bsrs took one motor and one `Vec<f64>`.
+- **Resolution:** Added `list_scan_nd`, the general multi-motor form; the existing
+  single-axis `list_scan` stays as the one-motor convenience (matching how bsrs
+  keeps `scan` alongside `inner_product_scan`). It zips the per-axis lists with
+  `patterns::inner_list_product` and runs the `scan_nd_with_md` traversal
+  (Coupled/one-combined-axis, `plan_name = "list_scan"`), so — like bluesky's
+  `scan_nd`/`move_per_step` — a motor is not re-commanded where its target repeats
+  (`pos_cache`). Unequal-length lists fail the run before it opens via `Msg::Fail`
+  (bluesky raises `ValueError`; `count_ext` uses the same up-front-Fail shape),
+  instead of silently visiting the empty trajectory a bare `inner_list_product`
+  returns. `per_step` is threaded through (default `one_nd_step`).
+- **Tests:** `list_scan_nd_zips_motor_positions_inner_product` (zipped not crossed,
+  all motors commanded, `plan_name` "list_scan"), `list_scan_nd_unequal_lengths_
+  fail_before_open` (mismatch → leading `Fail`, no `OpenRun`),
+  `list_scan_nd_skips_recommanding_repeated_position` (pos_cache boundary), plus a
+  `bp.list_scan_nd` REPL smoke line.
+- **Note (unchanged, separate):** single-motor `list_scan`/`list_scan_per_step`
+  retain their always-command 1-D body (they set the motor at every point even on a
+  repeated position); `list_scan_nd` is the pos_cache-faithful path. Reconciling the
+  1-D body to `list_scan_nd` would change existing single-motor emissions and is out
+  of PLAN-28's scope.
 - **Effort:** S
 
 ---
 
 ## P2 — Nice to Have
 
-### PLAN-29 — `broadcast_msg` missing
+### ~~PLAN-29~~ — `broadcast_msg` missing — **DONE**
 
-- **bsrs:** not present
+- **bsrs:** `plans::stubs::broadcast_msg(objs, make)`
 - **ref:** `plan_stubs.py:1488–1520`
 - **Gap:** Fan out a single command (e.g. `Trigger`, `Stage`) to multiple objects.
-- **Fix sketch:** Simple iterator over objects emitting `Msg(command, obj)`.
+- **Resolution:** Added as a typed fan. bluesky's `broadcast_msg(command, objs,
+  *args, **kwargs)` builds `Msg(command, obj, ...)` per object from a runtime
+  command *string*; bsrs's `Msg` is a typed enum, so the port takes a per-object
+  message builder closure `make: Fn(Arc<T>) -> Msg` instead. The existing
+  `stage_all`/`unstage_all`/`kickoff_all`/`complete_all` fans are fixed-command
+  specializations of this shape, and stage/unstage are the only commands bluesky
+  actually broadcasts (`cntx.py:169,173`) — both already exposed on the Lua side as
+  `bps.stage_all`/`unstage_all`, so no string-dispatch Lua binding was added (that
+  would be ceremony for a helper whose real uses are already reachable). bluesky's
+  collected per-object return values do not port to a value-less `Plan`; use the
+  `respond` channel when a per-object result is genuinely needed.
+- **Tests:** `broadcast_msg_fans_builder_across_objects_in_order` (Trigger fanned
+  across three objects, in order, carrying a shared group),
+  `broadcast_msg_empty_objects_yields_no_messages` (empty-list boundary).
 - **Effort:** S
 
 ---
@@ -457,14 +782,26 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-32 — `locate` plan stub missing
+### ~~PLAN-32~~ — `locate` — **DONE (resolved by the response channel; no standalone stub)**
 
-- **bsrs:** `LocatableObj` is used internally in `mvr`, `rel_list_scan`, etc., but
-  no `Msg::Locate` exists
+- **bsrs:** `Msg::Locate(Arc<dyn LocatableObj>)` + engine handler (run_engine.rs) →
+  `MsgResult::Location { setpoint, readback }`; Lua `locate()` (lua_env.rs:1948);
+  inline value-return via `respond(Msg::Locate(obj))` + `rx.await`.
 - **ref:** `plan_stubs.py:172–192` — `locate(*objs, squeeze=True)`
-- **Gap:** Plans cannot read multiple motor positions in one message.
-- **Fix sketch:** Add `Msg::Locate(Vec<Arc<dyn LocatableObj>>)` and `stubs::locate`.
-- **Effort:** S
+- **Reassessment:** bluesky's `locate` is a *value-returning generator*
+  (`pos = yield from locate(m)`), which works because Python generators send the
+  result back via `.send()`. bsrs plans are `BoxStream<PlanItem>` and compose by
+  stream *concatenation*, so a `stubs::locate(objs) -> Plan` has no channel to hand
+  a position back to its caller. The faithful bsrs equivalent is the **response
+  channel** (built for PLAN-08): a plan yields `respond(Msg::Locate(obj))` and
+  awaits `MsgResult::Location` inline — exactly where it needs the value. `locate`
+  also emits **no documents**, so it is outside the document-emission parity scope
+  regardless. Multi-motor `locate(*objs)` is expressed as one `respond` per motor
+  (or a caller-side loop); no `Vec` variant is warranted. Adding a `-> Plan` stub
+  would be non-faithful ceremony (senior-reviewer self-test).
+- **Test:** `respond_channel_delivers_location_to_plan` (a plan receives a device's
+  setpoint + readback inline through `Msg::Locate`).
+- **Effort:** S — closed by existing infra.
 
 ---
 
@@ -478,7 +815,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-34 — `wait_for` (asyncio Future) stub missing
+### PLAN-34 — `wait_for` (asyncio Future) stub missing — **DONE**
 
 - **bsrs:** not present
 - **ref:** `plan_stubs.py:1399–1419`
@@ -488,7 +825,7 @@ Priority counts: **P0: 9 · P1: 19 · P2: 10**
 
 ---
 
-### PLAN-35 — `prepare` stub (Preparable protocol) missing
+### PLAN-35 — `prepare` stub (Preparable protocol) missing — **DONE**
 
 - **bsrs:** not present
 - **ref:** `plan_stubs.py:757–788`

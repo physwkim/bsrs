@@ -7,11 +7,11 @@ use crate::core::msg::{
     CollectableObj, FlyableObj, LocatableObj, MonitorableObj, Msg, ReadableObj, RunMetadata,
     StageableObj,
 };
-use crate::core::plan::{plan_box, Plan, PlanItem};
+use crate::core::plan::{plan_items, Plan, PlanItem};
 use futures::StreamExt;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Drain a `Plan` stream into a Vec of messages. Useful when a wrapper
 /// needs random access (e.g. `relative_set_wrapper` rewrites Set values).
@@ -19,7 +19,7 @@ use std::sync::Arc;
 async fn drain(mut plan: Plan) -> Vec<Msg> {
     let mut out = Vec::new();
     while let Some(item) = plan.next().await {
-        let PlanItem::Bare(m) = item;
+        let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
         out.push(m);
     }
     out
@@ -34,18 +34,19 @@ pub fn plan_mutator<F>(inner: Plan, mut f: F) -> Plan
 where
     F: FnMut(&Msg) -> Option<Plan> + Send + 'static,
 {
-    plan_box(async_stream::stream! {
+    plan_items(async_stream::stream! {
         let mut inner = inner;
         while let Some(item) = inner.next().await {
-            let PlanItem::Bare(m) = item;
-            if let Some(repl) = f(&m) {
+            if let Some(repl) = f(item.msg()) {
+                // The replacement plan may itself carry `Respond` items; pass
+                // them through unchanged. The replaced item's own response
+                // channel (if any) is dropped — the replacement owns the flow.
                 let mut r = repl;
                 while let Some(it) = r.next().await {
-                    let PlanItem::Bare(rm) = it;
-                    yield rm;
+                    yield it;
                 }
             } else {
-                yield m;
+                yield item;
             }
         }
     })
@@ -57,11 +58,10 @@ pub fn msg_mutator<F>(inner: Plan, mut f: F) -> Plan
 where
     F: FnMut(Msg) -> Msg + Send + 'static,
 {
-    plan_box(async_stream::stream! {
+    plan_items(async_stream::stream! {
         let mut inner = inner;
         while let Some(item) = inner.next().await {
-            let PlanItem::Bare(m) = item;
-            yield f(m);
+            yield item.map_msg(&mut f);
         }
     })
 }
@@ -69,12 +69,11 @@ where
 /// `pchain(plans...)` — chain a sequence of plans, yielding each
 /// inner plan's messages in order.
 pub fn pchain(plans: Vec<Plan>) -> Plan {
-    plan_box(async_stream::stream! {
+    plan_items(async_stream::stream! {
         for plan in plans {
             let mut p = plan;
             while let Some(item) = p.next().await {
-                let PlanItem::Bare(m) = item;
-                yield m;
+                yield item;
             }
         }
     })
@@ -85,14 +84,13 @@ pub fn pchain(plans: Vec<Plan>) -> Plan {
 /// open/close (e.g. it was the body of a higher-level plan), this will
 /// emit nested run messages — caller's responsibility.
 pub fn run_wrapper(inner: Plan, md: RunMetadata) -> Plan {
-    plan_box(async_stream::stream! {
-        yield Msg::OpenRun(md);
+    plan_items(async_stream::stream! {
+        yield PlanItem::from(Msg::OpenRun(md));
         let mut inner = inner;
         while let Some(item) = inner.next().await {
-            let PlanItem::Bare(m) = item;
-            yield m;
+            yield item;
         }
-        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+        yield PlanItem::from(Msg::CloseRun { exit_status: "success".into(), reason: None });
     })
 }
 
@@ -114,14 +112,13 @@ pub fn inject_md_wrapper(inner: Plan, md_extra: HashMap<String, Value>) -> Plan 
 /// at the start and `Rewindable(prev)` at the end. The "previous" state
 /// is unknown to the wrapper so we restore to `true` (the default).
 pub fn rewindable_wrapper(inner: Plan, on: bool) -> Plan {
-    plan_box(async_stream::stream! {
-        yield Msg::Rewindable(on);
+    plan_items(async_stream::stream! {
+        yield PlanItem::from(Msg::Rewindable(on));
         let mut inner = inner;
         while let Some(item) = inner.next().await {
-            let PlanItem::Bare(m) = item;
-            yield m;
+            yield item;
         }
-        yield Msg::Rewindable(true);
+        yield PlanItem::from(Msg::Rewindable(true));
     })
 }
 
@@ -144,22 +141,21 @@ where
     FA: FnMut() -> Vec<Msg> + Send + 'static,
     FB: FnMut() -> Vec<Msg> + Send + 'static,
 {
-    plan_box(async_stream::stream! {
+    plan_items(async_stream::stream! {
         let mut inner = inner;
         while let Some(item) = inner.next().await {
-            let PlanItem::Bare(m) = item;
-            if matches!(m, Msg::OpenRun(_)) {
-                yield m;
+            if matches!(item.msg(), Msg::OpenRun(_)) {
+                yield item;
                 for msg in after_open() {
-                    yield msg;
+                    yield PlanItem::from(msg);
                 }
-            } else if matches!(m, Msg::CloseRun { .. }) {
+            } else if matches!(item.msg(), Msg::CloseRun { .. }) {
                 for msg in before_close() {
-                    yield msg;
+                    yield PlanItem::from(msg);
                 }
-                yield m;
+                yield item;
             } else {
-                yield m;
+                yield item;
             }
         }
     })
@@ -202,17 +198,16 @@ pub fn monitor_during_wrapper(inner: Plan, signals: Vec<Arc<dyn MonitorableObj>>
 /// `stage_wrapper(plan, devices)` — `Stage` each device before the inner
 /// plan, `Unstage` (LIFO) after. Same envelope contract as bluesky.
 pub fn stage_wrapper(inner: Plan, devices: Vec<Arc<dyn StageableObj>>) -> Plan {
-    plan_box(async_stream::stream! {
+    plan_items(async_stream::stream! {
         for d in &devices {
-            yield Msg::Stage(d.clone());
+            yield PlanItem::from(Msg::Stage(d.clone()));
         }
         let mut inner = inner;
         while let Some(item) = inner.next().await {
-            let PlanItem::Bare(m) = item;
-            yield m;
+            yield item;
         }
         for d in devices.into_iter().rev() {
-            yield Msg::Unstage(d);
+            yield PlanItem::from(Msg::Unstage(d));
         }
     })
 }
@@ -257,16 +252,14 @@ pub fn baseline_wrapper(
 /// catch panics or engine-side aborts on its own. The engine's own
 /// cleanup chain — unstage / stop_movables — runs separately.)
 pub fn finalize_wrapper(inner: Plan, final_plan: Plan) -> Plan {
-    plan_box(async_stream::stream! {
+    plan_items(async_stream::stream! {
         let mut inner = inner;
         while let Some(item) = inner.next().await {
-            let PlanItem::Bare(m) = item;
-            yield m;
+            yield item;
         }
         let mut fin = final_plan;
         while let Some(item) = fin.next().await {
-            let PlanItem::Bare(m) = item;
-            yield m;
+            yield item;
         }
     })
 }
@@ -296,7 +289,7 @@ where
 /// first moved, and a listed motor the plan never sets is never located. After
 /// the inner plan, no automatic restore; pair with `reset_positions_wrapper`.
 pub fn relative_set_wrapper(inner: Plan, motors: Vec<Arc<dyn LocatableObj>>) -> Plan {
-    plan_box(async_stream::stream! {
+    plan_items(async_stream::stream! {
         // Motors eligible for relative rewriting, indexed by name.
         let by_name: HashMap<String, Arc<dyn LocatableObj>> =
             motors.iter().map(|m| (m.name().to_string(), m.clone())).collect();
@@ -304,28 +297,38 @@ pub fn relative_set_wrapper(inner: Plan, motors: Vec<Arc<dyn LocatableObj>>) -> 
         let mut bases: HashMap<String, f64> = HashMap::new();
         let mut inner = inner;
         while let Some(item) = inner.next().await {
-            let PlanItem::Bare(m) = item;
-            let m = match m {
-                Msg::Set { obj, value, group } if by_name.contains_key(obj.name()) => {
-                    let bias = match bases.get(obj.name()) {
+            // Compute the bias for an eligible-motor `Set` (lazily locating on
+            // first touch); everything else — including any `Respond` item —
+            // passes through with its channel intact.
+            let bias = match item.msg() {
+                Msg::Set { obj, .. } if by_name.contains_key(obj.name()) => {
+                    let name = obj.name().to_string();
+                    let base = match bases.get(&name) {
                         Some(b) => *b,
                         None => {
-                            let base = by_name
-                                .get(obj.name())
+                            let b = by_name
+                                .get(&name)
                                 .expect("guard ensures the motor is eligible")
                                 .locate_dyn()
                                 .await
                                 .map(|loc| loc.setpoint)
                                 .unwrap_or(0.0);
-                            bases.insert(obj.name().to_string(), base);
-                            base
+                            bases.insert(name, b);
+                            b
                         }
                     };
-                    Msg::Set { obj, value: value + bias, group }
+                    Some(base)
                 }
-                other => other,
+                _ => None,
             };
-            yield m;
+            let item = match bias {
+                Some(base) => item.map_msg(|m| match m {
+                    Msg::Set { obj, value, group } => Msg::Set { obj, value: value + base, group },
+                    other => other,
+                }),
+                None => item,
+            };
+            yield item;
         }
     })
 }
@@ -336,14 +339,13 @@ pub fn relative_set_wrapper(inner: Plan, motors: Vec<Arc<dyn LocatableObj>>) -> 
 /// `print_summary_wrapper` in spirit (bsrs emits each line eagerly
 /// rather than first collecting the full plan).
 pub fn print_summary_wrapper(inner: Plan) -> Plan {
-    plan_box(async_stream::stream! {
+    plan_items(async_stream::stream! {
         let mut inner = inner;
         let mut idx = 0usize;
         while let Some(item) = inner.next().await {
-            let PlanItem::Bare(m) = item;
-            eprintln!("[plan {idx:04}] {m:?}");
+            eprintln!("[plan {idx:04}] {:?}", item.msg());
             idx += 1;
-            yield m;
+            yield item;
         }
     })
 }
@@ -355,15 +357,14 @@ pub fn suspend_wrapper(inner: Plan, suspender: Arc<dyn crate::core::Suspender>) 
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(1);
     let id = SEQ.fetch_add(1, Ordering::Relaxed);
-    plan_box(async_stream::stream! {
+    plan_items(async_stream::stream! {
         let any: Arc<dyn std::any::Any + Send + Sync> = Arc::new(suspender.clone());
-        yield Msg::InstallSuspender { id, suspender: any };
+        yield PlanItem::from(Msg::InstallSuspender { id, suspender: any });
         let mut inner = inner;
         while let Some(item) = inner.next().await {
-            let PlanItem::Bare(m) = item;
-            yield m;
+            yield item;
         }
-        yield Msg::RemoveSuspender { id };
+        yield PlanItem::from(Msg::RemoveSuspender { id });
     })
 }
 
@@ -427,17 +428,102 @@ pub fn fly_during_wrapper(
     )
 }
 
-/// `contingency_wrapper(plan, finally)` — run `plan`; whether it
-/// finishes normally or aborts, then run `finally`. Bluesky's full
-/// contingency_wrapper supports try/except/else branches with
-/// exception-class filtering; bsrs's stream model doesn't surface
-/// plan-level exceptions, so this is the conservative finalize-style
-/// shape (always run `finally`). For now, identical behaviour to
-/// `finalize_wrapper`; kept as a separate name so callers expressing
-/// intent ("run cleanup if anything goes wrong") see a matching
-/// API name.
-pub fn contingency_wrapper(inner: Plan, finally: Plan) -> Plan {
-    finalize_wrapper(inner, finally)
+/// `contingency_wrapper(plan, except_plan, else_plan, final_plan, auto_raise)`
+/// — bluesky's full try/except/else/finally plan bracket
+/// (preprocessors.py:508). Unlike [`finalize_wrapper`] (a pure stream bracket
+/// that only appends `final_plan` when `plan` completes normally), this observes
+/// a message *error* mid-plan and branches on it:
+///
+/// - `except_plan` runs when a message in `plan` errored. After it runs, the
+///   original error is re-raised iff `auto_raise` (bluesky's default `True`),
+///   so the run still fails; `auto_raise = false` swallows the error and the
+///   run continues. A `None` `except_plan` re-raises unconditionally.
+/// - `else_plan` runs when `plan` completed with no error.
+/// - `final_plan` runs on both paths, before any re-raise propagates — matching
+///   Python `finally` executing before the exception leaves the block.
+///
+/// The error observation is powered by the engine's contingency stack: this
+/// wrapper pushes an error sink ([`Msg::PushContingency`]) around `plan`, so a
+/// message error is routed into the sink (and the run kept alive) instead of
+/// failing immediately; the wrapper reads the sink right after forwarding the
+/// offending message. `except`/`else`/`final` run *outside* this wrapper's own
+/// contingency (it pops first), so an error in them propagates outward.
+///
+/// Deviation from bluesky: `except_plan` is a pre-built `Plan`, not a function
+/// of the exception — bsrs surfaces the error only as a reason string, threaded
+/// onto the re-raised [`Msg::Fail`]. Recovery plans that only need to clean up
+/// (e.g. `drop`) do not need the value.
+///
+/// Engine-teardown paths (abort/halt dropping the plan future) are bsrs's
+/// analogue of `GeneratorExit`: the wrapper's future is dropped, so nothing
+/// after the suspended `yield` runs — `final_plan` is skipped, matching
+/// bluesky's `cleanup = False` branch.
+pub fn contingency_wrapper(
+    inner: Plan,
+    except_plan: Option<Plan>,
+    else_plan: Option<Plan>,
+    final_plan: Option<Plan>,
+    auto_raise: bool,
+) -> Plan {
+    plan_items(async_stream::stream! {
+        let sink: crate::core::msg::ContingencySink = Arc::new(Mutex::new(None));
+        yield PlanItem::from(Msg::PushContingency(sink.clone()));
+
+        // try: forward `inner`. A message error under this contingency is
+        // written into `sink` by the engine (which keeps running); we detect it
+        // right after forwarding the offending message.
+        let mut errored: Option<String> = None;
+        let mut inner = inner;
+        while let Some(item) = inner.next().await {
+            yield item;
+            if let Some(e) = sink.lock().unwrap().take() {
+                errored = Some(e);
+                break;
+            }
+        }
+
+        // Leave our contingency region before running recovery, so an error in
+        // the except/else/finally plans propagates outward (to an enclosing
+        // contingency, or fails the run) rather than looping back into us.
+        yield PlanItem::from(Msg::PopContingency);
+
+        // except / else — mutually exclusive.
+        let mut reraise: Option<String> = None;
+        match errored {
+            Some(reason) => match except_plan {
+                Some(ep) => {
+                    let mut ep = ep;
+                    while let Some(item) = ep.next().await {
+                        yield item;
+                    }
+                    if auto_raise {
+                        reraise = Some(reason);
+                    }
+                }
+                None => reraise = Some(reason),
+            },
+            None => {
+                if let Some(ep) = else_plan {
+                    let mut ep = ep;
+                    while let Some(item) = ep.next().await {
+                        yield item;
+                    }
+                }
+            }
+        }
+
+        // finally: both paths, before any re-raise leaves the block.
+        if let Some(fp) = final_plan {
+            let mut fp = fp;
+            while let Some(item) = fp.next().await {
+                yield item;
+            }
+        }
+
+        if let Some(reason) = reraise {
+            yield PlanItem::from(Msg::Fail(reason));
+        }
+    })
 }
 
 /// `reset_positions_wrapper(plan, motors)` — capture each motor's position
@@ -455,7 +541,7 @@ pub fn contingency_wrapper(inner: Plan, finally: Plan) -> Plan {
 /// so an engine-side abort skips the reset (unlike bluesky's `finalize_wrapper`
 /// composition). That gap is a property of the stream model, not this capture.
 pub fn reset_positions_wrapper(inner: Plan, motors: Vec<Arc<dyn LocatableObj>>) -> Plan {
-    plan_box(async_stream::stream! {
+    plan_items(async_stream::stream! {
         let by_name: HashMap<String, Arc<dyn LocatableObj>> =
             motors.iter().map(|m| (m.name().to_string(), m.clone())).collect();
         // Positions to restore, captured lazily at first `Set`, in first-moved
@@ -464,8 +550,7 @@ pub fn reset_positions_wrapper(inner: Plan, motors: Vec<Arc<dyn LocatableObj>>) 
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut inner = inner;
         while let Some(item) = inner.next().await {
-            let PlanItem::Bare(m) = item;
-            if let Msg::Set { obj, .. } = &m {
+            if let Msg::Set { obj, .. } = item.msg() {
                 if by_name.contains_key(obj.name()) && seen.insert(obj.name().to_string()) {
                     let motor = by_name
                         .get(obj.name())
@@ -478,12 +563,12 @@ pub fn reset_positions_wrapper(inner: Plan, motors: Vec<Arc<dyn LocatableObj>>) 
                     }
                 }
             }
-            yield m;
+            yield item;
         }
         for (mv_obj, val) in initial {
-            yield Msg::Set { obj: mv_obj, value: val, group: Some("reset".into()) };
+            yield PlanItem::from(Msg::Set { obj: mv_obj, value: val, group: Some("reset".into()) });
         }
-        yield Msg::Wait { group: "reset".into(), error_on_timeout: true, timeout: None };
+        yield PlanItem::from(Msg::Wait { group: "reset".into(), error_on_timeout: true, timeout: None });
     })
 }
 
@@ -502,20 +587,19 @@ pub fn configure_count_time_wrapper(
     time: f64,
     detectors: Vec<Arc<dyn crate::core::msg::ConfigurableObj>>,
 ) -> Plan {
-    plan_box(async_stream::stream! {
+    plan_items(async_stream::stream! {
         for d in &detectors {
             let mut values = HashMap::new();
             values.insert("count_time".to_string(), Value::from(time));
-            yield Msg::Configure {
+            yield PlanItem::from(Msg::Configure {
                 obj: d.clone(),
                 args: crate::core::msg::ConfigureArgs { values },
-            };
+            });
         }
         let mut inner = inner;
         use futures::StreamExt;
         while let Some(item) = inner.next().await {
-            let crate::core::plan::PlanItem::Bare(m) = item;
-            yield m;
+            yield item;
         }
     })
 }
@@ -531,15 +615,14 @@ pub fn configure_count_time_wrapper(
 /// set per run is sparse.
 pub fn lazily_stage_wrapper(inner: Plan, devices: Vec<Arc<dyn StageableObj>>) -> Plan {
     use std::collections::HashSet;
-    plan_box(async_stream::stream! {
+    plan_items(async_stream::stream! {
         let by_name: HashMap<String, Arc<dyn StageableObj>> =
             devices.into_iter().map(|d| (d.name().to_string(), d)).collect();
         let mut staged: Vec<Arc<dyn StageableObj>> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         let mut inner = inner;
         while let Some(item) = inner.next().await {
-            let PlanItem::Bare(m) = item;
-            let touched: Option<&str> = match &m {
+            let touched: Option<&str> = match item.msg() {
                 Msg::Read(o)            => Some(o.name()),
                 Msg::Set { obj, .. }    => Some(obj.name()),
                 Msg::Trigger { obj, .. } => Some(obj.name()),
@@ -549,15 +632,15 @@ pub fn lazily_stage_wrapper(inner: Plan, devices: Vec<Arc<dyn StageableObj>>) ->
             if let Some(name) = touched {
                 if seen.insert(name.to_string()) {
                     if let Some(d) = by_name.get(name) {
-                        yield Msg::Stage(d.clone());
+                        yield PlanItem::from(Msg::Stage(d.clone()));
                         staged.push(d.clone());
                     }
                 }
             }
-            yield m;
+            yield item;
         }
         for d in staged.into_iter().rev() {
-            yield Msg::Unstage(d);
+            yield PlanItem::from(Msg::Unstage(d));
         }
     })
 }
@@ -594,28 +677,123 @@ pub fn set_run_key_wrapper(inner: Plan, run_key: impl Into<String>) -> Plan {
 /// constraint via the engine's `Msg::Fail` handler, which aborts the
 /// run with the supplied reason.
 pub fn stub_wrapper(inner: Plan) -> Plan {
-    plan_box(async_stream::stream! {
+    plan_items(async_stream::stream! {
         let mut inner = inner;
         while let Some(item) = inner.next().await {
-            let PlanItem::Bare(m) = item;
-            match &m {
+            match item.msg() {
                 Msg::OpenRun(_) => {
-                    yield Msg::Fail(
+                    yield PlanItem::from(Msg::Fail(
                         "stub_wrapper: inner plan must not emit OpenRun".into(),
-                    );
+                    ));
                     return;
                 }
                 Msg::CloseRun { .. } => {
-                    yield Msg::Fail(
+                    yield PlanItem::from(Msg::Fail(
                         "stub_wrapper: inner plan must not emit CloseRun".into(),
-                    );
+                    ));
                     return;
                 }
                 _ => {}
             }
-            yield m;
+            yield item;
         }
     })
+}
+
+/// A flyable device paired with its collectable, as consumed by
+/// [`fly_during_wrapper`] and stored in [`SupplementalData`]. bsrs splits the
+/// Flyable and Collectable roles across two traits, so the pair is explicit.
+pub type FlyerPair = (Arc<dyn FlyableObj>, Arc<dyn CollectableObj>);
+
+/// A port of bluesky's `SupplementalData` (`bluesky/preprocessors.py:1274`) —
+/// a mutable set of `baseline` devices, `monitors`, and `flyers`. As a plan
+/// preprocessor it inserts baseline readings around each run, monitors during
+/// it, and flies devices across it, composing [`baseline_wrapper`],
+/// [`monitor_during_wrapper`], and [`fly_during_wrapper`]. Register it on the
+/// RunEngine:
+///
+/// ```ignore
+/// let sd = std::sync::Arc::new(SupplementalData::new());
+/// sd.add_baseline(some_detector);
+/// re.add_preprocessor(sd.as_preprocessor());
+/// ```
+///
+/// The three lists are interior-mutable, so edits made after registration take
+/// effect on the next plan — the preprocessor re-reads them on every call —
+/// mirroring bluesky's interactive `sd.baseline.append(...)`.
+#[derive(Default)]
+pub struct SupplementalData {
+    baseline: Mutex<Vec<Arc<dyn ReadableObj>>>,
+    monitors: Mutex<Vec<Arc<dyn MonitorableObj>>>,
+    flyers: Mutex<Vec<FlyerPair>>,
+}
+
+impl SupplementalData {
+    /// An empty set.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a device to be read into the `baseline` stream at the start and end
+    /// of each run.
+    pub fn add_baseline(&self, device: Arc<dyn ReadableObj>) {
+        self.baseline.lock().unwrap().push(device);
+    }
+
+    /// Add a signal to be monitored (asynchronously) during each run.
+    pub fn add_monitor(&self, signal: Arc<dyn MonitorableObj>) {
+        self.monitors.lock().unwrap().push(signal);
+    }
+
+    /// Add a `(flyer, collectable)` pair to be kicked off at the start of each
+    /// run and completed/collected at the end.
+    pub fn add_flyer(&self, flyer: Arc<dyn FlyableObj>, collectable: Arc<dyn CollectableObj>) {
+        self.flyers.lock().unwrap().push((flyer, collectable));
+    }
+
+    /// Remove all baseline devices, monitors, and flyers.
+    pub fn clear(&self) {
+        self.baseline.lock().unwrap().clear();
+        self.monitors.lock().unwrap().clear();
+        self.flyers.lock().unwrap().clear();
+    }
+
+    /// Apply the supplemental wrappers to `plan`. Composed inside-out
+    /// (fly → monitor → baseline), matching bluesky `SupplementalData.__call__`
+    /// so the run order is: baseline read, start monitors, kick off flyers,
+    /// `plan`, complete/collect flyers, stop monitors, baseline read. Each
+    /// wrapper is skipped when its list is empty (bluesky's `if not devices`
+    /// no-op), so an all-empty `SupplementalData` is a pure passthrough.
+    pub fn apply(&self, plan: Plan) -> Plan {
+        let flyers = self.flyers.lock().unwrap().clone();
+        let monitors = self.monitors.lock().unwrap().clone();
+        let baseline = self.baseline.lock().unwrap().clone();
+
+        let plan = if flyers.is_empty() {
+            plan
+        } else {
+            fly_during_wrapper(plan, flyers)
+        };
+        let plan = if monitors.is_empty() {
+            plan
+        } else {
+            monitor_during_wrapper(plan, monitors)
+        };
+        if baseline.is_empty() {
+            plan
+        } else {
+            baseline_wrapper(plan, baseline, "baseline")
+        }
+    }
+
+    /// A RunEngine preprocessor closure (matching
+    /// [`crate::engine::Preprocessor`]) that applies this `SupplementalData` to
+    /// every plan, re-reading the current baseline/monitors/flyers on each
+    /// call.
+    pub fn as_preprocessor(self: &Arc<Self>) -> Arc<dyn Fn(Plan) -> Plan + Send + Sync + 'static> {
+        let this = self.clone();
+        Arc::new(move |plan| this.apply(plan))
+    }
 }
 
 #[cfg(test)]
@@ -927,5 +1105,42 @@ mod tests {
         assert!(matches!(&msgs[6], Msg::Read(_)));
         assert!(matches!(&msgs[7], Msg::Save));
         assert!(matches!(&msgs[8], Msg::CloseRun { .. }));
+    }
+
+    #[tokio::test]
+    async fn supplemental_data_empty_is_passthrough() {
+        let sd = Arc::new(SupplementalData::new());
+        let msgs = drain(sd.apply(run_body())).await;
+        // No baseline/monitor/fly insertion: just OpenRun, Null, CloseRun.
+        assert_eq!(msgs.len(), 3, "got {msgs:?}");
+        assert!(matches!(&msgs[0], Msg::OpenRun(_)));
+        assert!(matches!(&msgs[1], Msg::Null));
+        assert!(matches!(&msgs[2], Msg::CloseRun { .. }));
+    }
+
+    #[tokio::test]
+    async fn supplemental_data_inserts_baseline_around_run() {
+        let sd = Arc::new(SupplementalData::new());
+        sd.add_baseline(Arc::new(FakeStage("d".into())) as Arc<dyn ReadableObj>);
+        let msgs = drain(sd.apply(run_body())).await;
+        // OpenRun, Create(baseline), Read, Save, Null, Create(baseline), Read, Save, CloseRun.
+        assert_eq!(msgs.len(), 9, "got {msgs:?}");
+        assert!(matches!(&msgs[1], Msg::Create { stream_name } if stream_name == "baseline"));
+        assert!(matches!(&msgs[2], Msg::Read(_)));
+        assert!(matches!(&msgs[5], Msg::Create { stream_name } if stream_name == "baseline"));
+    }
+
+    #[tokio::test]
+    async fn supplemental_data_as_preprocessor_applies_current_lists() {
+        let sd = Arc::new(SupplementalData::new());
+        // Mutate after construction — the preprocessor must read this on call.
+        sd.add_baseline(Arc::new(FakeStage("d".into())) as Arc<dyn ReadableObj>);
+        let pp = sd.as_preprocessor();
+        let msgs = drain(pp(run_body())).await;
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, Msg::Create { stream_name } if stream_name == "baseline")),
+            "preprocessor did not insert the baseline stream; got {msgs:?}"
+        );
     }
 }

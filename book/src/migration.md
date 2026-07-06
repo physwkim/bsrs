@@ -48,10 +48,10 @@ Documents fan out from bsrs-qs's PUB socket to the same
 
 ### 2. Keep bluesky.RunEngine in Python, swap the document plumbing
 
-Use bsrs's sinks from Python via bsrs-py (M7 — deferred). For
-now, the inverse works: run bsrs's RunEngine in a small Rust
-helper binary, ZMQ-publish documents to your Python
-`RemoteDispatcher` setup. Same wire format as bluesky.callbacks.zmq.
+bsrs has no in-process Python bindings (Rust-only by design). Instead,
+run bsrs's RunEngine in a small Rust helper binary and ZMQ-publish
+documents to your Python `RemoteDispatcher` setup. Same wire format as
+bluesky.callbacks.zmq.
 
 ### 3. Native bsrs end-to-end
 

@@ -88,8 +88,12 @@ pub(crate) fn dispatch(
         // absent user_group — caller group already resolved from api_key.
         "plans_allowed" => {
             let all_names = registry.plan_names();
-            let allowed_names = permissions.filter_plans_for_group(&group, &all_names);
-            let dict = build_plan_dict(allowed_names.into_iter().cloned().collect());
+            let allowed: Vec<String> = permissions
+                .filter_plans_for_group(&group, &all_names)
+                .into_iter()
+                .cloned()
+                .collect();
+            let dict = registry.plans_dict_subset(&allowed);
             json!({
                 "success": true,
                 "msg": "",
@@ -103,12 +107,21 @@ pub(crate) fn dispatch(
             "plans_existing": registry.plan_dict(),
             "plans_existing_uid": "static",
         }),
-        "devices_allowed" => json!({
-            "success": true,
-            "msg": "",
-            "devices_allowed": registry.device_dict(),
-            "devices_allowed_uid": "static",
-        }),
+        "devices_allowed" => {
+            let all_names = registry.device_names();
+            let allowed: Vec<String> = permissions
+                .filter_devices_for_group(&group, &all_names)
+                .into_iter()
+                .cloned()
+                .collect();
+            let dict = registry.devices_dict_subset(&allowed);
+            json!({
+                "success": true,
+                "msg": "",
+                "devices_allowed": dict,
+                "devices_allowed_uid": "static",
+            })
+        }
         "devices_existing" => json!({
             "success": true,
             "msg": "",
@@ -516,22 +529,6 @@ fn function_execute(
     })
 }
 
-fn build_plan_dict(names: Vec<String>) -> Value {
-    let mut map = serde_json::Map::new();
-    for name in names {
-        map.insert(
-            name.clone(),
-            json!({
-                "name": name,
-                "description": "",
-                "parameters": [],
-                "module": "bsrs_qs",
-            }),
-        );
-    }
-    Value::Object(map)
-}
-
 fn panic_payload_message(p: Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = p.downcast_ref::<&'static str>() {
         return s.to_string();
@@ -766,6 +763,60 @@ fn queue_get(queue: &Arc<StdMutex<PlanQueue>>, state: &Arc<StdMutex<EngineState>
     })
 }
 
+/// Insert `queued` into `q` at the position requested by `pos` /
+/// `before_uid` / `after_uid` (mirrors `plan_queue_ops.py::add_item_to_queue`).
+/// Exactly one mode is honored: `before_uid`, else `after_uid`, else `pos`
+/// (string `"front"`/`"back"` or a signed integer index with the reference's
+/// negative-index / clamp arithmetic). Returns `Err(msg)` — **without mutating
+/// `q`** — when a referenced uid is absent or `pos` is malformed. Shared by
+/// single- and batch-add so both resolve position identically.
+fn insert_positioned(
+    q: &mut PlanQueue,
+    queued: QueuedItem,
+    pos_val: Option<&Value>,
+    before_uid: Option<&str>,
+    after_uid: Option<&str>,
+) -> Result<(), String> {
+    let qsize = q.len() as i64;
+    if let Some(buid) = before_uid {
+        if !q.insert_before_uid(buid, queued) {
+            return Err(format!("before_uid not found: {buid}"));
+        }
+    } else if let Some(auid) = after_uid {
+        if !q.insert_after_uid(auid, queued) {
+            return Err(format!("after_uid not found: {auid}"));
+        }
+    } else {
+        match pos_val {
+            None => q.push_back(queued),
+            Some(Value::String(s)) if s == "back" => q.push_back(queued),
+            Some(Value::String(s)) if s == "front" => q.insert_at(0, queued),
+            Some(Value::String(s)) => return Err(format!("invalid pos string: {s}")),
+            Some(Value::Number(n)) => {
+                let i = match n.as_i64() {
+                    Some(v) => v,
+                    None => return Err("pos must be an integer".to_string()),
+                };
+                if i == 0 || i < -qsize {
+                    q.insert_at(0, queued);
+                } else if i == -1 || i >= qsize {
+                    q.push_back(queued);
+                } else {
+                    // pos_reference: positive → direct index; negative → qsize + pos + 1
+                    let ref_idx = if i > 0 {
+                        i as usize
+                    } else {
+                        (qsize + i + 1) as usize
+                    };
+                    q.insert_at(ref_idx, queued);
+                }
+            }
+            Some(other) => return Err(format!("invalid pos value: {other}")),
+        }
+    }
+    Ok(())
+}
+
 fn queue_item_add(
     registry: &Arc<Registry>,
     queue: &Arc<StdMutex<PlanQueue>>,
@@ -825,43 +876,8 @@ fn queue_item_add(
     let queued_val = serde_json::to_value(&queued).unwrap();
 
     let mut q = queue.lock().unwrap();
-    let qsize = q.len() as i64;
-
-    if let Some(buid) = before_uid_str {
-        if !q.insert_before_uid(buid, queued) {
-            return err(format!("before_uid not found: {buid}"));
-        }
-    } else if let Some(auid) = after_uid_str {
-        if !q.insert_after_uid(auid, queued) {
-            return err(format!("after_uid not found: {auid}"));
-        }
-    } else {
-        match pos_val {
-            None => q.push_back(queued),
-            Some(Value::String(s)) if s == "back" => q.push_back(queued),
-            Some(Value::String(s)) if s == "front" => q.insert_at(0, queued),
-            Some(Value::String(s)) => return err(format!("invalid pos string: {s}")),
-            Some(Value::Number(n)) => {
-                let i = match n.as_i64() {
-                    Some(v) => v,
-                    None => return err("pos must be an integer"),
-                };
-                if i == 0 || i < -qsize {
-                    q.insert_at(0, queued);
-                } else if i == -1 || i >= qsize {
-                    q.push_back(queued);
-                } else {
-                    // pos_reference: positive → direct index; negative → qsize + pos + 1
-                    let ref_idx = if i > 0 {
-                        i as usize
-                    } else {
-                        (qsize + i + 1) as usize
-                    };
-                    q.insert_at(ref_idx, queued);
-                }
-            }
-            Some(other) => return err(format!("invalid pos value: {other}")),
-        }
+    if let Err(msg) = insert_positioned(&mut q, queued, pos_val, before_uid_str, after_uid_str) {
+        return err(msg);
     }
     json!({
         "success": true,
@@ -889,27 +905,42 @@ fn queue_item_add_batch(
         .get("user_group")
         .and_then(|v| v.as_str())
         .map(String::from);
-    let mut added_items: Vec<Value> = Vec::new();
-    let mut results: Vec<Value> = Vec::new();
+
+    // Batch position — applies to the FIRST item; the rest follow it as a
+    // contiguous block (ref: plan_queue_ops.py::_add_batch_to_queue). Same
+    // ambiguity rules as single-add.
+    let pos_val = params.get("pos");
+    let before_uid = params.get("before_uid").and_then(|v| v.as_str());
+    let after_uid = params.get("after_uid").and_then(|v| v.as_str());
+    if pos_val.is_some() && (before_uid.is_some() || after_uid.is_some()) {
+        return err("ambiguous: cannot specify both 'pos' and 'before_uid'/'after_uid'");
+    }
+    if before_uid.is_some() && after_uid.is_some() {
+        return err("ambiguous: cannot specify both 'before_uid' and 'after_uid'");
+    }
+
+    // Phase 1 — validate and build every item before touching the queue. The
+    // batch is atomic: if any item is rejected, nothing is added (ref: the
+    // add-then-undo loop in `_add_batch_to_queue`; here up-front validation
+    // makes the same guarantee without a partial insert to undo).
+    let mut prepared: Vec<QueuedItem> = Vec::with_capacity(items.len());
+    let mut results: Vec<Value> = Vec::with_capacity(items.len());
     let mut had_error = false;
-    for item in items {
+    for item in &items {
         let name = item
             .get("name")
             .and_then(|v| v.as_str())
             .map(str::to_string);
         match name {
             Some(n) if registry.plan(&n).is_some() => {
-                let mut qi = QueuedItem::plan(n, item);
+                let mut qi = QueuedItem::plan(n, item.clone());
                 qi.user = batch_user.clone();
                 qi.user_group = batch_user_group.clone();
-                let qi_val = serde_json::to_value(&qi).unwrap();
-                queue.lock().unwrap().push_back(qi);
-                added_items.push(qi_val);
+                prepared.push(qi);
                 results.push(json!({"success": true, "msg": ""}));
             }
             Some(n) => {
-                let msg = format!("unknown plan: {n}");
-                results.push(json!({"success": false, "msg": msg}));
+                results.push(json!({"success": false, "msg": format!("unknown plan: {n}")}));
                 had_error = true;
             }
             None => {
@@ -918,10 +949,47 @@ fn queue_item_add_batch(
             }
         }
     }
-    let q = queue.lock().unwrap();
+
+    let mut q = queue.lock().unwrap();
+
+    // Atomic rejection — queue untouched; return the submitted items unchanged
+    // (ref: `items_added = items` on failure).
+    if had_error {
+        return json!({
+            "success": false,
+            "msg": "batch rejected: one or more items failed validation",
+            "qsize": q.len(),
+            "items": items,
+            "results": results,
+            "plan_queue_uid": q.queue_uid(),
+        });
+    }
+
+    // Phase 2 — insert the block. First item at the batch position; each
+    // subsequent item immediately after the previous, preserving order.
+    let mut added_items: Vec<Value> = Vec::with_capacity(prepared.len());
+    let mut prev_uid: Option<String> = None;
+    for qi in prepared {
+        let uid = qi.item_uid.clone();
+        let qi_val = serde_json::to_value(&qi).unwrap();
+        let placed = match &prev_uid {
+            None => insert_positioned(&mut q, qi, pos_val, before_uid, after_uid),
+            Some(p) => insert_positioned(&mut q, qi, None, None, Some(p.as_str())),
+        };
+        if let Err(msg) = placed {
+            // Reachable only for the first item (a bad batch before_uid/after_uid),
+            // and it fails before any insert — so the queue is still untouched.
+            // Every later item inserts after the previous (which exists), so it
+            // cannot fail. Atomicity therefore holds without an undo path.
+            return err(msg);
+        }
+        added_items.push(qi_val);
+        prev_uid = Some(uid);
+    }
+
     json!({
-        "success": !had_error,
-        "msg": if had_error { "one or more items failed" } else { "" },
+        "success": true,
+        "msg": "",
         "qsize": q.len(),
         "items": added_items,
         "results": results,
@@ -1076,38 +1144,129 @@ fn queue_item_move(queue: &Arc<StdMutex<PlanQueue>>, params: &Value) -> Value {
 }
 
 fn queue_item_move_batch(queue: &Arc<StdMutex<PlanQueue>>, params: &Value) -> Value {
-    let uids = match params.get("uids").and_then(|v| v.as_array()) {
+    let uids: Vec<String> = match params.get("uids").and_then(|v| v.as_array()) {
         Some(a) => a
             .iter()
             .filter_map(|v| v.as_str().map(String::from))
-            .collect::<Vec<_>>(),
+            .collect(),
         None => return err("missing 'uids' array"),
     };
-    let dest = resolve_pos(params.get("pos_dest"), queue);
-    let mut moved = Vec::new();
-    {
-        let mut q = queue.lock().unwrap();
-        for (i, uid) in uids.iter().enumerate() {
-            if let Some(it) = q.move_to(uid, dest + i) {
-                moved.push(it);
-            }
+
+    // Destination — exactly one of pos_dest / before_uid / after_uid (JSON null
+    // counts as unspecified). Mirrors `plan_queue_ops.py::_move_batch`.
+    let pos_dest = params.get("pos_dest").filter(|v| !v.is_null());
+    let before_uid = params.get("before_uid").and_then(|v| v.as_str());
+    let after_uid = params.get("after_uid").and_then(|v| v.as_str());
+    let n_dest = pos_dest.is_some() as u8 + before_uid.is_some() as u8 + after_uid.is_some() as u8;
+    if n_dest < 1 {
+        return err("destination not specified: use 'pos_dest', 'before_uid', or 'after_uid'");
+    }
+    if n_dest > 1 {
+        return err("ambiguous: only one of 'pos_dest', 'before_uid', 'after_uid'");
+    }
+    let reorder = params
+        .get("reorder")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let mut q = queue.lock().unwrap();
+
+    // Atomic pre-validation — on any failure nothing is moved (ref: _move_batch).
+    // uids unique.
+    let mut seen = std::collections::HashSet::new();
+    for u in &uids {
+        if !seen.insert(u.as_str()) {
+            return err(format!("duplicate uid in batch: {u}"));
         }
     }
-    let q = queue.lock().unwrap();
+    // Every uid exists in the queue.
+    let missing: Vec<&str> = uids
+        .iter()
+        .filter(|u| q.get_by_uid(u).is_none())
+        .map(String::as_str)
+        .collect();
+    if !missing.is_empty() {
+        return err(format!("uids not in queue: {}", missing.join(", ")));
+    }
+    // The reference uid must exist and must NOT be a member of the batch.
+    if let Some(b) = before_uid {
+        if uids.iter().any(|u| u == b) {
+            return err(format!("before_uid is in the batch: {b}"));
+        }
+        if q.get_by_uid(b).is_none() {
+            return err(format!("before_uid not found: {b}"));
+        }
+    }
+    if let Some(a) = after_uid {
+        if uids.iter().any(|u| u == a) {
+            return err(format!("after_uid is in the batch: {a}"));
+        }
+        if q.get_by_uid(a).is_none() {
+            return err(format!("after_uid not found: {a}"));
+        }
+    }
+
+    // reorder=false → move in the order given in `uids`; reorder=true → move in
+    // the items' original queue order (sort uids by current index).
+    let ordered: Vec<String> = if reorder {
+        let mut with_idx: Vec<(usize, String)> = uids
+            .iter()
+            .map(|u| (q.index_of_uid(u).unwrap(), u.clone()))
+            .collect();
+        with_idx.sort_by_key(|(i, _)| *i);
+        with_idx.into_iter().map(|(_, u)| u).collect()
+    } else {
+        uids.clone()
+    };
+
+    // Block move — first item to the destination, each subsequent item
+    // immediately after the previous, preserving `ordered`.
+    let mut moved: Vec<Value> = Vec::with_capacity(ordered.len());
+    let mut prev_uid: Option<String> = None;
+    for uid in &ordered {
+        let placed = match &prev_uid {
+            None => {
+                if let Some(b) = before_uid {
+                    q.move_before_uid(uid, b)
+                } else if let Some(a) = after_uid {
+                    q.move_after_uid(uid, a)
+                } else {
+                    let dest = resolve_pos_q(pos_dest, &q);
+                    q.move_to(uid, dest)
+                }
+            }
+            Some(p) => q.move_after_uid(uid, p.as_str()),
+        };
+        match placed {
+            Some(it) => moved.push(serde_json::to_value(&it).unwrap()),
+            // Unreachable after validation (uid + ref both proven present).
+            None => return err(format!("move failed for uid: {uid}")),
+        }
+        prev_uid = Some(uid.clone());
+    }
+
     json!({
         "success": true,
         "msg": "",
         "items_moved": moved,
+        "qsize": q.len(),
         "plan_queue_uid": q.queue_uid(),
     })
 }
 
 fn resolve_pos(p: Option<&Value>, queue: &Arc<StdMutex<PlanQueue>>) -> usize {
+    resolve_pos_q(p, &queue.lock().unwrap())
+}
+
+/// Lock-free `pos_dest` resolution against an already-held queue. Callers that
+/// hold the queue lock (e.g. `queue_item_move_batch`) must use this — the
+/// lock-taking [`resolve_pos`] would deadlock.
+fn resolve_pos_q(p: Option<&Value>, q: &PlanQueue) -> usize {
     match p {
         Some(Value::String(s)) if s == "front" => 0,
-        Some(Value::String(s)) if s == "back" => queue.lock().unwrap().len(),
+        Some(Value::String(s)) if s == "back" => q.len(),
         Some(Value::Number(n)) => n.as_u64().unwrap_or(0) as usize,
-        _ => queue.lock().unwrap().len(),
+        _ => q.len(),
     }
 }
 
@@ -1145,7 +1304,9 @@ fn queue_item_execute(
             "success": r.exit_status == "success",
             "msg": "",
             "exit_status": r.exit_status,
-            "run_uid": r.run_uid,
+            // Preserve the single-valued `run_uid` wire field (the most recently
+            // opened run); RunResult now carries all opened UIDs in `run_uids`.
+            "run_uid": r.run_uids.last(),
         }),
         Err(e) => err(format!("run failed: {e}")),
     }

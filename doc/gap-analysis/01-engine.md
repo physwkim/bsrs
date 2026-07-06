@@ -46,7 +46,7 @@ All 30 public bluesky verbs map to a handled bsrs `Msg` arm.
 | `stage` / `unstage` | `Msg::Stage` / `Msg::Unstage` | ✓ |
 | `stop` | `Msg::Stop` | ✓ |
 | `subscribe` / `unsubscribe` | `Msg::Subscribe` / `Msg::Unsubscribe` | ✓ (filter gap — ENG-06) |
-| `open_run` / `close_run` | `Msg::OpenRun` / `Msg::CloseRun` | ✓ (multi-run gap — ENG-04) |
+| `open_run` / `close_run` | `Msg::OpenRun` / `Msg::CloseRun` | ✓ (multi-run: ENG-04 DONE) |
 | `declare_stream` | `Msg::DeclareStream` | ✓ |
 | `monitor` / `unmonitor` | `Msg::Monitor` / `Msg::Unmonitor` | ✓ |
 | `wait_for` | `Msg::WaitFor` | ✓ |
@@ -145,7 +145,7 @@ Without it, plan debugging requires re-implementing instrumentation outside the 
 
 ---
 
-### ENG-04 Multi-run per call not supported (Msg.run key) (P1)
+### ENG-04 Multi-run per call not supported (Msg.run key) (P1) — **DONE**
 
 **bsrs:** `EngineState` has `bundler: Option<RunBundler>` — exactly one open run at a time.
 `open_run()` (`engine.rs:1584`) errors if `state.bundler.is_some()`.
@@ -167,9 +167,30 @@ by key. `None` key = the single-run default (fully backward-compatible).
 
 **Effort:** L
 
+**Resolution:** Implemented as a *wrapper* rather than a per-variant field. A new
+`Msg::InRun { run: String, inner: Box<Msg> }` (constructed via `Msg::in_run(run, inner)`)
+carries the run key for any bundler-touching verb; `handle()` unwraps it once at the top into
+`(run_key: Option<String>, msg)` — `None` for an unwrapped message (the default run). This keeps
+every existing plan/test construction site zero-churn (no `run:` field threaded through ~150
+call sites) while expressing the key uniformly in one place. `EngineState.bundler:
+Option<RunBundler>` plus its four sibling per-run registries (`bundle_asset_objs`,
+`monitor_tasks`, `monitored`, `uncollected`) are replaced by `runs: HashMap<Option<String>,
+RunSlot>`, where `RunSlot` groups all per-run state so one run's documents, monitors, flyers and
+asset cache never bleed into another. Bundler-touching verbs (OpenRun/CloseRun/Create/Save/Drop/
+DeclareStream/Read/Kickoff/Collect/Monitor/Unmonitor/Configure) route by `run_key`; broadcast
+operations (checkpoint reset, ClearCheckpoint, pause-suspend/resume-restore of monitors, rewind,
+`record_interruption`, and the run-end `backstop_collect` + `drain_and_close`) iterate every open
+run — mirroring bluesky's `self._run_bundlers.values()`. `open_run` rejects only a *same-key*
+re-open, so distinct keys open concurrently; `close_run_if_open` removes one slot (dropping it
+tears down that run's monitor pumps by RAII). `is_cacheable`/replay preserve the `InRun` wrapper,
+so a rewind restores each run's key. `InRun` is not nestable (rejected in `handle`). Test:
+`interleaved_multi_run_routes_documents_by_run_key` opens runs A and B, interleaves their event
+bundles A,B,A,B, and asserts 2 RunStart / 2 RunStop / 2 Descriptor / 2 Event with each event
+bound to its own run's descriptor.
+
 ---
 
-### ENG-05 `RunResult` missing plan_result, interrupted, reason, exception; one uid only (P1)
+### ENG-05 `RunResult` missing plan_result, interrupted, reason, exception; one uid only (P1) — **DONE**
 
 **bsrs:** `engine.rs:203-207`:
 ```rust
@@ -202,6 +223,27 @@ from an abort without re-parsing `exit_status`.
 (currently only captures the last one assigned to `run_uid`).
 
 **Effort:** M
+
+**Resolution:** `RunResult` now has `run_uids: Vec<String>` (every RunStart uid opened
+during the call, accumulated in `run_loop` via `run_uids.push(uid)` — `handle` returns a
+uid exactly once per `Msg::OpenRun`, so no de-dup is needed), `interrupted: bool`,
+`reason: String`, and `exception: Option<BsrsError>`. A private `build_result(run_uids,
+exit_status, exception)` funnels all four construction sites through one place: it derives
+`interrupted` from the terminal state (`fail` / halting / stopping / aborting; a natural
+clean end leaves it false) and `reason` from the exception's `Display` (fail path) else
+`stop_reason()` (abort/halt/stop). The failure path moves the actual `BsrsError` into
+`exception` so callers can match on its variant rather than re-parse a string.
+`plan_result` is **intentionally omitted** — bsrs plans are `async_stream`s that yield
+`Msg`s and return `()`, so there is no generator return value to carry. `RunResult` also
+drops its `Clone` derive: `BsrsError` is not `Clone` (it wraps non-`Clone` sources such as
+`serde_json::Error`) and no caller cloned the whole struct. Downstream readers of the old
+single `run_uid` (`lua_env` two REPL result strings, `qs/server` `current_run_uid`,
+`qs/dispatch` JSON `run_uid` field, three examples) now take `run_uids.last()`, preserving
+the previous most-recently-opened-uid semantics and the qs wire format. Tests:
+`run_result_records_uid_and_marks_clean_success` (clean run → one uid, not interrupted,
+empty reason, no exception) and `run_result_on_failure_carries_typed_exception_and_reason`
+(Msg::Fail → interrupted, uid retained, `Some(BsrsError::Plan("boom"))`, reason `"plan
+logic error: boom"`).
 
 ---
 
@@ -342,7 +384,26 @@ beam flickers back and immediately fail because the beam is still unstable.
 
 ---
 
-### ENG-11 Suspender `pre_plan` / `post_plan` injection missing (P1)
+### ENG-11 Suspender `pre_plan` / `post_plan` injection missing (P1) — **DONE**
+
+**Resolution:** Added `suspend_until_with_plans(fut, justification, pre_plan, post_plan)`
+(`suspend_until_with` now delegates with `None, None`). `SuspendCallback` was repurposed from
+its unused `Box<dyn FnOnce() -> Plan>` placeholder to `Arc<dyn Fn() -> Plan + Send + Sync>` — a
+*factory* so each suspension produces a fresh message stream (mirrors bluesky's generator-callable
+pre/post_plan). The factories are stored on the engine before `mark_paused`, and the pause gate in
+`next_msg` drives them through the **same handlers as the main plan** via `run_injected_plan`:
+`pre_plan` after `on_pause_enter` (motor-stop + Pausable walk) and before the suspend wait;
+`post_plan` after `on_resume` (Pausable re-notify + monitor restore) and before the rewind replay
+— matching bluesky's order (run_engine.py:1199). Because a bare `Notify` (`permit`) drops a wakeup
+with no registered waiter, the gate now arms `permit.notified()` (`enable()`) *before* the
+pause-enter + pre_plan work and re-checks `is_paused`, closing the lost-wakeup race that
+pre_plan's real device motion would otherwise widen into a hang. Injected messages are **not**
+rewind-cached, so a later resume does not replay them. `run_injected_plan` is abort-aware and logs
+(does not propagate) a failing injected message. Test:
+`suspend_with_plans_runs_pre_on_pause_and_post_on_resume` proves the pre/post `Set` land real
+setpoints on a RecordingMotor, in order, pre strictly before the future resolves. Wiring
+`with_pre_plan` / `with_post_plan` ergonomics into the `SuspendBool*` / `SuspendThreshold` /
+`SuspendOutsideBand` builders (they call `suspend_until_with` per trip) is a mechanical follow-up.
 
 **bsrs:** `suspend_until_with` (`engine.rs:699-718`) immediately pauses + spawns a task that
 calls `resume()` when `fut` resolves. No way to inject a plan before the suspend or after it.
@@ -616,14 +677,14 @@ collects exceptions and either swallows them (if `ignore_exceptions=True`) or wa
 | ENG-01 | `Msg::Configure` does not invalidate/re-emit EventDescriptor | P0 | M |
 | ENG-02 | External-asset documents (Resource/Datum/StreamResource/StreamDatum) absent | P0 | L |
 | ENG-03 | `msg_hook` not exposed | P1 | S |
-| ENG-04 | Multi-run per call not supported (Msg.run key) | P1 | L |
+| ~~ENG-04~~ | ~~Multi-run per call not supported (Msg.run key)~~ **DONE** | P1 | L |
 | ENG-05 | `RunResult` missing plan_result, interrupted, reason, exception; one uid only | P1 | M |
 | ENG-06 | `Msg::Subscribe` has no document-type filter | P1 | S |
 | ENG-07 | `read_configuration`/`describe_configuration` absent from descriptors | P1 | M |
 | ENG-08 | `seq_num` not reset on rewind | P1 | M |
 | ENG-09 | `backstop_collect` not called on cleanup | P1 | S |
 | ENG-10 | Suspender `sleep` (resume-delay) missing | P1 | S |
-| ENG-11 | Suspender `pre_plan` / `post_plan` injection missing | P1 | M |
+| ~~ENG-11~~ | ~~Suspender `pre_plan` / `post_plan` injection missing~~ **DONE** | P1 | M |
 | ENG-12 | Suspenders not checked for tripped state before plan start | P1 | M |
 | ENG-13 | `SuspendWhenOutsideBand` and `SuspendWhenChanged` missing | P1 | S–M |
 | ENG-14 | `scan_id` not written back to `RE.md` after each run | P1 | S |

@@ -345,6 +345,24 @@ assert(string.find(
   RE:run(bp.grid_scan({d1},
     {{motor=m1, start=0, stop=0.2, num=2}, {motor=m2, start=0, stop=0.3, num=2}})),
   "exit_status=success"))
+-- PLAN-19: snake (boustrophedon) traversal via the optional trailing arg.
+assert(string.find(
+  RE:run(bp.grid_scan({d1},
+    {{motor=m1, start=0, stop=0.2, num=2}, {motor=m2, start=0, stop=0.3, num=3}}, true)),
+  "exit_status=success"))
+assert(string.find(
+  RE:run(bp.list_grid_scan({d1},
+    {{motor=m1, points={0, 0.1}}, {motor=m2, points={0, 0.1, 0.2}}}, true)),
+  "exit_status=success"))
+assert(string.find(
+  RE:run(bp.list_grid_scan({d1},
+    {{motor=m1, points={0, 0.1}}, {motor=m2, points={0, 0.1, 0.2}}}, {2})),
+  "exit_status=success"))
+-- PLAN-28: multi-motor inner-product list_scan; lists are zipped (equal length).
+assert(string.find(
+  RE:run(bp.list_scan_nd({d1},
+    {{motor=m1, points={0, 0.1, 0.2}}, {motor=m2, points={0, 0.1, 0.2}}})),
+  "exit_status=success"))
 assert(string.find(
   RE:run(bp.inner_product_scan({d1}, 3,
     {{motor=m1, start=0, stop=1}, {motor=m2, start=0, stop=2}})),
@@ -368,6 +386,7 @@ fn bps_namespace_stub_plans() {
     let (out, err, code) = run_script(
         r#"
 local m1 = soft_motor("m1", 0.0)
+local m2 = soft_motor("m2", 0.0)
 local d1 = soft_detector("d1")
 
 -- 1-Msg / small stubs
@@ -375,6 +394,9 @@ assert(string.find(RE:run(bps.null()), "exit_status="))
 assert(string.find(RE:run(bps.sleep(0.005)), "exit_status="))
 assert(string.find(RE:run(bps.mv(m1, 0.5)), "exit_status="))
 assert(string.find(RE:run(bps.mvr(m1, 0.1)), "exit_status="))
+-- PLAN-10: variadic multi-motor mv / mvr (all into one group, one wait)
+assert(string.find(RE:run(bps.mv(m1, 0.5, m2, 1.5)), "exit_status="))
+assert(string.find(RE:run(bps.mvr(m1, 0.1, m2, -0.2)), "exit_status="))
 assert(string.find(RE:run(bps.abs_set(m1, 1.0)), "exit_status="))
 
 -- bps.read inside a properly-bracketed run

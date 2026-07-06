@@ -14,6 +14,7 @@
 #![deny(missing_docs)]
 
 mod client;
+mod console;
 mod doctor;
 mod frame_source;
 mod manager;
@@ -40,6 +41,10 @@ enum TopCmd {
     /// in-process `RunEngine`; no qs-manager required. IPython-like
     /// development surface for plans.
     Repl(repl::ReplArgs),
+    /// Fused local Lua REPL + bsrs-qs server on one shared `RunEngine`.
+    /// The local prompt and remote queueserver clients drive the same
+    /// engine, queue, and devices. Environment is pre-opened at startup.
+    Console(console::ConsoleArgs),
     /// Validate the local environment for running bsrs: tokio,
     /// EPICS env vars, optional Tiled / Kafka reachability.
     Doctor(doctor::DoctorArgs),
@@ -58,6 +63,10 @@ fn main() {
         // REPL runs from a sync context so RE:run can `block_on` the
         // bsrs runtime to drive plans.
         TopCmd::Repl(a) => repl::run(a),
+        // Console = REPL + qs server. Also a sync entry: the blocking
+        // rustyline loop owns the main thread while the server runs on
+        // the bsrs runtime.
+        TopCmd::Console(a) => console::run(a),
         // Server / client paths build their own multi-thread tokio
         // runtime — neither needs the caller's runtime.
         TopCmd::QsManager(a) => {

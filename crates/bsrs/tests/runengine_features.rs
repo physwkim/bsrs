@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use bsrs::backends::soft::SoftDetector;
 use bsrs::callbacks::CapturingSink;
-use bsrs::core::msg::Msg;
+use bsrs::core::msg::{Msg, ReadableObj};
 use bsrs::core::plan::{plan_box, Plan};
 use bsrs::engine::EngineRunState;
 use bsrs::event_model::{DocFilter, Document};
@@ -959,18 +959,283 @@ async fn monitor_emits_descriptor_then_events() {
     re.run_async(plan).await.unwrap();
 
     let docs = sink.snapshot().await;
-    let descriptors = docs
+    let descriptors: Vec<_> = docs
         .iter()
-        .filter(|d| matches!(d, Document::Descriptor(_)))
-        .count();
+        .filter_map(|d| match d {
+            Document::Descriptor(d) => Some(d),
+            _ => None,
+        })
+        .collect();
     let events = docs
         .iter()
         .filter(|d| matches!(d, Document::Event(_)))
         .count();
-    assert!(descriptors >= 1, "expected at least one descriptor");
+    assert!(!descriptors.is_empty(), "expected at least one descriptor");
+    // The monitor descriptor carries the monitored object's configuration
+    // entry (bluesky `_monitor` runs ensure_cached + _prepare_stream,
+    // bundlers.py:473-475); TestMonitor is not configurable, so it is empty.
+    assert!(
+        descriptors[0].configuration.contains_key("mon1"),
+        "monitor descriptor has the object's configuration entry; got keys {:?}",
+        descriptors[0].configuration.keys().collect::<Vec<_>>()
+    );
     assert!(
         events >= 1,
         "expected at least one Event from the monitor pump"
+    );
+}
+
+// A device that is both Monitorable and Configurable, so a `configure` can
+// re-emit the descriptor of a stream fed by its own monitor pump — the path
+// that exercises the descriptor-before-event ordering guarantee.
+struct ConfigurableMonitor {
+    name: String,
+    tx: tokio::sync::watch::Sender<bsrs::core::reading::ReadingValue>,
+    gain: StdMutex<f64>,
+}
+
+impl ConfigurableMonitor {
+    fn new(name: &str) -> Arc<Self> {
+        let (tx, _rx) = tokio::sync::watch::channel(bsrs::core::reading::ReadingValue {
+            value: Value::from(0.0),
+            timestamp: 0.0,
+            alarm_severity: None,
+            message: None,
+        });
+        Arc::new(Self {
+            name: name.into(),
+            tx,
+            gain: StdMutex::new(2.5),
+        })
+    }
+    fn push(&self, v: f64, ts: f64) {
+        let _ = self.tx.send(bsrs::core::reading::ReadingValue {
+            value: Value::from(v),
+            timestamp: ts,
+            alarm_severity: None,
+            message: None,
+        });
+    }
+}
+
+impl bsrs::core::msg::NamedObj for ConfigurableMonitor {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[async_trait::async_trait]
+impl bsrs::core::msg::ReadableObj for ConfigurableMonitor {
+    async fn read_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, bsrs::core::reading::ReadingValue>,
+        bsrs::core::error::BsrsError,
+    > {
+        let v = self.tx.borrow().clone();
+        Ok(std::collections::HashMap::from([(self.name.clone(), v)]))
+    }
+    async fn describe_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, bsrs::event_model::DataKey>,
+        bsrs::core::error::BsrsError,
+    > {
+        Ok(std::collections::HashMap::from([(
+            self.name.clone(),
+            bsrs::event_model::DataKey {
+                source: format!("test://{}", self.name),
+                dtype: bsrs::event_model::Dtype::Number,
+                shape: vec![],
+                dtype_numpy: Some("<f8".into()),
+                external: None,
+                units: None,
+                precision: None,
+                object_name: None,
+                dims: None,
+                limits: None,
+                choices: None,
+            },
+        )]))
+    }
+    fn as_configurable(&self) -> Option<&dyn bsrs::core::msg::ConfigurableObj> {
+        Some(self)
+    }
+}
+
+#[async_trait::async_trait]
+impl bsrs::core::msg::MonitorableObj for ConfigurableMonitor {
+    async fn subscribe_dyn(
+        &self,
+    ) -> Result<bsrs::core::subscription::Subscription, bsrs::core::error::BsrsError> {
+        Ok(bsrs::core::subscription::Subscription::new(
+            self.tx.subscribe(),
+            bsrs::core::status::SubToken::noop(),
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl bsrs::core::msg::ConfigurableObj for ConfigurableMonitor {
+    async fn read_configuration_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, bsrs::core::reading::ReadingValue>,
+        bsrs::core::error::BsrsError,
+    > {
+        let g = *self.gain.lock().unwrap();
+        Ok(std::collections::HashMap::from([(
+            format!("{}_gain", self.name),
+            bsrs::core::reading::ReadingValue {
+                value: Value::from(g),
+                timestamp: 0.0,
+                alarm_severity: None,
+                message: None,
+            },
+        )]))
+    }
+    async fn describe_configuration_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, bsrs::event_model::DataKey>,
+        bsrs::core::error::BsrsError,
+    > {
+        Ok(std::collections::HashMap::from([(
+            format!("{}_gain", self.name),
+            bsrs::event_model::DataKey {
+                source: format!("test://{}.gain", self.name),
+                dtype: bsrs::event_model::Dtype::Number,
+                shape: vec![],
+                dtype_numpy: Some("<f8".into()),
+                external: None,
+                units: None,
+                precision: None,
+                object_name: None,
+                dims: None,
+                limits: None,
+                choices: None,
+            },
+        )]))
+    }
+    async fn configure_dyn(
+        &self,
+        _args: bsrs::core::msg::ConfigureArgs,
+    ) -> Result<(), bsrs::core::error::BsrsError> {
+        *self.gain.lock().unwrap() = 5.0;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn configure_during_monitor_reemits_descriptor_before_any_event() {
+    // Closes the monitor-pump ordering boundary: configuring an object that is
+    // being MONITORED re-emits its stream's descriptor as a new generation, and
+    // that descriptor must reach the wire before any event the pump stamps with
+    // it. The Configure handler composes the new descriptor, broadcasts it, and
+    // only THEN installs it as the generation the pump reads — so the invariant
+    // "every Event references a descriptor already emitted" holds regardless of
+    // when the pump task fires relative to the configure.
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let mon = ConfigurableMonitor::new("cm1");
+    let mon_for_monitor: Arc<dyn bsrs::core::msg::MonitorableObj> = mon.clone();
+    let mon_for_configure: Arc<dyn bsrs::core::msg::ConfigurableObj> = mon.clone();
+    let mon_for_drive = mon.clone();
+
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Monitor { obj: mon_for_monitor.clone(), name: None };
+        yield Msg::Sleep(Duration::from_millis(50));
+        // First generation events.
+        for i in 1..=2 {
+            mon_for_drive.push(i as f64, i as f64);
+            yield Msg::Sleep(Duration::from_millis(50));
+        }
+        // Reconfigure the monitored object mid-stream -> new descriptor gen.
+        yield Msg::Configure { obj: mon_for_configure.clone(), args: Default::default() };
+        // Second generation events.
+        for i in 3..=4 {
+            mon_for_drive.push(i as f64, i as f64);
+            yield Msg::Sleep(Duration::from_millis(50));
+        }
+        yield Msg::Unmonitor(mon_for_monitor);
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    re.run_async(plan).await.unwrap();
+
+    let docs = sink.snapshot().await;
+
+    // Two descriptor generations for the (single) monitor stream: same name and
+    // data_keys schema, distinct uids — configure advanced the configuration
+    // sub-document, not the schema.
+    let descriptors: Vec<_> = docs
+        .iter()
+        .filter_map(|d| match d {
+            Document::Descriptor(d) => Some(d),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        descriptors.len(),
+        2,
+        "configure during monitor emits a second descriptor generation"
+    );
+    assert_eq!(
+        descriptors[0].name, descriptors[1].name,
+        "both generations name the same stream"
+    );
+    assert_ne!(
+        descriptors[0].uid, descriptors[1].uid,
+        "the reconfigured generation has a fresh uid"
+    );
+    assert_eq!(
+        descriptors[0]
+            .data_keys
+            .keys()
+            .collect::<std::collections::BTreeSet<_>>(),
+        descriptors[1]
+            .data_keys
+            .keys()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "schema (data_keys) is frozen across generations"
+    );
+    assert_eq!(
+        descriptors[1]
+            .configuration
+            .get("cm1")
+            .and_then(|c| c.data.get("cm1_gain")),
+        Some(&Value::from(5.0)),
+        "the second generation carries the post-configure gain"
+    );
+
+    // The ordering guarantee: walk the sink in order and require every Event's
+    // descriptor uid to have been emitted by an earlier Descriptor doc. This is
+    // exactly the property the emit-before-install split protects; it must hold
+    // for whatever interleaving the async pump produced.
+    let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut saw_gen2_event = false;
+    for d in &docs {
+        match d {
+            Document::Descriptor(desc) => {
+                emitted.insert(desc.uid.clone());
+            }
+            Document::Event(ev) => {
+                assert!(
+                    emitted.contains(&ev.descriptor),
+                    "event references descriptor {} not yet emitted (ordering violated)",
+                    ev.descriptor
+                );
+                if ev.descriptor == descriptors[1].uid {
+                    saw_gen2_event = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    // The pump picked up the reconfigured generation for post-configure values.
+    assert!(
+        saw_gen2_event,
+        "expected at least one monitor event against the reconfigured descriptor"
     );
 }
 
@@ -1724,6 +1989,124 @@ async fn suspend_until_pauses_then_auto_resumes() {
     );
 }
 
+// A movable that records every setpoint it receives, so a test can prove an
+// injected pre/post-suspend plan's `Set` was driven through the engine
+// handlers (real device motion), not merely that a factory was invoked.
+struct RecordingMotor {
+    name: String,
+    log: Arc<StdMutex<Vec<f64>>>,
+}
+
+impl bsrs::core::msg::NamedObj for RecordingMotor {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn inspect_dyn(&self) -> Value {
+        serde_json::json!({ "name": self.name, "type": "RecordingMotor" })
+    }
+}
+
+#[async_trait::async_trait]
+impl bsrs::core::msg::MovableObj for RecordingMotor {
+    async fn set_dyn(&self, value: f64) -> bsrs::core::status::Status {
+        self.log.lock().unwrap().push(value);
+        bsrs::core::status::Status::done()
+    }
+}
+
+// ENG-11: suspend_until_with_plans runs `pre_plan` on suspension (after the
+// motor-stop walk, before the wait) and `post_plan` on resume (before the
+// rewind replay). Both are real plans whose `Set`/`Wait` go through the same
+// handlers as the main plan — verified by the setpoints they land on the
+// RecordingMotor, and by their order relative to the suspend future resolving.
+#[tokio::test]
+async fn suspend_with_plans_runs_pre_on_pause_and_post_on_resume() {
+    use bsrs::core::msg::MovableObj;
+
+    let log = Arc::new(StdMutex::new(Vec::<f64>::new()));
+    let pre_motor: Arc<dyn MovableObj> = Arc::new(RecordingMotor {
+        name: "shutter".into(),
+        log: log.clone(),
+    });
+    let post_motor = pre_motor.clone();
+
+    // Factories (not bare plans): each call yields a fresh stream, mirroring
+    // bluesky's generator-callable pre/post_plan.
+    let pre: bsrs::engine::SuspendCallback = Arc::new(move || {
+        let m = pre_motor.clone();
+        plan_box(async_stream::stream! {
+            yield Msg::Set { obj: m.clone(), value: 10.0, group: Some("pre".into()) };
+            yield Msg::Wait { group: "pre".into(), error_on_timeout: true, timeout: None };
+        })
+    });
+    let post: bsrs::engine::SuspendCallback = Arc::new(move || {
+        let m = post_motor.clone();
+        plan_box(async_stream::stream! {
+            yield Msg::Set { obj: m.clone(), value: 20.0, group: Some("post".into()) };
+            yield Msg::Wait { group: "post".into(), error_on_timeout: true, timeout: None };
+        })
+    });
+
+    let re = Arc::new(RunEngine::new(vec![]));
+    let re2 = re.clone();
+    // Two short sleeps: the first is the window for `suspend_until_with_plans`
+    // to land; the pause gate then triggers at the sleep boundary. Once
+    // suspended the engine parks in the gate, so the second sleep does not run
+    // until resume — the plan cannot finish before the injection is observed.
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::Sleep(Duration::from_millis(30));
+        yield Msg::Sleep(Duration::from_millis(30));
+    });
+    let join = tokio::spawn(async move { re2.run_async(plan).await });
+
+    wait_for_state(&re, EngineRunState::Running).await;
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    re.suspend_until_with_plans(
+        Box::pin(async move {
+            let _ = rx.await;
+        }),
+        Some("shutter interlock".into()),
+        Some(pre),
+        Some(post),
+    );
+
+    // pre_plan runs while still suspended, before the future resolves.
+    {
+        let log = log.clone();
+        wait_until("pre_plan Set landed", move || {
+            log.lock().unwrap().contains(&10.0)
+        })
+        .await;
+    }
+    assert!(
+        !log.lock().unwrap().contains(&20.0),
+        "post_plan must not run before the suspend future resolves"
+    );
+
+    // Resolve the suspend condition → resume → post_plan.
+    let _ = tx.send(());
+    {
+        let log = log.clone();
+        wait_until("post_plan Set landed", move || {
+            log.lock().unwrap().contains(&20.0)
+        })
+        .await;
+    }
+
+    let _ = tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("did not resume + finish in time")
+        .unwrap()
+        .unwrap();
+
+    let final_log = log.lock().unwrap().clone();
+    assert_eq!(
+        final_log,
+        vec![10.0, 20.0],
+        "pre_plan (10) then post_plan (20), each exactly once"
+    );
+}
+
 // -- Msg::Input --------------------------------------------------------------
 
 #[tokio::test]
@@ -1960,6 +2343,46 @@ async fn per_call_md_wins_over_per_run_open_run_extra() {
 }
 
 #[tokio::test]
+async fn run_start_carries_plan_type_generator_overridable_by_extra() {
+    // ENG-22: bluesky stamps every RunStart with `plan_type`
+    // (`type(self._plan).__name__`, "generator" for generator plans) at a
+    // ChainMap level below the OpenRun kwargs (run_engine.py:1858-1868). bsrs
+    // plans are lazy Msg streams, so plan_type defaults to "generator" and a
+    // plan that sets it via the OpenRun extra must win.
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    re.run_async(one_count_plan()).await.unwrap();
+
+    // A plan that overrides plan_type through the OpenRun extra.
+    let plan = plan_box(async_stream::stream! {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("plan_type".to_string(), Value::String("custom".into()));
+        yield Msg::OpenRun(bsrs::core::msg::RunMetadata { extra, ..Default::default() });
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    re.run_async(plan).await.unwrap();
+
+    let docs = sink.snapshot().await;
+    let starts: Vec<&Value> = docs
+        .iter()
+        .filter_map(|d| match d {
+            Document::Start(s) => s.extra.get("plan_type"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        starts[0],
+        &Value::String("generator".into()),
+        "default plan_type is generator"
+    );
+    assert_eq!(
+        starts[1],
+        &Value::String("custom".into()),
+        "OpenRun extra overrides the computed plan_type"
+    );
+}
+
+#[tokio::test]
 async fn run_async_with_temp_subs_auto_remove_at_run_end() {
     let count = Arc::new(AtomicU64::new(0));
     let c2 = count.clone();
@@ -2178,4 +2601,412 @@ async fn sigint_count_resets_across_runs() {
     // sigint_count reset is needed for.
     assert_eq!(re.state(), EngineRunState::Idle);
     let _ = AtomicU8::new(0); // touch import to silence unused warning
+}
+
+// ---------------------------------------------------------------------------
+// PLAN-22: contingency_wrapper try/except/else/finally, powered by the engine's
+// contingency stack (Msg::PushContingency / PopContingency). A message error
+// inside the wrapped plan is routed into the wrapper's sink and the run keeps
+// running so the wrapper can branch, instead of failing immediately.
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::AtomicUsize;
+
+/// A one-message plan that bumps `counter` when the engine processes it (via a
+/// `WaitFor` factory), so a test can observe whether a given branch ran.
+fn bump_plan(counter: Arc<AtomicUsize>) -> Plan {
+    plan_box(async_stream::stream! {
+        let c = counter.clone();
+        let factory: bsrs::core::msg::AwaitableFactory = Arc::new(move || {
+            let c = c.clone();
+            Box::pin(async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+        yield Msg::WaitFor { factories: vec![factory], timeout: None };
+    })
+}
+
+/// A plan that always errors when the engine runs it.
+fn boom_plan() -> Plan {
+    plan_box(async_stream::stream! {
+        yield Msg::Fail("boom".into());
+    })
+}
+
+fn drain_into(inner: Plan) -> Plan {
+    // Wrap `inner` inside OpenRun / CloseRun so it runs as a real run.
+    plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        let mut inner = inner;
+        while let Some(item) = futures::StreamExt::next(&mut inner).await {
+            let bsrs::core::plan::PlanItem::Bare(m) = item else { unreachable!() };
+            yield m;
+        }
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    })
+}
+
+#[tokio::test]
+async fn contingency_wrapper_runs_except_and_finally_then_reraises_on_error() {
+    let except_ran = Arc::new(AtomicUsize::new(0));
+    let else_ran = Arc::new(AtomicUsize::new(0));
+    let final_ran = Arc::new(AtomicUsize::new(0));
+
+    let guarded = bsrs::plans::preprocessors::contingency_wrapper(
+        boom_plan(),
+        Some(bump_plan(except_ran.clone())),
+        Some(bump_plan(else_ran.clone())),
+        Some(bump_plan(final_ran.clone())),
+        true,
+    );
+    let re = RunEngine::new(vec![]);
+    let result = re.run_async(drain_into(guarded)).await.unwrap();
+
+    // The error re-raised after recovery: the run fails.
+    assert_eq!(result.exit_status, "fail");
+    assert_eq!(except_ran.load(Ordering::SeqCst), 1, "except branch ran");
+    assert_eq!(
+        else_ran.load(Ordering::SeqCst),
+        0,
+        "else branch must NOT run on error"
+    );
+    assert_eq!(final_ran.load(Ordering::SeqCst), 1, "finally always runs");
+}
+
+#[tokio::test]
+async fn contingency_wrapper_runs_else_and_finally_on_success() {
+    let except_ran = Arc::new(AtomicUsize::new(0));
+    let else_ran = Arc::new(AtomicUsize::new(0));
+    let final_ran = Arc::new(AtomicUsize::new(0));
+
+    let inner = plan_box(async_stream::stream! { yield Msg::Null; });
+    let guarded = bsrs::plans::preprocessors::contingency_wrapper(
+        inner,
+        Some(bump_plan(except_ran.clone())),
+        Some(bump_plan(else_ran.clone())),
+        Some(bump_plan(final_ran.clone())),
+        true,
+    );
+    let re = RunEngine::new(vec![]);
+    let result = re.run_async(drain_into(guarded)).await.unwrap();
+
+    assert_eq!(result.exit_status, "success");
+    assert_eq!(
+        except_ran.load(Ordering::SeqCst),
+        0,
+        "except must NOT run on success"
+    );
+    assert_eq!(else_ran.load(Ordering::SeqCst), 1, "else branch ran");
+    assert_eq!(final_ran.load(Ordering::SeqCst), 1, "finally always runs");
+}
+
+#[tokio::test]
+async fn contingency_wrapper_auto_raise_false_swallows_error() {
+    let except_ran = Arc::new(AtomicUsize::new(0));
+
+    let guarded = bsrs::plans::preprocessors::contingency_wrapper(
+        boom_plan(),
+        Some(bump_plan(except_ran.clone())),
+        None,
+        None,
+        false, // swallow: do not re-raise after except
+    );
+    let re = RunEngine::new(vec![]);
+    let result = re.run_async(drain_into(guarded)).await.unwrap();
+
+    // auto_raise=false swallows the error: the run continues to a clean close.
+    assert_eq!(result.exit_status, "success");
+    assert_eq!(except_ran.load(Ordering::SeqCst), 1, "except branch ran");
+}
+
+// -- ENG-04: multiple runs open at once, routed by run key -------------------
+
+/// Two runs (A and B) open concurrently and interleaved: every bundler verb
+/// carries its run key via `Msg::in_run` (bluesky's `msg.run`). The engine
+/// keeps one `RunSlot` per key, so each run's documents — RunStart, Descriptor,
+/// Event, RunStop — stay in that run and never cross into the other. This is the
+/// core ENG-04 invariant: routing by key, not a single shared bundler.
+#[tokio::test]
+async fn interleaved_multi_run_routes_documents_by_run_key() {
+    use std::collections::{HashMap, HashSet};
+
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+
+    let det_a = SoftDetector::new("det_a");
+    let det_b = SoftDetector::new("det_b");
+
+    // Open both runs first, then interleave their event bundles A,B,A,B so a
+    // shared-bundler implementation (the pre-ENG-04 behaviour) could not keep
+    // them apart — the second OpenRun would have been rejected as "a previous
+    // run is still open".
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::in_run("A", Msg::OpenRun(Default::default()));
+        yield Msg::in_run("B", Msg::OpenRun(Default::default()));
+        yield Msg::in_run("A", Msg::Create { stream_name: "primary".into() });
+        yield Msg::in_run("B", Msg::Create { stream_name: "primary".into() });
+        yield Msg::in_run("A", Msg::Read(det_a.clone() as Arc<dyn ReadableObj>));
+        yield Msg::in_run("B", Msg::Read(det_b.clone() as Arc<dyn ReadableObj>));
+        yield Msg::in_run("A", Msg::Save);
+        yield Msg::in_run("B", Msg::Save);
+        yield Msg::in_run("A", Msg::CloseRun { exit_status: "success".into(), reason: None });
+        yield Msg::in_run("B", Msg::CloseRun { exit_status: "success".into(), reason: None });
+    });
+    re.run_async(plan).await.unwrap();
+
+    let docs = sink.snapshot().await;
+
+    let starts: Vec<_> = docs
+        .iter()
+        .filter_map(|d| match d {
+            Document::Start(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    let stops: Vec<_> = docs
+        .iter()
+        .filter_map(|d| match d {
+            Document::Stop(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    let descriptors: Vec<_> = docs
+        .iter()
+        .filter_map(|d| match d {
+            Document::Descriptor(d) => Some(d),
+            _ => None,
+        })
+        .collect();
+    let events: Vec<_> = docs
+        .iter()
+        .filter_map(|d| match d {
+            Document::Event(e) => Some(e),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(starts.len(), 2, "one RunStart per open run");
+    assert_eq!(stops.len(), 2, "one RunStop per open run");
+    assert_eq!(
+        descriptors.len(),
+        2,
+        "one descriptor per run's primary stream"
+    );
+    assert_eq!(events.len(), 2, "one event per run");
+
+    // The two runs have distinct start uids.
+    let start_uids: HashSet<String> = starts.iter().map(|s| s.uid.clone()).collect();
+    assert_eq!(start_uids.len(), 2, "the two runs have distinct uids");
+
+    // Each run closed exactly once, success — the stop set covers both starts
+    // (no double-close of one run, no run left open).
+    let stop_starts: HashSet<String> = stops.iter().map(|s| s.run_start.clone()).collect();
+    assert_eq!(stop_starts, start_uids, "each run closed exactly once");
+    for s in &stops {
+        assert_eq!(s.exit_status, ExitStatus::Success);
+    }
+
+    // Each run's stream got its own descriptor (descriptor.run_start covers both
+    // starts, one each).
+    let desc_runs: HashSet<String> = descriptors.iter().map(|d| d.run_start.clone()).collect();
+    assert_eq!(
+        desc_runs, start_uids,
+        "each run's stream got its own descriptor"
+    );
+
+    // The routing invariant: each run's event landed on that run's descriptor.
+    // A's read must never have bundled into B's descriptor, and vice versa.
+    let desc_run_by_uid: HashMap<String, String> = descriptors
+        .iter()
+        .map(|d| (d.uid.clone(), d.run_start.clone()))
+        .collect();
+    let event_runs: HashSet<String> = events
+        .iter()
+        .map(|e| {
+            desc_run_by_uid
+                .get(&e.descriptor)
+                .cloned()
+                .expect("event references a descriptor emitted this session")
+        })
+        .collect();
+    assert_eq!(
+        event_runs, start_uids,
+        "each run's event stayed within that run's descriptor"
+    );
+}
+
+// -- Single-plan invariant: run_async rejects a concurrent plan --------------
+
+/// A `RunEngine` runs at most one plan at a time. A second `run_async` issued
+/// while the first is still in flight is rejected (not silently interleaved
+/// into the one shared run loop), and the claim is released when the first plan
+/// finishes so the engine is reusable. This is the enforcement point behind the
+/// fused console+qserver guard: a local `RE:run` and the qs queue worker can
+/// never both drive the engine at once.
+#[tokio::test]
+async fn run_async_rejects_concurrent_plan_and_releases_after() {
+    use tokio::sync::Notify;
+
+    let re = Arc::new(RunEngine::new(vec![]));
+    let gate = Arc::new(Notify::new());
+
+    // Opens a run, parks until `gate` fires, then closes — so the engine is
+    // provably mid-plan while the second run_async is attempted.
+    let gate_for_plan = gate.clone();
+    let blocking = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        gate_for_plan.notified().await;
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+
+    let re_run = re.clone();
+    let task = tokio::spawn(async move { re_run.run_async(blocking).await });
+
+    // First plan has claimed the engine.
+    wait_for_state(&re, EngineRunState::Running).await;
+
+    // Concurrent run is rejected, in-flight run untouched.
+    let err = re.run_async(one_count_plan()).await.unwrap_err();
+    assert!(
+        err.to_string().contains("already running"),
+        "expected a single-plan rejection, got: {err}"
+    );
+
+    // Release the first plan; it completes and frees the claim.
+    gate.notify_one();
+    task.await.unwrap().unwrap();
+
+    // The claim was released — a fresh run now succeeds.
+    re.run_async(one_count_plan()).await.unwrap();
+}
+
+/// The plan↔engine response channel: a plan yields a `Respond(Wait)` item and
+/// receives the engine's `MsgResult` back inline. On an empty group the Wait
+/// completes immediately, so the plan must observe `WaitComplete { done: true }`.
+/// This is the primitive `collect_while_completing` loops on.
+#[tokio::test]
+async fn respond_channel_delivers_wait_done_to_plan() {
+    let captured: Arc<StdMutex<Option<bool>>> = Arc::new(StdMutex::new(None));
+    let cap = captured.clone();
+    let plan = bsrs::core::plan::plan_items(async_stream::stream! {
+        let (item, rx) = bsrs::core::plan::respond(Msg::Wait {
+            group: "empty".into(),
+            error_on_timeout: false,
+            timeout: None,
+        });
+        yield item;
+        if let Ok(bsrs::engine::MsgResult::WaitComplete { done }) = rx.await {
+            *cap.lock().unwrap() = Some(done);
+        }
+    });
+    let re = RunEngine::new(vec![]);
+    re.run_async(plan).await.unwrap();
+    assert_eq!(
+        *captured.lock().unwrap(),
+        Some(true),
+        "Respond(Wait) on an empty group must deliver WaitComplete {{ done: true }} to the plan"
+    );
+}
+
+/// A fixed-position motor for the `locate` round-trip test.
+struct FixedLocatable {
+    name: String,
+    setpoint: f64,
+    readback: f64,
+}
+
+impl bsrs::core::msg::NamedObj for FixedLocatable {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[async_trait::async_trait]
+impl bsrs::core::msg::MovableObj for FixedLocatable {
+    async fn set_dyn(&self, _value: f64) -> bsrs::core::status::Status {
+        bsrs::core::status::Status::done()
+    }
+}
+
+#[async_trait::async_trait]
+impl bsrs::core::msg::LocatableObj for FixedLocatable {
+    async fn locate_dyn(
+        &self,
+    ) -> Result<bsrs::core::msg::DynLocation, bsrs::core::error::BsrsError> {
+        Ok(bsrs::core::msg::DynLocation {
+            setpoint: self.setpoint,
+            readback: self.readback,
+        })
+    }
+}
+
+/// PLAN-32: bluesky's value-returning `locate(*objs)` generator maps onto bsrs's
+/// response channel — a plan yields `Respond(Locate)` and receives the setpoint +
+/// readback inline as `MsgResult::Location`. `locate` emits no documents, and a
+/// standalone `-> Plan` helper cannot hand a value back in bsrs's stream model
+/// (plans compose by stream concatenation, not `yield from … -> value`), so this
+/// inline pattern — not a `stubs::locate` — is the faithful bsrs shape. The same
+/// capability is already exposed to Lua as `locate()`.
+#[tokio::test]
+async fn respond_channel_delivers_location_to_plan() {
+    let motor: Arc<dyn bsrs::core::msg::LocatableObj> = Arc::new(FixedLocatable {
+        name: "th".into(),
+        setpoint: 3.5,
+        readback: 3.49,
+    });
+    let captured: Arc<StdMutex<Option<(f64, f64)>>> = Arc::new(StdMutex::new(None));
+    let cap = captured.clone();
+    let plan = bsrs::core::plan::plan_items(async_stream::stream! {
+        let (item, rx) = bsrs::core::plan::respond(Msg::Locate(motor.clone()));
+        yield item;
+        if let Ok(bsrs::engine::MsgResult::Location { setpoint, readback }) = rx.await {
+            *cap.lock().unwrap() = Some((setpoint, readback));
+        }
+    });
+    let re = RunEngine::new(vec![]);
+    re.run_async(plan).await.unwrap();
+    assert_eq!(
+        *captured.lock().unwrap(),
+        Some((3.5, 3.49)),
+        "Respond(Locate) must deliver the device's setpoint + readback to the plan inline"
+    );
+}
+
+/// PLAN-27: bluesky's value-returning `rd(obj)` — read one scalar from a `Readable`,
+/// picking the hinted (or sole) field — maps onto bsrs's response channel. A plan
+/// yields `Respond(Read)` and receives `MsgResult::Reading { data }` inline, then
+/// selects the field it needs. `rd` emits **no documents** (a bare `Read` outside a
+/// `Create`/`Save` bundle produces no Event), and a `stubs::rd(obj) -> Plan` cannot
+/// hand a value back in bsrs's stream model, so — as with `locate` (PLAN-32) — the
+/// inline pattern, not a stub, is the faithful shape. Exposed to Lua as `read()`.
+#[tokio::test]
+async fn respond_channel_delivers_reading_to_plan() {
+    let det = TestMonitor::new("det");
+    // Keep a receiver alive so `push` (a `watch::Sender::send`) is not a no-op —
+    // `TestMonitor::new` drops its own receiver, and `send` with zero receivers
+    // silently leaves the stored value untouched.
+    let _keep = det.rx();
+    det.push(42.0, 1.0);
+    let read_det = det.clone() as Arc<dyn ReadableObj>;
+    let captured: Arc<StdMutex<Option<f64>>> = Arc::new(StdMutex::new(None));
+    let cap = captured.clone();
+    let plan = bsrs::core::plan::plan_items(async_stream::stream! {
+        let (item, rx) = bsrs::core::plan::respond(Msg::Read(read_det.clone()));
+        yield item;
+        if let Ok(bsrs::engine::MsgResult::Reading { data }) = rx.await {
+            // `rd` returns the scalar of the single field.
+            if let Some(rv) = data.get("det") {
+                *cap.lock().unwrap() = rv.value.as_f64();
+            }
+        }
+    });
+    let re = RunEngine::new(vec![]);
+    re.run_async(plan).await.unwrap();
+    assert_eq!(
+        *captured.lock().unwrap(),
+        Some(42.0),
+        "Respond(Read) must deliver the device's reading to the plan inline"
+    );
 }

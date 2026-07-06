@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use crate::core::error::{BsrsError, Result};
-use crate::core::msg::{Msg, RunMetadata};
+use crate::core::msg::{Msg, MsgResult, RunMetadata, SubscriptionId};
 use crate::core::plan::{Plan, PlanItem};
 use crate::core::status::{Status, StatusError};
 use crate::event_model::compose::RunBundle;
@@ -72,8 +72,9 @@ pub enum EngineRunState {
 /// `sinks`). They must be quick — slow callbacks back the engine up.
 pub type DocumentCallback = Arc<dyn Fn(&Document) + Send + Sync + 'static>;
 
-/// Stable identifier returned by [`RunEngine::subscribe`].
-pub type SubscriptionId = u64;
+/// Channel a plan's [`PlanItem::Respond`] carries so the engine can hand the
+/// [`MsgResult`] back into the plan. `None` for a plain `Bare` message.
+type PlanResponder = Option<tokio::sync::oneshot::Sender<MsgResult>>;
 
 /// Custom-command handler signature. The engine downcasts the
 /// `Msg::Custom` payload itself before invoking, so handlers receive a
@@ -153,77 +154,31 @@ pub type CheckpointHook = Arc<dyn Fn(CheckpointSnapshot) + Send + Sync + 'static
 pub type InputHandler =
     Arc<dyn Fn(String) -> BoxFuture<'static, Result<String>> + Send + Sync + 'static>;
 
-/// Side-channel result from the most recently-processed `Msg`. Producers
-/// that yield `Msg`s (Lua coroutines, future async-fn plans) can poll
-/// `RunEngine::take_msg_result` after each yield to see what the engine
-/// did with the Msg.
+/// Final state of a finished run — bsrs's analogue of bluesky's
+/// `RunEngineResult` (run_engine.py:92). bluesky's `plan_result` (the value the
+/// plan generator returns via `StopIteration`) has no bsrs equivalent: bsrs
+/// plans are `async_stream`s that yield `Msg`s and return `()`, so there is no
+/// plan return value to carry — that field is intentionally absent.
 ///
-/// `MsgResult` reflects the *engine's* observable effect — it is not a
-/// promise that the operation has fully completed. For grouped
-/// Set/Trigger/Kickoff/Complete, the `Status` is added to the named
-/// wait group; the result reports that group name. For ungrouped
-/// (synchronous) variants, the engine has already awaited completion
-/// before writing the result.
-#[derive(Debug, Clone)]
-pub enum MsgResult {
-    /// No useful result for this Msg kind.
-    None,
-    /// `OpenRun` produced a fresh run-start UID.
-    OpenRun {
-        /// Run-start UID.
-        uid: String,
-    },
-    /// `Set` / `Trigger` / `Kickoff` / `Complete` issued a Status that
-    /// was added to the given wait group. Plans pair this with a
-    /// matching `Msg::Wait { group }`.
-    Status {
-        /// Wait group the Status was added to.
-        group: String,
-    },
-    /// `Read` produced a reading per signal. Same shape as the engine
-    /// stored into the bundler.
-    Reading {
-        /// `field_name` → `ReadingValue`.
-        data: HashMap<String, crate::core::reading::ReadingValue>,
-    },
-    /// `Locate` produced a setpoint + readback pair.
-    Location {
-        /// Where the device was last requested to move.
-        setpoint: f64,
-        /// Where the device currently is.
-        readback: f64,
-    },
-    /// `CloseRun` finished. Engine reports the exit status it just
-    /// emitted in the RunStop document.
-    CloseRun {
-        /// `success` / `abort` / `fail` / etc.
-        exit_status: String,
-    },
-    /// `Msg::Input` produced a string from the configured handler.
-    Input {
-        /// The user's response.
-        text: String,
-    },
-    /// `Msg::ReClass` — the engine identifies itself.
-    EngineClass {
-        /// Stable identifier — `"bsrs.RunEngine"`.
-        name: &'static str,
-    },
-    /// `Msg::Subscribe` returned an id; pair with `Msg::Unsubscribe`
-    /// to remove early. Otherwise the engine drops it at run end.
-    SubscriptionId {
-        /// Stable subscription id.
-        id: SubscriptionId,
-    },
-}
-
-/// Final state of a finished run.
-#[derive(Debug, Clone)]
+/// Not `Clone`: [`exception`](Self::exception) holds a [`BsrsError`], which is
+/// not `Clone` (it wraps non-`Clone` sources such as `serde_json::Error`).
+#[derive(Debug)]
 pub struct RunResult {
-    /// Run start UID, if a run was opened.
-    pub run_uid: Option<String>,
+    /// Every `RunStart` UID opened during this call, in the order the runs
+    /// opened. Empty if the plan opened no run. bluesky
+    /// `RunEngineResult.run_start_uids`.
+    pub run_uids: Vec<String>,
     /// Final exit status (`success` / `abort` / `fail` / `halt` / `no-run`).
     pub exit_status: String,
+    /// `true` unless the plan ran to a clean completion — i.e. it was stopped,
+    /// aborted, halted, or failed. bluesky `RunEngineResult.interrupted`.
+    pub interrupted: bool,
+    /// Text reason for an abort/halt/stop, or the failure's error message;
+    /// empty when the plan completed cleanly. bluesky `RunEngineResult.reason`.
+    pub reason: String,
+    /// The error that failed the run, if any — `Some` only on the `fail` path,
+    /// `None` on success/abort/halt. bluesky `RunEngineResult.exception`.
+    pub exception: Option<BsrsError>,
 }
 
 /// Per-call options for [`RunEngine::run_async_with`]. Mirrors
@@ -245,8 +200,15 @@ struct WaitGroup {
     members: Vec<Status>,
 }
 
-/// Optional pre/post-suspend plan injection (placeholder for M4+).
-pub type SuspendCallback = Box<dyn FnOnce() -> Plan + Send + Sync>;
+/// Factory for a suspender `pre_plan` / `post_plan` — an injected plan run
+/// when the engine enters (`pre_plan`) or leaves (`post_plan`) a suspension.
+/// It is a factory (not a bare [`Plan`]) so a fresh message stream is produced
+/// each time a suspension fires, mirroring bluesky's `pre_plan` / `post_plan`
+/// (`run_engine.py:1199`), which are generator callables re-invoked per
+/// suspend. The produced plan's messages run through the *same* handlers as the
+/// main plan — so a `pre_plan` can e.g. close a shutter (real `Set`/`Wait`) and
+/// emit documents before the wait, and `post_plan` can re-open it on resume.
+pub type SuspendCallback = Arc<dyn Fn() -> Plan + Send + Sync>;
 
 /// The RunEngine.
 pub struct RunEngine {
@@ -263,6 +225,16 @@ pub struct RunEngine {
     /// engine is actually paused instead of busy-looping a resume —
     /// distinct from `permit` (which wakes the *plan* loop on resume).
     pause_notify: Arc<Notify>,
+    /// Injected plan factories for the currently-requested suspension, set by
+    /// [`Self::suspend_until_with_plans`] *before* the pause takes effect. The
+    /// pause gate in `next_msg` takes `pending_pre_plan` right after
+    /// `on_pause_enter` (before the suspend wait) and `pending_post_plan` right
+    /// after `on_resume` (before the rewind replay), driving each produced plan
+    /// through the engine handlers. A plain `StdMutex` (not the async `state`
+    /// lock) so the synchronous `suspend_until_with_plans` can store them before
+    /// `mark_paused` without an await. Mirrors bluesky pre/post_plan injection.
+    pending_pre_plan: StdMutex<Option<SuspendCallback>>,
+    pending_post_plan: StdMutex<Option<SuspendCallback>>,
     is_running: AtomicBool,
     deferred_pause: AtomicBool,
     is_aborting: AtomicBool,
@@ -341,20 +313,15 @@ pub struct RunEngine {
 
 #[derive(Default)]
 struct EngineState {
-    bundler: Option<RunBundler>,
+    /// Open runs keyed by run key (`None` = the single default run). The bsrs
+    /// analogue of bluesky's `_run_bundlers: dict[run_key, RunBundler]`
+    /// (run_engine.py:504): several runs can be open at once, each owning its
+    /// own bundler, monitors, uncollected flyers and asset cache (see
+    /// [`RunSlot`]). A `Msg::InRun { run, .. }` routes a bundler-touching verb
+    /// to `Some(run)`; an unwrapped verb targets `None`. Empty = no run open.
+    runs: HashMap<Option<String>, RunSlot>,
     groups: HashMap<String, WaitGroup>,
     staged: Vec<Arc<dyn crate::core::msg::StageableObj>>,
-    /// Live monitor pumps, keyed by the monitored object's name (`obj.name()`)
-    /// — the identity `Msg::Unmonitor(obj)` carries — independent of the
-    /// descriptor stream name. The `MonitorTask` drops the `Subscription` (RAII
-    /// unsubscribe) and aborts the pump on `Drop`. Inserted by `Msg::Monitor`,
-    /// removed by `Msg::Unmonitor`.
-    monitor_tasks: HashMap<String, MonitorTask>,
-    /// Active monitor registrations, keyed by `obj.name()` like `monitor_tasks`
-    /// — the persistent record (obj + stream) that outlives the pump. Kept
-    /// across a pause so resume can re-install the pump; cleared by
-    /// `Msg::Unmonitor` and at run close. bluesky's `_monitor_params`.
-    monitored: HashMap<String, MonitorSpec>,
     /// Movables touched by `Msg::Set` during this run, keyed by name
     /// for dedup. Engine walks this on pause / cleanup and calls
     /// `MovableObj::stop_on_pause(success=true)`. Mirrors bluesky's
@@ -372,10 +339,112 @@ struct EngineState {
     /// bluesky's `_temp_callback_ids` — entries are removed
     /// automatically when the run ends.
     temp_subscribers: Vec<SubscriptionId>,
+    /// Active `contingency_wrapper` error sinks, innermost last (a LIFO stack).
+    /// While non-empty, a message error is written into the top sink (as its
+    /// `Display` string) and the run keeps going, rather than failing — so the
+    /// wrapper that pushed it can run its `except`/`finally` recovery and decide
+    /// whether to re-raise via `Msg::Fail`. Pushed by `Msg::PushContingency`,
+    /// popped by `Msg::PopContingency`; the equivalent of the exception
+    /// propagating to the nearest enclosing generator `try` in bluesky.
+    contingency_stack: Vec<crate::core::msg::ContingencySink>,
     msg_cache: VecDeque<Msg>,
     replay_queue: VecDeque<Msg>,
     rewindable: bool,
     suspenders: HashMap<u64, SuspenderHandle>,
+}
+
+/// All state owned by one open run, keyed in [`EngineState::runs`] by run key.
+/// The bsrs analogue of one bluesky `RunBundler` plus the per-run engine-side
+/// registries that in bsrs live beside the bundler. Grouping them here is what
+/// makes multiple runs coexist: routing a `Msg::InRun { run, .. }` selects one
+/// `RunSlot`, so its documents, monitors, flyers and assets never bleed into
+/// another open run. Created in [`RunEngine::open_run`]; removed in
+/// [`RunEngine::close_run_if_open`].
+struct RunSlot {
+    /// The run's document composer (RunStart/Descriptor/Event/RunStop, sequence
+    /// counters, config caches). Bluesky's `RunBundler`.
+    bundler: RunBundler,
+    /// Read objects in this run's current event bundle that also write external
+    /// assets ([`ReadableObj::writes_external_assets`]). Populated on `Msg::Read`
+    /// while bundling; drained on `Msg::Save` (their `collect_asset_docs_dyn`
+    /// emits `StreamResource`/`StreamDatum` stamped with the bundle's
+    /// descriptor); cleared when the bundle ends (`Save`/`Drop`/`rewind`) or a
+    /// new one begins (`Create`). Bluesky's per-bundle `_asset_docs_cache`
+    /// (bundlers.py:158), reset on `create`.
+    ///
+    /// [`ReadableObj::writes_external_assets`]: crate::core::msg::ReadableObj::writes_external_assets
+    bundle_asset_objs: Vec<Arc<dyn crate::core::msg::ReadableObj>>,
+    /// Live monitor pumps for this run, keyed by the monitored object's name
+    /// (`obj.name()`) — the identity `Msg::Unmonitor(obj)` carries — independent
+    /// of the descriptor stream name. The `MonitorTask` drops the `Subscription`
+    /// (RAII unsubscribe) and aborts the pump on `Drop`. Inserted by
+    /// `Msg::Monitor`, removed by `Msg::Unmonitor`.
+    monitor_tasks: HashMap<String, MonitorTask>,
+    /// Active monitor registrations for this run, keyed by `obj.name()` like
+    /// `monitor_tasks` — the persistent record (obj + stream) that outlives the
+    /// pump. Kept across a pause so resume can re-install the pump; cleared by
+    /// `Msg::Unmonitor` and at run close. bluesky's `_monitor_params`.
+    monitored: HashMap<String, MonitorSpec>,
+    /// Flyers kicked off into this run but not yet collected — the collectable
+    /// view of every `Msg::Kickoff` object that exposes one
+    /// ([`FlyableObj::as_collectable`]), keyed by name. An entry is removed when
+    /// the object is collected (`Msg::Collect`). At run finalize the engine
+    /// drains whatever remains so a flyer aborted between kickoff and collect
+    /// still lands its buffered data before RunStop. Mirrors bluesky's
+    /// `_uncollected` set + `backstop_collect` (bundlers.py:172, 1190).
+    uncollected: HashMap<String, Arc<dyn crate::core::msg::CollectableObj>>,
+}
+
+impl RunSlot {
+    /// A fresh slot wrapping `bundler`, with empty per-run registries.
+    fn new(bundler: RunBundler) -> Self {
+        Self {
+            bundler,
+            bundle_asset_objs: Vec::new(),
+            monitor_tasks: HashMap::new(),
+            monitored: HashMap::new(),
+            uncollected: HashMap::new(),
+        }
+    }
+}
+
+impl EngineState {
+    /// The [`RunSlot`] for `run` (`None` = default run), if that run is open.
+    fn run(&self, run: &Option<String>) -> Option<&RunSlot> {
+        self.runs.get(run)
+    }
+
+    /// Mutable [`RunSlot`] for `run`, if open.
+    fn run_mut(&mut self, run: &Option<String>) -> Option<&mut RunSlot> {
+        self.runs.get_mut(run)
+    }
+
+    /// This run's bundler, if the run is open.
+    fn bundler(&self, run: &Option<String>) -> Option<&RunBundler> {
+        self.runs.get(run).map(|s| &s.bundler)
+    }
+
+    /// This run's bundler mutably, if open.
+    fn bundler_mut(&mut self, run: &Option<String>) -> Option<&mut RunBundler> {
+        self.runs.get_mut(run).map(|s| &mut s.bundler)
+    }
+
+    /// Whether `run` is currently open.
+    fn run_open(&self, run: &Option<String>) -> bool {
+        self.runs.contains_key(run)
+    }
+
+    /// Whether any run at all is open.
+    fn any_run_open(&self) -> bool {
+        !self.runs.is_empty()
+    }
+
+    /// Whether any open run has an event bundle in flight (between `create` and
+    /// `save`). bluesky rejects `checkpoint`/`configure` when any bundler is
+    /// bundling (run_engine.py:2437, 2515).
+    fn any_bundling(&self) -> bool {
+        self.runs.values().any(|s| s.bundler.is_bundling())
+    }
 }
 
 /// One live monitor pump. Drops abort the pump task and (transitively)
@@ -401,6 +470,135 @@ struct MonitorSpec {
     stream: String,
 }
 
+/// Read one object's configuration into the descriptor's per-object
+/// [`Configuration`] shape — values/timestamps from `read_configuration`,
+/// keys from `describe_configuration`. bluesky `_StreamCache.cache_read_config`
+/// + `_cache_describe_config` (bundlers.py:109-130).
+async fn read_object_configuration(
+    obj: &dyn crate::core::msg::ConfigurableObj,
+) -> Result<crate::event_model::Configuration, BsrsError> {
+    let (readings, data_keys) = tokio::join!(
+        obj.read_configuration_dyn(),
+        obj.describe_configuration_dyn()
+    );
+    let (readings, data_keys) = (readings?, data_keys?);
+    let mut data = HashMap::new();
+    let mut timestamps = HashMap::new();
+    for (k, r) in readings {
+        data.insert(k.clone(), r.value);
+        timestamps.insert(k, r.timestamp);
+    }
+    Ok(crate::event_model::Configuration {
+        data,
+        data_keys,
+        timestamps,
+    })
+}
+
+/// Validate + stamp one drain of external-asset documents, the engine-owned
+/// half of every `StreamResource`/`StreamDatum` emission. Port of bluesky
+/// `_pack_external_assets` + `_pack_seq_nums_into_stream_datum`
+/// (bundlers.py:830-940):
+///
+/// - `StreamResource`: run_start stamped (single owner: the engine); a uid
+///   emitted twice in one run is an error; its `data_key` must be one of the
+///   descriptor's external (`STREAM:`) keys and is recorded in the run's
+///   `resource_data_keys` registry.
+/// - `StreamDatum`: must reference a registered resource uid; must arrive
+///   with `seq_nums {0, 0}` (the sequence counter belongs to the run, never
+///   the writer); every datum in one drain must span the same indices width
+///   (detectors in a stream advance together); `seq_nums` is filled with
+///   `[next_seq, next_seq + width)`.
+/// - After the drain: if any datum arrived, every external data key of the
+///   descriptor must have received one — a writer silently dropping one of
+///   its datasets desyncs the stream.
+///
+/// Returns the shared indices width (0 when the drain holds no datums).
+fn pack_external_assets(
+    docs: &mut [Document],
+    run_start: &str,
+    next_seq: u64,
+    external_data_keys: &[String],
+    resource_data_keys: &mut HashMap<String, String>,
+) -> Result<u64, BsrsError> {
+    let mut width: Option<u64> = None;
+    let mut data_keys_received: std::collections::HashSet<String> = Default::default();
+    for doc in docs.iter_mut() {
+        match doc {
+            Document::StreamResource(r) => {
+                if r.run_start.is_none() {
+                    r.run_start = Some(run_start.to_string());
+                }
+                if resource_data_keys.contains_key(&r.uid) {
+                    return Err(BsrsError::Plan(format!(
+                        "Received `stream_resource` with uid {} twice",
+                        r.uid
+                    )));
+                }
+                if !external_data_keys.contains(&r.data_key) {
+                    return Err(BsrsError::Plan(format!(
+                        "Received a `stream_resource` with data_key {} that is \
+                         not in the descriptor 'STREAM:' data_keys \
+                         {external_data_keys:?}",
+                        r.data_key
+                    )));
+                }
+                resource_data_keys.insert(r.uid.clone(), r.data_key.clone());
+            }
+            Document::StreamDatum(d) => {
+                if d.seq_nums.start != 0 || d.seq_nums.stop != 0 {
+                    return Err(BsrsError::Plan(format!(
+                        "StreamDatum {} arrived with pre-filled seq_nums \
+                         [{}, {}); the run engine owns the sequence counter and \
+                         writers must emit seq_nums {{0, 0}}",
+                        d.uid, d.seq_nums.start, d.seq_nums.stop
+                    )));
+                }
+                let Some(data_key) = resource_data_keys.get(&d.stream_resource) else {
+                    return Err(BsrsError::Plan(format!(
+                        "Received a `stream_datum` referring to an unknown \
+                         stream resource {}",
+                        d.stream_resource
+                    )));
+                };
+                data_keys_received.insert(data_key.clone());
+                let w = d.indices.stop.saturating_sub(d.indices.start);
+                match width {
+                    None => width = Some(w),
+                    Some(prev) if prev != w => {
+                        return Err(BsrsError::Plan(format!(
+                            "StreamDatum {} spans {w} indices but another datum \
+                             in the same drain spans {prev}; every detector in a \
+                             stream must advance by the same number of indices",
+                            d.uid
+                        )));
+                    }
+                    Some(_) => {}
+                }
+                d.seq_nums = crate::event_model::StreamRange {
+                    start: next_seq,
+                    stop: next_seq + w,
+                };
+            }
+            _ => {}
+        }
+    }
+    if !data_keys_received.is_empty()
+        && (external_data_keys.len() != data_keys_received.len()
+            || !external_data_keys
+                .iter()
+                .all(|k| data_keys_received.contains(k)))
+    {
+        return Err(BsrsError::Plan(format!(
+            "Received `stream_datum` for the data keys {data_keys_received:?}, \
+             but the descriptor's 'STREAM:' data keys are \
+             {external_data_keys:?}; every external data key must receive a \
+             `stream_datum` in the same drain"
+        )));
+    }
+    Ok(width.unwrap_or(0))
+}
+
 impl RunEngine {
     /// Construct a fresh RunEngine with the given sinks.
     pub fn new(sinks: Vec<Arc<dyn DocumentSink>>) -> Self {
@@ -410,6 +608,8 @@ impl RunEngine {
             permit: Arc::new(Notify::new()),
             is_paused: Arc::new(AtomicBool::new(false)),
             pause_notify: Arc::new(Notify::new()),
+            pending_pre_plan: StdMutex::new(None),
+            pending_post_plan: StdMutex::new(None),
             is_running: AtomicBool::new(false),
             deferred_pause: AtomicBool::new(false),
             is_aborting: AtomicBool::new(false),
@@ -489,12 +689,32 @@ impl RunEngine {
 
     /// Async entry point — drive a plan to completion.
     pub async fn run_async(&self, plan: Plan) -> Result<RunResult> {
-        // before_plan hook — runs before is_running flips on, so it sees
-        // EngineRunState::Idle.
+        // Enforce the single-plan invariant by construction: at most one plan
+        // runs on a RunEngine at a time. `compare_exchange(false → true)` both
+        // claims the engine and rejects a *concurrent* `run_async` — e.g. a
+        // local console `RE:run` firing while the qs queue worker is mid-plan
+        // (or vice versa), which would otherwise corrupt the single shared run
+        // loop (pause gate, permit, replay queue, `runs` map). The claim is
+        // released at run end (`is_running.store(false)` below); there is no
+        // early return between claim and release, so the flag never leaks. A
+        // rejection here has zero side effects: the `before_plan` hook and every
+        // state reset are skipped, so a rejected caller leaves the in-flight
+        // run untouched.
+        if self
+            .is_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(BsrsError::State(
+                "a plan is already running on this RunEngine".into(),
+            ));
+        }
+        // before_plan hook — fires only once the engine has claimed the run, so
+        // it never fires for a rejected concurrent call. `state()` reports
+        // `Running` during the hook.
         if let Some(h) = self.before_plan.lock().unwrap().clone() {
             h();
         }
-        self.is_running.store(true, Ordering::SeqCst);
         // Reset abort/halt/stop flags from a previous (terminated) run so
         // `RunEngine` is reusable across plans.
         self.is_aborting.store(false, Ordering::SeqCst);
@@ -528,6 +748,33 @@ impl RunEngine {
             }
             p
         };
+        // ENG-12: honor suspenders that are already tripped at plan start.
+        // bluesky's `__call__` collects every currently-tripped suspender's
+        // clear-future and prepends a `wait_for` before the plan, so a scan
+        // never runs its first point while a condition (e.g. beam down) is bad
+        // (run_engine.py:933-967). Gather the tripped futures from the
+        // installed suspenders, log the justifications, and wait for all to
+        // clear before entering the run loop. A non-tripped suspender returns
+        // `None`, so a clear engine starts immediately. This runs *outside* the
+        // loop_timeout below because, like bluesky, waiting for beam is
+        // intentionally unbounded.
+        let tripped: Vec<(String, BoxFuture<'static, ()>)> = {
+            let state = self.state.lock().await;
+            state
+                .suspenders
+                .values()
+                .filter_map(|h| h.inner.tripped().map(|f| (h.inner.name().to_string(), f)))
+                .collect()
+        };
+        if !tripped.is_empty() {
+            let names: Vec<&str> = tripped.iter().map(|(n, _)| n.as_str()).collect();
+            tracing::warn!(
+                "at least one suspender is tripped; waiting to start: {}",
+                names.join(", ")
+            );
+            futures::future::join_all(tripped.into_iter().map(|(_, f)| f)).await;
+        }
+
         let timeout = *self.loop_timeout.lock().unwrap();
         let outcome = match timeout {
             Some(d) => match tokio::time::timeout(d, self.run_loop(plan)).await {
@@ -546,11 +793,21 @@ impl RunEngine {
         let staged = std::mem::take(&mut state.staged);
         let movables = std::mem::take(&mut state.movable_objs_touched);
         let flyables = std::mem::take(&mut state.flyable_objs_touched);
+        // Drop every run's slot. `drain_and_close` already closed all runs at
+        // finalize (draining each `uncollected` via `backstop_collect` before its
+        // RunStop and removing the slot), so this normally takes an empty map; it
+        // is the defensive backstop for a slot that survived — dropping it aborts
+        // that run's monitor pumps (K1: `monitor_tasks`), drops its monitor
+        // registry (`monitored` — run over, no resume) and any un-drained
+        // `uncollected`, so nothing leaks into the next run.
+        let _ = std::mem::take(&mut state.runs);
+        // A run that ends with a contingency region still on the stack (e.g. an
+        // abort tore the wrapper down before its PopContingency) must not leak
+        // it into the next run.
+        let _ = std::mem::take(&mut state.contingency_stack);
         let temp_subs = std::mem::take(&mut state.temp_subscribers);
         let _ = std::mem::take(&mut state.pausables);
         let _ = std::mem::take(&mut state.suspenders); // Drop aborts watchers
-        let _ = std::mem::take(&mut state.monitor_tasks); // K1: monitor pumps
-        let _ = std::mem::take(&mut state.monitored); // K1: monitor registry — run over, no resume
         drop(state);
         // Bluesky `_temp_callback_ids` parity: subscribers added via
         // `Msg::Subscribe` or run_async_with's `subs` arg are removed
@@ -588,11 +845,13 @@ impl RunEngine {
     /// Lua coroutine bridge surfaces this as the `coroutine.yield`
     /// return value for `msg.open_run`).
     pub async fn current_run_uid(&self) -> Option<String> {
-        self.state
-            .lock()
-            .await
-            .bundler
-            .as_ref()
+        let state = self.state.lock().await;
+        // The default (unkeyed) run is what a plain `Msg::OpenRun` opens and what
+        // the Lua bridge's `msg.open_run` return surfaces; fall back to any open
+        // run so a keyed-only plan still gets a UID.
+        state
+            .bundler(&None)
+            .or_else(|| state.runs.values().next().map(|s| &s.bundler))
             .map(|b| b.start_uid.clone())
     }
 
@@ -801,6 +1060,29 @@ impl RunEngine {
         fut: BoxFuture<'static, ()>,
         justification: Option<String>,
     ) {
+        self.suspend_until_with_plans(fut, justification, None, None);
+    }
+
+    /// Like [`Self::suspend_until_with`] but injects `pre_plan` on suspension
+    /// (after motors stop, before the wait) and `post_plan` on resume (after
+    /// Pausable devices re-notify, before the rewind replay). Mirrors bluesky's
+    /// `request_suspend(fut, pre_plan=…, post_plan=…)` (`run_engine.py:1199`):
+    /// close a shutter before parking, re-open it on resume. Each factory is a
+    /// [`SuspendCallback`]; its plan's messages run through the same handlers as
+    /// the main plan (real device motion + document emission), *not* as opaque
+    /// side-effects. `None` for either leaves that phase unchanged.
+    pub fn suspend_until_with_plans(
+        self: &Arc<Self>,
+        fut: BoxFuture<'static, ()>,
+        justification: Option<String>,
+        pre_plan: Option<SuspendCallback>,
+        post_plan: Option<SuspendCallback>,
+    ) {
+        // Store the injected plans BEFORE `mark_paused` flips `is_paused`: the
+        // pause gate reads them the moment it observes the pause, so a store
+        // that raced after `mark_paused` could be missed on a fast pause entry.
+        *self.pending_pre_plan.lock().unwrap() = pre_plan;
+        *self.pending_post_plan.lock().unwrap() = post_plan;
         self.mark_paused();
         let me = Arc::downgrade(self);
         let label = justification.unwrap_or_else(|| "suspended".into());
@@ -959,9 +1241,229 @@ impl RunEngine {
 
     // -- main loop ----------------------------------------------------------
 
+    /// Collect one collectable object into the open run: declare any new
+    /// stream(s), emit their stream-asset docs, then emit the per-collect
+    /// events. Sole owner of the collect path — driven by `Msg::Collect` and by
+    /// [`Self::backstop_collect`] at finalize. On success the object is removed
+    /// from the uncollected set so the finalize backstop does not re-drain it.
+    async fn collect_object(
+        &self,
+        run_key: &Option<String>,
+        obj: Arc<dyn crate::core::msg::CollectableObj>,
+        stream_name: Option<String>,
+    ) -> Result<()> {
+        // Open-run precondition, checked before the device is described.
+        // bluesky's _collect rejects a collect with no open run at the top
+        // (run_engine.py:2201-2206) *before* current_run.collect() runs
+        // describe_collect. bsrs called describe_collect_dyn before its
+        // bundler check below, so a collect with no open run did a wasted
+        // device describe round-trip before erroring. Gate it here,
+        // mirroring the Read path which describes only when bundling. The
+        // later `ok_or_else` checks stay as defense for the bundler being
+        // cleared mid-await (a pause landing while collect_dyn is awaiting).
+        {
+            let state = self.state.lock().await;
+            if !state.run_open(run_key) {
+                return Err(BsrsError::Plan(
+                    "A 'collect' message was sent but no run is open".into(),
+                ));
+            }
+        }
+        let descs = obj.describe_collect_dyn().await?;
+        // The collect object's configuration, for any descriptor
+        // declared below — bluesky's collect path runs
+        // `ensure_cached(obj)` + `_prepare_stream`, which folds the
+        // object's config into the descriptor (bundlers.py:814-819).
+        let config = self
+            .ensure_object_configuration(run_key, obj.name(), obj.as_configurable())
+            .await?;
+        let new_descriptors: Vec<crate::event_model::EventDescriptor> = {
+            let mut state = self.state.lock().await;
+            let bundler = state
+                .bundler_mut(run_key)
+                .ok_or_else(|| BsrsError::Plan("Collect with no open run".into()))?;
+            let mut out = Vec::new();
+            for (name, dks) in &descs {
+                if bundler.descriptor_uid(name).is_none() {
+                    let configuration = HashMap::from([(obj.name().to_string(), config.clone())]);
+                    out.push(bundler.declare_stream(name.clone(), dks.clone(), configuration)?);
+                }
+            }
+            out
+        };
+        for descriptor in new_descriptors {
+            self.broadcast(&Document::Descriptor(descriptor)).await?;
+        }
+        // Emit the writer's StreamResource/StreamDatum, stamped with the
+        // collect stream's just-composed EventDescriptor UID, so stream
+        // data links back to its descriptor (CBEM-13). StandardDetector
+        // collects into a single stream; pass that stream's descriptor.
+        let (collect_stream, collect_descriptor) = {
+            let state = self.state.lock().await;
+            let bundler = state.bundler(run_key).ok_or_else(|| {
+                BsrsError::Plan("Collect lost open run before stream docs".into())
+            })?;
+            let stream = descs.keys().next().cloned();
+            (
+                stream.clone(),
+                stream.and_then(|s| bundler.descriptor_uid(&s)),
+            )
+        };
+        if let Some(descriptor_uid) = collect_descriptor {
+            let mut asset_docs = obj.collect_stream_docs_dyn(&descriptor_uid).await?;
+            if !asset_docs.is_empty() {
+                // Validate + stamp the drain, fill the datums'
+                // seq_nums from the stream's counter, and advance it
+                // by the indices width: no per-frame Event exists on
+                // this path to advance it ("we do it ourselves",
+                // bluesky bundlers.py:1180). The summary index event
+                // composed below then lands after the datum span,
+                // keeping one monotonic sequence axis.
+                let stream = collect_stream
+                    .as_deref()
+                    .expect("descriptor_uid implies a collect stream name");
+                let mut state = self.state.lock().await;
+                let bundler = state.bundler_mut(run_key).ok_or_else(|| {
+                    BsrsError::Plan("Collect lost open run before stream docs".into())
+                })?;
+                let next_seq = bundler.compose().peek_next_seq(stream).ok_or_else(|| {
+                    BsrsError::Plan(format!(
+                        "Collect stream `{stream}` has a descriptor but \
+                         no sequence counter"
+                    ))
+                })?;
+                let external_keys = bundler
+                    .compose()
+                    .external_data_keys(stream)
+                    .unwrap_or_default();
+                let run_start = bundler.start_uid.clone();
+                let width = pack_external_assets(
+                    &mut asset_docs,
+                    &run_start,
+                    next_seq,
+                    &external_keys,
+                    bundler.stream_resource_data_keys_mut(),
+                )?;
+                if width > 0 {
+                    bundler.compose().advance_seq(stream, width);
+                }
+                drop(state);
+                for doc in asset_docs {
+                    self.broadcast(&doc).await?;
+                }
+            }
+        }
+        let events = obj.collect_dyn().await?;
+        for (name, data, timestamps) in events {
+            let stream = stream_name.clone().unwrap_or(name);
+            let ev = {
+                let state = self.state.lock().await;
+                let bundler = state.bundler(run_key).ok_or_else(|| {
+                    BsrsError::Plan(
+                        "Collect lost open run mid-process (bundler cleared while \
+                         collect_dyn was awaiting)"
+                            .into(),
+                    )
+                })?;
+                bundler
+                    .compose()
+                    .event(&stream, data, timestamps)
+                    .ok_or_else(|| BsrsError::Plan("event for unknown stream".into()))?
+            };
+            self.broadcast(&Document::Event(ev)).await?;
+        }
+        // Collected: drop it from this run's uncollected set so the finalize
+        // backstop will not drain it a second time. bluesky
+        // `_uncollected.discard(obj)` (bundlers.py:1090).
+        if let Some(slot) = self.state.lock().await.run_mut(run_key) {
+            slot.uncollected.remove(obj.name());
+        }
+        Ok(())
+    }
+
+    /// Before a run closes, drain any flyer that was kicked off but never
+    /// explicitly collected, so its buffered data lands in the run rather than
+    /// being lost. Mirrors bluesky's `RunBundler.backstop_collect`
+    /// (bundlers.py:1190), called from the `_run` finally on every exit path
+    /// (run_engine.py:1777). Runs only while the run is still open, and swallows
+    /// per-object errors — "some might not support partial collection".
+    async fn backstop_collect(&self) {
+        // Every open run's uncollected flyers, paired with the run key so each
+        // drains into its own bundler. bluesky iterates `_run_bundlers`
+        // (run_engine.py:1777).
+        let pending: Vec<(Option<String>, Arc<dyn crate::core::msg::CollectableObj>)> = {
+            let state = self.state.lock().await;
+            state
+                .runs
+                .iter()
+                .flat_map(|(run, slot)| {
+                    slot.uncollected
+                        .values()
+                        .cloned()
+                        .map(move |obj| (run.clone(), obj))
+                })
+                .collect()
+        };
+        for (run, obj) in pending {
+            let name = obj.name().to_string();
+            if let Err(e) = self.collect_object(&run, obj, None).await {
+                tracing::warn!("backstop collect failed for flyer {name}: {e}");
+            }
+        }
+    }
+
+    /// Drain uncollected flyers, then close *every* open run with
+    /// `status`/`reason`. The single finalize path for `run_loop`: bluesky runs
+    /// `backstop_collect` immediately before closing each run in its `_run`
+    /// finally (run_engine.py:1777, 1789), so every run — success or abort —
+    /// emits its flyer data before the RunStop that ends it. Runs left open by a
+    /// plan that never issued `CloseRun` are all closed here.
+    async fn drain_and_close(&self, status: &str, reason: Option<String>) -> Result<()> {
+        self.backstop_collect().await;
+        let open_keys: Vec<Option<String>> = self.state.lock().await.runs.keys().cloned().collect();
+        for key in open_keys {
+            self.close_run_if_open(&key, status, reason.clone()).await?;
+        }
+        Ok(())
+    }
+
+    /// Assemble the [`RunResult`], deriving `interrupted` and `reason` from the
+    /// engine's terminal state. `exception` is `Some` only on the failure path;
+    /// its message then supplies `reason`, otherwise the caller-set abort/halt/
+    /// stop reason ([`stop_reason`](Self::stop_reason)) does.
+    fn build_result(
+        &self,
+        run_uids: Vec<String>,
+        exit_status: String,
+        exception: Option<BsrsError>,
+    ) -> RunResult {
+        // Interrupted = anything but a clean run to completion. bluesky sets
+        // `_interrupted` on pause/stop/abort/halt/fail; a natural end leaves it
+        // false. (Pause returns before a result is built, so it is not tested
+        // here.)
+        let interrupted = exit_status == "fail"
+            || self.is_halting.load(Ordering::SeqCst)
+            || self.is_stopping.load(Ordering::SeqCst)
+            || self.is_aborting.load(Ordering::SeqCst);
+        let reason = match &exception {
+            Some(e) => e.to_string(),
+            None => self.stop_reason().unwrap_or_default(),
+        };
+        RunResult {
+            run_uids,
+            exit_status,
+            interrupted,
+            reason,
+            exception,
+        }
+    }
+
     async fn run_loop(&self, plan: Plan) -> Result<RunResult> {
         let plan = Mutex::new(plan);
-        let mut run_uid: Option<String> = None;
+        // Every RunStart UID opened during this call, in open order (bluesky
+        // accumulates `_run_start_uids` in `_open_run`); `handle` returns a UID
+        // exactly once per `Msg::OpenRun`, so no de-duplication is needed.
+        let mut run_uids: Vec<String> = Vec::new();
         let mut exit_status = String::from("no-run");
 
         let resolve_exit = |this: &Self, current: &mut String| {
@@ -975,8 +1477,8 @@ impl RunEngine {
         };
 
         loop {
-            let msg = match self.next_msg(&plan).await {
-                Some(m) => m,
+            let (msg, responder) = match self.next_msg(&plan).await {
+                Some(pair) => pair,
                 None => {
                     resolve_exit(self, &mut exit_status);
                     break;
@@ -1000,17 +1502,45 @@ impl RunEngine {
                 h(&msg);
             }
             match self.handle(msg).await {
-                Ok(Some(uid)) => run_uid = Some(uid),
+                Ok(Some(uid)) => run_uids.push(uid),
                 Ok(None) => {}
                 Err(e) => {
+                    // If a `contingency_wrapper` region is active, route the
+                    // error into its innermost sink and keep running instead of
+                    // failing the run. The wrapper reads the sink right after it
+                    // forwarded the offending message, runs its `except`/`finally`
+                    // recovery, and re-raises via `Msg::Fail` if it chooses to.
+                    // This is bsrs's stand-in for an exception surfacing at a
+                    // generator `yield` inside a Python `try` block.
+                    let routed = {
+                        let state = self.state.lock().await;
+                        match state.contingency_stack.last() {
+                            Some(sink) => {
+                                *sink.lock().unwrap() = Some(format!("{e}"));
+                                true
+                            }
+                            None => false,
+                        }
+                    };
+                    if routed {
+                        tracing::debug!("plan error routed to contingency: {e}");
+                        continue;
+                    }
                     tracing::error!("plan error: {e}");
                     exit_status = "fail".into();
-                    self.close_run_if_open("fail", Some(format!("{e}"))).await?;
-                    return Ok(RunResult {
-                        run_uid,
-                        exit_status,
-                    });
+                    self.drain_and_close("fail", Some(format!("{e}"))).await?;
+                    // Move the error itself into the result so callers can match
+                    // on its variant (bluesky's `RunEngineResult.exception`).
+                    return Ok(self.build_result(run_uids, exit_status, Some(e)));
                 }
+            }
+            // Hand the engine's result back to a `Respond`-issuing plan so it can
+            // branch on it inline (e.g. `collect_while_completing` looping on the
+            // `Wait` done-flag). Reached only after a successful `handle`; on
+            // error the sender is dropped and the plan observes `Err(RecvError)`.
+            // A dropped receiver (plan already advanced) is equally fine to drop.
+            if let Some(tx) = responder {
+                let _ = tx.send(self.take_msg_result());
             }
         }
 
@@ -1021,45 +1551,63 @@ impl RunEngine {
             // not a hardcoded string — bluesky threads `_reason` onto the stop
             // document (run_engine.py:1792).
             let reason = self.stop_reason();
-            self.close_run_if_open(&exit_status, reason).await?;
-            return Ok(RunResult {
-                run_uid,
-                exit_status,
-            });
+            self.drain_and_close(&exit_status, reason).await?;
+            return Ok(self.build_result(run_uids, exit_status, None));
         }
         if exit_status == "success" && self.is_stopping.load(Ordering::SeqCst) {
             // `stop()` sets no reason, so this resolves to `None` (bluesky's
             // default `_reason = ""`), not a hardcoded "user-requested stop".
-            self.close_run_if_open("success", self.stop_reason())
-                .await?;
-            return Ok(RunResult {
-                run_uid,
-                exit_status,
-            });
+            self.drain_and_close("success", self.stop_reason()).await?;
+            return Ok(self.build_result(run_uids, exit_status, None));
         }
 
         // Normal exit: close any open run as success.
-        let still_open = self.state.lock().await.bundler.is_some();
+        let still_open = self.state.lock().await.any_run_open();
         if still_open {
-            self.close_run_if_open("success", None).await?;
+            self.drain_and_close("success", None).await?;
             exit_status = "success".into();
-        } else if run_uid.is_some() && exit_status == "no-run" {
+        } else if !run_uids.is_empty() && exit_status == "no-run" {
             exit_status = "success".into();
         }
 
-        Ok(RunResult {
-            run_uid,
-            exit_status,
-        })
+        Ok(self.build_result(run_uids, exit_status, None))
     }
 
     /// Pull the next message: handle pause gating, replay queue, then plan.
-    async fn next_msg(&self, plan: &Mutex<Plan>) -> Option<Msg> {
+    async fn next_msg(&self, plan: &Mutex<Plan>) -> Option<(Msg, PlanResponder)> {
         // Pause gate
         while self.is_paused.load(Ordering::SeqCst) && !self.is_aborting.load(Ordering::SeqCst) {
+            // Arm the resume notification BEFORE the (possibly slow)
+            // pause-enter + pre_plan work. `permit` is a bare `Notify` whose
+            // `notify_waiters` drops the wakeup if no waiter is registered yet,
+            // so a suspend future that resolves and calls `resume` mid-pre_plan
+            // would otherwise be lost and the engine would hang. `enable()`
+            // registers the waiter up front; the `is_paused` re-check below
+            // closes the tiny window between the loop condition and `enable()`.
+            let resumed = self.permit.notified();
+            tokio::pin!(resumed);
+            resumed.as_mut().enable();
+
             self.on_pause_enter().await;
-            self.permit.notified().await;
+            // pre_plan: run after the motor-stop / Pausable walk and before the
+            // suspend wait, driven through the same handlers as the main plan.
+            let pre = self.pending_pre_plan.lock().unwrap().take();
+            if let Some(pre) = pre {
+                self.run_injected_plan(pre()).await;
+            }
+            // Wait for resume — unless it already fired during pause-enter or
+            // pre_plan (captured by the armed `resumed`, or observed here as a
+            // cleared `is_paused` when the notify landed before `enable()`).
+            if self.is_paused.load(Ordering::SeqCst) {
+                resumed.await;
+            }
             self.on_resume().await;
+            // post_plan: run after Pausable resume + monitor restore and before
+            // the rewind replay drains, mirroring bluesky's post_plan.
+            let post = self.pending_post_plan.lock().unwrap().take();
+            if let Some(post) = post {
+                self.run_injected_plan(post()).await;
+            }
         }
         if self.is_aborting.load(Ordering::SeqCst) {
             return None;
@@ -1068,7 +1616,7 @@ impl RunEngine {
         {
             let mut state = self.state.lock().await;
             if let Some(m) = state.replay_queue.pop_front() {
-                return Some(m);
+                return Some((m, None));
             }
         }
         // Plan stream
@@ -1076,8 +1624,13 @@ impl RunEngine {
             let mut p = plan.lock().await;
             p.next().await
         };
-        let item = item?;
-        let PlanItem::Bare(m) = item;
+        let m = match item? {
+            PlanItem::Bare(m) => m,
+            // A `Respond` item carries a oneshot the engine fulfills after
+            // handling. It is never cached for rewind: the sender can't be
+            // cloned, and a resumed replay would have no channel to answer.
+            PlanItem::Respond(m, tx) => return Some((m, Some(tx))),
+        };
         // Cache if rewindable
         {
             let mut state = self.state.lock().await;
@@ -1085,7 +1638,35 @@ impl RunEngine {
                 state.msg_cache.push_back(m.clone());
             }
         }
-        Some(m)
+        Some((m, None))
+    }
+
+    /// Drive an injected suspender plan (`pre_plan` / `post_plan`) through the
+    /// engine handlers, exactly as the main plan is driven — so its `Set`/`Wait`
+    /// move real devices and any documents are emitted — but WITHOUT rewind
+    /// caching (these messages are not part of the rewindable main-plan region,
+    /// so a later resume must not replay them) and WITHOUT re-entering the pause
+    /// gate (the caller is already inside it). A failing message is logged and
+    /// ends the injection; it does not abort the run. Mirrors bluesky running
+    /// pre/post_plan messages through the same `_run` loop.
+    async fn run_injected_plan(&self, mut plan: Plan) {
+        while !self.is_aborting.load(Ordering::SeqCst) {
+            // Injected plans may also issue `Respond` items; carry the sender so
+            // an inline-result plan (e.g. a suspender that waits with a done-flag)
+            // works here too, mirroring the main loop's fulfillment.
+            let (m, responder) = match plan.next().await {
+                Some(PlanItem::Bare(m)) => (m, None),
+                Some(PlanItem::Respond(m, tx)) => (m, Some(tx)),
+                None => break,
+            };
+            if let Err(e) = self.handle(m).await {
+                tracing::warn!("suspender injected plan message failed: {e}");
+                break;
+            }
+            if let Some(tx) = responder {
+                let _ = tx.send(self.take_msg_result());
+            }
+        }
     }
 
     async fn on_pause_enter(&self) {
@@ -1094,11 +1675,14 @@ impl RunEngine {
         // can't hold the engine state locked.
         let (movables, flyables, pausables) = {
             let mut state = self.state.lock().await;
-            // Suspend monitors — drop the live pumps (releasing the backend
-            // subscriptions) but keep the `monitored` registrations, so
-            // `on_resume` re-installs them. Mirrors bluesky `suspend_monitors`
-            // (clear_sub but keep `_monitor_params`, bundlers.py:661-663).
-            state.monitor_tasks.clear();
+            // Suspend monitors on every open run — drop the live pumps
+            // (releasing the backend subscriptions) but keep the `monitored`
+            // registrations, so `on_resume` re-installs them. Mirrors bluesky
+            // `suspend_monitors` (clear_sub but keep `_monitor_params`,
+            // bundlers.py:661-663).
+            for slot in state.runs.values_mut() {
+                slot.monitor_tasks.clear();
+            }
             let movables: Vec<_> = state.movable_objs_touched.values().cloned().collect();
             let flyables: Vec<_> = state.flyable_objs_touched.values().cloned().collect();
             let pausables: Vec<_> = state.pausables.values().cloned().collect();
@@ -1149,8 +1733,14 @@ impl RunEngine {
             // open by a pause that landed mid-event so the replayed `Create`
             // does not collide with it.
             if !cache.is_empty() {
-                if let Some(b) = state.bundler.as_mut() {
-                    b.rewind();
+                // Roll back EVERY open run — a pause mid-event in any run leaves
+                // a bundle the replayed `Create` would collide with.
+                for slot in state.runs.values_mut() {
+                    slot.bundler.rewind();
+                    // The cancelled bundle's external-asset reads are replayed
+                    // from the checkpoint (which precedes the bundle's `Create`),
+                    // so drop the stale tracking to match the bundler rewind.
+                    slot.bundle_asset_objs.clear();
                 }
             }
             state.replay_queue.extend(cache);
@@ -1161,17 +1751,29 @@ impl RunEngine {
                 tracing::warn!("resume_dyn failed for {}: {e}", p.name());
             }
         }
-        // Re-install the monitors suspended on pause. Mirrors bluesky
+        // Re-install the monitors suspended on pause, per run. Mirrors bluesky
         // `restore_monitors` (re-subscribe from the kept `_monitor_params`,
         // bundlers.py:665-666). `start_monitor` is idempotent on the descriptor
         // (the stream was already declared), so this re-subscribes the device
         // and respawns the pump without re-emitting the Descriptor.
-        let specs: Vec<MonitorSpec> = {
+        let specs: Vec<(Option<String>, MonitorSpec)> = {
             let state = self.state.lock().await;
-            state.monitored.values().cloned().collect()
+            state
+                .runs
+                .iter()
+                .flat_map(|(run, slot)| {
+                    slot.monitored
+                        .values()
+                        .cloned()
+                        .map(move |spec| (run.clone(), spec))
+                })
+                .collect()
         };
-        for spec in specs {
-            if let Err(e) = self.start_monitor(spec.stream, spec.obj.clone()).await {
+        for (run, spec) in specs {
+            if let Err(e) = self
+                .start_monitor(&run, spec.stream, spec.obj.clone())
+                .await
+            {
                 tracing::warn!("restore monitor failed for {}: {e}", spec.obj.name());
             }
         }
@@ -1199,15 +1801,31 @@ impl RunEngine {
     /// snapshot, so it takes its own path.
     fn reset_checkpoint_state(state: &mut EngineState) {
         state.msg_cache.clear();
-        if let Some(b) = state.bundler.as_mut() {
-            b.reset_checkpoint_state();
+        // Snapshot every open run's sequence counters as the rewind rollback
+        // target — bluesky iterates `_run_bundlers.values()` (run_engine.py:2465).
+        for slot in state.runs.values_mut() {
+            slot.bundler.reset_checkpoint_state();
         }
     }
 
     async fn handle(&self, msg: Msg) -> Result<Option<String>> {
+        // Extract the run key once (bluesky's `msg.run`): `Msg::InRun { run, .. }`
+        // routes its inner bundler verb to `Some(run)`; every other message
+        // targets the default run `None`. `InRun` is not nestable — a wrapped
+        // `InRun` is a plan bug, rejected here rather than silently unwrapped.
+        let (run_key, msg): (Option<String>, Msg) = match msg {
+            Msg::InRun { run, inner } => {
+                if matches!(*inner, Msg::InRun { .. }) {
+                    return Err(BsrsError::Plan("InRun cannot be nested".into()));
+                }
+                (Some(run), *inner)
+            }
+            other => (None, other),
+        };
         match msg {
+            Msg::InRun { .. } => unreachable!("InRun unwrapped above"),
             Msg::OpenRun(meta) => {
-                let uid = self.open_run(meta).await?;
+                let uid = self.open_run(&run_key, meta).await?;
                 *self.last_msg_result.lock().unwrap() = MsgResult::OpenRun { uid: uid.clone() };
                 return Ok(Some(uid));
             }
@@ -1215,61 +1833,142 @@ impl RunEngine {
                 exit_status,
                 reason,
             } => {
-                // bluesky's _close_run raises IllegalMessageSequence when no run
-                // is open (run_engine.py:1902-1905). close_run_if_open is
-                // intentionally lenient — it is the internal run-end cleanup path
-                // (run_loop) — so the strict check belongs on the explicit
-                // message path here.
-                if self.state.lock().await.bundler.is_none() {
+                // bluesky's _close_run raises IllegalMessageSequence when the
+                // keyed run is not open (run_engine.py:1902-1905).
+                // close_run_if_open is intentionally lenient — it is the internal
+                // run-end cleanup path (run_loop) — so the strict check belongs on
+                // the explicit message path here.
+                if !self.state.lock().await.run_open(&run_key) {
                     return Err(BsrsError::Plan("CloseRun without an open run".into()));
                 }
-                self.close_run_if_open(&exit_status, reason).await?;
+                self.close_run_if_open(&run_key, &exit_status, reason)
+                    .await?;
                 *self.last_msg_result.lock().unwrap() = MsgResult::CloseRun {
                     exit_status: exit_status.clone(),
                 };
             }
             Msg::Create { stream_name } => {
-                self.state
-                    .lock()
-                    .await
-                    .bundler
-                    .as_mut()
-                    .ok_or_else(|| BsrsError::Plan("Create with no open run".into()))?
-                    .create(stream_name)?;
+                let mut state = self.state.lock().await;
+                let slot = state
+                    .run_mut(&run_key)
+                    .ok_or_else(|| BsrsError::Plan("Create with no open run".into()))?;
+                slot.bundler.create(stream_name)?;
+                // A fresh bundle starts with no external-asset reads (bluesky
+                // resets `_asset_docs_cache` on create, bundlers.py:388).
+                slot.bundle_asset_objs.clear();
             }
             Msg::Save => {
-                let docs = {
+                // Compose the bundle's Descriptor (first event only) + Event,
+                // and capture the stream name + the asset-writing read objects
+                // to drain — all before `save` consumes the open bundle.
+                let (docs, stream_name, asset_objs) = {
                     let mut state = self.state.lock().await;
-                    state
-                        .bundler
-                        .as_mut()
-                        .ok_or_else(|| BsrsError::Plan("Save with no open run".into()))?
-                        .save()?
+                    let slot = state
+                        .run_mut(&run_key)
+                        .ok_or_else(|| BsrsError::Plan("Save with no open run".into()))?;
+                    let stream_name = slot.bundler.open_stream_name();
+                    let docs = slot.bundler.save()?;
+                    let asset_objs = std::mem::take(&mut slot.bundle_asset_objs);
+                    (docs, stream_name, asset_objs)
                 };
-                for d in docs {
-                    self.broadcast(&d).await?;
+                // Drain external-asset docs (`StreamResource`/`StreamDatum`)
+                // from the read objects that write them, stamped with this
+                // stream's just-composed EventDescriptor UID — the step-mode
+                // analogue of the Collect path, and a port of bluesky
+                // `_pack_external_assets` on save (bundlers.py:610).
+                let descriptor_uid = {
+                    let state = self.state.lock().await;
+                    match (state.bundler(&run_key), stream_name.as_ref()) {
+                        (Some(b), Some(s)) => b.descriptor_uid(s),
+                        _ => None,
+                    }
+                };
+                let mut assets = Vec::new();
+                if let Some(uid) = &descriptor_uid {
+                    for obj in &asset_objs {
+                        assets.extend(obj.collect_asset_docs_dyn(uid).await?);
+                    }
+                }
+                if !assets.is_empty() {
+                    // Validate + stamp the drain (run_start, resource/datum
+                    // cross-checks) and fill the datums' seq_nums from the
+                    // Event this save just composed: the datums accompany
+                    // that event, so they cover [event_seq, event_seq +
+                    // width) — bluesky packs with the stream counter at the
+                    // same point (bundlers.py:830). The event itself advanced
+                    // the counter; no extra advance here.
+                    let event_seq = docs.iter().find_map(|d| match d {
+                        Document::Event(ev) => Some(ev.seq_num),
+                        _ => None,
+                    });
+                    if event_seq.is_none()
+                        && assets.iter().any(|a| matches!(a, Document::StreamDatum(_)))
+                    {
+                        return Err(BsrsError::Plan(
+                            "Save drained StreamDatum documents but composed no \
+                             Event to anchor their seq_nums"
+                                .into(),
+                        ));
+                    }
+                    let mut state = self.state.lock().await;
+                    let bundler = state.bundler_mut(&run_key).ok_or_else(|| {
+                        BsrsError::Plan("Save lost open run before stream docs".into())
+                    })?;
+                    let external_keys = stream_name
+                        .as_deref()
+                        .and_then(|s| bundler.compose().external_data_keys(s))
+                        .unwrap_or_default();
+                    let run_start = bundler.start_uid.clone();
+                    pack_external_assets(
+                        &mut assets,
+                        &run_start,
+                        event_seq.unwrap_or(0),
+                        &external_keys,
+                        bundler.stream_resource_data_keys_mut(),
+                    )?;
+                }
+                // Emit order: Descriptor(s) → StreamResource/StreamDatum →
+                // Event(s), so a consumer sees the descriptor before the stream
+                // docs that reference it, and the stream docs before the event
+                // they accompany.
+                for d in &docs {
+                    if matches!(d, Document::Descriptor(_)) {
+                        self.broadcast(d).await?;
+                    }
+                }
+                for a in &assets {
+                    self.broadcast(a).await?;
+                }
+                for d in &docs {
+                    if !matches!(d, Document::Descriptor(_)) {
+                        self.broadcast(d).await?;
+                    }
                 }
             }
             Msg::Drop => {
-                self.state
-                    .lock()
-                    .await
-                    .bundler
-                    .as_mut()
-                    .ok_or_else(|| BsrsError::Plan("Drop with no open run".into()))?
-                    .drop_bundle()?;
+                let mut state = self.state.lock().await;
+                let slot = state
+                    .run_mut(&run_key)
+                    .ok_or_else(|| BsrsError::Plan("Drop with no open run".into()))?;
+                slot.bundler.drop_bundle()?;
+                // The discarded bundle's external-asset reads go with it.
+                slot.bundle_asset_objs.clear();
             }
             Msg::DeclareStream {
                 stream_name,
                 data_keys,
             } => {
+                // `Msg::DeclareStream` carries raw data keys, not objects
+                // (deviation from bluesky, whose declare_stream takes the
+                // collect objects), so there is nothing to read configuration
+                // from — the descriptor's configuration stays empty here. The
+                // object-driven paths (Read/save, Collect, Monitor) fill it.
                 let descriptor = {
                     let mut state = self.state.lock().await;
                     state
-                        .bundler
-                        .as_mut()
+                        .bundler_mut(&run_key)
                         .ok_or_else(|| BsrsError::Plan("DeclareStream with no open run".into()))?
-                        .declare_stream(stream_name, data_keys)?
+                        .declare_stream(stream_name, data_keys, HashMap::new())?
                 };
                 self.broadcast(&Document::Descriptor(descriptor)).await?;
             }
@@ -1285,17 +1984,34 @@ impl RunEngine {
                 // which DO raise without a run: run_engine.py:1942/1968.)
                 let bundler_present = {
                     let state = self.state.lock().await;
-                    state.bundler.is_some()
+                    state.run_open(&run_key)
                 };
                 if bundler_present {
                     // describe() only matters for the bundle's descriptor, so
                     // compute it (awaiting before re-locking) only when bundling.
                     let data_keys = obj.describe_dyn().await?;
+                    // The object's configuration goes into the same descriptor,
+                    // keyed by object name — empty for non-configurables
+                    // (bluesky `_prepare_stream`, bundlers.py:286-290).
+                    let config = self
+                        .ensure_object_configuration(&run_key, obj.name(), obj.as_configurable())
+                        .await?;
                     let object_name = Some(obj.name().to_string());
                     let hint_fields = obj.hint_fields();
+                    let tracks_assets = obj.writes_external_assets();
                     let mut state = self.state.lock().await;
-                    if let Some(bundler) = state.bundler.as_mut() {
-                        bundler.add_readings(readings, data_keys, object_name, hint_fields)?;
+                    if let Some(slot) = state.run_mut(&run_key) {
+                        slot.bundler
+                            .add_readings(readings, data_keys, object_name, hint_fields)?;
+                        slot.bundler
+                            .add_configuration(obj.name().to_string(), config)?;
+                        // Track asset-writing readables so the paired `Save`
+                        // drains their `StreamResource`/`StreamDatum`, stamped
+                        // with the bundle's descriptor (bluesky
+                        // `maybe_collect_asset_docs`, bundlers.py:444).
+                        if tracks_assets {
+                            slot.bundle_asset_objs.push(obj.clone());
+                        }
                     }
                 }
                 // Surface the reading even when there's no open run; the
@@ -1372,12 +2088,21 @@ impl RunEngine {
                 // registered or started so no hardware begins flying.
                 {
                     let mut state = self.state.lock().await;
-                    if state.bundler.is_none() {
+                    if !state.run_open(&run_key) {
                         return Err(BsrsError::Plan("Kickoff sent but no run is open".into()));
                     }
                     state
                         .flyable_objs_touched
                         .insert(obj.name().to_string(), obj.clone());
+                    // Record the flyer's collectable view (if any) into THIS run so
+                    // a finalize-time backstop can drain it should the run abort
+                    // before the plan issues its own `Msg::Collect`. bluesky adds
+                    // `msg.obj` to the keyed run's `_uncollected` (bundlers.py:707).
+                    if let Some(coll) = obj.clone().as_collectable() {
+                        if let Some(slot) = state.run_mut(&run_key) {
+                            slot.uncollected.insert(coll.name().to_string(), coll);
+                        }
+                    }
                 }
                 let status = obj.kickoff_dyn().await;
                 if let Some(g) = group.clone() {
@@ -1393,76 +2118,7 @@ impl RunEngine {
                 self.handle_status(status, group).await?;
             }
             Msg::Collect { obj, stream_name } => {
-                // Open-run precondition, checked before the device is described.
-                // bluesky's _collect rejects a collect with no open run at the top
-                // (run_engine.py:2201-2206) *before* current_run.collect() runs
-                // describe_collect. bsrs called describe_collect_dyn before its
-                // bundler check below, so a collect with no open run did a wasted
-                // device describe round-trip before erroring. Gate it here,
-                // mirroring the Read path which describes only when bundling. The
-                // later `ok_or_else` checks stay as defense for the bundler being
-                // cleared mid-await (a pause landing while collect_dyn is awaiting).
-                {
-                    let state = self.state.lock().await;
-                    if state.bundler.is_none() {
-                        return Err(BsrsError::Plan(
-                            "A 'collect' message was sent but no run is open".into(),
-                        ));
-                    }
-                }
-                let descs = obj.describe_collect_dyn().await?;
-                let new_descriptors: Vec<crate::event_model::EventDescriptor> = {
-                    let mut state = self.state.lock().await;
-                    let bundler = state
-                        .bundler
-                        .as_mut()
-                        .ok_or_else(|| BsrsError::Plan("Collect with no open run".into()))?;
-                    let mut out = Vec::new();
-                    for (name, dks) in &descs {
-                        if bundler.descriptor_uid(name).is_none() {
-                            out.push(bundler.declare_stream(name.clone(), dks.clone())?);
-                        }
-                    }
-                    out
-                };
-                for descriptor in new_descriptors {
-                    self.broadcast(&Document::Descriptor(descriptor)).await?;
-                }
-                // Emit the writer's StreamResource/StreamDatum, stamped with the
-                // collect stream's just-composed EventDescriptor UID, so stream
-                // data links back to its descriptor (CBEM-13). StandardDetector
-                // collects into a single stream; pass that stream's descriptor.
-                let collect_descriptor = {
-                    let state = self.state.lock().await;
-                    let bundler = state.bundler.as_ref().ok_or_else(|| {
-                        BsrsError::Plan("Collect lost open run before stream docs".into())
-                    })?;
-                    descs.keys().next().and_then(|s| bundler.descriptor_uid(s))
-                };
-                if let Some(descriptor_uid) = collect_descriptor {
-                    for doc in obj.collect_stream_docs_dyn(&descriptor_uid).await? {
-                        self.broadcast(&doc).await?;
-                    }
-                }
-                let events = obj.collect_dyn().await?;
-                for (name, data, timestamps) in events {
-                    let stream = stream_name.clone().unwrap_or(name);
-                    let ev = {
-                        let state = self.state.lock().await;
-                        let bundler = state.bundler.as_ref().ok_or_else(|| {
-                            BsrsError::Plan(
-                                "Collect lost open run mid-process (bundler cleared while \
-                                 collect_dyn was awaiting)"
-                                    .into(),
-                            )
-                        })?;
-                        bundler
-                            .compose()
-                            .event(&stream, data, timestamps)
-                            .ok_or_else(|| BsrsError::Plan("event for unknown stream".into()))?
-                    };
-                    self.broadcast(&Document::Event(ev)).await?;
-                }
+                self.collect_object(&run_key, obj, stream_name).await?;
             }
             Msg::Monitor { obj, name } => {
                 {
@@ -1476,7 +2132,7 @@ impl RunEngine {
                     // erroring. Gate it here, mirroring the Read path which
                     // describes only when a bundler is present. start_monitor keeps
                     // its internal check as defense for the resume re-install path.
-                    if state.bundler.is_none() {
+                    if !state.run_open(&run_key) {
                         return Err(BsrsError::Plan(
                             "A 'monitor' message was sent but no run is open".into(),
                         ));
@@ -1492,7 +2148,10 @@ impl RunEngine {
                     // calls start_monitor directly from the kept `monitored`
                     // registry and is unaffected (same split as the lenient
                     // CloseRun cleanup).
-                    if state.monitored.contains_key(obj.name()) {
+                    if state
+                        .run(&run_key)
+                        .is_some_and(|s| s.monitored.contains_key(obj.name()))
+                    {
                         return Err(BsrsError::Plan(format!(
                             "A 'monitor' message was sent for {} which is already monitored",
                             obj.name()
@@ -1500,14 +2159,16 @@ impl RunEngine {
                     }
                 }
                 let stream = name.unwrap_or_else(default_monitor_stream_name);
-                self.start_monitor(stream.clone(), obj.clone()).await?;
+                self.start_monitor(&run_key, stream.clone(), obj.clone())
+                    .await?;
                 let mut state = self.state.lock().await;
                 // Record the registration so the monitor survives a pause: the
                 // pump (monitor_tasks) is dropped on pause, this spec is not, and
                 // resume re-installs the pump from it. bluesky `_monitor_params`.
-                state
-                    .monitored
-                    .insert(obj.name().to_string(), MonitorSpec { obj, stream });
+                if let Some(slot) = state.run_mut(&run_key) {
+                    slot.monitored
+                        .insert(obj.name().to_string(), MonitorSpec { obj, stream });
+                }
                 Self::reset_checkpoint_state(&mut state);
             }
             Msg::Unmonitor(obj) => {
@@ -1525,18 +2186,22 @@ impl RunEngine {
                 // precondition. The bulk teardown on pause/close (monitor_tasks
                 // .clear / monitored.clear) is intentionally lenient and unaffected
                 // — this guard is on the explicit per-object message path only.
-                if !state.monitored.contains_key(obj.name()) {
+                if !state
+                    .run(&run_key)
+                    .is_some_and(|s| s.monitored.contains_key(obj.name()))
+                {
                     return Err(BsrsError::Plan(format!(
                         "Cannot 'unmonitor' {}; it is not being monitored",
                         obj.name()
                     )));
                 }
-                state
-                    .monitor_tasks
-                    .retain(|obj_name, _| obj_name != obj.name());
-                // Drop the registration too, so a later resume does not
-                // re-install a monitor the plan explicitly removed.
-                state.monitored.remove(obj.name());
+                if let Some(slot) = state.run_mut(&run_key) {
+                    slot.monitor_tasks
+                        .retain(|obj_name, _| obj_name != obj.name());
+                    // Drop the registration too, so a later resume does not
+                    // re-install a monitor the plan explicitly removed.
+                    slot.monitored.remove(obj.name());
+                }
                 Self::reset_checkpoint_state(&mut state);
             }
             Msg::Wait {
@@ -1544,7 +2209,10 @@ impl RunEngine {
                 error_on_timeout,
                 timeout,
             } => {
-                self.wait_group(&group, error_on_timeout, timeout).await?;
+                // `done` is false only on a move-on timeout with members still
+                // pending; plans that `Respond` on this loop until it's true.
+                let done = self.wait_group(&group, error_on_timeout, timeout).await?;
+                *self.last_msg_result.lock().unwrap() = MsgResult::WaitComplete { done };
             }
             Msg::Sleep(d) => {
                 let token = self.cancel.lock().unwrap().clone();
@@ -1561,15 +2229,22 @@ impl RunEngine {
                 // to a point inside an open event bundle cannot be done cleanly.
                 // bluesky rejects it with IllegalMessageSequence
                 // (run_engine.py:2444-2446); mirror that here.
-                if state.bundler.as_ref().is_some_and(|b| b.is_bundling()) {
+                if state.any_bundling() {
                     return Err(BsrsError::Plan(
                         "Cannot 'checkpoint' after 'create' and before 'save'".into(),
                     ));
                 }
-                // Clear cache up to this point — the rewindable region restarts.
+                // Clear cache up to this point — the rewindable region restarts
+                // across every open run.
                 Self::reset_checkpoint_state(&mut state);
                 state.rewindable = true;
-                let run_uid = state.bundler.as_ref().map(|b| b.start_uid.clone());
+                // Crash-audit anchor: the default run's UID if open, else any
+                // open run's. (The snapshot schema carries one UID; multi-run
+                // per-run audit is a follow-up.)
+                let run_uid = state
+                    .bundler(&None)
+                    .or_else(|| state.runs.values().next().map(|s| &s.bundler))
+                    .map(|b| b.start_uid.clone());
                 drop(state);
                 // Crash-recovery hook: persist the snapshot so post-
                 // restart auditing can pinpoint where the engine
@@ -1601,8 +2276,8 @@ impl RunEngine {
                 // the Checkpoint / lifecycle resets, this CLEARS the snapshot
                 // rather than taking one.
                 state.msg_cache.clear();
-                if let Some(b) = state.bundler.as_mut() {
-                    b.clear_checkpoint();
+                for slot in state.runs.values_mut() {
+                    slot.bundler.clear_checkpoint();
                 }
             }
             Msg::Pause { defer } => {
@@ -1680,13 +2355,51 @@ impl RunEngine {
                 // family as the `checkpoint`-in-bundle rejection.
                 {
                     let state = self.state.lock().await;
-                    if state.bundler.as_ref().is_some_and(|b| b.is_bundling()) {
+                    if state.bundler(&run_key).is_some_and(|b| b.is_bundling()) {
                         return Err(BsrsError::Plan(
                             "Cannot configure after 'create' but before 'save'".into(),
                         ));
                     }
                 }
                 obj.configure_dyn(args).await?;
+                // Refresh the run's cached configuration (so streams declared
+                // after this point carry the new values, bluesky
+                // cache_read_config, bundlers.py:1209) AND re-emit the
+                // descriptors of already-declared streams that include this
+                // object, each a new generation carrying the fresh config with
+                // the sequence counter unbroken — bluesky's configure-time
+                // invalidation (bundlers.py:1213-1218). Without the re-emit,
+                // events after the configure would keep referencing the old
+                // descriptor and its stale configuration.
+                let run_open = { self.state.lock().await.run_open(&run_key) };
+                if run_open {
+                    let config = read_object_configuration(obj.as_ref()).await?;
+                    // Compose the new generations WITHOUT installing them, then
+                    // broadcast, then install. A monitor pump composes its events
+                    // against the stream's *current* descriptor on a separate
+                    // task; installing only after the broadcast guarantees the new
+                    // descriptor is on the wire before the pump can stamp it onto
+                    // an event (descriptor-before-event holds by construction, not
+                    // by a runtime lock).
+                    let new_descriptors = {
+                        let mut state = self.state.lock().await;
+                        match state.bundler_mut(&run_key) {
+                            Some(b) => {
+                                b.cache_configuration(obj.name().to_string(), config.clone());
+                                b.compose_reconfigure(obj.name(), config)
+                            }
+                            None => Vec::new(),
+                        }
+                    };
+                    for d in &new_descriptors {
+                        self.broadcast(&Document::Descriptor(d.clone())).await?;
+                    }
+                    if !new_descriptors.is_empty() {
+                        if let Some(b) = self.state.lock().await.bundler_mut(&run_key) {
+                            b.install_reconfigured(&new_descriptors);
+                        }
+                    }
+                }
             }
             Msg::Prepare { obj, value, group } => {
                 let status = obj.prepare_dyn(value).await;
@@ -1747,28 +2460,75 @@ impl RunEngine {
             Msg::Fail(reason) => {
                 return Err(BsrsError::Plan(reason));
             }
+            Msg::PushContingency(sink) => {
+                // Clear any stale error before arming, so this region starts
+                // with an empty sink regardless of what the Arc last held.
+                *sink.lock().unwrap() = None;
+                self.state.lock().await.contingency_stack.push(sink);
+            }
+            Msg::PopContingency => {
+                self.state.lock().await.contingency_stack.pop();
+            }
         }
         Ok(None)
     }
 
+    /// The run-cached configuration for object `name`, reading it through
+    /// `configurable` on first use (empty when the object is not
+    /// configurable). Cache lives on the `RunBundler` (run-scoped); the
+    /// bluesky analogue is `ensure_cached` filling the config caches once
+    /// per object (bundlers.py:93-102). Returns the configuration even if
+    /// the run closed mid-read (it just isn't cached then).
+    async fn ensure_object_configuration(
+        &self,
+        run_key: &Option<String>,
+        name: &str,
+        configurable: Option<&dyn crate::core::msg::ConfigurableObj>,
+    ) -> Result<crate::event_model::Configuration> {
+        let cached = {
+            let state = self.state.lock().await;
+            state
+                .bundler(run_key)
+                .and_then(|b| b.cached_configuration(name))
+        };
+        if let Some(c) = cached {
+            return Ok(c);
+        }
+        let config = match configurable {
+            Some(c) => read_object_configuration(c).await?,
+            None => crate::event_model::Configuration::default(),
+        };
+        let mut state = self.state.lock().await;
+        if let Some(b) = state.bundler_mut(run_key) {
+            b.cache_configuration(name.to_string(), config.clone());
+        }
+        Ok(config)
+    }
+
     async fn start_monitor(
         &self,
+        run_key: &Option<String>,
         stream: String,
         obj: Arc<dyn crate::core::msg::MonitorableObj>,
     ) -> Result<()> {
         // Step 1: declare the descriptor for this stream from the device's
-        // own describe_dyn (MonitorableObj : ReadableObj).
+        // own describe_dyn (MonitorableObj : ReadableObj), with the device's
+        // configuration — bluesky `_monitor` runs `ensure_cached(obj)` +
+        // `_prepare_stream(name, {obj: ...})` (bundlers.py:473-475).
         let data_keys = obj.describe_dyn().await?;
+        let config = self
+            .ensure_object_configuration(run_key, obj.name(), obj.as_configurable())
+            .await?;
         let (descriptor, bundle) = {
             let mut state = self.state.lock().await;
             let bundler = state
-                .bundler
-                .as_mut()
+                .bundler_mut(run_key)
                 .ok_or_else(|| BsrsError::Plan("Monitor with no open run".into()))?;
             let descriptor = if bundler.descriptor_uid(&stream).is_some() {
                 None
             } else {
-                Some(bundler.declare_stream(stream.clone(), data_keys.clone())?)
+                let configuration = HashMap::from([(obj.name().to_string(), config)]);
+                Some(bundler.declare_stream(stream.clone(), data_keys.clone(), configuration)?)
             };
             (descriptor, bundler.bundle())
         };
@@ -1812,11 +2572,11 @@ impl RunEngine {
         // Msg::Unmonitor(obj) carries — NOT by the descriptor stream name.
         // Keying by `stream` leaked the pump whenever a custom monitor name was
         // used: Unmonitor matched the key against obj.name() and never found it.
-        self.state
-            .lock()
-            .await
-            .monitor_tasks
-            .insert(obj.name().to_string(), MonitorTask { abort });
+        // Stored on THIS run's slot so pause/close teardown is per-run.
+        if let Some(slot) = self.state.lock().await.run_mut(run_key) {
+            slot.monitor_tasks
+                .insert(obj.name().to_string(), MonitorTask { abort });
+        }
         Ok(())
     }
 
@@ -1825,35 +2585,40 @@ impl RunEngine {
         self.suspender_count.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// Emit an Event to the special `"interruptions"` stream. No-op
-    /// when recording is off, when there is no open run, or when the
-    /// `OpenRun` happened *before* recording was turned on (the
-    /// stream is declared at OpenRun time only).
+    /// Emit an Event to the special `"interruptions"` stream of *every* open
+    /// run that has one declared. No-op when recording is off; a run whose
+    /// `OpenRun` happened *before* recording was turned on has no such stream
+    /// (declared at OpenRun time only) and is skipped. bluesky records the
+    /// interruption in each `_run_bundlers` value (run_engine.py:1585-1592).
     async fn record_interruption(&self, content: &str) {
         if !self.record_interruptions.load(Ordering::SeqCst) {
             return;
         }
-        let bundle = {
+        // One bundle handle per run whose interruptions stream is declared.
+        let bundles = {
             let state = self.state.lock().await;
-            let bundler = match state.bundler.as_ref() {
-                Some(b) => b,
-                None => return,
-            };
-            if bundler.descriptor_uid("interruptions").is_none() {
-                return;
-            }
-            bundler.bundle()
+            state
+                .runs
+                .values()
+                .filter(|slot| slot.bundler.descriptor_uid("interruptions").is_some())
+                .map(|slot| slot.bundler.bundle())
+                .collect::<Vec<_>>()
         };
+        if bundles.is_empty() {
+            return;
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
-        let mut data = HashMap::new();
-        data.insert("interruption".to_string(), Value::String(content.into()));
-        let mut timestamps = HashMap::new();
-        timestamps.insert("interruption".to_string(), now);
-        if let Some(ev) = bundle.event("interruptions", data, timestamps) {
-            let _ = self.broadcast(&Document::Event(ev)).await;
+        for bundle in bundles {
+            let mut data = HashMap::new();
+            data.insert("interruption".to_string(), Value::String(content.into()));
+            let mut timestamps = HashMap::new();
+            timestamps.insert("interruption".to_string(), now);
+            if let Some(ev) = bundle.event("interruptions", data, timestamps) {
+                let _ = self.broadcast(&Document::Event(ev)).await;
+            }
         }
     }
 
@@ -1917,13 +2682,14 @@ impl RunEngine {
         self.state.lock().await.suspenders.clear();
     }
 
-    async fn open_run(&self, meta: RunMetadata) -> Result<String> {
-        // Reject a second open_run *before* any side effect — bluesky's
-        // `run_key in self._run_bundlers` check precedes scan_id resolution and
-        // document emission (run_engine.py:1849-1851). Doing it here means a
-        // rejected re-open neither advances the scan_id counter nor broadcasts
-        // a spurious RunStart.
-        if self.state.lock().await.bundler.is_some() {
+    async fn open_run(&self, run_key: &Option<String>, meta: RunMetadata) -> Result<String> {
+        // Reject a second open_run *for the same run key* before any side
+        // effect — bluesky's `run_key in self._run_bundlers` check precedes
+        // scan_id resolution and document emission (run_engine.py:1849-1851).
+        // Doing it here means a rejected re-open neither advances the scan_id
+        // counter nor broadcasts a spurious RunStart. A *different* run key is
+        // allowed to open concurrently — that is exactly the multi-run case.
+        if self.state.lock().await.run_open(run_key) {
             return Err(BsrsError::Plan(
                 "OpenRun while a previous run is still open".into(),
             ));
@@ -1941,6 +2707,13 @@ impl RunEngine {
                                                          // {plan_type, plan_name} above self.md and below msg.kwargs and
                                                          // _metadata_per_call, so this is an `insert` (overwrite persistent),
                                                          // not the previous `or_insert` (which left it lowest-precedence).
+                                                         // plan_type: bluesky computes `type(self._plan).__name__`, which is
+                                                         // "generator" for every generator-function plan. bsrs plans are lazy
+                                                         // `Msg` streams — generators — so the faithful value is the constant
+                                                         // "generator"; a plan or caller that wants a different plan_type sets
+                                                         // it via the OpenRun `extra` or per-call md, both inserted after this
+                                                         // and thus higher precedence.
+            m.insert("plan_type".into(), Value::String("generator".into()));
             if let Some(ref pn) = meta.plan_name {
                 m.insert("plan_name".into(), Value::String(pn.clone()));
             }
@@ -2026,11 +2799,13 @@ impl RunEngine {
                         choices: None,
                     },
                 );
-                Some(bundler.declare_stream("interruptions".into(), keys)?)
+                // No configuration: bluesky's interruptions descriptor is
+                // composed from a bare data key, no objects (bundlers.py).
+                Some(bundler.declare_stream("interruptions".into(), keys, HashMap::new())?)
             } else {
                 None
             };
-            state.bundler = Some(bundler);
+            state.runs.insert(run_key.clone(), RunSlot::new(bundler));
             descriptor
         };
         if let Some(d) = interruptions_descriptor {
@@ -2039,7 +2814,12 @@ impl RunEngine {
         Ok(uid)
     }
 
-    async fn close_run_if_open(&self, exit_status: &str, reason: Option<String>) -> Result<()> {
+    async fn close_run_if_open(
+        &self,
+        run_key: &Option<String>,
+        exit_status: &str,
+        reason: Option<String>,
+    ) -> Result<()> {
         // The RunStop document's `exit_status` is constrained by the event-model
         // schema to `success` | `abort` | `fail`. The engine's run-result status
         // additionally uses `halt` (and `no-run`) for its own reporting —
@@ -2057,24 +2837,19 @@ impl RunEngine {
         };
         let stop_doc = {
             let mut state = self.state.lock().await;
-            let stop = state
-                .bundler
-                .take()
-                .map(|bundler| bundler.compose().stop(exit_status, reason));
-            if stop.is_some() {
-                // Tear down any monitors still active when the run closes —
-                // bluesky's close_run clears each remaining `_monitor_params`
-                // subscription (bundlers.py:246-248). A `Msg::Monitor` not
-                // explicitly `Unmonitor`'d is unsubscribed per-run, not leaked
-                // into the next run, where its pump would otherwise keep
-                // composing Events against this now-closed bundle.
-                // `MonitorTask::drop` aborts the pump and drops its Subscription.
-                state.monitor_tasks.clear();
-                // Drop the registrations too — a closed run must not restore its
-                // monitors on a later resume.
-                state.monitored.clear();
-            }
-            stop
+            // Remove THIS run's slot and compose its RunStop. Dropping the slot
+            // tears down any monitors still active when the run closes — bluesky's
+            // close_run clears each remaining `_monitor_params` subscription
+            // (bundlers.py:246-248). A `Msg::Monitor` not explicitly `Unmonitor`'d
+            // is unsubscribed as the slot's `monitor_tasks`/`monitored` drop with
+            // it, not leaked into the next run where its pump would keep composing
+            // Events against this now-closed bundle. `MonitorTask::drop` aborts the
+            // pump and drops its Subscription. The slot's `uncollected` set is
+            // already drained by the finalize `backstop_collect` that precedes this.
+            state
+                .runs
+                .remove(run_key)
+                .map(|slot| slot.bundler.compose().stop(exit_status, reason))
         };
         if let Some(stop) = stop_doc {
             let run_uid = stop.run_start.clone();
@@ -2134,12 +2909,16 @@ impl RunEngine {
         }
     }
 
+    /// Await a status group. Returns `Ok(true)` when every member completed,
+    /// `Ok(false)` when a move-on timeout (`error_on_timeout=false`) elapsed with
+    /// members still pending (they are restored to the group). Propagates `Err`
+    /// on member failure, or on a hard timeout when `error_on_timeout` is true.
     async fn wait_group(
         &self,
         group: &str,
         error_on_timeout: bool,
         timeout: Option<Duration>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let members = {
             let mut state = self.state.lock().await;
             state
@@ -2149,7 +2928,7 @@ impl RunEngine {
                 .unwrap_or_default()
         };
         if members.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
         // Await *clones* of the members so the originals survive a move-on
         // timeout and can be restored to the group below. A clone shares the
@@ -2179,7 +2958,7 @@ impl RunEngine {
         };
         match timeout {
             Some(d) => match tokio::time::timeout(d, fut).await {
-                Ok(r) => r,
+                Ok(r) => r.map(|_| true),
                 Err(_) => {
                     if error_on_timeout {
                         Err(BsrsError::Timeout(d))
@@ -2202,11 +2981,11 @@ impl RunEngine {
                                 .members
                                 .extend(members);
                         }
-                        Ok(())
+                        Ok(false)
                     }
                 }
             },
-            None => fut.await,
+            None => fut.await.map(|_| true),
         }
     }
 }
@@ -2220,6 +2999,169 @@ impl Default for RunEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn datum_for(uid: &str, resource: &str, indices: (u64, u64), seq_nums: (u64, u64)) -> Document {
+        Document::StreamDatum(crate::event_model::StreamDatum {
+            uid: uid.into(),
+            stream_resource: resource.into(),
+            descriptor: "desc".into(),
+            indices: crate::event_model::StreamRange {
+                start: indices.0,
+                stop: indices.1,
+            },
+            seq_nums: crate::event_model::StreamRange {
+                start: seq_nums.0,
+                stop: seq_nums.1,
+            },
+        })
+    }
+
+    fn datum(uid: &str, indices: (u64, u64), seq_nums: (u64, u64)) -> Document {
+        datum_for(uid, "res", indices, seq_nums)
+    }
+
+    fn resource(uid: &str, data_key: &str) -> Document {
+        Document::StreamResource(crate::event_model::StreamResource {
+            uid: uid.into(),
+            data_key: data_key.into(),
+            mimetype: "application/x-hdf5".into(),
+            uri: "file://localhost/data/f.h5".into(),
+            parameters: Default::default(),
+            run_start: None,
+        })
+    }
+
+    /// One registered resource for the datum-only tests: `res` → `img`, the
+    /// descriptor's sole external key.
+    fn seeded_registry() -> HashMap<String, String> {
+        HashMap::from([("res".to_string(), "img".to_string())])
+    }
+
+    const EXTERNAL: [&str; 1] = ["img"];
+
+    fn external() -> Vec<String> {
+        EXTERNAL.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The engine fills `[next_seq, next_seq + width)` into every datum of a
+    /// drain, each from its own indices span, reports the shared width, and
+    /// stamps `run_start` on resources (writers emit `None`).
+    #[test]
+    fn pack_assets_fills_seq_nums_and_stamps_run_start() {
+        let mut registry = HashMap::new();
+        let mut docs = vec![
+            resource("res", "img"),
+            datum("a", (10, 13), (0, 0)),
+            datum("b", (5, 8), (0, 0)),
+            Document::Event(crate::event_model::Event {
+                uid: "ev".into(),
+                descriptor: "desc".into(),
+                time: 0.0,
+                seq_num: 7,
+                data: Default::default(),
+                timestamps: Default::default(),
+                filled: Default::default(),
+            }),
+        ];
+        let width =
+            pack_external_assets(&mut docs, "run-1", 7, &external(), &mut registry).unwrap();
+        assert_eq!(width, 3);
+        let Document::StreamResource(r) = &docs[0] else {
+            panic!("expected resource")
+        };
+        assert_eq!(r.run_start.as_deref(), Some("run-1"));
+        assert_eq!(registry.get("res").map(String::as_str), Some("img"));
+        for d in &docs[1..3] {
+            let Document::StreamDatum(d) = d else {
+                panic!("expected datum")
+            };
+            assert_eq!((d.seq_nums.start, d.seq_nums.stop), (7, 10));
+        }
+    }
+
+    /// A writer that pre-fills seq_nums violates the engine's ownership of
+    /// the sequence counter and is rejected, mirroring bluesky's
+    /// `_pack_seq_nums_into_stream_datum` assertion (bundlers.py:830).
+    #[test]
+    fn pack_assets_rejects_prefilled_datum() {
+        let mut docs = vec![datum("a", (0, 1), (1, 2))];
+        let err = pack_external_assets(&mut docs, "run-1", 1, &external(), &mut seeded_registry())
+            .unwrap_err();
+        assert!(err.to_string().contains("pre-filled"), "got: {err}");
+    }
+
+    /// Two detectors in one stream must advance by the same number of
+    /// indices per drain; a mismatch means their frames no longer line up
+    /// with a common event sequence.
+    #[test]
+    fn pack_assets_rejects_mismatched_indices_width() {
+        let mut docs = vec![datum("a", (0, 2), (0, 0)), datum("b", (0, 3), (0, 0))];
+        let err = pack_external_assets(&mut docs, "run-1", 1, &external(), &mut seeded_registry())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("same number of indices"),
+            "got: {err}"
+        );
+    }
+
+    /// A drain with no datums (resources only, or empty) is a no-op with
+    /// width 0 — the Collect path must not advance the stream counter.
+    #[test]
+    fn pack_assets_empty_drain_reports_zero_width() {
+        let mut docs: Vec<Document> = Vec::new();
+        assert_eq!(
+            pack_external_assets(&mut docs, "run-1", 5, &external(), &mut HashMap::new()).unwrap(),
+            0
+        );
+    }
+
+    /// The same `StreamResource` uid emitted twice in one run is a writer
+    /// bug (bsrs writers emit each resource exactly once, on first drain).
+    #[test]
+    fn pack_assets_rejects_duplicate_resource_uid() {
+        let mut registry = seeded_registry();
+        let mut docs = vec![resource("res", "img")];
+        let err =
+            pack_external_assets(&mut docs, "run-1", 1, &external(), &mut registry).unwrap_err();
+        assert!(err.to_string().contains("twice"), "got: {err}");
+    }
+
+    /// A resource whose data_key is not among the descriptor's `STREAM:`
+    /// keys points at data no event will ever reference.
+    #[test]
+    fn pack_assets_rejects_resource_for_unknown_data_key() {
+        let mut docs = vec![resource("res2", "not_in_descriptor")];
+        let err = pack_external_assets(&mut docs, "run-1", 1, &external(), &mut HashMap::new())
+            .unwrap_err();
+        assert!(err.to_string().contains("STREAM:"), "got: {err}");
+    }
+
+    /// A datum referencing a resource uid never emitted this run cannot be
+    /// linked to any dataset.
+    #[test]
+    fn pack_assets_rejects_datum_with_unknown_resource() {
+        let mut docs = vec![datum_for("a", "ghost", (0, 1), (0, 0))];
+        let err = pack_external_assets(&mut docs, "run-1", 1, &external(), &mut HashMap::new())
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown"), "got: {err}");
+    }
+
+    /// If any datum arrived, every external key of the descriptor must have
+    /// received one in the same drain — a writer silently dropping one of
+    /// its datasets (e.g. an NDAttribute) desyncs the stream.
+    #[test]
+    fn pack_assets_rejects_incomplete_data_key_coverage() {
+        let mut registry = seeded_registry();
+        registry.insert("res_attr".to_string(), "temp".to_string());
+        let ext = vec!["img".to_string(), "temp".to_string()];
+        // Only `img` gets a datum; `temp` is missing.
+        let mut docs = vec![datum("a", (0, 1), (0, 0))];
+        let err = pack_external_assets(&mut docs, "run-1", 1, &ext, &mut registry).unwrap_err();
+        assert!(
+            err.to_string().contains("every external data key"),
+            "got: {err}"
+        );
+    }
 
     /// K1 regression: `install_signal_handler` must capture `Weak<Self>`,
     /// not `Arc<Self>`. Otherwise the watcher pins the engine forever and
@@ -2295,8 +3237,9 @@ mod tests {
             .wait_group("g", false, Some(Duration::from_millis(50)))
             .await;
         assert!(
-            r.is_ok(),
-            "error_on_timeout=false must not fail the run on timeout, got {r:?}"
+            matches!(r, Ok(false)),
+            "error_on_timeout=false must not fail the run on timeout and must \
+             report not-done (Ok(false)) with members still pending, got {r:?}"
         );
         let restored = {
             let state = re.state.lock().await;

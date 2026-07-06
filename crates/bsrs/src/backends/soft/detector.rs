@@ -293,10 +293,10 @@ impl DetectorWriter for SoftDetectorWriter {
                     start: last,
                     stop: up_to,
                 },
-                seq_nums: crate::event_model::StreamRange {
-                    start: last + 1,
-                    stop: up_to + 1,
-                },
+                // The run engine owns the sequence counter and fills
+                // seq_nums at the Save/Collect drain (bluesky
+                // `_pack_seq_nums_into_stream_datum`).
+                seq_nums: crate::event_model::StreamRange { start: 0, stop: 0 },
             };
             self.last_emitted.store(up_to, Ordering::SeqCst);
             docs.push(StreamAsset::Datum(datum));

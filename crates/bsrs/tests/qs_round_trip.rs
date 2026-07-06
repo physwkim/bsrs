@@ -255,6 +255,58 @@ async fn plans_existing_matches_plans_allowed() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
 
+/// QS-03: `plans_allowed` must surface each plan's real parameter schema
+/// (name/kind/annotation/description), not empty stubs — clients build
+/// parameter-entry forms and validate submissions from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn plans_allowed_count_carries_parameter_schema() {
+    let mut reg = Registry::new();
+    reg.register_plan_count("count");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    let r = rpc(&req, "plans_allowed", json!({}));
+    let count = &r["plans_allowed"]["count"];
+
+    // Plan-level schema: non-empty description, generator property, module.
+    assert!(
+        count["description"].as_str().map(|s| !s.is_empty()) == Some(true),
+        "count.description must be populated: {r}"
+    );
+    assert_eq!(count["properties"]["is_generator"], true, "{r}");
+    assert_eq!(count["module"], "bsrs_qs", "{r}");
+
+    // Parameter schema: `detectors` then `num`, each with an inspect-style
+    // `kind` dict and a type annotation.
+    let params = count["parameters"].as_array().expect("parameters array");
+    assert_eq!(params.len(), 2, "count has two params: {r}");
+
+    assert_eq!(params[0]["name"], "detectors", "{r}");
+    assert_eq!(params[0]["kind"]["name"], "POSITIONAL_OR_KEYWORD", "{r}");
+    assert_eq!(params[0]["kind"]["value"], 1, "{r}");
+    assert_eq!(
+        params[0]["annotation"]["type"], "typing.List[Readable]",
+        "{r}"
+    );
+    assert!(
+        params[0]["description"].as_str().map(|s| !s.is_empty()) == Some(true),
+        "detectors.description must be populated: {r}"
+    );
+
+    assert_eq!(params[1]["name"], "num", "{r}");
+    assert_eq!(params[1]["kind"]["value"], 1, "{r}");
+    assert_eq!(params[1]["annotation"]["type"], "int", "{r}");
+    // `num` is required in bsrs → no default advertised.
+    assert!(
+        params[1].get("default").is_none(),
+        "num has no default: {r}"
+    );
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn queue_clear_empties_queue() {
     let det = SoftDetector::new("det1");
@@ -843,6 +895,68 @@ async fn plans_allowed_filtered_by_caller_group() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
 
+/// QS-14: `devices_allowed` must be group-filtered against the caller's
+/// `allowed_devices` (mirroring `plans_allowed`), while `devices_existing`
+/// stays the full list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn devices_allowed_filtered_by_caller_group() {
+    let toml = r#"
+        default_group = "restricted"
+
+        [user_groups.restricted]
+        allowed_plans = [".*"]
+        allowed_devices = ["det1"]
+
+        [user_groups.admin]
+        admin = true
+        allowed_plans = [".*"]
+        allowed_devices = [".*"]
+
+        [api_keys]
+        "admin-key" = "admin"
+    "#;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("permissions.toml");
+    std::fs::write(&path, toml).unwrap();
+
+    let det1 = SoftDetector::new("det1");
+    let det2 = SoftDetector::new("det2");
+    let mut reg = Registry::new();
+    reg.register_readable("det1", det1 as Arc<dyn ReadableObj>);
+    reg.register_readable("det2", det2 as Arc<dyn ReadableObj>);
+    let shutdown = spawn_server_with_perms(reg, path);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    // Restricted group (allowed_devices = ["det1"]) sees only det1.
+    let r = rpc(&req, "devices_allowed", json!({}));
+    let devs = r["devices_allowed"].as_object().expect("must be object");
+    assert!(devs.contains_key("det1"), "restricted must see det1: {r}");
+    assert!(
+        !devs.contains_key("det2"),
+        "restricted must NOT see det2: {r}"
+    );
+
+    // devices_existing is NOT group-filtered — restricted still sees both.
+    let r = rpc(&req, "devices_existing", json!({}));
+    let devs = r["devices_existing"].as_object().expect("must be object");
+    assert!(
+        devs.contains_key("det1") && devs.contains_key("det2"),
+        "devices_existing must list all devices regardless of group: {r}"
+    );
+
+    // Admin group (allowed_devices = [".*"]) sees both.
+    let r = rpc(&req, "devices_allowed", json!({"api_key": "admin-key"}));
+    let devs = r["devices_allowed"].as_object().expect("must be object");
+    assert!(
+        devs.contains_key("det1") && devs.contains_key("det2"),
+        "admin must see both devices: {r}"
+    );
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
 // -- QS-03: plans_allowed / devices_allowed rich dict ----------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1142,6 +1256,326 @@ async fn queue_item_add_positional_insertion() {
         !r["success"].as_bool().unwrap_or(true),
         "before+after should fail: {r}"
     );
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+/// QS-09: `queue_item_add_batch` inserts the batch as a contiguous block at the
+/// requested position (first item at `pos`, the rest immediately after it,
+/// order preserved) — not an unconditional append.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_item_add_batch_inserts_block_at_position() {
+    let det = SoftDetector::new("det1");
+    let mut reg = Registry::new();
+    reg.register_readable("det1", det as Arc<dyn ReadableObj>);
+    reg.register_plan_count("count");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    // Baseline: single item X.
+    let rx = rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": ["det1", 1]}}),
+    );
+    let uid_x = rx["item"]["item_uid"].as_str().unwrap().to_string();
+
+    // Batch [A, B] at pos="front" → queue becomes [A, B, X].
+    let rb = rpc(
+        &req,
+        "queue_item_add_batch",
+        json!({"items": [
+            {"name": "count", "args": ["det1", 2]},
+            {"name": "count", "args": ["det1", 3]},
+        ], "pos": "front"}),
+    );
+    assert_eq!(rb["success"], true, "{rb}");
+    assert_eq!(rb["qsize"], 3, "{rb}");
+    let added = rb["items"].as_array().unwrap();
+    assert_eq!(added.len(), 2);
+    let uid_a = added[0]["item_uid"].as_str().unwrap().to_string();
+    let uid_b = added[1]["item_uid"].as_str().unwrap().to_string();
+    // results mirror items: both success.
+    let results = rb["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|r| r["success"] == true), "{rb}");
+
+    // Verify contiguous-block order A, B, X.
+    let q = rpc(&req, "queue_get", json!({}));
+    let items = q["items"].as_array().unwrap();
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0]["item_uid"], uid_a, "block first: {q}");
+    assert_eq!(items[1]["item_uid"], uid_b, "block second: {q}");
+    assert_eq!(items[2]["item_uid"], uid_x, "baseline last: {q}");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+/// QS-09: `queue_item_add_batch` honors `after_uid` for the whole block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_item_add_batch_after_uid() {
+    let det = SoftDetector::new("det1");
+    let mut reg = Registry::new();
+    reg.register_readable("det1", det as Arc<dyn ReadableObj>);
+    reg.register_plan_count("count");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    // Baseline X, Y → [X, Y].
+    let rx = rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": ["det1", 1]}}),
+    );
+    let uid_x = rx["item"]["item_uid"].as_str().unwrap().to_string();
+    let ry = rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": ["det1", 2]}}),
+    );
+    let uid_y = ry["item"]["item_uid"].as_str().unwrap().to_string();
+
+    // Batch [A, B] after_uid=X → [X, A, B, Y].
+    let rb = rpc(
+        &req,
+        "queue_item_add_batch",
+        json!({"items": [
+            {"name": "count", "args": ["det1", 3]},
+            {"name": "count", "args": ["det1", 4]},
+        ], "after_uid": uid_x}),
+    );
+    assert_eq!(rb["success"], true, "{rb}");
+    let added = rb["items"].as_array().unwrap();
+    let uid_a = added[0]["item_uid"].as_str().unwrap().to_string();
+    let uid_b = added[1]["item_uid"].as_str().unwrap().to_string();
+
+    let q = rpc(&req, "queue_get", json!({}));
+    let items = q["items"].as_array().unwrap();
+    assert_eq!(items.len(), 4);
+    assert_eq!(items[0]["item_uid"], uid_x, "{q}");
+    assert_eq!(items[1]["item_uid"], uid_a, "{q}");
+    assert_eq!(items[2]["item_uid"], uid_b, "{q}");
+    assert_eq!(items[3]["item_uid"], uid_y, "{q}");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+/// QS-09: `queue_item_add_batch` is atomic — if any item is rejected, the whole
+/// batch is rejected and nothing is added (ref: `_add_batch_to_queue`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_item_add_batch_atomic_reject_on_unknown_plan() {
+    let det = SoftDetector::new("det1");
+    let mut reg = Registry::new();
+    reg.register_readable("det1", det as Arc<dyn ReadableObj>);
+    reg.register_plan_count("count");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    // Baseline X so we can prove the batch left the queue untouched.
+    let rx = rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": ["det1", 1]}}),
+    );
+    let uid_x = rx["item"]["item_uid"].as_str().unwrap().to_string();
+
+    // Batch [valid, unknown] → rejected in full, nothing added.
+    let rb = rpc(
+        &req,
+        "queue_item_add_batch",
+        json!({"items": [
+            {"name": "count", "args": ["det1", 2]},
+            {"name": "does_not_exist", "args": []},
+        ]}),
+    );
+    assert_eq!(rb["success"], false, "batch must be rejected: {rb}");
+    assert_eq!(rb["qsize"], 1, "queue size unchanged: {rb}");
+    let results = rb["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2, "results mirror items: {rb}");
+    assert_eq!(
+        results[0]["success"], true,
+        "valid item ok in results: {rb}"
+    );
+    assert_eq!(results[1]["success"], false, "unknown item failed: {rb}");
+    assert!(
+        results[1]["msg"]
+            .as_str()
+            .unwrap_or("")
+            .contains("unknown plan"),
+        "failure names the plan: {rb}"
+    );
+
+    // Queue still holds only the baseline — the valid batch item was NOT added.
+    let q = rpc(&req, "queue_get", json!({}));
+    let items = q["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "nothing added on rejection: {q}");
+    assert_eq!(items[0]["item_uid"], uid_x, "{q}");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+/// Build a server with `count` and add `n` count items; return (shutdown, req,
+/// uids) with the queue = [uids[0], uids[1], ...] in add order.
+#[cfg(test)]
+async fn move_batch_fixture(n: usize) -> (ServerShutdown, zmq::Socket, Vec<String>) {
+    let det = SoftDetector::new("det1");
+    let mut reg = Registry::new();
+    reg.register_readable("det1", det as Arc<dyn ReadableObj>);
+    reg.register_plan_count("count");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+    let mut uids = Vec::with_capacity(n);
+    for i in 0..n {
+        let r = rpc(
+            &req,
+            "queue_item_add",
+            json!({"item": {"name": "count", "args": ["det1", i]}}),
+        );
+        uids.push(r["item"]["item_uid"].as_str().unwrap().to_string());
+    }
+    (shutdown, req, uids)
+}
+
+#[cfg(test)]
+fn queue_order(req: &zmq::Socket) -> Vec<String> {
+    let q = rpc(req, "queue_get", json!({}));
+    q["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["item_uid"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// QS-20: `queue_item_move_batch` moves the batch as a contiguous block to
+/// `before_uid`, preserving the `uids` order (reorder default false).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_item_move_batch_before_uid_block() {
+    let (shutdown, req, u) = move_batch_fixture(5).await; // [0,1,2,3,4]
+
+    // Move [0, 2] before uid 4 → [1, 3, 0, 2, 4].
+    let r = rpc(
+        &req,
+        "queue_item_move_batch",
+        json!({"uids": [u[0], u[2]], "before_uid": u[4]}),
+    );
+    assert_eq!(r["success"], true, "{r}");
+    assert_eq!(
+        queue_order(&req),
+        vec![
+            u[1].clone(),
+            u[3].clone(),
+            u[0].clone(),
+            u[2].clone(),
+            u[4].clone()
+        ]
+    );
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+/// QS-20: `reorder=false` (default) moves items in `uids` order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_item_move_batch_reorder_false_uses_uids_order() {
+    let (shutdown, req, u) = move_batch_fixture(5).await; // [0,1,2,3,4]
+
+    // Move [2, 0] to front, reorder false → block in uids order [2, 0].
+    let r = rpc(
+        &req,
+        "queue_item_move_batch",
+        json!({"uids": [u[2], u[0]], "pos_dest": "front"}),
+    );
+    assert_eq!(r["success"], true, "{r}");
+    assert_eq!(
+        queue_order(&req),
+        vec![
+            u[2].clone(),
+            u[0].clone(),
+            u[1].clone(),
+            u[3].clone(),
+            u[4].clone()
+        ]
+    );
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+/// QS-20: `reorder=true` moves items in their original queue order regardless of
+/// the order given in `uids`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_item_move_batch_reorder_true_uses_queue_order() {
+    let (shutdown, req, u) = move_batch_fixture(5).await; // [0,1,2,3,4]
+
+    // Move [2, 0] to front, reorder true → sorted by index [0, 2].
+    let r = rpc(
+        &req,
+        "queue_item_move_batch",
+        json!({"uids": [u[2], u[0]], "pos_dest": "front", "reorder": true}),
+    );
+    assert_eq!(r["success"], true, "{r}");
+    assert_eq!(
+        queue_order(&req),
+        vec![
+            u[0].clone(),
+            u[2].clone(),
+            u[1].clone(),
+            u[3].clone(),
+            u[4].clone()
+        ]
+    );
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+/// QS-20: `queue_item_move_batch` is atomic — a destination uid inside the
+/// batch, a missing uid, or a duplicate uid rejects the whole move and leaves
+/// the queue untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_item_move_batch_rejects_invalid_and_leaves_queue() {
+    let (shutdown, req, u) = move_batch_fixture(5).await; // [0,1,2,3,4]
+    let original = queue_order(&req);
+
+    // before_uid is a member of the batch → rejected.
+    let r = rpc(
+        &req,
+        "queue_item_move_batch",
+        json!({"uids": [u[0], u[1]], "before_uid": u[1]}),
+    );
+    assert_eq!(r["success"], false, "dest-in-batch must reject: {r}");
+    assert_eq!(queue_order(&req), original, "queue unchanged after reject");
+
+    // A uid not in the queue → rejected.
+    let r = rpc(
+        &req,
+        "queue_item_move_batch",
+        json!({"uids": [u[0], "nonexistent-uid"], "pos_dest": "front"}),
+    );
+    assert_eq!(r["success"], false, "missing uid must reject: {r}");
+    assert_eq!(queue_order(&req), original, "queue unchanged after reject");
+
+    // Duplicate uid in the batch → rejected.
+    let r = rpc(
+        &req,
+        "queue_item_move_batch",
+        json!({"uids": [u[0], u[0]], "pos_dest": "front"}),
+    );
+    assert_eq!(r["success"], false, "duplicate uid must reject: {r}");
+    assert_eq!(queue_order(&req), original, "queue unchanged after reject");
+
+    // No destination specified → rejected.
+    let r = rpc(&req, "queue_item_move_batch", json!({"uids": [u[0]]}));
+    assert_eq!(r["success"], false, "no destination must reject: {r}");
 
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;

@@ -250,7 +250,7 @@ async fn async_main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     // Scan from -8 to 8 in 17 points (covers the PinHole gaussian
     // peak at center=0, sigma=5).
-    let plan = bsrs::plans::scan(
+    let plan = bsrs::plans::scan_1d(
         vec![det.clone() as Arc<dyn ReadableObj>],
         motor.clone() as Arc<dyn MovableObj>,
         motor.clone() as Arc<dyn ReadableObj>,
@@ -261,7 +261,8 @@ async fn async_main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let result = re.run_async(plan).await?;
     eprintln!(
         "[bsrs] scan finished: exit_status={} run_uid={:?}",
-        result.exit_status, result.run_uid
+        result.exit_status,
+        result.run_uids.last()
     );
     eprintln!("[bsrs] documents captured in {jsonl_path}");
 

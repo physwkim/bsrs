@@ -520,7 +520,11 @@ impl UserData for LuaRunEngine {
             Ok(format!(
                 "exit_status={} run_uid={}",
                 result.exit_status,
-                result.run_uid.unwrap_or_else(|| "—".into())
+                result
+                    .run_uids
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| "—".into())
             ))
         });
         methods.add_method("pause", |_, this, deferred: Option<bool>| {
@@ -958,7 +962,11 @@ impl UserData for LuaRunEngine {
                 Ok(format!(
                     "exit_status={} run_uid={}",
                     result.exit_status,
-                    result.run_uid.unwrap_or_else(|| "—".into())
+                    result
+                        .run_uids
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| "—".into())
                 ))
             },
         );
@@ -1337,7 +1345,10 @@ fn register_plan_factories(lua: &Lua) -> mlua::Result<()> {
                 .readable
                 .clone()
                 .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not readable", m.name)))?;
-            let plan = crate::plans::scan(detectors, movable, readable, start, stop, num);
+            // Lua's `scan(dets, motor, start, stop, num)` is the 1-D form, so it
+            // maps to the Rust `scan_1d` convenience; the N-motor `scan` takes a
+            // Vec<ScanAxis> that Lua does not construct here.
+            let plan = crate::plans::scan_1d(detectors, movable, readable, start, stop, num);
             Ok(LuaPlan {
                 label: format!("scan(n={})", num),
                 kind: TMutex::new(Some(LuaPlanKind::Prebuilt(plan))),
@@ -2276,6 +2287,7 @@ fn msg_result_to_lua(lua: &Lua, r: crate::engine::MsgResult) -> LuaValue {
             .create_string(&group)
             .map(LuaValue::String)
             .unwrap_or(LuaValue::Nil),
+        MsgResult::WaitComplete { done } => LuaValue::Boolean(done),
         MsgResult::CloseRun { exit_status } => lua
             .create_string(&exit_status)
             .map(LuaValue::String)
@@ -2398,6 +2410,53 @@ fn monitors_of(t: &mlua::Table) -> mlua::Result<Vec<Arc<dyn MonitorableObj>>> {
     Ok(out)
 }
 
+/// Parse a variadic `(device, number)` argument list into `(capability, value)`
+/// pairs for the multi-motor `mv`/`mvr` stubs (bluesky `mv(*args)`). `project`
+/// maps each `LuaDevice` to the capability the stub needs (movable / locatable).
+fn move_pairs<T: ?Sized>(
+    args: &[mlua::Value],
+    ctx: &str,
+    project: impl Fn(&LuaDevice) -> Option<Arc<T>>,
+) -> mlua::Result<Vec<(Arc<T>, f64)>> {
+    if args.is_empty() || !args.len().is_multiple_of(2) {
+        return Err(mlua::Error::RuntimeError(format!(
+            "{ctx} expects (motor, value) pairs"
+        )));
+    }
+    let mut out = Vec::with_capacity(args.len() / 2);
+    let mut i = 0;
+    while i < args.len() {
+        let ud = args[i].as_userdata().ok_or_else(|| {
+            mlua::Error::RuntimeError(format!("{ctx}: argument {} must be a device", i + 1))
+        })?;
+        let d = ud.borrow::<LuaDevice>()?;
+        let dev = project(&d).ok_or_else(|| {
+            mlua::Error::RuntimeError(format!("{} lacks the capability required by {ctx}", d.name))
+        })?;
+        let v = match &args[i + 1] {
+            mlua::Value::Number(n) => *n,
+            mlua::Value::Integer(n) => *n as f64,
+            _ => {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "{ctx}: argument {} must be a number",
+                    i + 2
+                )))
+            }
+        };
+        out.push((dev, v));
+        i += 2;
+    }
+    Ok(out)
+}
+
+fn mv_pairs(args: &[mlua::Value], ctx: &str) -> mlua::Result<Vec<(Arc<dyn MovableObj>, f64)>> {
+    move_pairs(args, ctx, |d| d.movable.clone())
+}
+
+fn mvr_pairs(args: &[mlua::Value], ctx: &str) -> mlua::Result<Vec<(Arc<dyn LocatableObj>, f64)>> {
+    move_pairs(args, ctx, |d| d.locatable.clone())
+}
+
 type MotorMR = (Arc<dyn MovableObj>, Arc<dyn ReadableObj>, String);
 
 fn motor_movable_readable(ud: &mlua::AnyUserData) -> mlua::Result<MotorMR> {
@@ -2454,6 +2513,38 @@ fn register_bluesky_namespaces(lua: &Lua) -> mlua::Result<()> {
     Ok(())
 }
 
+/// Lua arg tuple for `bp.spiral` — dets table, x/y motors, the six spiral
+/// scalars, then optional `dr_y`/`tilt` (nil ⇒ circular/untilted).
+type SpiralPlanArgs = (
+    mlua::Table,
+    mlua::AnyUserData,
+    mlua::AnyUserData,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    usize,
+    Option<f64>,
+    Option<f64>,
+);
+
+/// Lua arg tuple for `bp.spiral_fermat` — as [`SpiralPlanArgs`] but the sixth
+/// scalar is `factor` (f64), not `nth`.
+type SpiralFermatPlanArgs = (
+    mlua::Table,
+    mlua::AnyUserData,
+    mlua::AnyUserData,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    Option<f64>,
+    Option<f64>,
+);
+
 fn register_bp(lua: &Lua) -> mlua::Result<()> {
     let bp = lua.create_table()?;
 
@@ -2492,9 +2583,11 @@ fn register_bp(lua: &Lua) -> mlua::Result<()> {
         lua.create_function(
             |_, (dt, mu, start, stop, num): (mlua::Table, mlua::AnyUserData, f64, f64, usize)| {
                 let (mv, rd, _) = motor_movable_readable(&mu)?;
+                // `bp.scan(dets, motor, start, stop, num)` is the 1-D form → the
+                // Rust `scan_1d` convenience (the N-motor `scan` takes ScanAxis).
                 Ok(wrap_prebuilt(
                     format!("scan(n={num})"),
-                    crate::plans::scan(dets(&dt)?, mv, rd, start, stop, num),
+                    crate::plans::scan_1d(dets(&dt)?, mv, rd, start, stop, num),
                 ))
             },
         )?,
@@ -2510,6 +2603,21 @@ fn register_bp(lua: &Lua) -> mlua::Result<()> {
                 ))
             },
         )?,
+    )?;
+    // Multi-motor inner-product list scan (bluesky's variadic list_scan). Axes
+    // are given as a table of `{motor=, points={...}}` rows — the same shape as
+    // list_grid_scan — but here the lists are zipped, not crossed. All `points`
+    // lists must be equal length (the plan Fails otherwise).
+    bp.set(
+        "list_scan_nd",
+        lua.create_function(|_, (dt, axes_t): (mlua::Table, mlua::Table)| {
+            let dets = dets_table_to_readables(&dt)?;
+            let axes = axes_table_to_list_grid_axes(&axes_t)?;
+            Ok(wrap_prebuilt(
+                "list_scan_nd",
+                crate::plans::list_scan_nd(dets, axes, None),
+            ))
+        })?,
     )?;
     bp.set(
         "rel_scan",
@@ -2564,16 +2672,29 @@ fn register_bp(lua: &Lua) -> mlua::Result<()> {
     // axis is {motor=, start=, stop=, num=}.
     bp.set(
         "grid_scan",
-        lua.create_function(|_, (dt, axes_t): (mlua::Table, mlua::Table)| {
-            let dets = dets_table_to_readables(&dt)?;
-            let (a1, a2) = pair_grid_axes(&axes_t)?;
-            Ok(wrap_prebuilt(
-                "grid_scan",
-                crate::plans::grid_scan(
-                    dets, a1.0, a1.1, a1.2, a1.3, a1.4, a2.0, a2.1, a2.2, a2.3, a2.4,
-                ),
-            ))
-        })?,
+        lua.create_function(
+            |_, (dt, axes_t, snake): (mlua::Table, mlua::Table, Option<bool>)| {
+                let dets = dets_table_to_readables(&dt)?;
+                let (a1, a2) = pair_grid_axes(&axes_t)?;
+                Ok(wrap_prebuilt(
+                    "grid_scan",
+                    crate::plans::grid_scan_snake(
+                        dets,
+                        a1.0,
+                        a1.1,
+                        a1.2,
+                        a1.3,
+                        a1.4,
+                        a2.0,
+                        a2.1,
+                        a2.2,
+                        a2.3,
+                        a2.4,
+                        snake.unwrap_or(false),
+                    ),
+                ))
+            },
+        )?,
     )?;
     bp.set(
         "rel_grid_scan",
@@ -2590,14 +2711,17 @@ fn register_bp(lua: &Lua) -> mlua::Result<()> {
     )?;
     bp.set(
         "list_grid_scan",
-        lua.create_function(|_, (dt, axes_t): (mlua::Table, mlua::Table)| {
-            let dets = dets_table_to_readables(&dt)?;
-            let axes = axes_table_to_list_grid_axes(&axes_t)?;
-            Ok(wrap_prebuilt(
-                "list_grid_scan",
-                crate::plans::list_grid_scan(dets, axes),
-            ))
-        })?,
+        lua.create_function(
+            |_, (dt, axes_t, snake): (mlua::Table, mlua::Table, mlua::Value)| {
+                let dets = dets_table_to_readables(&dt)?;
+                let axes = axes_table_to_list_grid_axes(&axes_t)?;
+                let snake_axes = parse_snake_axes(snake)?;
+                Ok(wrap_prebuilt(
+                    "list_grid_scan",
+                    crate::plans::list_grid_scan_snake(dets, axes, snake_axes),
+                ))
+            },
+        )?,
     )?;
     bp.set(
         "inner_product_scan",
@@ -2627,39 +2751,29 @@ fn register_bp(lua: &Lua) -> mlua::Result<()> {
     // spiral / spiral_square / spiral_fermat — same arg shape.
     bp.set(
         "spiral",
-        lua.create_function(
-            |_,
-             (dt, xm, ym, x_start, y_start, x_range, y_range, dr, nth): (
-                mlua::Table,
-                mlua::AnyUserData,
-                mlua::AnyUserData,
-                f64,
-                f64,
-                f64,
-                f64,
-                f64,
-                usize,
-            )| {
-                let (xmv, xrd, _) = motor_movable_readable(&xm)?;
-                let (ymv, yrd, _) = motor_movable_readable(&ym)?;
-                Ok(wrap_prebuilt(
-                    "spiral",
-                    crate::plans::spiral(
-                        dets(&dt)?,
-                        xmv,
-                        xrd,
-                        ymv,
-                        yrd,
-                        x_start,
-                        y_start,
-                        x_range,
-                        y_range,
-                        dr,
-                        nth,
-                    ),
-                ))
-            },
-        )?,
+        lua.create_function(|_, args: SpiralPlanArgs| {
+            let (dt, xm, ym, x_start, y_start, x_range, y_range, dr, nth, dr_y, tilt) = args;
+            let (xmv, xrd, _) = motor_movable_readable(&xm)?;
+            let (ymv, yrd, _) = motor_movable_readable(&ym)?;
+            Ok(wrap_prebuilt(
+                "spiral",
+                crate::plans::spiral(
+                    dets(&dt)?,
+                    xmv,
+                    xrd,
+                    ymv,
+                    yrd,
+                    x_start,
+                    y_start,
+                    x_range,
+                    y_range,
+                    dr,
+                    nth,
+                    dr_y,
+                    tilt.unwrap_or(0.0),
+                ),
+            ))
+        })?,
     )?;
     bp.set(
         "spiral_square",
@@ -2699,57 +2813,34 @@ fn register_bp(lua: &Lua) -> mlua::Result<()> {
     )?;
     bp.set(
         "spiral_fermat",
-        lua.create_function(
-            |_,
-             (dt, xm, ym, x_start, y_start, x_range, y_range, dr, factor): (
-                mlua::Table,
-                mlua::AnyUserData,
-                mlua::AnyUserData,
-                f64,
-                f64,
-                f64,
-                f64,
-                f64,
-                f64,
-            )| {
-                let (xmv, xrd, _) = motor_movable_readable(&xm)?;
-                let (ymv, yrd, _) = motor_movable_readable(&ym)?;
-                Ok(wrap_prebuilt(
-                    "spiral_fermat",
-                    crate::plans::spiral_fermat(
-                        dets(&dt)?,
-                        xmv,
-                        xrd,
-                        ymv,
-                        yrd,
-                        x_start,
-                        y_start,
-                        x_range,
-                        y_range,
-                        dr,
-                        factor,
-                    ),
-                ))
-            },
-        )?,
+        lua.create_function(|_, args: SpiralFermatPlanArgs| {
+            let (dt, xm, ym, x_start, y_start, x_range, y_range, dr, factor, dr_y, tilt) = args;
+            let (xmv, xrd, _) = motor_movable_readable(&xm)?;
+            let (ymv, yrd, _) = motor_movable_readable(&ym)?;
+            Ok(wrap_prebuilt(
+                "spiral_fermat",
+                crate::plans::spiral_fermat(
+                    dets(&dt)?,
+                    xmv,
+                    xrd,
+                    ymv,
+                    yrd,
+                    x_start,
+                    y_start,
+                    x_range,
+                    y_range,
+                    dr,
+                    factor,
+                    dr_y,
+                    tilt.unwrap_or(0.0),
+                ),
+            ))
+        })?,
     )?;
-    bp.set(
-        "ramp_plan",
-        lua.create_function(
-            |_, (go_plan, dt, period_secs, samples): (mlua::AnyUserData, mlua::Table, f64, usize)| {
-                let go = take_inner_plan(&go_plan)?;
-                Ok(wrap_prebuilt(
-                    format!("ramp_plan(n={samples})"),
-                    crate::plans::ramp_plan(
-                        go,
-                        dets(&dt)?,
-                        std::time::Duration::from_secs_f64(period_secs),
-                        samples,
-                    ),
-                ))
-            },
-        )?,
-    )?;
+    // NOTE: `bp.ramp_plan` is intentionally not bound. The status-driven
+    // `plans::ramp_plan` takes Rust closures (an `is_complete` predicate and an
+    // inner-plan factory) that have no faithful Lua representation; a Lua
+    // completion condition is a separate design (see gap-analysis PLAN-04).
     bp.set(
         "log_scan",
         lua.create_function(
@@ -2827,6 +2918,39 @@ fn axes_table_to_list_grid_axes(t: &mlua::Table) -> mlua::Result<Vec<crate::plan
         out.push((mv, rd, vec_f64(&pts_t)?));
     }
     Ok(out)
+}
+
+/// Parse a Lua `snake_axes` argument into [`crate::plans::SnakeAxes`]:
+/// `nil` / `false` → `None`, `true` → `All` (snake every axis but the
+/// slowest), a table of 1-based axis positions → `Axes` (converted to the
+/// 0-based indices the plan layer uses). Mirrors bluesky's `bool | list`
+/// `snake_axes` argument.
+fn parse_snake_axes(v: mlua::Value) -> mlua::Result<crate::plans::SnakeAxes> {
+    match v {
+        mlua::Value::Nil => Ok(crate::plans::SnakeAxes::None),
+        mlua::Value::Boolean(b) => Ok(if b {
+            crate::plans::SnakeAxes::All
+        } else {
+            crate::plans::SnakeAxes::None
+        }),
+        mlua::Value::Table(t) => {
+            let mut idxs = Vec::new();
+            for pos in t.sequence_values::<i64>() {
+                let pos = pos?;
+                if pos < 1 {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "snake_axes entries are 1-based axis positions, got {pos}"
+                    )));
+                }
+                idxs.push((pos - 1) as usize);
+            }
+            Ok(crate::plans::SnakeAxes::Axes(idxs))
+        }
+        other => Err(mlua::Error::RuntimeError(format!(
+            "snake_axes must be nil, a boolean, or a table of axis positions, got {}",
+            other.type_name()
+        ))),
+    }
 }
 
 type InnerProductAxis = (Arc<dyn MovableObj>, Arc<dyn ReadableObj>, f64, f64);
@@ -2942,26 +3066,22 @@ fn register_bps(lua: &Lua) -> mlua::Result<()> {
             },
         )?,
     )?;
+    // `bps.mv(m1, v1[, m2, v2, ...])` — variadic like bluesky's `mv(*args)`:
+    // every (motor, target) pair moves in parallel behind one wait. The 2-arg
+    // form is the single-motor case.
     bps.set(
         "mv",
-        lua.create_function(|_, (mu, v): (mlua::AnyUserData, f64)| {
-            let d = mu.borrow::<LuaDevice>()?;
-            let mv = d
-                .movable
-                .clone()
-                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not movable", d.name)))?;
-            Ok(wrap_prebuilt("mv", stubs::mv(mv, v)))
+        lua.create_function(|_, args: mlua::Variadic<mlua::Value>| {
+            let moves = mv_pairs(&args, "mv")?;
+            Ok(wrap_prebuilt("mv", stubs::mv_many(moves)))
         })?,
     )?;
+    // `bps.mvr(m1, d1[, m2, d2, ...])` — variadic relative multi-motor move.
     bps.set(
         "mvr",
-        lua.create_function(|_, (mu, delta): (mlua::AnyUserData, f64)| {
-            let d = mu.borrow::<LuaDevice>()?;
-            let lo = d
-                .locatable
-                .clone()
-                .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not locatable", d.name)))?;
-            Ok(wrap_prebuilt("mvr", stubs::mvr(lo, delta)))
+        lua.create_function(|_, args: mlua::Variadic<mlua::Value>| {
+            let moves = mvr_pairs(&args, "mvr")?;
+            Ok(wrap_prebuilt("mvr", stubs::mvr_many(moves)))
         })?,
     )?;
     bps.set(
@@ -3195,8 +3315,18 @@ fn register_bpt(lua: &Lua) -> mlua::Result<()> {
     bpt.set(
         "spiral",
         lua.create_function(
-            |lua, (xs, ys, xr, yr, dr, nth): (f64, f64, f64, f64, f64, usize)| {
-                let pts = patterns::spiral(xs, ys, xr, yr, dr, nth);
+            |lua,
+             (xs, ys, xr, yr, dr, nth, dr_y, tilt): (
+                f64,
+                f64,
+                f64,
+                f64,
+                f64,
+                usize,
+                Option<f64>,
+                Option<f64>,
+            )| {
+                let pts = patterns::spiral(xs, ys, xr, yr, dr, nth, dr_y, tilt.unwrap_or(0.0));
                 pairs_to_lua_table(lua, &pts)
             },
         )?,
@@ -3213,8 +3343,27 @@ fn register_bpt(lua: &Lua) -> mlua::Result<()> {
     bpt.set(
         "spiral_fermat",
         lua.create_function(
-            |lua, (xs, ys, xr, yr, dr, factor): (f64, f64, f64, f64, f64, f64)| {
-                let pts = patterns::spiral_fermat_pattern(xs, ys, xr, yr, dr, factor);
+            |lua,
+             (xs, ys, xr, yr, dr, factor, dr_y, tilt): (
+                f64,
+                f64,
+                f64,
+                f64,
+                f64,
+                f64,
+                Option<f64>,
+                Option<f64>,
+            )| {
+                let pts = patterns::spiral_fermat_pattern(
+                    xs,
+                    ys,
+                    xr,
+                    yr,
+                    dr,
+                    factor,
+                    dr_y,
+                    tilt.unwrap_or(0.0),
+                );
                 pairs_to_lua_table(lua, &pts)
             },
         )?,
@@ -3403,9 +3552,12 @@ fn register_bpp(lua: &Lua) -> mlua::Result<()> {
             |_, (plan_ud, fin_ud): (mlua::AnyUserData, mlua::AnyUserData)| {
                 let inner = take_inner_plan(&plan_ud)?;
                 let fin = take_inner_plan(&fin_ud)?;
+                // Lua's 2-arg `contingency(plan, fin)` maps to a try/finally:
+                // `fin` runs on both normal completion and error. The richer
+                // except/else branches are Rust-only for now.
                 Ok(wrap_prebuilt(
                     "contingency_wrapper",
-                    pp::contingency_wrapper(inner, fin),
+                    pp::contingency_wrapper(inner, None, None, Some(fin), true),
                 ))
             },
         )?,
@@ -3558,6 +3710,14 @@ impl UserData for LuaAdFile {
         m.add_method("set_template", |_, this, t: String| {
             ad_block("ad_file:set_template", this.0.set_template(&t))
         });
+        // Apply / revert this plugin's `stage_sigs` (populated by
+        // `select_save_plugin`). Mirrors ophyd staging.
+        m.add_method("stage", |_, this, ()| {
+            ad_block("ad_file:stage", this.0.plugin.stage_sigs.stage())
+        });
+        m.add_method("unstage", |_, this, ()| {
+            ad_block("ad_file:unstage", this.0.plugin.stage_sigs.unstage())
+        });
     }
 }
 
@@ -3604,6 +3764,12 @@ impl UserData for LuaAdStats {
                 SignalBackend::<bool>::put(this.0.compute_histogram.as_ref(), Some(b)),
             )
         });
+        m.add_method("stage", |_, this, ()| {
+            ad_block("ad_stats:stage", this.0.plugin.stage_sigs.stage())
+        });
+        m.add_method("unstage", |_, this, ()| {
+            ad_block("ad_stats:unstage", this.0.plugin.stage_sigs.unstage())
+        });
     }
 }
 
@@ -3639,6 +3805,12 @@ impl UserData for LuaAdRoi {
         );
         m.add_method("set_enabled_xy", |_, this, (x, y): (bool, bool)| {
             ad_block("ad_roi:set_enabled_xy", this.0.set_enabled_xy(x, y))
+        });
+        m.add_method("stage", |_, this, ()| {
+            ad_block("ad_roi:stage", this.0.plugin.stage_sigs.stage())
+        });
+        m.add_method("unstage", |_, this, ()| {
+            ad_block("ad_roi:unstage", this.0.plugin.stage_sigs.unstage())
         });
     }
 }
@@ -3715,15 +3887,16 @@ fn install_areadetector_factories(lua: &Lua) -> mlua::Result<()> {
             }
             let sib_refs: Vec<&crate::host::areadetector::NdFile> =
                 siblings.iter().map(|a| a.as_ref()).collect();
-            ad_block(
-                "select_save_plugin",
-                ad_select_save_plugin_fn(file_arc.as_ref(), &source_port, &sib_refs),
-            )
+            // Records the routing into each plugin's `stage_sigs`; call
+            // `file:stage()` / sibling `:stage()` to apply (and `:unstage()`
+            // to revert).
+            ad_select_save_plugin_fn(file_arc.as_ref(), &source_port, &sib_refs);
+            Ok(())
         },
     )?;
     lua.globals().set("select_save_plugin", f)?;
 
-    // `num_rois({roi1, roi2, …}, n)` — enable first n, disable rest.
+    // `num_rois({roi1, roi2, …}, n)` — stage first n enabled, rest disabled.
     let f = lua.create_function(|_, (rois_tbl, n): (mlua::Table, usize)| {
         let mut rois: Vec<Arc<crate::host::areadetector::NdRoi>> = Vec::new();
         for pair in rois_tbl.pairs::<mlua::Value, mlua::AnyUserData>() {
@@ -3733,7 +3906,9 @@ fn install_areadetector_factories(lua: &Lua) -> mlua::Result<()> {
         }
         let refs: Vec<&crate::host::areadetector::NdRoi> =
             rois.iter().map(|a| a.as_ref()).collect();
-        ad_block("num_rois", ad_num_rois_fn(&refs, n))
+        ad_num_rois_fn(&refs, n)
+            .map_err(|e| mlua::Error::RuntimeError(format!("num_rois: {e}")))?;
+        Ok(())
     })?;
     lua.globals().set("num_rois", f)?;
 

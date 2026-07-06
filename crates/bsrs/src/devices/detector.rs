@@ -2,7 +2,8 @@
 
 use crate::core::error::{BsrsError, Result};
 use crate::core::msg::{
-    CollectableObj, FlyableObj, NamedObj, ReadableObj, StageableObj, TriggerableObj,
+    CollectableObj, ConfigurableObj, FlyableObj, NamedObj, ReadableObj, StageableObj,
+    TriggerableObj,
 };
 use crate::core::reading::ReadingValue;
 use crate::core::status::Status;
@@ -87,6 +88,31 @@ where
                 self.name
             ))
         })
+    }
+
+    /// Drain the writer's buffered `StreamResource`/`StreamDatum` for frames up
+    /// to the current write index, mapped to `Document`s and each `StreamDatum`
+    /// stamped with `descriptor`. Shared by the fly path
+    /// ([`CollectableObj::collect_stream_docs_dyn`]) and the step path
+    /// ([`ReadableObj::collect_asset_docs_dyn`]); a given scan drives exactly
+    /// one of them, so the writer's `last_emitted` cursor is never
+    /// double-consumed.
+    ///
+    /// [`CollectableObj::collect_stream_docs_dyn`]: crate::core::msg::CollectableObj::collect_stream_docs_dyn
+    /// [`ReadableObj::collect_asset_docs_dyn`]: crate::core::msg::ReadableObj::collect_asset_docs_dyn
+    async fn drain_asset_documents(
+        &self,
+        descriptor: &str,
+    ) -> Result<Vec<crate::event_model::Document>> {
+        let up_to = WritesStreamAssets::get_index(self).await?;
+        let docs = WritesStreamAssets::collect_asset_docs(self, up_to, descriptor)
+            .map(|asset| match asset {
+                StreamAsset::Resource(r) => crate::event_model::Document::StreamResource(r),
+                StreamAsset::Datum(d) => crate::event_model::Document::StreamDatum(d),
+            })
+            .collect::<Vec<_>>()
+            .await;
+        Ok(docs)
     }
 }
 
@@ -339,15 +365,10 @@ where
         &self,
         descriptor: &str,
     ) -> Result<Vec<crate::event_model::Document>> {
-        let up_to = WritesStreamAssets::get_index(self).await?;
-        let docs = WritesStreamAssets::collect_asset_docs(self, up_to, descriptor)
-            .map(|asset| match asset {
-                StreamAsset::Resource(r) => crate::event_model::Document::StreamResource(r),
-                StreamAsset::Datum(d) => crate::event_model::Document::StreamDatum(d),
-            })
-            .collect::<Vec<_>>()
-            .await;
-        Ok(docs)
+        self.drain_asset_documents(descriptor).await
+    }
+    fn as_configurable(&self) -> Option<&dyn ConfigurableObj> {
+        Some(self)
     }
 }
 
@@ -375,8 +396,49 @@ where
         // Read cached DataKeys, never re-open the writer (DB-04).
         self.cached_data_keys()
     }
+    fn as_stageable(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn StageableObj>> {
+        Some(self)
+    }
     fn hint_fields(&self) -> Option<Vec<String>> {
         Some(vec![format!("{}_index", self.name)])
+    }
+    fn writes_external_assets(&self) -> bool {
+        true
+    }
+    async fn collect_asset_docs_dyn(
+        &self,
+        descriptor: &str,
+    ) -> Result<Vec<crate::event_model::Document>> {
+        self.drain_asset_documents(descriptor).await
+    }
+    fn as_configurable(&self) -> Option<&dyn ConfigurableObj> {
+        Some(self)
+    }
+}
+
+/// Configuration = the control half's slow-changing acquisition parameters
+/// (ophyd-async `AreaDetector` adds `driver.acquire_time`/`acquire_period`
+/// as CONFIG_SIGNALs; controls without config parameters contribute none).
+#[async_trait]
+impl<C, W> ConfigurableObj for StandardDetector<C, W>
+where
+    C: DetectorControl + Send + Sync + 'static,
+    W: DetectorWriter + Send + Sync + 'static,
+{
+    async fn read_configuration_dyn(&self) -> Result<HashMap<String, ReadingValue>> {
+        self.control.read_configuration(&self.name).await
+    }
+    async fn describe_configuration_dyn(&self) -> Result<HashMap<String, DataKey>> {
+        self.control.describe_configuration(&self.name).await
+    }
+    async fn configure_dyn(&self, _args: crate::core::ConfigureArgs) -> Result<()> {
+        // Acquisition parameters are set through `prepare(TriggerInfo)`, not
+        // a generic configure — same as ophyd-async, whose detectors expose
+        // config signals read-only on the descriptor path.
+        Err(BsrsError::State(format!(
+            "{}: StandardDetector is configured via prepare(TriggerInfo), not configure()",
+            self.name
+        )))
     }
 }
 

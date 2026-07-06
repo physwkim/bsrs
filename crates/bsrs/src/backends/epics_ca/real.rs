@@ -827,6 +827,28 @@ impl SignalBackend<i64> for EpicsCaBackend<i64> {
     }
 }
 
+impl EpicsCaBackend<bool> {
+    /// Fire-and-forget put (`CA_PROTO_WRITE`, no put-callback). For busy
+    /// records (areaDetector `Acquire`/`Capture`) a put-callback completes
+    /// only when the *operation* ends — and a `0` put's callback can
+    /// deadlock outright — so callers that just need the value written use
+    /// this and watch the readback instead (the ophyd-async
+    /// `EpicsOptions(wait=non_zero)` convention).
+    pub async fn put_nowait(&self, value: bool) -> Result<()> {
+        let ch = self
+            .ensure_channel(Duration::from_secs(2))
+            .await
+            .map_err(|e| BsrsError::Backend(format!("{e}")))?;
+        let native = channel_native_type(&ch)
+            .await
+            .map_err(|e| BsrsError::Backend(format!("{e}")))?;
+        let v = bool_to_wire(native, value);
+        ch.put_nowait(&v)
+            .await
+            .map_err(|e| BsrsError::Backend(format!("ca put_nowait: {e}")))
+    }
+}
+
 #[async_trait]
 impl SignalBackend<bool> for EpicsCaBackend<bool> {
     async fn connect(&self, timeout: Duration) -> Result<()> {

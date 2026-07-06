@@ -18,7 +18,8 @@ fn main() -> Result<()> {
     let result = re.run_blocking(plan)?;
     println!(
         "run finished: {} (uid: {:?})",
-        result.exit_status, result.run_uid
+        result.exit_status,
+        result.run_uids.last()
     );
     Ok(())
 }

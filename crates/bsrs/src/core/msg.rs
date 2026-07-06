@@ -41,6 +41,15 @@ pub struct ConfigureArgs {
 pub type AwaitableFactory =
     Arc<dyn Fn() -> BoxFuture<'static, crate::core::error::Result<()>> + Send + Sync>;
 
+/// Error sink for a [`Msg::PushContingency`] region. While a run has one of
+/// these on its contingency stack, the engine routes a message error into the
+/// innermost sink (as its `Display` string) and keeps running, instead of
+/// failing the run — letting the plan-level `contingency_wrapper` observe the
+/// error, run its `except`/`finally` recovery, and choose whether to re-raise
+/// (via [`Msg::Fail`]). Mirrors how bluesky's generator plans catch an engine
+/// error at the `yield` point.
+pub type ContingencySink = Arc<std::sync::Mutex<Option<String>>>;
+
 /// The complete set of commands that plans can issue. Closed enum + `Custom`.
 #[non_exhaustive]
 pub enum Msg {
@@ -52,6 +61,26 @@ pub enum Msg {
         exit_status: String,
         /// Optional reason string.
         reason: Option<String>,
+    },
+
+    /// Route a bundler-touching message to a *named* run, so several runs can
+    /// be open at once (a fly scan with a `primary` and a `diagnostics` run, an
+    /// outer run wrapping per-point sub-runs). The bsrs analogue of bluesky's
+    /// `msg.run` field (`run_engine.py:504` `_run_bundlers: dict`): every
+    /// message carries an implicit run key, `None` (an unwrapped message) being
+    /// the single default run. Wrapping `inner` in `InRun` sets that key to
+    /// `Some(run)`, so the engine dispatches it to the run's own [`RunBundler`],
+    /// monitors, uncollected flyers and asset cache. Only the bundler-touching
+    /// verbs (`OpenRun`/`CloseRun`/`Create`/`Save`/`Drop`/`DeclareStream`/
+    /// `Read`/`Collect`/`Monitor`/`Unmonitor`/`Configure`/`Kickoff`) consult the
+    /// key; wrapping any other verb runs it unchanged (the key is ignored,
+    /// matching bluesky, which ignores `msg.run` outside the bundler path).
+    /// Not nestable — an `InRun` inside an `InRun` is rejected by the engine.
+    InRun {
+        /// The run key this message targets.
+        run: String,
+        /// The bundler-touching message to dispatch under `run`.
+        inner: Box<Msg>,
     },
 
     /// Open a new event bundle for a stream.
@@ -283,11 +312,33 @@ pub enum Msg {
     /// standard `Read` / `Save` / `Collect` path does not construct.
     Publish(Box<crate::event_model::Document>),
 
+    /// Begin a contingency region: push `sink` onto the engine's contingency
+    /// stack. A message error that occurs before the matching
+    /// [`Msg::PopContingency`] is written into the innermost sink and the run
+    /// keeps going, rather than failing immediately — so the
+    /// `contingency_wrapper` that owns `sink` can run its `except`/`finally`
+    /// recovery. Emitted only by `contingency_wrapper`; not for direct use.
+    PushContingency(ContingencySink),
+    /// End the current contingency region: pop the top of the engine's
+    /// contingency stack. Paired with [`Msg::PushContingency`] by
+    /// `contingency_wrapper`.
+    PopContingency,
+
     /// No-op message — useful for spinning the loop.
     Null,
 }
 
 impl Msg {
+    /// Wrap `inner` so the engine routes it to the run named `run` (see
+    /// [`Msg::InRun`]). Convenience for multi-run plans:
+    /// `Msg::in_run("diag", Msg::Create { stream_name: "primary".into() })`.
+    pub fn in_run(run: impl Into<String>, inner: Msg) -> Msg {
+        Msg::InRun {
+            run: run.into(),
+            inner: Box::new(inner),
+        }
+    }
+
     /// Whether this message should be added to the rewind cache when the
     /// engine is in a rewindable region (between `Checkpoint` and the next
     /// `ClearCheckpoint` / non-rewindable command).
@@ -309,6 +360,12 @@ impl Msg {
     /// re-issued acquisition ran under whatever configuration the device had
     /// drifted to during the pause instead of the one the plan requested.
     pub fn is_cacheable(&self) -> bool {
+        // A run-routed message caches exactly as its inner verb would, so a
+        // rewind replays `InRun`-wrapped Set/Read/Save into the same run. (A
+        // wrapped OpenRun/CloseRun/Monitor stays uncacheable via the inner.)
+        if let Msg::InRun { inner, .. } = self {
+            return inner.is_cacheable();
+        }
         !matches!(
             self,
             Msg::OpenRun(_)
@@ -332,6 +389,8 @@ impl Msg {
                 | Msg::Subscribe { .. }
                 | Msg::Unsubscribe(_)
                 | Msg::Fail(_)
+                | Msg::PushContingency(_)
+                | Msg::PopContingency
                 | Msg::Null
         )
     }
@@ -341,6 +400,7 @@ impl Msg {
     /// build `objs_seen` / `movable_objs_touched` registers.
     pub fn obj_name(&self) -> Option<&str> {
         match self {
+            Msg::InRun { inner, .. } => inner.obj_name(),
             Msg::Read(o) => Some(o.name()),
             Msg::Set { obj, .. } => Some(obj.name()),
             Msg::Trigger { obj, .. } => Some(obj.name()),
@@ -372,6 +432,10 @@ impl Clone for Msg {
             } => Msg::CloseRun {
                 exit_status: exit_status.clone(),
                 reason: reason.clone(),
+            },
+            Msg::InRun { run, inner } => Msg::InRun {
+                run: run.clone(),
+                inner: Box::new((**inner).clone()),
             },
             Msg::Create { stream_name } => Msg::Create {
                 stream_name: stream_name.clone(),
@@ -471,6 +535,8 @@ impl Clone for Msg {
             Msg::Custom { .. } => Msg::Null,
             Msg::Publish(d) => Msg::Publish(d.clone()),
             Msg::Locate(o) => Msg::Locate(o.clone()),
+            Msg::PushContingency(sink) => Msg::PushContingency(sink.clone()),
+            Msg::PopContingency => Msg::PopContingency,
             Msg::Null => Msg::Null,
         }
     }
@@ -481,6 +547,7 @@ impl std::fmt::Debug for Msg {
         match self {
             Msg::OpenRun(_) => write!(f, "OpenRun"),
             Msg::CloseRun { exit_status, .. } => write!(f, "CloseRun({exit_status})"),
+            Msg::InRun { run, inner } => write!(f, "InRun({run}, {inner:?})"),
             Msg::Create { stream_name } => write!(f, "Create({stream_name})"),
             Msg::Save => write!(f, "Save"),
             Msg::Drop => write!(f, "Drop"),
@@ -518,6 +585,8 @@ impl std::fmt::Debug for Msg {
             Msg::Custom { name, .. } => write!(f, "Custom({name})"),
             Msg::Publish(d) => write!(f, "Publish({})", document_label(d)),
             Msg::Locate(o) => write!(f, "Locate({})", o.name()),
+            Msg::PushContingency(_) => write!(f, "PushContingency"),
+            Msg::PopContingency => write!(f, "PopContingency"),
             Msg::Null => write!(f, "Null"),
         }
     }
@@ -589,6 +658,55 @@ pub trait ReadableObj: NamedObj {
     fn hint_fields(&self) -> Option<Vec<String>> {
         None
     }
+    /// Staging capability query: if this readable is also a [`StageableObj`]
+    /// (a detector that arms on stage, a signal that holds a monitor), return
+    /// `Some(self)` so a plan can `Stage` it before the run and `Unstage` it
+    /// after — mirroring bluesky staging `list(detectors) + motors`. The
+    /// default is `None` (not stageable); devices that impl [`StageableObj`]
+    /// override to `Some(self)`. An `Arc<Self>` receiver lets the returned
+    /// handle share ownership without the device holding a self-reference. This
+    /// is the static-typing analogue of bluesky's duck-typed "does it have a
+    /// `stage()` method?" check.
+    fn as_stageable(self: Arc<Self>) -> Option<Arc<dyn StageableObj>> {
+        None
+    }
+    /// Whether this readable also writes external assets, i.e. it emits
+    /// `StreamResource` / `StreamDatum` documents alongside its Event. Default
+    /// `false`; only asset-writing readables (e.g. `StandardDetector` in step
+    /// mode) return `true`. The engine tracks a bundle's read objects that
+    /// return `true` and drains their [`collect_asset_docs_dyn`] at `save`,
+    /// mirroring bluesky's `check_supports(obj, WritesStreamAssets)` gate in
+    /// `maybe_collect_asset_docs` (bundlers.py:444).
+    ///
+    /// [`collect_asset_docs_dyn`]: ReadableObj::collect_asset_docs_dyn
+    fn writes_external_assets(&self) -> bool {
+        false
+    }
+    /// Drain external-asset documents (`StreamResource` / `StreamDatum`) for
+    /// frames written since the last call, each `StreamDatum` stamped with
+    /// `descriptor` — the EventDescriptor UID the engine composed for the event
+    /// bundle this read landed in. The engine broadcasts them right before the
+    /// Event on `Msg::Save`, so a consumer can link the step scan's frame data
+    /// back to the event's descriptor. This is the step-mode analogue of
+    /// [`CollectableObj::collect_stream_docs_dyn`] and a port of bluesky's
+    /// `_pack_external_assets` on `save` (bundlers.py:610). Default yields none;
+    /// only readables that also write external assets override it.
+    async fn collect_asset_docs_dyn(
+        &self,
+        _descriptor: &str,
+    ) -> Result<Vec<crate::event_model::Document>, crate::core::error::BsrsError> {
+        Ok(Vec::new())
+    }
+    /// This object's configuration view, if it has one. The engine reads
+    /// `read_configuration`/`describe_configuration` through it to fill the
+    /// descriptor's per-object `configuration` — bluesky's
+    /// `isinstance(obj, Configurable)` gate in `_StreamCache.ensure_cached`
+    /// (bundlers.py:93-130). Default `None`: the object still gets a
+    /// `configuration` entry in the descriptor, with empty data/keys, exactly
+    /// as bluesky gives non-Configurable objects empty cache dicts.
+    fn as_configurable(&self) -> Option<&dyn ConfigurableObj> {
+        None
+    }
 }
 
 /// Anything that can be moved (set to a value).
@@ -603,6 +721,13 @@ pub trait MovableObj: NamedObj {
     async fn stop_on_pause(&self, success: bool) -> Result<(), crate::core::error::BsrsError> {
         let _ = success;
         Ok(())
+    }
+    /// Staging capability query — the movable analogue of
+    /// [`ReadableObj::as_stageable`], so a plan stages `list(detectors) +
+    /// motors` uniformly. Default `None` (no library motor is stageable today);
+    /// a stageable motor overrides to `Some(self)`.
+    fn as_stageable(self: Arc<Self>) -> Option<Arc<dyn StageableObj>> {
+        None
     }
 }
 
@@ -661,6 +786,16 @@ pub trait FlyableObj: NamedObj {
         let _ = success;
         Ok(())
     }
+    /// This object's collectable view, if it has one — the flyer twin of
+    /// [`ReadableObj::as_configurable`]. The engine records the collectable of
+    /// every kicked-off flyer so it can drain any that were kicked off but
+    /// never explicitly collected before the run closes (bluesky's
+    /// `RunBundler.backstop_collect`, bundlers.py:1190). A flyer that is also
+    /// [`CollectableObj`] returns `Some(self)`; the default — a pure flyer with
+    /// no buffered data to drain — yields `None`.
+    fn as_collectable(self: Arc<Self>) -> Option<Arc<dyn CollectableObj>> {
+        None
+    }
 }
 
 /// Anything that can be `prepare()`'d for a step / fly scan.
@@ -713,6 +848,13 @@ pub trait CollectableObj: NamedObj {
     ) -> Result<Vec<crate::event_model::Document>, crate::core::error::BsrsError> {
         Ok(Vec::new())
     }
+    /// This object's configuration view, if it has one — the collect-path
+    /// twin of [`ReadableObj::as_configurable`], read when the engine
+    /// declares this object's collect stream(s) (bluesky `describe_collect`
+    /// runs `ensure_cached` + `_prepare_stream`, bundlers.py:814-819).
+    fn as_configurable(&self) -> Option<&dyn ConfigurableObj> {
+        None
+    }
 }
 
 /// Anything that can be subscribed to (monitor stream). A monitorable
@@ -741,4 +883,80 @@ pub trait ConfigurableObj: NamedObj {
     /// Apply a configuration change.
     async fn configure_dyn(&self, args: ConfigureArgs)
         -> Result<(), crate::core::error::BsrsError>;
+}
+
+/// Stable identifier returned by `RunEngine::subscribe`.
+pub type SubscriptionId = u64;
+
+/// Side-channel result from the most recently-processed `Msg`. Producers
+/// that yield `Msg`s (Lua coroutines, async-fn plans) can poll
+/// `RunEngine::take_msg_result` after each yield to see what the engine
+/// did with the Msg. Plans that need the result inline receive it through
+/// [`PlanItem::Respond`](crate::core::plan::PlanItem::Respond).
+///
+/// `MsgResult` reflects the *engine's* observable effect — it is not a
+/// promise that the operation has fully completed. For grouped
+/// Set/Trigger/Kickoff/Complete, the `Status` is added to the named
+/// wait group; the result reports that group name. For ungrouped
+/// (synchronous) variants, the engine has already awaited completion
+/// before writing the result.
+#[derive(Debug, Clone)]
+pub enum MsgResult {
+    /// No useful result for this Msg kind.
+    None,
+    /// `OpenRun` produced a fresh run-start UID.
+    OpenRun {
+        /// Run-start UID.
+        uid: String,
+    },
+    /// `Set` / `Trigger` / `Kickoff` / `Complete` issued a Status that
+    /// was added to the given wait group. Plans pair this with a
+    /// matching `Msg::Wait { group }`.
+    Status {
+        /// Wait group the Status was added to.
+        group: String,
+    },
+    /// `Wait` finished. `done` is true when every member of the group
+    /// completed, false when a move-on timeout (`error_on_timeout=false`)
+    /// elapsed with members still pending. Plans loop on this — e.g.
+    /// `collect_while_completing` collects each period until `done`.
+    WaitComplete {
+        /// Whether the whole group completed (vs. a move-on timeout).
+        done: bool,
+    },
+    /// `Read` produced a reading per signal. Same shape as the engine
+    /// stored into the bundler.
+    Reading {
+        /// `field_name` → `ReadingValue`.
+        data: HashMap<String, crate::core::reading::ReadingValue>,
+    },
+    /// `Locate` produced a setpoint + readback pair.
+    Location {
+        /// Where the device was last requested to move.
+        setpoint: f64,
+        /// Where the device currently is.
+        readback: f64,
+    },
+    /// `CloseRun` finished. Engine reports the exit status it just
+    /// emitted in the RunStop document.
+    CloseRun {
+        /// `success` / `abort` / `fail` / etc.
+        exit_status: String,
+    },
+    /// `Msg::Input` produced a string from the configured handler.
+    Input {
+        /// The user's response.
+        text: String,
+    },
+    /// `Msg::ReClass` — the engine identifies itself.
+    EngineClass {
+        /// Stable identifier — `"bsrs.RunEngine"`.
+        name: &'static str,
+    },
+    /// `Msg::Subscribe` returned an id; pair with `Msg::Unsubscribe`
+    /// to remove early. Otherwise the engine drops it at run end.
+    SubscriptionId {
+        /// Stable subscription id.
+        id: SubscriptionId,
+    },
 }

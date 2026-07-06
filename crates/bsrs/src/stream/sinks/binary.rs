@@ -112,7 +112,7 @@ impl DetectorWriter for BinaryFrameSink {
         out.insert(
             format!("{}_image", self.name),
             DataKey {
-                source: format!("file://{}", self.path.display()),
+                source: crate::event_model::file_uri(&self.path.display().to_string()),
                 dtype: Dtype::Number,
                 shape: if self.payload_size > 0 {
                     vec![Some(self.payload_size)]
@@ -150,7 +150,7 @@ impl DetectorWriter for BinaryFrameSink {
                     uid: new_uid.clone(),
                     data_key: format!("{}_image", self.name),
                     mimetype: "application/x-cirbin1".into(),
-                    uri: format!("file://{}", self.path.display()),
+                    uri: crate::event_model::file_uri(&self.path.display().to_string()),
                     parameters: Default::default(),
                     run_start: None,
                 }));
@@ -167,10 +167,10 @@ impl DetectorWriter for BinaryFrameSink {
                     start: last,
                     stop: up_to,
                 },
-                seq_nums: StreamRange {
-                    start: last + 1,
-                    stop: up_to + 1,
-                },
+                // The run engine owns the sequence counter and fills
+                // seq_nums at the drain; in the run-less frame-source
+                // pipeline {0, 0} stays, meaning "not anchored to events".
+                seq_nums: StreamRange { start: 0, stop: 0 },
             }));
             self.last_emitted.store(up_to, Ordering::SeqCst);
         }

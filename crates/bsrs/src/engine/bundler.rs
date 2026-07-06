@@ -27,6 +27,12 @@ struct OpenBundle {
     object_keys: HashMap<String, Vec<String>>,
     /// Object → fields hint accumulator for this bundle's descriptor.
     hints: Option<HashMap<String, PerObjectHint>>,
+    /// Per-object configuration accumulated from this bundle's `Read`s,
+    /// keyed by object name — one entry per object read, empty for
+    /// non-configurable objects. Folded into the descriptor at `save`
+    /// (bluesky `_prepare_stream` builds `config[obj.name]` from the
+    /// stream cache, bundlers.py:286-290).
+    config: HashMap<String, Configuration>,
     /// Whether at least one `Read` has been folded into this bundle. The
     /// bsrs equivalent of bluesky's `_objs_read` non-emptiness: a `save`
     /// with no preceding `read` emits no Event (bundlers.py:570-573).
@@ -48,13 +54,27 @@ pub struct RunBundler {
     open: Option<OpenBundle>,
     /// Run start UID.
     pub start_uid: String,
-    /// Configuration accumulated for the next descriptor.
-    pending_config: HashMap<String, Configuration>,
+    /// Run-scoped per-object configuration cache, keyed by object name: the
+    /// engine reads an object's configuration once per run (at its first
+    /// bundled read / declare) and re-reads only on `Msg::Configure`,
+    /// mirroring bluesky's `ensure_cached` config caches
+    /// (`_StreamCache.config_*_cache`, bundlers.py:85-130). bsrs keeps one
+    /// run-wide cache where bluesky keeps one per stream — the values only
+    /// change via `configure`, which updates this cache, so the per-stream
+    /// split buys nothing here.
+    config_cache: HashMap<String, Configuration>,
     /// Snapshot of per-stream sequence counters taken at the last checkpoint,
     /// used to roll them back on `rewind` so a replayed `save` re-emits the same
     /// `seq_num`. `None` when no checkpoint region is active. bluesky
     /// `RunBundler._sequence_counters_copy` (bundlers.py:167).
     seq_snapshot: Option<HashMap<String, u64>>,
+    /// Every `StreamResource` uid emitted this run → its `data_key`. The
+    /// engine's asset-drain validation records resources here and requires
+    /// each later `StreamDatum` to reference a known uid. Run-scoped and
+    /// never rewound — a datum after a rewind still legitimately references
+    /// the resource emitted before it. bluesky
+    /// `RunBundler._stream_resource_data_keys`.
+    stream_resource_data_keys: HashMap<String, String>,
 }
 
 impl RunBundler {
@@ -65,8 +85,79 @@ impl RunBundler {
             bundle,
             descriptors: HashMap::new(),
             open: None,
-            pending_config: HashMap::new(),
+            config_cache: HashMap::new(),
             seq_snapshot: None,
+            stream_resource_data_keys: HashMap::new(),
+        }
+    }
+
+    /// The run's `StreamResource` uid → `data_key` registry, for the engine's
+    /// asset-drain validation (see the field doc).
+    pub fn stream_resource_data_keys_mut(&mut self) -> &mut HashMap<String, String> {
+        &mut self.stream_resource_data_keys
+    }
+
+    /// Look up the run's cached configuration for `object_name` (see the
+    /// `config_cache` field doc).
+    pub fn cached_configuration(&self, object_name: &str) -> Option<Configuration> {
+        self.config_cache.get(object_name).cloned()
+    }
+
+    /// Insert or replace the run's cached configuration for `object_name` —
+    /// called at an object's first bundled read/declare, and again from
+    /// `Msg::Configure` so future descriptors carry the new values (bluesky
+    /// `RunBundler.configure` re-runs `cache_read_config`, bundlers.py:1209).
+    pub fn cache_configuration(&mut self, object_name: String, config: Configuration) {
+        self.config_cache.insert(object_name, config);
+    }
+
+    /// Build — but do **not** install — the next descriptor generation for
+    /// every declared stream whose current descriptor includes `object_name`,
+    /// carrying `configuration` freshly read after a `configure`. Returns the
+    /// candidate descriptors (each names its own stream) for the engine to
+    /// broadcast; the streams' current descriptors and the local uid cache are
+    /// untouched until [`install_reconfigured`](RunBundler::install_reconfigured)
+    /// is called with the broadcast result. Splitting compose from install lets
+    /// the engine emit each new descriptor before it becomes the generation a
+    /// concurrent monitor pump would stamp onto an event, so
+    /// descriptor-before-event holds by construction. Ports bluesky
+    /// `RunBundler.configure`'s invalidation loop (bundlers.py:1213-1218).
+    pub fn compose_reconfigure(
+        &self,
+        object_name: &str,
+        configuration: Configuration,
+    ) -> Vec<EventDescriptor> {
+        let mut out = Vec::new();
+        for name in self.descriptors.keys() {
+            if let Some(desc) =
+                self.bundle
+                    .compose_redescribe(name, object_name, configuration.clone())
+            {
+                out.push(desc);
+            }
+        }
+        out
+    }
+
+    /// Install the descriptors returned by
+    /// [`compose_reconfigure`](RunBundler::compose_reconfigure) — call this only
+    /// after they have all been broadcast. Swaps each stream's current
+    /// descriptor (`RunBundle::streams`, new uid, same `seq_num`) and the local
+    /// uid cache (`self.descriptors`) in lockstep — the single point that keeps
+    /// the two descriptor caches in sync, so no later `descriptor_uid` lookup
+    /// can return a stale generation.
+    pub fn install_reconfigured(&mut self, descriptors: &[EventDescriptor]) {
+        for desc in descriptors {
+            let Some(name) = desc.name.clone() else {
+                continue;
+            };
+            self.bundle.install_descriptor(&name, desc.clone());
+            self.descriptors.insert(
+                name,
+                DescriptorState {
+                    uid: desc.uid.clone(),
+                },
+            );
         }
     }
 
@@ -98,6 +189,7 @@ impl RunBundler {
             data_keys: HashMap::new(),
             object_keys: HashMap::new(),
             hints: None,
+            config: HashMap::new(),
             had_read: false,
         });
         Ok(())
@@ -144,6 +236,20 @@ impl RunBundler {
         Ok(())
     }
 
+    /// Record `object_name`'s configuration on the open bundle, for the
+    /// descriptor synthesized at `save`. Called by the engine alongside
+    /// [`RunBundler::add_readings`] for every bundled read — with an empty
+    /// [`Configuration`] for non-configurable objects, matching bluesky's
+    /// per-object `config[obj.name]` entries (bundlers.py:286-290).
+    pub fn add_configuration(&mut self, object_name: String, config: Configuration) -> Result<()> {
+        let bundle = self
+            .open
+            .as_mut()
+            .ok_or_else(|| BsrsError::Plan("read with no open bundle".into()))?;
+        bundle.config.insert(object_name, config);
+        Ok(())
+    }
+
     /// Save the open bundle as documents. Emits a Descriptor on first save
     /// per stream, then an Event.
     pub fn save(&mut self) -> Result<Vec<Document>> {
@@ -171,7 +277,7 @@ impl RunBundler {
             let (descriptor, _new) = self.bundle.descriptor(
                 &stream_name,
                 std::mem::take(&mut bundle.data_keys),
-                std::mem::take(&mut self.pending_config),
+                std::mem::take(&mut bundle.config),
                 bundle.hints.take(),
                 std::mem::take(&mut bundle.object_keys),
             );
@@ -207,6 +313,13 @@ impl RunBundler {
         self.open.is_some()
     }
 
+    /// Stream name of the currently open event bundle, if any. Lets the engine
+    /// look up the stream's descriptor UID to stamp the bundle's external-asset
+    /// docs at `save` — captured *before* `save` consumes the open bundle.
+    pub fn open_stream_name(&self) -> Option<String> {
+        self.open.as_ref().map(|b| b.stream_name.clone())
+    }
+
     /// Discard the open bundle.
     pub fn drop_bundle(&mut self) -> Result<()> {
         if self.open.take().is_none() {
@@ -238,19 +351,19 @@ impl RunBundler {
         }
     }
 
-    /// Pre-declare a stream (fly scans).
+    /// Pre-declare a stream (fly scans). `configuration` carries the
+    /// declaring object(s)' per-name configuration, read by the engine
+    /// (bluesky `declare_stream` → `_prepare_stream` folds it the same way,
+    /// bundlers.py:318-352); empty when no object is available to read from.
     pub fn declare_stream(
         &mut self,
         stream_name: String,
         data_keys: HashMap<String, DataKey>,
+        configuration: HashMap<String, Configuration>,
     ) -> Result<EventDescriptor> {
-        let (descriptor, _new) = self.bundle.descriptor(
-            &stream_name,
-            data_keys,
-            HashMap::new(),
-            None,
-            HashMap::new(),
-        );
+        let (descriptor, _new) =
+            self.bundle
+                .descriptor(&stream_name, data_keys, configuration, None, HashMap::new());
         self.descriptors.insert(
             stream_name,
             DescriptorState {

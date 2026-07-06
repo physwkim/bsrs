@@ -22,7 +22,7 @@ pub use ext::{
 pub use kind::Kind;
 pub use lua_exposable::{LuaExposable, LuaMethodEntry};
 pub use msg::{ConfigureArgs, GroupId, Msg, RunMetadata};
-pub use plan::{plan_box, Plan, PlanItem};
+pub use plan::{plan_box, plan_items, respond, Plan, PlanItem};
 pub use reading::{ReadingF64, ReadingValue, TypedReading};
 pub use runtime::{bsrs_runtime, runtime_handle};
 pub use status::{

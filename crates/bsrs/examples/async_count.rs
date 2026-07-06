@@ -18,7 +18,8 @@ async fn main() -> Result<()> {
     let result = re.run_async(plan).await?;
     println!(
         "run finished: {} (uid: {:?})",
-        result.exit_status, result.run_uid
+        result.exit_status,
+        result.run_uids.last()
     );
     Ok(())
 }

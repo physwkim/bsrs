@@ -7,10 +7,10 @@ pub mod preprocessors;
 
 use crate::core::msg::{
     AwaitableFactory, CollectableObj, ConfigurableObj, ConfigureArgs, FlyableObj, LocatableObj,
-    MonitorableObj, MovableObj, Msg, PreparableObj, ReadableObj, RunMetadata, StageableObj,
-    StoppableObj, TriggerableObj,
+    MonitorableObj, MovableObj, Msg, MsgResult, PreparableObj, ReadableObj, RunMetadata,
+    StageableObj, StoppableObj, TriggerableObj,
 };
-use crate::core::plan::{plan_box, Plan};
+use crate::core::plan::{plan_box, plan_items, respond, Plan, PlanItem};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,6 +28,160 @@ use std::time::Duration;
 fn short_uid(label: &str) -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     format!("{label}-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+/// How a scan's motors map onto the independent axes reported in the
+/// `dimensions` hint. Coupled motors (inner-product) move together and form a
+/// single combined axis; grid (outer-product) motors are independent axes, one
+/// per motor; a `Time` series (`count`) has no motor and reports the implicit
+/// `time` axis. Mirrors the split between bluesky's `derive_default_hints`
+/// (coupled, plans.py:58-63) and the per-motor `motor_hints` in the
+/// outer-product plans (plans.py:350).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AxisGrouping {
+    /// One combined axis over all motors' hinted fields (inner product).
+    Coupled,
+    /// One axis per motor (outer product / grid).
+    Grid,
+    /// No motor; the implicit `time` axis (`count`).
+    Time,
+}
+
+/// A motor reader's hinted axis fields — its `hint_fields()`, or its own name
+/// when it declares none. Ports bluesky `motor.hints["fields"]`, which defaults
+/// to `[motor.name]`.
+fn motor_hint_fields(reader: &Arc<dyn ReadableObj>) -> Vec<String> {
+    reader
+        .hint_fields()
+        .unwrap_or_else(|| vec![reader.name().to_string()])
+}
+
+/// Assemble the RunStart metadata bluesky's scan-family plans inject so a
+/// consumer (BEC / LiveTable / LiveFit) can label axes and size the scan:
+/// the device-name lists (`detectors`, `motors`), the point counts
+/// (`num_points`, `num_intervals`), the `dimensions` hint grouped per
+/// [`AxisGrouping`], and the plan's call arguments (`plan_args`) so a catalog
+/// (Tiled / Databroker) can reconstruct the scan. Rides the same
+/// `RunMetadata::extra` -> `RunStart` path as `plan_name`/`scan_id`, so every
+/// key lands as a top-level RunStart field. Ports the `_md` dicts in
+/// bluesky/plans.py (count 104-116, outer_product 336-352) plus
+/// `derive_default_hints` (plans.py:58-63).
+///
+/// `plan_args` is the caller-built JSON object of the plan's arguments,
+/// mirroring bluesky's per-plan `plan_args` dict. bluesky stores each device
+/// as its Python `repr()`; bsrs has no such repr, so device arguments are
+/// captured by `name()` (the reconstruction-relevant token, and the same
+/// spelling used in the `detectors`/`motors` lists). A `Value::Null` is
+/// omitted so a plan with no meaningful args leaves the key absent.
+fn scan_run_md(
+    plan_name: &str,
+    detectors: &[Arc<dyn ReadableObj>],
+    motors: &[Arc<dyn ReadableObj>],
+    num_points: Option<usize>,
+    grouping: AxisGrouping,
+    plan_args: serde_json::Value,
+) -> RunMetadata {
+    use crate::event_model::{DimensionItem, Hints};
+    use serde_json::Value;
+
+    let mut extra: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    if !plan_args.is_null() {
+        extra.insert("plan_args".into(), plan_args);
+    }
+    extra.insert(
+        "detectors".into(),
+        Value::from(
+            detectors
+                .iter()
+                .map(|d| d.name().to_string())
+                .collect::<Vec<_>>(),
+        ),
+    );
+    if !motors.is_empty() {
+        extra.insert(
+            "motors".into(),
+            Value::from(
+                motors
+                    .iter()
+                    .map(|m| m.name().to_string())
+                    .collect::<Vec<_>>(),
+            ),
+        );
+    }
+    if let Some(n) = num_points {
+        extra.insert("num_points".into(), Value::from(n));
+        // bluesky: `num_intervals = num - 1` (plans.py:106).
+        extra.insert("num_intervals".into(), Value::from(n.saturating_sub(1)));
+    }
+    // One `[fields, "primary"]` entry per independent axis.
+    let axes: Vec<Vec<String>> = match grouping {
+        AxisGrouping::Time => vec![vec!["time".to_string()]],
+        AxisGrouping::Coupled => vec![motors.iter().flat_map(motor_hint_fields).collect()],
+        AxisGrouping::Grid => motors.iter().map(motor_hint_fields).collect(),
+    };
+    let dimensions: Vec<Vec<DimensionItem>> = axes
+        .into_iter()
+        .filter(|fields| !fields.is_empty())
+        .map(|fields| {
+            vec![
+                DimensionItem::Fields(fields),
+                DimensionItem::Name("primary".to_string()),
+            ]
+        })
+        .collect();
+    let hints = Hints {
+        dimensions: if dimensions.is_empty() {
+            None
+        } else {
+            Some(dimensions)
+        },
+    };
+    // `serde_json::to_value(Hints)` cannot fail (no maps with non-string keys,
+    // no non-finite floats); unwrap is a real invariant, not a silenced error.
+    extra.insert(
+        "hints".into(),
+        serde_json::to_value(hints).expect("Hints serializes to a JSON object"),
+    );
+    RunMetadata {
+        plan_name: Some(plan_name.to_string()),
+        extra,
+        ..Default::default()
+    }
+}
+
+/// Device names for a `plan_args` argument list — bsrs's stand-in for the
+/// Python `repr()` bluesky stores per device (see [`scan_run_md`]).
+fn arg_names<T: ?Sized + crate::core::msg::NamedObj>(objs: &[Arc<T>]) -> Vec<String> {
+    objs.iter().map(|o| o.name().to_string()).collect()
+}
+
+/// A `RunMetadata` carrying only `plan_name` and `plan_args`, for the plans that
+/// build their own RunStart without [`scan_run_md`]'s axis/hint machinery
+/// (`ramp_plan`, `fly`, `adaptive_scan`, `tune_centroid`). A `Value::Null`
+/// `plan_args` leaves the key absent, matching [`scan_run_md`].
+fn run_md_with_args(plan_name: &str, plan_args: serde_json::Value) -> RunMetadata {
+    let mut extra = std::collections::HashMap::new();
+    if !plan_args.is_null() {
+        extra.insert("plan_args".into(), plan_args);
+    }
+    RunMetadata {
+        plan_name: Some(plan_name.to_string()),
+        extra,
+        ..Default::default()
+    }
+}
+
+/// A `count` `delay` argument as JSON for `plan_args`: `None` (no delay,
+/// bluesky's default `delay=None`) → `null`, a constant → seconds, a sequence →
+/// an array of seconds.
+fn count_delay_json(delay: &CountDelay) -> serde_json::Value {
+    match delay {
+        CountDelay::None => serde_json::Value::Null,
+        CountDelay::Every(d) => serde_json::json!(d.as_secs_f64()),
+        CountDelay::Sequence(seq) => {
+            serde_json::json!(seq.iter().map(|d| d.as_secs_f64()).collect::<Vec<_>>())
+        }
+    }
 }
 
 // ===========================================================================
@@ -128,37 +282,65 @@ pub mod stubs {
         })
     }
 
-    /// `mv(motor, value)` — set + wait. Same group lifetime.
-    pub fn mv(motor: Arc<dyn MovableObj>, value: f64) -> Plan {
+    /// `mv_many(moves)` — bluesky's variadic `mv(*args)` (plan_stubs.py:357):
+    /// fire every `(motor, target)` into ONE shared group, then wait once, so
+    /// the motors move in parallel behind a single barrier. Daily beamline
+    /// pattern (e.g. sample position + detector distance together). The
+    /// single-motor [`mv`] is the one-element case.
+    pub fn mv_many(moves: Vec<(Arc<dyn MovableObj>, f64)>) -> Plan {
         plan_box(async_stream::stream! {
-            yield Msg::Set { obj: motor, value, group: Some("mv".into()) };
+            for (motor, value) in &moves {
+                yield Msg::Set { obj: motor.clone(), value: *value, group: Some("mv".into()) };
+            }
+            // One wait for the whole group — parallel motion, single barrier.
             yield Msg::Wait { group: "mv".into(), error_on_timeout: true, timeout: None };
         })
     }
 
-    /// `mvr(motor, delta)` — relative move. The plan reads the current
-    /// setpoint (commanded position) via `LocatableObj::locate_dyn` *inside*
-    /// the generator, adds `delta`, then yields `Set`+`Wait` for the absolute
-    /// target. Bases on the setpoint, not the readback, matching bluesky's
-    /// `relative_set_wrapper` (`__read_and_stash_a_motor`).
-    /// Motor must implement `LocatableObj` (which extends `MovableObj`).
-    pub fn mvr(motor: Arc<dyn LocatableObj>, delta: f64) -> Plan {
+    /// `mv(motor, value)` — set + wait. The single-motor case of [`mv_many`].
+    pub fn mv(motor: Arc<dyn MovableObj>, value: f64) -> Plan {
+        mv_many(vec![(motor, value)])
+    }
+
+    /// `mvr_many(moves)` — relative multi-motor move: each motor's absolute
+    /// target is its own current setpoint (via `LocatableObj::locate_dyn`) plus
+    /// its `delta`. Every target is resolved FIRST (all reads before any
+    /// motion), then all `Set`s fire into one shared group and a single `Wait`
+    /// follows — so a `locate_dyn` failure on any motor aborts the run via
+    /// `Msg::Fail` before a single motor starts moving. Bases on the setpoint,
+    /// not the readback, matching bluesky's `relative_set_wrapper`
+    /// (`__read_and_stash_a_motor`). The single-motor [`mvr`] is the
+    /// one-element case.
+    pub fn mvr_many(moves: Vec<(Arc<dyn LocatableObj>, f64)>) -> Plan {
         plan_box(async_stream::stream! {
-            let loc = match motor.locate_dyn().await {
-                Ok(l) => l,
-                Err(e) => {
-                    // Fail the run cleanly via Msg::Fail rather than
-                    // panicking the plan task. The engine's Fail
-                    // handler closes the run with exit_status="fail".
-                    yield Msg::Fail(format!("mvr({}): locate_dyn failed: {e}", motor.name()));
-                    return;
-                }
-            };
-            let target = loc.setpoint + delta;
-            let movable: Arc<dyn MovableObj> = motor;
-            yield Msg::Set { obj: movable, value: target, group: Some("mv".into()) };
+            // Read every setpoint before yielding any Set, so a locate failure
+            // fails the run before any motion begins.
+            let mut targets: Vec<(Arc<dyn MovableObj>, f64)> = Vec::with_capacity(moves.len());
+            for (motor, delta) in moves {
+                let loc = match motor.locate_dyn().await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        // Fail the run cleanly via Msg::Fail rather than
+                        // panicking the plan task. The engine's Fail handler
+                        // closes the run with exit_status="fail".
+                        yield Msg::Fail(format!("mvr({}): locate_dyn failed: {e}", motor.name()));
+                        return;
+                    }
+                };
+                targets.push((motor as Arc<dyn MovableObj>, loc.setpoint + delta));
+            }
+            for (motor, value) in &targets {
+                yield Msg::Set { obj: motor.clone(), value: *value, group: Some("mv".into()) };
+            }
             yield Msg::Wait { group: "mv".into(), error_on_timeout: true, timeout: None };
         })
+    }
+
+    /// `mvr(motor, delta)` — relative move. The single-motor case of
+    /// [`mvr_many`]. Motor must implement `LocatableObj` (which extends
+    /// `MovableObj`).
+    pub fn mvr(motor: Arc<dyn LocatableObj>, delta: f64) -> Plan {
+        mvr_many(vec![(motor, delta)])
     }
 
     /// `rel_set(motor, value, group)` — set relative to the motor's current
@@ -369,6 +551,61 @@ pub mod stubs {
         })
     }
 
+    /// `collect_while_completing(flyers, dets, flush_period, stream_name)`.
+    ///
+    /// Kicks off `complete` on every flyer without waiting, then repeatedly
+    /// `Wait`s on the group for up to `flush_period` (move-on:
+    /// `error_on_timeout = false`) and `collect`s every detector once, until the
+    /// group reports done. With `flush_period = None` the `Wait` blocks until the
+    /// flyers finish, yielding a single terminal collect; with `Some(period)` the
+    /// detectors are flushed each period while the flyers run. Mirrors bluesky's
+    /// `collect_while_completing` (plan_stubs.py). bluesky's `watch` groups are
+    /// consumer-side progress reporting and have no bsrs equivalent, so they are
+    /// omitted.
+    ///
+    /// This is the canonical consumer of the plan↔engine response channel: each
+    /// loop turn yields a [`respond`]-carrying `Wait` and awaits the engine's
+    /// [`MsgResult::WaitComplete`] to decide whether to iterate again.
+    pub fn collect_while_completing(
+        flyers: Vec<Arc<dyn FlyableObj>>,
+        dets: Vec<Arc<dyn CollectableObj>>,
+        flush_period: Option<Duration>,
+        stream_name: Option<String>,
+    ) -> Plan {
+        let group = short_uid("complete");
+        plan_items(async_stream::stream! {
+            // complete_all(flyers, group, wait=false): kick every flyer off
+            // against the shared group, do not block here.
+            for f in flyers {
+                yield PlanItem::from(Msg::Complete { obj: f, group: Some(group.clone()) });
+            }
+            loop {
+                let (item, rx) = respond(Msg::Wait {
+                    group: group.clone(),
+                    error_on_timeout: false,
+                    timeout: flush_period,
+                });
+                yield item;
+                let done = match rx.await {
+                    Ok(MsgResult::WaitComplete { done }) => done,
+                    // Sender dropped (the engine failed the `Wait` and tore the
+                    // run down) or an unexpected result: stop instead of looping
+                    // forever. No further collect — the engine is done with us.
+                    _ => break,
+                };
+                for d in &dets {
+                    yield PlanItem::from(Msg::Collect {
+                        obj: d.clone(),
+                        stream_name: stream_name.clone(),
+                    });
+                }
+                if done {
+                    break;
+                }
+            }
+        })
+    }
+
     /// `stage(obj)`.
     pub fn stage(obj: Arc<dyn StageableObj>) -> Plan {
         plan_box(async_stream::stream! {
@@ -394,6 +631,34 @@ pub mod stubs {
     pub fn unstage_all(objs: Vec<Arc<dyn StageableObj>>) -> Plan {
         plan_box(async_stream::stream! {
             for o in objs.into_iter().rev() { yield Msg::Unstage(o); }
+        })
+    }
+
+    /// `broadcast_msg(objs, make)` — fan one command across many objects,
+    /// yielding `make(obj)` for each. bsrs's typed analog of bluesky's
+    /// `broadcast_msg(command, objs, *args, **kwargs)` (plan_stubs.py:1489),
+    /// which builds `Msg(command, obj, ...)` per object.
+    ///
+    /// bsrs's `Msg` is a typed enum, not a `(command_str, obj)` pair, so the
+    /// caller supplies the per-object message builder rather than a command
+    /// string. The fixed-command fans above (`stage_all`, `unstage_all`,
+    /// `kickoff_all`, `complete_all`) are specializations of this shape — and
+    /// stage/unstage are exactly what bluesky uses `broadcast_msg` for
+    /// (`cntx.py:169,173`). bluesky also collects each message's engine return
+    /// value; a bsrs `Plan` yields into the engine with no caller-visible
+    /// return, so only the fan-out is ported (use [`respond`] when a per-object
+    /// result is actually needed).
+    pub fn broadcast_msg<T>(
+        objs: Vec<Arc<T>>,
+        make: impl Fn(Arc<T>) -> Msg + Send + 'static,
+    ) -> Plan
+    where
+        T: ?Sized + Send + Sync + 'static,
+    {
+        plan_box(async_stream::stream! {
+            for o in objs {
+                yield make(o);
+            }
         })
     }
 
@@ -444,10 +709,34 @@ pub mod stubs {
                 yield Msg::Wait { group: "trig".into(), error_on_timeout: true, timeout: None };
             }
             yield Msg::Create { stream_name: name };
-            for r in &readables {
-                yield Msg::Read(r.clone());
+            // bluesky wraps the reads in a contingency: on a read exception the
+            // open bundle is `drop`ped (not `save`d) and the error re-raised;
+            // on success the bundle is `save`d (plan_stubs.py:1466-1481). Port
+            // that so a mid-bundle read failure discards the partial bundle
+            // through the sanctioned Drop path instead of relying on the run-end
+            // bundler teardown, and so a future caller that catches the failure
+            // never inherits a half-open bundle.
+            let read_plan = {
+                let readables = readables.clone();
+                plan_box(async_stream::stream! {
+                    for r in &readables {
+                        yield Msg::Read(r.clone());
+                    }
+                })
+            };
+            let guarded = preprocessors::contingency_wrapper(
+                read_plan,
+                Some(drop_bundle()),
+                Some(save()),
+                None,
+                true,
+            );
+            let mut guarded = guarded;
+            while let Some(item) = futures::StreamExt::next(&mut guarded).await {
+                // Internal Bare-only sub-plan: no `Respond` item to preserve.
+                let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
+                yield m;
             }
-            yield Msg::Save;
         })
     }
 
@@ -467,7 +756,8 @@ pub mod stubs {
             yield Msg::Checkpoint;
             let mut inner = trigger_and_read(triggerables, readables, "primary");
             while let Some(item) = futures::StreamExt::next(&mut inner).await {
-                let crate::core::plan::PlanItem::Bare(m) = item;
+                // Internal Bare-only sub-plan: no `Respond` item to preserve.
+                let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
                 yield m;
             }
         })
@@ -479,12 +769,14 @@ pub mod stubs {
     where
         F: FnMut() -> Plan + Send + 'static,
     {
-        plan_box(async_stream::stream! {
+        plan_items(async_stream::stream! {
             for _ in 0..n {
                 let mut p = plan_fn();
                 while let Some(item) = futures::StreamExt::next(&mut p).await {
-                    let crate::core::plan::PlanItem::Bare(m) = item;
-                    yield m;
+                    // User-supplied plan: preserve whole items so a `Respond`
+                    // (e.g. `repeater(n, || collect_while_completing(...))`) keeps
+                    // its response channel across repetitions.
+                    yield item;
                 }
             }
         })
@@ -509,7 +801,7 @@ pub mod stubs {
     where
         F: FnMut() -> Plan + Send + 'static,
     {
-        plan_box(async_stream::stream! {
+        plan_items(async_stream::stream! {
             let mut i: usize = 0;
             loop {
                 if let Some(n) = num {
@@ -522,20 +814,84 @@ pub mod stubs {
                 // includes the engine's processing of this iteration's messages
                 // (matching bluesky's `now = time.time()` span).
                 let start = std::time::Instant::now();
-                yield Msg::Checkpoint;
+                yield PlanItem::from(Msg::Checkpoint);
                 let mut p = plan_fn();
                 while let Some(item) = futures::StreamExt::next(&mut p).await {
-                    let crate::core::plan::PlanItem::Bare(m) = item;
-                    yield m;
+                    // User-supplied plan: preserve whole items so a `Respond`
+                    // survives repetition (see `repeater`).
+                    yield item;
                 }
                 if !delay.is_zero() {
                     let elapsed = start.elapsed();
                     if delay > elapsed {
-                        yield Msg::Sleep(delay - elapsed);
+                        yield PlanItem::from(Msg::Sleep(delay - elapsed));
                     }
                 }
                 i += 1;
             }
+        })
+    }
+
+    /// `move_per_step(motors)` — the move half of one step: a `Checkpoint`, a
+    /// `Set` for each motor that carries a target (`Some`), then a single `Wait`
+    /// on the shared `"set"` group. A motor with a `None` target is already at
+    /// position and is not re-commanded (bluesky `move_per_step`'s
+    /// skip-unchanged, plan_stubs.py:1678). The `Wait` is emitted
+    /// unconditionally, matching bluesky — a wait on an empty group is a no-op.
+    /// A building block for custom [`PerStep`](super::PerStep) hooks.
+    pub fn move_per_step(motors: Vec<super::StepMotor>) -> Plan {
+        plan_box(async_stream::stream! {
+            yield Msg::Checkpoint;
+            for (m, _, target) in &motors {
+                if let Some(pos) = target {
+                    yield Msg::Set { obj: m.clone(), value: *pos, group: Some("set".into()) };
+                }
+            }
+            yield Msg::Wait { group: "set".into(), error_on_timeout: true, timeout: None };
+        })
+    }
+
+    /// `one_nd_step(detectors, motors)` — the default [`PerStep`](super::PerStep):
+    /// [`move_per_step`] then read the motor readers and detectors into
+    /// `"primary"` as a `Create → Read* → Save` bundle. bsrs's port of bluesky's
+    /// `one_nd_step` (plan_stubs.py:1707); reads without triggering (bsrs step
+    /// scans take plain `Readable` detectors, not `Triggerable`).
+    pub fn one_nd_step(
+        detectors: Vec<Arc<dyn ReadableObj>>,
+        motors: Vec<super::StepMotor>,
+    ) -> Plan {
+        plan_box(async_stream::stream! {
+            let mut mv = move_per_step(motors.clone());
+            while let Some(item) = futures::StreamExt::next(&mut mv).await {
+                // Internal Bare-only sub-plan: no `Respond` item to preserve.
+                let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
+                yield m;
+            }
+            yield Msg::Create { stream_name: "primary".into() };
+            for (_, reader, _) in &motors {
+                yield Msg::Read(reader.clone());
+            }
+            for d in &detectors {
+                yield Msg::Read(d.clone());
+            }
+            yield Msg::Save;
+        })
+    }
+
+    /// `read_shot(detectors)` — the default read-only [`PerShot`](super::PerShot)
+    /// for [`count`](super::count): a `Checkpoint` then read the detectors into
+    /// `"primary"` as a `Create → Read* → Save` bundle, without triggering. This
+    /// is the plain-read analogue of [`one_shot`], which triggers via
+    /// `trigger_and_read`; `count` takes plain `Readable` detectors, so its
+    /// default does not trigger.
+    pub fn read_shot(detectors: Vec<Arc<dyn ReadableObj>>) -> Plan {
+        plan_box(async_stream::stream! {
+            yield Msg::Checkpoint;
+            yield Msg::Create { stream_name: "primary".into() };
+            for d in &detectors {
+                yield Msg::Read(d.clone());
+            }
+            yield Msg::Save;
         })
     }
 }
@@ -544,29 +900,191 @@ pub mod stubs {
 //  plans (compound; mirrors bluesky.plans)
 // ===========================================================================
 
-/// `count(detectors, num)` — read each detector `num` times.
+/// One motor's role in a scan step: its handle, its reader, and — if it should
+/// be commanded this step — the target position. A `None` target means the motor
+/// is already at position and must not be re-commanded (bluesky `move_per_step`'s
+/// skip-unchanged); the step still reads it. Used by [`PerStep`] hooks.
+pub type StepMotor = (Arc<dyn MovableObj>, Arc<dyn ReadableObj>, Option<f64>);
+
+/// Per-step hook for step scans: given the detectors and this step's motors,
+/// yield the Msgs for one inner-loop step (move + read). bsrs's analogue of
+/// bluesky's `per_step`; the default is [`stubs::one_nd_step`]. A custom hook
+/// replaces the entire move-and-read step, so it owns its own `Checkpoint`,
+/// moves, and reads.
+pub type PerStep = Arc<dyn Fn(Vec<Arc<dyn ReadableObj>>, Vec<StepMotor>) -> Plan + Send + Sync>;
+
+/// Per-shot hook for `count`: given the detectors, yield the Msgs for one shot.
+/// bsrs's analogue of bluesky's `per_shot`; the default is [`stubs::read_shot`].
+pub type PerShot = Arc<dyn Fn(Vec<Arc<dyn ReadableObj>>) -> Plan + Send + Sync>;
+
+/// Inter-shot delay for [`count_ext`]. Ports bluesky's `count` `delay`
+/// (`ScalarOrIterableFloat`, plans.py:66). The delay is time-compensated: the
+/// emitted `Sleep` is the target minus the wall-clock the shot itself took, so a
+/// slow shot shortens the sleep and never lengthens the cadence (matching
+/// bluesky's `d - (now - then)` and bsrs's [`stubs::repeat`]).
+#[derive(Debug, Clone, Default)]
+pub enum CountDelay {
+    /// No delay between shots (bluesky `delay=0.0`).
+    #[default]
+    None,
+    /// The same target delay after every shot (bluesky scalar `delay`). Applied
+    /// after every shot, including the last — mirroring bluesky, whose scalar
+    /// delay is an infinite `itertools.repeat`, and bsrs's [`stubs::repeat`].
+    Every(Duration),
+    /// One target delay per inter-shot interval (bluesky iterable `delay`);
+    /// entry `i` is applied after shot `i`. For a finite `num` this must have at
+    /// least `num - 1` entries, or the plan fails immediately with `Msg::Fail`,
+    /// mirroring bluesky's `ValueError`. When the sequence is exhausted the run
+    /// closes (bluesky's `StopIteration → break`), so no trailing sleep follows
+    /// the final delivered entry.
+    Sequence(Vec<Duration>),
+}
+
+/// `count(detectors, num)` — read each detector `num` times. Convenience form of
+/// [`count_per_shot`] with the default per-shot action ([`stubs::one_shot`]).
 pub fn count(detectors: Vec<Arc<dyn ReadableObj>>, num: usize) -> Plan {
-    plan_box(async_stream::stream! {
-        yield Msg::OpenRun(RunMetadata {
-            plan_name: Some("count".into()),
-            ..Default::default()
-        });
-        for _ in 0..num {
-            // Per-shot rewind boundary (bluesky count == repeat(one_shot),
-            // both of which emit a Checkpoint per shot: plan_stubs.py:1808,
-            // :1622). Without it a pause/resume rewinds the whole run.
-            yield Msg::Checkpoint;
-            yield Msg::Create { stream_name: "primary".into() };
-            for d in &detectors {
-                yield Msg::Read(d.clone());
+    count_per_shot(detectors, num, None)
+}
+
+/// `count_per_shot(detectors, num, per_shot)` — read the detectors `num` times,
+/// delegating each shot to `per_shot`. Convenience form of [`count_ext`] with a
+/// finite `num` and no delay. `None` uses [`stubs::read_shot`]
+/// (`Checkpoint → Create → Read* → Save`), byte-for-byte the previous `count`
+/// body. Ports bluesky's `count` `per_shot` hook (plans.py:66): a custom hook can
+/// trigger before reading, read into a different stream, or repeat a shot.
+pub fn count_per_shot(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    num: usize,
+    per_shot: Option<PerShot>,
+) -> Plan {
+    count_ext(detectors, Some(num), CountDelay::None, per_shot)
+}
+
+/// Collect the distinct [`StageableObj`] devices among `detectors` + `motors`
+/// — bluesky stages `list(detectors) + motors` before a run and unstages after.
+/// Deduplicated by identity so a device appearing as both a reader and a motor
+/// is staged once; devices that are not stageable ([`ReadableObj::as_stageable`]
+/// / [`MovableObj::as_stageable`] → `None`, e.g. a bare motor or a plain
+/// readable) are skipped — the static-typing analogue of bluesky staging only
+/// the objects that expose a `stage()` method. A compound plan feeds the result
+/// to [`preprocessors::stage_wrapper`]; when nothing is stageable (the common
+/// case for sim/test devices) the wrapper emits no `Stage`/`Unstage` and the
+/// message stream is unchanged.
+fn stageables_for(
+    detectors: &[Arc<dyn ReadableObj>],
+    motors: &[Arc<dyn MovableObj>],
+) -> Vec<Arc<dyn StageableObj>> {
+    let mut out: Vec<Arc<dyn StageableObj>> = Vec::new();
+    let candidates = detectors
+        .iter()
+        .cloned()
+        .filter_map(|d| d.as_stageable())
+        .chain(motors.iter().cloned().filter_map(|m| m.as_stageable()));
+    for s in candidates {
+        if !out.iter().any(|o| Arc::ptr_eq(o, &s)) {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// `count_ext(detectors, num, delay, per_shot)` — the full `count`: read the
+/// detectors `num` times (or forever when `num` is `None`), sleeping `delay`
+/// between shots and delegating each shot to `per_shot`. Ports bluesky's `count`
+/// (plans.py:66) `num`/`delay`/`per_shot`:
+///
+/// - `num = None` acquires indefinitely until the engine cancels (bluesky's
+///   `num=None`); `Some(n)` takes exactly `n` shots.
+/// - `delay` is time-compensated per [`CountDelay`].
+/// - `per_shot = None` uses [`stubs::read_shot`].
+///
+/// Each shot carries exactly one `Checkpoint` (inside `per_shot`); unlike bluesky
+/// `count == repeat(one_shot)`, which double-checkpoints (both the `repeat` and
+/// the `one_shot` emit one), bsrs keeps the single per-shot Checkpoint it already
+/// used, so it does not route through [`stubs::repeat`].
+pub fn count_ext(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    num: Option<usize>,
+    delay: CountDelay,
+    per_shot: Option<PerShot>,
+) -> Plan {
+    // Upfront delay-length validation, mirroring bluesky's `ValueError` when a
+    // finite `num` outruns an explicit delay sequence (needs `num - 1`
+    // intervals). Fail before staging or opening the run so an invalid `count`
+    // arms nothing and leaks no partial run.
+    if let (Some(n), CountDelay::Sequence(seq)) = (num, &delay) {
+        if n > 1 && seq.len() < n - 1 {
+            let msg = format!(
+                "count: num={n} needs at least {} delay entries but got {}",
+                n - 1,
+                seq.len()
+            );
+            return plan_box(async_stream::stream! {
+                yield Msg::Fail(msg);
+            });
+        }
+    }
+    // The default per_shot carries the per-shot Checkpoint (bluesky one_shot:
+    // plan_stubs.py:1622), so a pause/resume rewinds only the current shot.
+    let per_shot = per_shot.unwrap_or_else(|| Arc::new(stubs::read_shot) as PerShot);
+    // Stage the detectors before the run and unstage after (PLAN-09); `count`
+    // has no motors. Non-stageable detectors contribute nothing.
+    let staged = stageables_for(&detectors, &[]);
+    let inner = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(scan_run_md(
+            "count",
+            &detectors,
+            &[],
+            num,
+            AxisGrouping::Time,
+            serde_json::json!({
+                "detectors": arg_names(&detectors),
+                "num": num,
+                "delay": count_delay_json(&delay),
+            }),
+        ));
+        let mut i: usize = 0;
+        loop {
+            if let Some(n) = num {
+                if i >= n {
+                    break;
+                }
             }
-            yield Msg::Save;
+            // Captured before the shot so the compensation covers the shot's own
+            // duration (bluesky's `now = time.time()` before the plan runs).
+            let start = std::time::Instant::now();
+            let mut shot = per_shot(detectors.clone());
+            while let Some(item) = futures::StreamExt::next(&mut shot).await {
+                // Internal Bare-only sub-plan: no `Respond` item to preserve.
+                let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
+                yield m;
+            }
+            // Next inter-shot delay. `None` from a Sequence means it is exhausted
+            // (bluesky's `StopIteration`), which ends the run.
+            let target: Option<Duration> = match &delay {
+                CountDelay::None => Some(Duration::ZERO),
+                CountDelay::Every(d) => Some(*d),
+                CountDelay::Sequence(seq) => seq.get(i).copied(),
+            };
+            match target {
+                None => break,
+                Some(d) => {
+                    if !d.is_zero() {
+                        let elapsed = start.elapsed();
+                        if d > elapsed {
+                            yield Msg::Sleep(d - elapsed);
+                        }
+                    }
+                }
+            }
+            i += 1;
         }
         yield Msg::CloseRun {
             exit_status: "success".into(),
             reason: None,
         };
-    })
+    });
+    preprocessors::stage_wrapper(inner, staged)
 }
 
 /// `count_with_trigger(detectors, num)` — trigger then read each iteration.
@@ -576,10 +1094,18 @@ pub fn count_with_trigger(
     num: usize,
 ) -> Plan {
     plan_box(async_stream::stream! {
-        yield Msg::OpenRun(RunMetadata {
-            plan_name: Some("count_with_trigger".into()),
-            ..Default::default()
-        });
+        yield Msg::OpenRun(scan_run_md(
+            "count_with_trigger",
+            &detectors,
+            &[],
+            Some(num),
+            AxisGrouping::Time,
+            serde_json::json!({
+                "detectors": arg_names(&detectors),
+                "triggerables": arg_names(&triggerables),
+                "num": num,
+            }),
+        ));
         for _ in 0..num {
             // Per-shot rewind boundary (bluesky count == repeat(one_shot):
             // plan_stubs.py:1808, :1622). Without it a pause/resume rewinds
@@ -611,8 +1137,36 @@ pub fn count_with_trigger(
     })
 }
 
-/// 1-D step `scan` from `start` to `stop` (inclusive) in `num` steps.
-pub fn scan(
+/// `scan(detectors, axes, num)` — the canonical N-motor step scan: move every
+/// axis simultaneously (inner product) from its `start` to its `stop` in `num`
+/// steps, reading the detectors at each point. Ports bluesky's `scan`
+/// (plans.py:1185), which moves all listed motors together and emits
+/// `plan_name = "scan"`. A single-axis call is an ordinary 1-D scan; the
+/// [`scan_1d`] convenience takes the motor/bounds inline for that common case.
+/// Convenience form of [`scan_per_step`] with the default per-step action.
+pub fn scan(detectors: Vec<Arc<dyn ReadableObj>>, axes: Vec<ScanAxis>, num: usize) -> Plan {
+    scan_per_step(detectors, axes, num, None)
+}
+
+/// N-motor `scan` delegating each point to `per_step` (default
+/// [`stubs::one_nd_step`]). Same inner-product traversal as
+/// [`inner_product_scan_per_step`] but emits `plan_name = "scan"` (bluesky's
+/// canonical name). Ports bluesky's `scan` `per_step` hook (plans.py:1096).
+pub fn scan_per_step(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    axes: Vec<ScanAxis>,
+    num: usize,
+    per_step: Option<PerStep>,
+) -> Plan {
+    inner_product_core(detectors, num, axes, per_step, "scan")
+}
+
+/// 1-D step `scan` from `start` to `stop` (inclusive) in `num` steps — the
+/// single-motor convenience form of [`scan`]. Ports the common `scan(dets, m,
+/// s, e, num=N)` shape; emits `plan_name = "scan"` like the N-motor form.
+/// Convenience form of [`scan_1d_per_step`] with the default per-step action
+/// ([`stubs::one_nd_step`]).
+pub fn scan_1d(
     detectors: Vec<Arc<dyn ReadableObj>>,
     motor: Arc<dyn MovableObj>,
     motor_reader: Arc<dyn ReadableObj>,
@@ -620,44 +1174,63 @@ pub fn scan(
     stop: f64,
     num: usize,
 ) -> Plan {
+    scan_1d_per_step(detectors, motor, motor_reader, start, stop, num, None)
+}
+
+/// 1-D step `scan` delegating each step to `per_step`. `None` uses
+/// [`stubs::one_nd_step`] (`Checkpoint → Set → Wait → Create → Read* → Save`),
+/// byte-for-byte the previous 1-D `scan` body. Ports bluesky's `scan` `per_step`
+/// hook (plans.py:1096): a custom hook owns the whole move-and-read step, so it
+/// can trigger detectors, read into extra streams, or settle differently.
+pub fn scan_1d_per_step(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    motor: Arc<dyn MovableObj>,
+    motor_reader: Arc<dyn ReadableObj>,
+    start: f64,
+    stop: f64,
+    num: usize,
+    per_step: Option<PerStep>,
+) -> Plan {
     let step = if num > 1 {
         (stop - start) / (num as f64 - 1.0)
     } else {
         0.0
     };
-    plan_box(async_stream::stream! {
-        yield Msg::OpenRun(RunMetadata {
-            plan_name: Some("scan".into()),
-            ..Default::default()
-        });
+    let custom_per_step = per_step.is_some();
+    let plan_args = serde_json::json!({
+        "detectors": arg_names(&detectors),
+        "num": num,
+        "args": [motor.name(), start, stop],
+        "per_step": if custom_per_step { "custom" } else { "default" },
+    });
+    let per_step = per_step.unwrap_or_else(|| Arc::new(stubs::one_nd_step) as PerStep);
+    // Stage detectors + the motor before the run, unstage after (PLAN-09).
+    let staged = stageables_for(&detectors, std::slice::from_ref(&motor));
+    let inner = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(scan_run_md(
+            "scan",
+            &detectors,
+            std::slice::from_ref(&motor_reader),
+            Some(num),
+            AxisGrouping::Coupled,
+            plan_args,
+        ));
         for i in 0..num {
-            // Per-step rewind boundary (bluesky one_1d_step.move(): a
-            // Checkpoint before the set, plan_stubs.py:1669). Without it a
-            // pause/resume rewinds the whole run instead of the current step.
-            yield Msg::Checkpoint;
             let pos = start + step * (i as f64);
-            yield Msg::Set {
-                obj: motor.clone(),
-                value: pos,
-                group: Some("set".into()),
-            };
-            yield Msg::Wait {
-                group: "set".into(),
-                error_on_timeout: true,
-                timeout: None,
-            };
-            yield Msg::Create { stream_name: "primary".into() };
-            yield Msg::Read(motor_reader.clone());
-            for d in &detectors {
-                yield Msg::Read(d.clone());
+            let motors: Vec<StepMotor> = vec![(motor.clone(), motor_reader.clone(), Some(pos))];
+            let mut sub = per_step(detectors.clone(), motors);
+            while let Some(item) = futures::StreamExt::next(&mut sub).await {
+                // Internal Bare-only sub-plan: no `Respond` item to preserve.
+                let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
+                yield m;
             }
-            yield Msg::Save;
         }
         yield Msg::CloseRun {
             exit_status: "success".into(),
             reason: None,
         };
-    })
+    });
+    preprocessors::stage_wrapper(inner, staged)
 }
 
 /// `list_scan(detectors, motor, points)` — visit each position in `points`,
@@ -668,37 +1241,123 @@ pub fn list_scan(
     motor_reader: Arc<dyn ReadableObj>,
     points: Vec<f64>,
 ) -> Plan {
-    plan_box(async_stream::stream! {
-        yield Msg::OpenRun(RunMetadata {
-            plan_name: Some("list_scan".into()),
-            ..Default::default()
-        });
+    list_scan_per_step(detectors, motor, motor_reader, points, None)
+}
+
+/// 1-D `list_scan` over explicit `points`, delegating each step to `per_step`.
+/// `None` uses [`stubs::one_nd_step`] (`Checkpoint → Set → Wait → Create →
+/// Read* → Save`), byte-for-byte the previous `list_scan` body. Ports bluesky's
+/// `list_scan` `per_step` hook (plans.py:576).
+pub fn list_scan_per_step(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    motor: Arc<dyn MovableObj>,
+    motor_reader: Arc<dyn ReadableObj>,
+    points: Vec<f64>,
+    per_step: Option<PerStep>,
+) -> Plan {
+    let custom_per_step = per_step.is_some();
+    let plan_args = serde_json::json!({
+        "detectors": arg_names(&detectors),
+        "args": [serde_json::json!(motor.name()), serde_json::json!(points)],
+        "per_step": if custom_per_step { "custom" } else { "default" },
+    });
+    let per_step = per_step.unwrap_or_else(|| Arc::new(stubs::one_nd_step) as PerStep);
+    // Stage detectors + the motor before the run, unstage after (PLAN-09).
+    let staged = stageables_for(&detectors, std::slice::from_ref(&motor));
+    let inner = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(scan_run_md(
+            "list_scan",
+            &detectors,
+            std::slice::from_ref(&motor_reader),
+            Some(points.len()),
+            AxisGrouping::Coupled,
+            plan_args,
+        ));
         for pos in points {
-            // Per-step rewind boundary (bluesky one_1d_step.move():
-            // plan_stubs.py:1669).
-            yield Msg::Checkpoint;
-            yield Msg::Set {
-                obj: motor.clone(),
-                value: pos,
-                group: Some("set".into()),
-            };
-            yield Msg::Wait {
-                group: "set".into(),
-                error_on_timeout: true,
-                timeout: None,
-            };
-            yield Msg::Create { stream_name: "primary".into() };
-            yield Msg::Read(motor_reader.clone());
-            for d in &detectors {
-                yield Msg::Read(d.clone());
+            let motors: Vec<StepMotor> = vec![(motor.clone(), motor_reader.clone(), Some(pos))];
+            let mut sub = per_step(detectors.clone(), motors);
+            while let Some(item) = futures::StreamExt::next(&mut sub).await {
+                // Internal Bare-only sub-plan: no `Respond` item to preserve.
+                let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
+                yield m;
             }
-            yield Msg::Save;
         }
         yield Msg::CloseRun {
             exit_status: "success".into(),
             reason: None,
         };
-    })
+    });
+    preprocessors::stage_wrapper(inner, staged)
+}
+
+/// `list_scan_nd(detectors, axes, per_step)` — multi-motor **inner-product**
+/// list scan: every axis's Nth position is visited together, so the axes'
+/// position lists are zipped, not crossed (bluesky's multi-motor
+/// `list_scan(dets, m1, [pts1], m2, [pts2], …)`, plans.py:132, which builds
+/// `inner_list_product` then `scan_nd`). The single-axis [`list_scan`] is the
+/// one-motor convenience; this is the general form.
+///
+/// All position lists must be the same length. A mismatch fails the run before
+/// it opens by emitting [`Msg::Fail`] — mirroring bluesky's `ValueError`, and
+/// matching how [`count_ext`] rejects a too-short delay sequence — rather than
+/// silently visiting an empty trajectory (which is what a bare
+/// `inner_list_product` returns on unequal lengths).
+///
+/// Like bluesky's `scan_nd`/`move_per_step`, a motor is not re-commanded at a
+/// point where its target equals its previous one (the `pos_cache` in
+/// [`scan_nd_with_md`]). All motors are reported as one combined axis in the
+/// `dimensions` hint (bluesky's coupled `derive_default_hints`), unlike the
+/// per-axis Grid hint of [`list_grid_scan`].
+pub fn list_scan_nd(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    axes: Vec<ListScanAxis>,
+    per_step: Option<PerStep>,
+) -> Plan {
+    // Equal-length check up front, mirroring bluesky's `ValueError`. Without it,
+    // `inner_list_product` silently returns an empty trajectory on a mismatch,
+    // hiding the user's error as a zero-point run.
+    if let Some((first, rest)) = axes.split_first() {
+        let len0 = first.2.len();
+        if let Some(bad) = rest.iter().find(|a| a.2.len() != len0) {
+            let msg = format!(
+                "list_scan: all position lists must be the same length; \
+                 '{}' has {} but '{}' has {}",
+                first.0.name(),
+                len0,
+                bad.0.name(),
+                bad.2.len()
+            );
+            return plan_box(async_stream::stream! {
+                yield Msg::Fail(msg);
+            });
+        }
+    }
+    // Flattened `[motor, points, …]`, mirroring bluesky list_scan's `md_args`.
+    let plan_args = serde_json::json!({
+        "detectors": arg_names(&detectors),
+        "args": axes
+            .iter()
+            .flat_map(|(m, _, pts)| [serde_json::json!(m.name()), serde_json::json!(pts)])
+            .collect::<Vec<_>>(),
+        "per_step": if per_step.is_some() { "custom" } else { "default" },
+    });
+    let lists: Vec<Vec<f64>> = axes.iter().map(|(_, _, l)| l.clone()).collect();
+    let pts = patterns::inner_list_product(&lists);
+    let motors: Vec<(Arc<dyn MovableObj>, Arc<dyn ReadableObj>)> =
+        axes.into_iter().map(|(m, r, _)| (m, r)).collect();
+    let motor_readers: Vec<Arc<dyn ReadableObj>> =
+        motors.iter().map(|(_, mr)| mr.clone()).collect();
+    // Inner product: all motors form one combined axis (Coupled), like the
+    // single-motor `list_scan`, not `list_grid_scan`'s per-motor Grid axes.
+    let md = scan_run_md(
+        "list_scan",
+        &detectors,
+        &motor_readers,
+        Some(pts.len()),
+        AxisGrouping::Coupled,
+        plan_args,
+    );
+    scan_nd_with_md(detectors, motors, pts, md, per_step)
 }
 
 /// `rel_scan(detectors, motor, start, stop, num)` — like `scan` but
@@ -719,7 +1378,7 @@ pub fn rel_scan(
     num: usize,
 ) -> Plan {
     let reset_motor = motor.clone();
-    let inner = scan(
+    let inner = scan_1d(
         detectors,
         motor,
         motor_reader,
@@ -730,7 +1389,8 @@ pub fn rel_scan(
     plan_box(async_stream::stream! {
         let mut inner = inner;
         while let Some(item) = futures::StreamExt::next(&mut inner).await {
-            let crate::core::plan::PlanItem::Bare(m) = item;
+            // Internal Bare-only sub-plan: no `Respond` item to preserve.
+            let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
             yield m;
         }
         // `current` is the readback the caller snapshotted before the scan;
@@ -742,7 +1402,8 @@ pub fn rel_scan(
 
 /// `grid_scan(dets, m1, s1, e1, n1, m2, s2, e2, n2)` — 2-D rectilinear scan.
 /// `m1` is the slow axis (outer loop), `m2` is the fast axis (inner loop).
-/// Every grid point the detectors are read once into `primary`.
+/// Every grid point the detectors are read once into `primary`. Natural
+/// (non-snaked) order; the non-snaked form of [`grid_scan_snake`].
 #[allow(clippy::too_many_arguments)]
 pub fn grid_scan(
     detectors: Vec<Arc<dyn ReadableObj>>,
@@ -757,6 +1418,44 @@ pub fn grid_scan(
     e2: f64,
     n2: usize,
 ) -> Plan {
+    grid_scan_snake(
+        detectors,
+        motor1,
+        motor1_reader,
+        s1,
+        e1,
+        n1,
+        motor2,
+        motor2_reader,
+        s2,
+        e2,
+        n2,
+        false,
+    )
+}
+
+/// `grid_scan_snake(..., snake)` — 2-D scan where `snake = true` traverses the
+/// fast axis (`m2`) in boustrophedon order: forward on even slow-axis rows,
+/// reversed on odd ones, so the stage never flies back across the row. Mirrors
+/// bluesky `grid_scan(..., snake_axes=True)`, which snakes the fast axis and
+/// never the slowest (plans.py:1294). The slow axis and every emitted document
+/// are otherwise identical to [`grid_scan`]; only the fast-axis position order
+/// within alternate rows changes.
+#[allow(clippy::too_many_arguments)]
+pub fn grid_scan_snake(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    motor1: Arc<dyn MovableObj>,
+    motor1_reader: Arc<dyn ReadableObj>,
+    s1: f64,
+    e1: f64,
+    n1: usize,
+    motor2: Arc<dyn MovableObj>,
+    motor2_reader: Arc<dyn ReadableObj>,
+    s2: f64,
+    e2: f64,
+    n2: usize,
+    snake: bool,
+) -> Plan {
     let step1 = if n1 > 1 {
         (e1 - s1) / (n1 as f64 - 1.0)
     } else {
@@ -767,11 +1466,21 @@ pub fn grid_scan(
     } else {
         0.0
     };
-    plan_box(async_stream::stream! {
-        yield Msg::OpenRun(RunMetadata {
-            plan_name: Some("grid_scan".into()),
-            ..Default::default()
-        });
+    // Stage detectors + both motors before the run, unstage after (PLAN-09).
+    let staged = stageables_for(&detectors, &[motor1.clone(), motor2.clone()]);
+    let inner = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(scan_run_md(
+            "grid_scan",
+            &detectors,
+            &[motor1_reader.clone(), motor2_reader.clone()],
+            Some(n1 * n2),
+            AxisGrouping::Grid,
+            serde_json::json!({
+                "detectors": arg_names(&detectors),
+                "args": [motor1.name(), s1, e1, n1, motor2.name(), s2, e2, n2],
+                "snake_axes": snake,
+            }),
+        ));
         for i in 0..n1 {
             // Row-change rewind boundary: a pause during the slow-axis move
             // rewinds here, re-driving motor1 (bluesky move_per_step emits a
@@ -793,7 +1502,11 @@ pub fn grid_scan(
                 // already settled at p1 above). Mirrors one Checkpoint per
                 // grid point (bluesky move_per_step, plan_stubs.py:1695).
                 yield Msg::Checkpoint;
-                let p2 = s2 + step2 * (j as f64);
+                // Snake: reverse the fast axis on odd slow-axis rows so the
+                // stage winds back and forth instead of flying back each row
+                // (bluesky snake_cyclers, utils/__init__.py:656).
+                let jj = if snake && i % 2 == 1 { n2 - 1 - j } else { j };
+                let p2 = s2 + step2 * (jj as f64);
                 yield Msg::Set {
                     obj: motor2.clone(),
                     value: p2,
@@ -817,7 +1530,8 @@ pub fn grid_scan(
             exit_status: "success".into(),
             reason: None,
         };
-    })
+    });
+    preprocessors::stage_wrapper(inner, staged)
 }
 
 // ---------------------------------------------------------------------------
@@ -835,6 +1549,12 @@ pub type ListGridAxis = (Arc<dyn MovableObj>, Arc<dyn ReadableObj>, Vec<f64>);
 /// motor must be `LocatableObj` so that the setpoint can be snapshotted.
 pub type RelListGridAxis = (Arc<dyn LocatableObj>, Arc<dyn ReadableObj>, Vec<f64>);
 
+/// One axis of a multi-motor inner-product [`list_scan_nd`]:
+/// `(motor, motor_reader, points)`. Every axis's `points` list must be the same
+/// length — the lists are zipped position-by-position (bluesky's
+/// `inner_list_product`), unlike the outer-product [`ListGridAxis`].
+pub type ListScanAxis = (Arc<dyn MovableObj>, Arc<dyn ReadableObj>, Vec<f64>);
+
 /// `inner_product_scan(dets, num, [(motor1, s1, e1), ...])` — all motors move
 /// together (linspaced) for `num` points. Mirrors bluesky's
 /// `inner_product_scan` for the typical positional-only argument shape.
@@ -843,36 +1563,84 @@ pub fn inner_product_scan(
     num: usize,
     axes: Vec<ScanAxis>,
 ) -> Plan {
+    inner_product_scan_per_step(detectors, num, axes, None)
+}
+
+/// N-motor coupled `inner_product_scan`, delegating each point to `per_step`.
+/// `None` uses [`stubs::one_nd_step`] (`Checkpoint → Set* → Wait → Create →
+/// Read* → Save`, all motors commanded), byte-for-byte the previous
+/// `inner_product_scan` body. Ports bluesky's `inner_product_scan` `per_step`
+/// hook (plans.py:942).
+pub fn inner_product_scan_per_step(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    num: usize,
+    axes: Vec<ScanAxis>,
+    per_step: Option<PerStep>,
+) -> Plan {
+    inner_product_core(detectors, num, axes, per_step, "inner_product_scan")
+}
+
+/// Shared inner-product traversal for [`scan`] and [`inner_product_scan`]: move
+/// every axis together (all commanded each point) from `start` to `stop` in
+/// `num` steps, delegating each point to `per_step` (default
+/// [`stubs::one_nd_step`]). The two public entry points differ only in the
+/// emitted `plan_name`, so it is a parameter here; the traversal lives in one
+/// place.
+fn inner_product_core(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    num: usize,
+    axes: Vec<ScanAxis>,
+    per_step: Option<PerStep>,
+    plan_name: &'static str,
+) -> Plan {
     let bounds: Vec<(f64, f64)> = axes.iter().map(|(_, _, s, e)| (*s, *e)).collect();
     let pts = patterns::inner_product(num, &bounds);
-    plan_box(async_stream::stream! {
-        yield Msg::OpenRun(RunMetadata {
-            plan_name: Some("inner_product_scan".into()),
-            ..Default::default()
-        });
+    // Flattened `[motor, start, stop, …]`, mirroring bluesky scan's `md_args`.
+    let plan_args = serde_json::json!({
+        "detectors": arg_names(&detectors),
+        "num": num,
+        "args": axes
+            .iter()
+            .flat_map(|(m, _, s, e)| {
+                [serde_json::json!(m.name()), serde_json::json!(s), serde_json::json!(e)]
+            })
+            .collect::<Vec<_>>(),
+        "per_step": if per_step.is_some() { "custom" } else { "default" },
+    });
+    let per_step = per_step.unwrap_or_else(|| Arc::new(stubs::one_nd_step) as PerStep);
+    // Stage detectors + every axis motor before the run, unstage after (PLAN-09).
+    let stage_motors: Vec<Arc<dyn MovableObj>> =
+        axes.iter().map(|(m, _, _, _)| m.clone()).collect();
+    let staged = stageables_for(&detectors, &stage_motors);
+    let inner = plan_box(async_stream::stream! {
+        let motor_readers: Vec<Arc<dyn ReadableObj>> =
+            axes.iter().map(|(_, mr, _, _)| mr.clone()).collect();
+        yield Msg::OpenRun(scan_run_md(
+            plan_name,
+            &detectors,
+            &motor_readers,
+            Some(num),
+            AxisGrouping::Coupled,
+            plan_args,
+        ));
         for row in pts {
-            // Per-step rewind boundary before this point's moves (bluesky
-            // move_per_step, plan_stubs.py:1695).
-            yield Msg::Checkpoint;
-            for (i, val) in row.iter().enumerate() {
-                yield Msg::Set {
-                    obj: axes[i].0.clone(),
-                    value: *val,
-                    group: Some("set".into()),
-                };
+            // Every axis is commanded each point (Some), matching the previous
+            // unconditional Set-all loop.
+            let motors: Vec<StepMotor> = axes
+                .iter()
+                .zip(row.iter())
+                .map(|((m, mr, _, _), val)| (m.clone(), mr.clone(), Some(*val)))
+                .collect();
+            let mut sub = per_step(detectors.clone(), motors);
+            while let Some(item) = futures::StreamExt::next(&mut sub).await {
+                // Internal Bare-only sub-plan: no `Respond` item to preserve.
+                let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
+                yield m;
             }
-            yield Msg::Wait { group: "set".into(), error_on_timeout: true, timeout: None };
-            yield Msg::Create { stream_name: "primary".into() };
-            for (_, mr, _, _) in &axes {
-                yield Msg::Read(mr.clone());
-            }
-            for d in &detectors {
-                yield Msg::Read(d.clone());
-            }
-            yield Msg::Save;
         }
         yield Msg::CloseRun { exit_status: "success".into(), reason: None };
-    })
+    });
+    preprocessors::stage_wrapper(inner, staged)
 }
 
 /// `x2x_scan(dets, motor1, m1_reader, motor2, m2_reader, start, stop, num)` —
@@ -911,17 +1679,67 @@ pub fn x2x_scan(
 
 /// `scan_nd(dets, motors, points)` — visit each row of `points` (shape
 /// `[N, len(motors)]`). Stripped-down `scan_nd`; bluesky's full version
-/// accepts `cycler` objects, this one takes the pre-computed list.
+/// accepts `cycler` objects, this one takes the pre-computed list. The motors
+/// are reported as a single combined axis in the `dimensions` hint (bluesky's
+/// `derive_default_hints` default, plans.py:58-63); outer-product callers that
+/// want one axis per motor use [`scan_nd_with_md`] with a `Grid`-grouped md.
 pub fn scan_nd(
     detectors: Vec<Arc<dyn ReadableObj>>,
     motors: Vec<(Arc<dyn MovableObj>, Arc<dyn ReadableObj>)>,
     points: Vec<Vec<f64>>,
 ) -> Plan {
-    plan_box(async_stream::stream! {
-        yield Msg::OpenRun(RunMetadata {
-            plan_name: Some("scan_nd".into()),
-            ..Default::default()
-        });
+    scan_nd_per_step(detectors, motors, points, None)
+}
+
+/// `scan_nd` delegating each point to `per_step`. `None` uses
+/// [`stubs::one_nd_step`], which reproduces the previous `scan_nd` traversal
+/// byte-for-byte (each point moves only the motors whose target differs from
+/// their last-set position — the `pos_cache`/`StepMotor::None` skip — then reads
+/// all motor readers and detectors). Ports bluesky's `scan_nd` `per_step` hook
+/// (plans.py:271).
+pub fn scan_nd_per_step(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    motors: Vec<(Arc<dyn MovableObj>, Arc<dyn ReadableObj>)>,
+    points: Vec<Vec<f64>>,
+    per_step: Option<PerStep>,
+) -> Plan {
+    let motor_readers: Vec<Arc<dyn ReadableObj>> =
+        motors.iter().map(|(_, mr)| mr.clone()).collect();
+    let plan_args = serde_json::json!({
+        "detectors": arg_names(&detectors),
+        "args": motors.iter().map(|(m, _)| m.name().to_string()).collect::<Vec<_>>(),
+        "num_points": points.len(),
+        "per_step": if per_step.is_some() { "custom" } else { "default" },
+    });
+    let md = scan_run_md(
+        "scan_nd",
+        &detectors,
+        &motor_readers,
+        Some(points.len()),
+        AxisGrouping::Coupled,
+        plan_args,
+    );
+    scan_nd_with_md(detectors, motors, points, md, per_step)
+}
+
+/// The shared body of the `scan_nd` family: drive each row of `points` and read
+/// `motors`+`detectors` into `primary`, opening the run with the caller-built
+/// `md`. Keeps the `dimensions`-grouping decision (coupled vs grid) at the
+/// caller — `scan_nd` passes a combined axis, `list_grid_scan` one per motor —
+/// while the traversal stays in one place.
+fn scan_nd_with_md(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    motors: Vec<(Arc<dyn MovableObj>, Arc<dyn ReadableObj>)>,
+    points: Vec<Vec<f64>>,
+    md: RunMetadata,
+    per_step: Option<PerStep>,
+) -> Plan {
+    let per_step = per_step.unwrap_or_else(|| Arc::new(stubs::one_nd_step) as PerStep);
+    // Stage detectors + every motor before the run, unstage after (PLAN-09).
+    let stage_motors: Vec<Arc<dyn MovableObj>> = motors.iter().map(|(m, _)| m.clone()).collect();
+    let staged = stageables_for(&detectors, &stage_motors);
+    let inner = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(md);
         // Per-motor last-set position — bsrs's port of bluesky's
         // move_per_step `pos_cache` (plan_stubs.py:1688-1702). A motor whose
         // target equals its last-set value is NOT re-commanded this point:
@@ -932,51 +1750,114 @@ pub fn scan_nd(
         // pos_cache with a None default, so the first `pos == None` is False).
         // Exact equality mirrors bluesky's `pos == pos_cache[motor]`: grid
         // points recur exactly, so an epsilon is unwanted (it would skip a
-        // genuine small move).
+        // genuine small move). The pos_cache decision becomes each motor's
+        // `StepMotor` target (`Some` to command, `None` to skip); `one_nd_step`
+        // then emits Checkpoint/Set*/Wait and reads all motor readers, so the
+        // default reproduces the previous inline loop exactly.
         let mut pos_cache: Vec<Option<f64>> = vec![None; motors.len()];
         for row in points {
-            // Per-step rewind boundary before this point's moves (bluesky
-            // move_per_step, plan_stubs.py:1695).
-            yield Msg::Checkpoint;
-            for (i, v) in row.iter().enumerate() {
-                if i >= motors.len() { break; }
-                if pos_cache[i] == Some(*v) {
-                    // This step does not move motor i (bluesky move_per_step
-                    // `if pos == pos_cache[motor]: continue`, plan_stubs.py:1698).
-                    continue;
-                }
-                yield Msg::Set {
-                    obj: motors[i].0.clone(),
-                    value: *v,
-                    group: Some("set".into()),
-                };
-                pos_cache[i] = Some(*v);
+            let step_motors: Vec<StepMotor> = motors
+                .iter()
+                .enumerate()
+                .map(|(i, (m, mr))| {
+                    // Row shorter than motors: trailing motors are never
+                    // commanded (target None) but are still read, matching the
+                    // previous `for (i, v) in row.iter()` + break/continue.
+                    let target = if i < row.len() && pos_cache[i] != Some(row[i]) {
+                        pos_cache[i] = Some(row[i]);
+                        Some(row[i])
+                    } else {
+                        None
+                    };
+                    (m.clone(), mr.clone(), target)
+                })
+                .collect();
+            let mut sub = per_step(detectors.clone(), step_motors);
+            while let Some(item) = futures::StreamExt::next(&mut sub).await {
+                // Internal Bare-only sub-plan: no `Respond` item to preserve.
+                let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
+                yield m;
             }
-            // Yielded unconditionally, matching bluesky (the wait on an empty
-            // `set` group is a no-op). Real grid points always move the fast
-            // axis, so the group is non-empty in practice.
-            yield Msg::Wait { group: "set".into(), error_on_timeout: true, timeout: None };
-            yield Msg::Create { stream_name: "primary".into() };
-            for (_, mr) in &motors {
-                yield Msg::Read(mr.clone());
-            }
-            for d in &detectors {
-                yield Msg::Read(d.clone());
-            }
-            yield Msg::Save;
         }
         yield Msg::CloseRun { exit_status: "success".into(), reason: None };
-    })
+    });
+    preprocessors::stage_wrapper(inner, staged)
+}
+
+/// Which axes of an N-D grid scan follow a snake (boustrophedon) trajectory.
+/// Ports bluesky's `snake_axes` argument (`bool | list`, plans.py:1294):
+/// `None` snakes nothing, `All` snakes every axis except the slowest (which is
+/// traversed once, so snaking it is a no-op), and `Axes(idxs)` snakes exactly
+/// the listed axis indices (0 = slowest).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SnakeAxes {
+    /// Do not snake any axis — plain outer-product order.
+    #[default]
+    None,
+    /// Snake all axes except the slowest (bluesky `snake_axes=True`).
+    All,
+    /// Snake exactly these axis indices (bluesky `snake_axes=[m2, m3, …]`).
+    Axes(Vec<usize>),
+}
+
+impl SnakeAxes {
+    /// Expand to a per-axis flag vector of length `n` (index 0 = slowest).
+    fn to_flags(&self, n: usize) -> Vec<bool> {
+        match self {
+            SnakeAxes::None => vec![false; n],
+            // The slowest axis (index 0) never snakes: it is traversed once.
+            SnakeAxes::All => (0..n).map(|i| i > 0).collect(),
+            SnakeAxes::Axes(idxs) => (0..n).map(|i| idxs.contains(&i)).collect(),
+        }
+    }
 }
 
 /// `list_grid_scan(dets, [(motor, [points...]), ...])` — N-D grid where
-/// each axis traces a user-supplied list of positions.
+/// each axis traces a user-supplied list of positions. Natural (non-snaked)
+/// order; the non-snaked form of [`list_grid_scan_snake`].
 pub fn list_grid_scan(detectors: Vec<Arc<dyn ReadableObj>>, axes: Vec<ListGridAxis>) -> Plan {
+    list_grid_scan_snake(detectors, axes, SnakeAxes::None)
+}
+
+/// `list_grid_scan_snake(dets, axes, snake_axes)` — N-D list grid with per-axis
+/// snake traversal (bluesky `list_grid_scan(..., snake_axes=…)`). The axes
+/// selected by `snake_axes` reverse on alternating passes; all emitted
+/// documents are otherwise identical to [`list_grid_scan`].
+pub fn list_grid_scan_snake(
+    detectors: Vec<Arc<dyn ReadableObj>>,
+    axes: Vec<ListGridAxis>,
+    snake_axes: SnakeAxes,
+) -> Plan {
     let lists: Vec<Vec<f64>> = axes.iter().map(|(_, _, l)| l.clone()).collect();
-    let pts = patterns::outer_list_product(&lists);
+    let pts = patterns::outer_list_product_snake(&lists, &snake_axes.to_flags(lists.len()));
     let motors: Vec<(Arc<dyn MovableObj>, Arc<dyn ReadableObj>)> =
         axes.into_iter().map(|(m, r, _)| (m, r)).collect();
-    scan_nd(detectors, motors, pts)
+    // A grid: each motor is its own axis in the `dimensions` hint (bluesky's
+    // outer-product `motor_hints`, plans.py:350), unlike `scan_nd`'s coupled
+    // default.
+    let motor_readers: Vec<Arc<dyn ReadableObj>> =
+        motors.iter().map(|(_, mr)| mr.clone()).collect();
+    let plan_args = serde_json::json!({
+        "detectors": arg_names(&detectors),
+        "args": motors
+            .iter()
+            .zip(lists.iter())
+            .flat_map(|((m, _), pts)| [serde_json::json!(m.name()), serde_json::json!(pts)])
+            .collect::<Vec<_>>(),
+        "snake_axes": snake_axes.to_flags(lists.len()),
+    });
+    let md = scan_run_md(
+        "list_grid_scan",
+        &detectors,
+        &motor_readers,
+        Some(pts.len()),
+        AxisGrouping::Grid,
+        plan_args,
+    );
+    // grid-family per_step is deferred: grid_scan_snake settles the slow axis
+    // in a separate "set1" group per row, which does not match one_nd_step's
+    // single-group move. Route through the default until that reconciliation.
+    scan_nd_with_md(detectors, motors, pts, md, None)
 }
 
 /// `rel_list_grid_scan(dets, axes)` — relative variant of [`list_grid_scan`]
@@ -1002,7 +1883,8 @@ pub fn rel_list_grid_scan(
         }
         let mut inner = list_grid_scan(detectors, abs_axes);
         while let Some(item) = futures::StreamExt::next(&mut inner).await {
-            let crate::core::plan::PlanItem::Bare(m) = item;
+            // Internal Bare-only sub-plan: no `Respond` item to preserve.
+            let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
             yield m;
         }
     });
@@ -1028,10 +1910,24 @@ pub fn spiral_square(
 ) -> Plan {
     let pts = patterns::spiral_square_pattern(x_center, y_center, x_range, y_range, x_num, y_num);
     plan_box(async_stream::stream! {
-        yield Msg::OpenRun(RunMetadata {
-            plan_name: Some("spiral_square".into()),
-            ..Default::default()
-        });
+        yield Msg::OpenRun(scan_run_md(
+            "spiral_square",
+            &detectors,
+            &[x_reader.clone(), y_reader.clone()],
+            None,
+            AxisGrouping::Grid,
+            serde_json::json!({
+                "detectors": arg_names(&detectors),
+                "x_motor": x_motor.name(),
+                "y_motor": y_motor.name(),
+                "x_center": x_center,
+                "y_center": y_center,
+                "x_range": x_range,
+                "y_range": y_range,
+                "x_num": x_num,
+                "y_num": y_num,
+            }),
+        ));
         for (x, y) in pts {
             // Per-point rewind boundary (bluesky move_per_step, :1695).
             yield Msg::Checkpoint;
@@ -1051,8 +1947,10 @@ pub fn spiral_square(
 }
 
 /// `spiral(dets, x_motor, y_motor, x_start, y_start, x_range, y_range, dr,
-/// nth)` — Archimedean spiral through `(x, y)` until the spiral exits the
-/// bounding rect. `dr` is radial increment / turn; `nth` is points / turn.
+/// nth, dr_y, tilt)` — Archimedean spiral through `(x, y)` (bluesky
+/// `plans.spiral`). `dr` is the minor-axis radial step, `nth` the base angular
+/// steps per ring; `dr_y` (`None` ⇒ circular) is the major-axis radial step and
+/// `tilt` (radians) shears the clip box. See [`patterns::spiral`].
 #[allow(clippy::too_many_arguments)]
 pub fn spiral(
     detectors: Vec<Arc<dyn ReadableObj>>,
@@ -1066,13 +1964,31 @@ pub fn spiral(
     y_range: f64,
     dr: f64,
     nth: usize,
+    dr_y: Option<f64>,
+    tilt: f64,
 ) -> Plan {
-    let pts = patterns::spiral(x_start, y_start, x_range, y_range, dr, nth);
+    let pts = patterns::spiral(x_start, y_start, x_range, y_range, dr, nth, dr_y, tilt);
     plan_box(async_stream::stream! {
-        yield Msg::OpenRun(RunMetadata {
-            plan_name: Some("spiral".into()),
-            ..Default::default()
-        });
+        yield Msg::OpenRun(scan_run_md(
+            "spiral",
+            &detectors,
+            &[x_reader.clone(), y_reader.clone()],
+            None,
+            AxisGrouping::Grid,
+            serde_json::json!({
+                "detectors": arg_names(&detectors),
+                "x_motor": x_motor.name(),
+                "y_motor": y_motor.name(),
+                "x_start": x_start,
+                "y_start": y_start,
+                "x_range": x_range,
+                "y_range": y_range,
+                "dr": dr,
+                "nth": nth,
+                "dr_y": dr_y,
+                "tilt": tilt,
+            }),
+        ));
         for (x, y) in pts {
             // Per-point rewind boundary (bluesky move_per_step, :1695).
             yield Msg::Checkpoint;
@@ -1091,39 +2007,116 @@ pub fn spiral(
     })
 }
 
-/// `ramp_plan(go_plan, monitor_signal, take_pre_data_count, period)` —
-/// kicks off `go_plan` (a *sub-plan* that initiates a monotonic ramp,
-/// e.g. `mv(temperature, 300)`), then samples `detectors` every `period`
-/// while waiting for the ramp to land. Simplified vs bluesky's full
-/// version — no wait_for_motor_done branch; caller must interrupt.
+/// Builds a fresh inner plan for one ramp sample — bluesky's `inner_plan_func`.
+/// Called once per data point (pre, each poll, and post), typically a
+/// `trigger_and_read` of the detectors.
+pub type RampInnerFn = Arc<dyn Fn() -> Plan + Send + Sync>;
+
+/// Ramp-completion predicate — the bsrs stand-in for bluesky's `status.done`.
+/// Polled between samples; returns `true` once the ramp has landed. bsrs plans
+/// receive no Status back from the engine, so the caller supplies this (e.g.
+/// "motor readback within tolerance of the target").
+pub type RampDoneFn = Arc<dyn Fn() -> futures::future::BoxFuture<'static, bool> + Send + Sync>;
+
+/// `ramp_plan(go_plan, monitor_sig, inner, is_complete, take_pre_data, timeout,
+/// period)` — take data while ramping a positioner. Ports bluesky's `ramp_plan`
+/// (plans.py:2214): an optional pre-sample, start the ramp via `go_plan`, then
+/// repeatedly sample with `inner` until `is_complete` reports the ramp landed,
+/// then a final post-sample. `monitor_sig` is monitored across the whole run
+/// (bluesky's `monitor_during_decorator`).
+///
+/// bluesky captures a Status from `go_plan` and loops `while not status.done`.
+/// bsrs plans get no value back from the engine, so completion is the
+/// caller-supplied `is_complete` predicate, polled before each sample. `timeout`
+/// bounds the total ramp — exceeding it fails the run (bluesky's `RampFail`).
+/// `period` rate-limits sampling to at most one point per `period`; if a sample
+/// already took longer, the next runs with no added delay.
+#[allow(clippy::too_many_arguments)]
 pub fn ramp_plan(
     go_plan: Plan,
-    detectors: Vec<Arc<dyn ReadableObj>>,
-    period: std::time::Duration,
-    samples: usize,
+    monitor_sig: Arc<dyn MonitorableObj>,
+    inner: RampInnerFn,
+    is_complete: RampDoneFn,
+    take_pre_data: bool,
+    timeout: Option<Duration>,
+    period: Option<Duration>,
 ) -> Plan {
-    plan_box(async_stream::stream! {
-        yield Msg::OpenRun(RunMetadata {
-            plan_name: Some("ramp_plan".into()),
-            ..Default::default()
-        });
-        // Kick off the ramp (do not wait — go_plan should issue Set
-        // without a Wait if it wants asynchronous progress).
+    // Snapshot the monitor's name for `plan_args` before the stream captures
+    // `monitor_sig` by move (it is handed to `monitor_during_wrapper` below).
+    let monitor_name = monitor_sig.name().to_string();
+    let body = plan_box(async_stream::stream! {
+        use futures::StreamExt;
+        yield Msg::OpenRun(run_md_with_args(
+            "ramp_plan",
+            serde_json::json!({
+                "monitor": monitor_name,
+                "take_pre_data": take_pre_data,
+                "timeout": timeout.map(|t| t.as_secs_f64()),
+                "period": period.map(|t| t.as_secs_f64()),
+            }),
+        ));
+        // Watch the clock only if a timeout was given (bluesky `fail_time`).
+        let fail_time = timeout.map(|t| std::time::Instant::now() + t);
+        // Pre-sample, before the ramp starts.
+        if take_pre_data {
+            let mut pre = inner();
+            while let Some(item) = pre.next().await {
+                // Internal Bare-only sub-plan: no `Respond` item to preserve.
+                let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
+                yield m;
+            }
+        }
+        // Start the ramp (go_plan issues its Set(s) without waiting).
         let mut go = go_plan;
-        while let Some(item) = futures::StreamExt::next(&mut go).await {
-            let crate::core::plan::PlanItem::Bare(m) = item;
+        while let Some(item) = go.next().await {
+            // Internal Bare-only sub-plan: no `Respond` item to preserve.
+            let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
             yield m;
         }
-        for _ in 0..samples {
-            yield Msg::Sleep(period);
-            yield Msg::Create { stream_name: "primary".into() };
-            for d in &detectors {
-                yield Msg::Read(d.clone());
+        // Sample until the ramp lands (bluesky `while not status.done`).
+        let mut timed_out = false;
+        loop {
+            if is_complete().await {
+                break;
             }
-            yield Msg::Save;
+            let start = std::time::Instant::now();
+            let mut p = inner();
+            while let Some(item) = p.next().await {
+                // Internal Bare-only sub-plan: no `Respond` item to preserve.
+                let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
+                yield m;
+            }
+            if let Some(ft) = fail_time {
+                if std::time::Instant::now() > ft {
+                    timed_out = true;
+                    break;
+                }
+            }
+            // Rate-limit: sleep out the remainder of this sample's period.
+            if let Some(min_period) = period {
+                let remaining =
+                    (start + min_period).saturating_duration_since(std::time::Instant::now());
+                if !remaining.is_zero() {
+                    yield Msg::Sleep(remaining);
+                }
+            }
+        }
+        if timed_out {
+            // bluesky raises utils.RampFail(); bsrs fails the run.
+            yield Msg::Fail("ramp_plan: ramp did not complete within timeout".into());
+            return;
+        }
+        // Post-sample, after completion.
+        let mut post = inner();
+        while let Some(item) = post.next().await {
+            // Internal Bare-only sub-plan: no `Respond` item to preserve.
+            let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
+            yield m;
         }
         yield Msg::CloseRun { exit_status: "success".into(), reason: None };
-    })
+    });
+    // Monitor `monitor_sig` for the duration of the run.
+    preprocessors::monitor_during_wrapper(body, vec![monitor_sig])
 }
 
 /// `rel_list_scan` — relative variant of `list_scan`. Reads each motor's
@@ -1143,7 +2136,8 @@ pub fn rel_list_scan(
         let mv: Arc<dyn MovableObj> = motor;
         let mut inner = list_scan(detectors, mv, motor_reader, abs_points);
         while let Some(item) = futures::StreamExt::next(&mut inner).await {
-            let crate::core::plan::PlanItem::Bare(m) = item;
+            // Internal Bare-only sub-plan: no `Respond` item to preserve.
+            let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
             yield m;
         }
     });
@@ -1182,7 +2176,8 @@ pub fn rel_grid_scan(
             s2 + b2, e2 + b2, n2,
         );
         while let Some(item) = futures::StreamExt::next(&mut inner).await {
-            let crate::core::plan::PlanItem::Bare(m) = item;
+            // Internal Bare-only sub-plan: no `Respond` item to preserve.
+            let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
             yield m;
         }
     });
@@ -1241,9 +2236,11 @@ pub fn rel_log_scan(
 }
 
 /// `spiral_fermat(detectors, x_motor, x_reader, y_motor, y_reader,
-/// x_start, y_start, x_range, y_range, dr, factor)` —
-/// Fermat (sunflower) spiral via golden-angle increments. See
-/// `patterns::spiral_fermat_pattern`.
+/// x_start, y_start, x_range, y_range, dr, factor, dr_y, tilt)` —
+/// Fermat (sunflower) spiral via golden-angle increments (bluesky
+/// `plans.spiral_fermat`). `dr_y` (`None` ⇒ circular) is the major-axis radial
+/// step and `tilt` (radians) shears the clip box. See
+/// [`patterns::spiral_fermat_pattern`].
 #[allow(clippy::too_many_arguments)]
 pub fn spiral_fermat(
     detectors: Vec<Arc<dyn ReadableObj>>,
@@ -1257,13 +2254,32 @@ pub fn spiral_fermat(
     y_range: f64,
     dr: f64,
     factor: f64,
+    dr_y: Option<f64>,
+    tilt: f64,
 ) -> Plan {
-    let pts = patterns::spiral_fermat_pattern(x_start, y_start, x_range, y_range, dr, factor);
+    let pts =
+        patterns::spiral_fermat_pattern(x_start, y_start, x_range, y_range, dr, factor, dr_y, tilt);
     plan_box(async_stream::stream! {
-        yield Msg::OpenRun(RunMetadata {
-            plan_name: Some("spiral_fermat".into()),
-            ..Default::default()
-        });
+        yield Msg::OpenRun(scan_run_md(
+            "spiral_fermat",
+            &detectors,
+            &[x_reader.clone(), y_reader.clone()],
+            None,
+            AxisGrouping::Grid,
+            serde_json::json!({
+                "detectors": arg_names(&detectors),
+                "x_motor": x_motor.name(),
+                "y_motor": y_motor.name(),
+                "x_start": x_start,
+                "y_start": y_start,
+                "x_range": x_range,
+                "y_range": y_range,
+                "dr": dr,
+                "factor": factor,
+                "dr_y": dr_y,
+                "tilt": tilt,
+            }),
+        ));
         for (x, y) in pts {
             // Per-point rewind boundary (bluesky move_per_step, :1695).
             yield Msg::Checkpoint;
@@ -1302,11 +2318,14 @@ pub fn rel_spiral(
     y_range: f64,
     dr: f64,
     nth: usize,
+    dr_y: Option<f64>,
+    tilt: f64,
 ) -> Plan {
     let xm: Arc<dyn MovableObj> = x_motor.clone();
     let ym: Arc<dyn MovableObj> = y_motor.clone();
     let inner = spiral(
-        detectors, xm, x_reader, ym, y_reader, x_start, y_start, x_range, y_range, dr, nth,
+        detectors, xm, x_reader, ym, y_reader, x_start, y_start, x_range, y_range, dr, nth, dr_y,
+        tilt,
     );
     let rel = preprocessors::relative_set_wrapper(inner, vec![x_motor.clone(), y_motor.clone()]);
     preprocessors::reset_positions_wrapper(rel, vec![x_motor, y_motor])
@@ -1356,48 +2375,68 @@ pub fn rel_spiral_fermat(
     y_range: f64,
     dr: f64,
     factor: f64,
+    dr_y: Option<f64>,
+    tilt: f64,
 ) -> Plan {
     let xm: Arc<dyn MovableObj> = x_motor.clone();
     let ym: Arc<dyn MovableObj> = y_motor.clone();
     let inner = spiral_fermat(
         detectors, xm, x_reader, ym, y_reader, x_start, y_start, x_range, y_range, dr, factor,
+        dr_y, tilt,
     );
     let rel = preprocessors::relative_set_wrapper(inner, vec![x_motor.clone(), y_motor.clone()]);
     preprocessors::reset_positions_wrapper(rel, vec![x_motor, y_motor])
 }
 
-/// `fly(flyer, dets)` — kickoff, collect while completing, unstage.
-pub fn fly(
-    flyer: Arc<dyn FlyableObj>,
-    collectable: Arc<dyn CollectableObj>,
-    stageables: Vec<Arc<dyn StageableObj>>,
-) -> Plan {
+/// One flyer of a [`fly`] scan: its `Flyable` (kickoff/complete) paired with the
+/// `Collectable` that drains its buffered data. bsrs splits bluesky's single
+/// `Flyable` interface across two traits, so a flyer is a `(Flyable, Collectable)`
+/// pair.
+pub type Flyer = (Arc<dyn FlyableObj>, Arc<dyn CollectableObj>);
+
+/// `fly(flyers)` — fly scan over one or more flyers. Ports bluesky's `fly`
+/// (plans.py:2305): kick off every flyer, wait, tell every flyer to complete,
+/// wait, then collect each. Mirrors `kickoff_all` / `complete_all` (one group,
+/// one barrier) so the flyers run concurrently rather than one-at-a-time.
+///
+/// No staging: as in bluesky, `fly` does not stage its flyers — wrap it with
+/// [`preprocessors::stage_wrapper`] (bluesky's `stage_decorator`) when the
+/// devices need staging.
+pub fn fly(flyers: Vec<Flyer>) -> Plan {
     plan_box(async_stream::stream! {
-        yield Msg::OpenRun(RunMetadata {
-            plan_name: Some("fly".into()),
-            ..Default::default()
-        });
-        for s in &stageables {
-            yield Msg::Stage(s.clone());
+        yield Msg::OpenRun(run_md_with_args(
+            "fly",
+            serde_json::json!({
+                "flyers": flyers.iter().map(|(f, _)| f.name().to_string()).collect::<Vec<_>>(),
+            }),
+        ));
+        // Kick off every flyer under one group and wait, then tell every flyer
+        // to complete under one group and wait — reusing the canonical
+        // `kickoff_all` / `complete_all` stubs (bluesky's helpers of the same
+        // name). An empty flyer list emits no kickoff/complete/wait at all,
+        // matching bluesky's `for flyer in flyers` loops.
+        if !flyers.is_empty() {
+            let objs: Vec<Arc<dyn FlyableObj>> =
+                flyers.iter().map(|(f, _)| f.clone()).collect();
+            let mut kick = stubs::kickoff_all(objs.clone(), Some("kick".into()), true);
+            while let Some(item) = futures::StreamExt::next(&mut kick).await {
+                // Internal Bare-only sub-plan: no `Respond` item to preserve.
+                let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
+                yield m;
+            }
+            let mut done = stubs::complete_all(objs, Some("complete".into()), true);
+            while let Some(item) = futures::StreamExt::next(&mut done).await {
+                // Internal Bare-only sub-plan: no `Respond` item to preserve.
+                let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
+                yield m;
+            }
         }
-        yield Msg::Kickoff { obj: flyer.clone(), group: Some("kick".into()) };
-        yield Msg::Wait {
-            group: "kick".into(),
-            error_on_timeout: true,
-            timeout: None,
-        };
-        yield Msg::Complete { obj: flyer.clone(), group: Some("done".into()) };
-        yield Msg::Wait {
-            group: "done".into(),
-            error_on_timeout: true,
-            timeout: None,
-        };
-        yield Msg::Collect {
-            obj: collectable.clone(),
-            stream_name: None,
-        };
-        for s in &stageables {
-            yield Msg::Unstage(s.clone());
+        // Collect each flyer's buffered data.
+        for (_, c) in &flyers {
+            yield Msg::Collect {
+                obj: c.clone(),
+                stream_name: None,
+            };
         }
         yield Msg::CloseRun {
             exit_status: "success".into(),
@@ -1407,20 +2446,22 @@ pub fn fly(
 }
 
 /// `adaptive_scan(detectors, signal_field, motor, motor_reader, start,
-/// stop, min_step, max_step, target_delta, backstep)` — adaptive
-/// step-sized 1-D scan. Mirrors bluesky's `adaptive_scan`.
+/// stop, min_step, max_step, target_delta, backstep, threshold)` — adaptive
+/// step-sized 1-D scan. Ports bluesky's `adaptive_scan` (plans.py:673)
+/// slope-normalised step sizing.
 ///
-/// At each step, reads `signal_field` from the first detector's
-/// reading. Compares delta to the previous reading:
-/// - If `|delta|` exceeds `target_delta * 1.5`, the next step
-///   shrinks (toward `min_step`) and optionally back-steps (when
-///   `backstep=true`) to capture the missed transition.
-/// - If `|delta|` is well below `target_delta * 0.5`, the next step
-///   doubles (toward `max_step`).
+/// At each step it reads `signal_field`, forms the gradient
+/// `slope = |ΔI| / step`, and picks the next step so the *signal* changes
+/// by about `target_delta`: `new_step = clip(target_delta / slope, min_step,
+/// max_step)` (or a gentle `min(step*1.1, max_step)` grow when the slope is
+/// flat). The applied step is exponentially smoothed (`0.2·new + 0.8·old`).
+/// When `backstep` and the new step falls below `step * threshold`, it steps
+/// back over the region it overshot and re-scans it with the finer step.
 ///
-/// Useful for scanning across a peak / edge where uniform-step
-/// density would either miss the feature or oversample the flat
-/// regions.
+/// Requires `0 < min_step < max_step`; otherwise the plan fails immediately
+/// (bluesky raises `ValueError`). Useful for scanning across a peak / edge
+/// where uniform-step density would either miss the feature or oversample the
+/// flat regions.
 #[allow(clippy::too_many_arguments)]
 pub fn adaptive_scan(
     detectors: Vec<Arc<dyn ReadableObj>>,
@@ -1433,30 +2474,48 @@ pub fn adaptive_scan(
     max_step: f64,
     target_delta: f64,
     backstep: bool,
+    threshold: f64,
 ) -> Plan {
     let signal_field = signal_field.into();
-    let mid_step = (min_step + max_step) * 0.5;
     plan_box(async_stream::stream! {
-        yield Msg::OpenRun(RunMetadata {
-            plan_name: Some("adaptive_scan".into()),
-            ..Default::default()
-        });
+        if !(min_step > 0.0 && min_step < max_step) {
+            yield Msg::Fail(format!(
+                "adaptive_scan: require 0 < min_step < max_step, got min_step={min_step}, max_step={max_step}"
+            ));
+            return;
+        }
+        yield Msg::OpenRun(run_md_with_args(
+            "adaptive_scan",
+            serde_json::json!({
+                "detectors": arg_names(&detectors),
+                "target_field": signal_field.clone(),
+                "motor": motor.name(),
+                "start": start,
+                "stop": stop,
+                "min_step": min_step,
+                "max_step": max_step,
+                "target_delta": target_delta,
+                "backstep": backstep,
+                "threshold": threshold,
+            }),
+        ));
         let direction = if stop >= start { 1.0_f64 } else { -1.0 };
         let mut pos = start;
-        let mut prev_signal: Option<f64> = None;
-        let mut step = mid_step.max(min_step.min(max_step));
+        let mut past_i: Option<f64> = None;
+        // bluesky's initial step is the half-range, not the midpoint.
+        let mut step = (max_step - min_step) / 2.0;
+        // Safety cap: backstep can oscillate on degenerate signals; bluesky
+        // relies on physics to terminate, we bound it to avoid a hang.
         let max_iters = 10_000_usize;
         let mut iter = 0_usize;
-        loop {
+        // Strict boundary matches bluesky `while next_pos*dir < stop*dir`.
+        while pos * direction < stop * direction {
             iter += 1;
             if iter > max_iters {
                 break;
             }
-            if (direction > 0.0 && pos > stop) || (direction < 0.0 && pos < stop) {
-                break;
-            }
-            // Per-step rewind boundary (bluesky one_1d_step.move(): :1669).
-            // After the break checks, so a terminal iteration emits none.
+            // Per-step rewind boundary (bluesky emits `checkpoint` before the
+            // `mv`, plans.py:764).
             yield Msg::Checkpoint;
             yield Msg::Set { obj: motor.clone(), value: pos, group: Some("set".into()) };
             yield Msg::Wait {
@@ -1470,36 +2529,46 @@ pub fn adaptive_scan(
                 yield Msg::Read(d.clone());
             }
             yield Msg::Save;
-            // Best-effort signal sample for adaptation. We don't
-            // have direct access to the value yielded into the
-            // bundler from this side of the plan stream, so we
-            // re-read the first detector. For soft / fast-read
-            // detectors this is cheap; for slow ones consider a
-            // separate signal channel.
-            let now_signal: Option<f64> = if let Some(d) = detectors.first() {
+            // Signal sample for adaptation. bsrs plans do not receive the
+            // value bundled by `Msg::Read`, so re-read `signal_field` from the
+            // first detector that reports it (bluesky reads it from whichever
+            // device carries `target_field`, plans.py:770).
+            let mut cur_i: Option<f64> = None;
+            for d in &detectors {
                 if let Ok(map) = d.read_dyn().await {
-                    map.get(&signal_field).and_then(|rv| rv.value.as_f64())
-                } else { None }
-            } else { None };
-            let next_step = match (prev_signal, now_signal) {
-                (Some(p), Some(n)) => {
-                    let abs_delta = (n - p).abs();
-                    if abs_delta > target_delta * 1.5 {
-                        let new_step = (step * 0.5).max(min_step);
-                        if backstep && new_step < step {
-                            pos -= step * direction;
-                        }
-                        new_step
-                    } else if abs_delta < target_delta * 0.5 {
-                        (step * 2.0).min(max_step)
-                    } else {
-                        step
+                    if let Some(v) = map.get(&signal_field).and_then(|rv| rv.value.as_f64()) {
+                        cur_i = Some(v);
+                        break;
                     }
                 }
-                _ => step,
+            }
+            // First point: seed the reference, advance, no adaptation.
+            let Some(p) = past_i else {
+                past_i = cur_i;
+                pos += step * direction;
+                continue;
             };
-            prev_signal = now_signal.or(prev_signal);
-            step = next_step.clamp(min_step, max_step);
+            // No signal this point: keep the step, do not update the reference.
+            let Some(n) = cur_i else {
+                pos += step * direction;
+                continue;
+            };
+            let di = (n - p).abs();
+            let slope = di / step;
+            let new_step = if slope != 0.0 {
+                (target_delta / slope).clamp(min_step, max_step)
+            } else {
+                (step * 1.1).min(max_step)
+            };
+            if backstep && new_step < step * threshold {
+                // Overshot: step back over the region and re-scan it finer.
+                // Verbatim bluesky arithmetic (`next_pos -= step`, no sign).
+                pos -= step;
+                step = new_step;
+            } else {
+                past_i = Some(n);
+                step = 0.2 * new_step + 0.8 * step;
+            }
             pos += step * direction;
         }
         yield Msg::CloseRun {
@@ -1509,13 +2578,23 @@ pub fn adaptive_scan(
     })
 }
 
-/// `tune_centroid(detectors, signal_field, motor, motor_reader, start,
-/// stop, num)` — a uniform scan that finds the centroid of
-/// `signal_field` across the detector readings, then sets `motor`
-/// to that centroid. Mirrors a simplified bluesky `tune_centroid`.
+/// `tune_centroid(detectors, signal_field, motor, motor_reader, start, stop,
+/// min_step, num, step_factor, snake)` — iteratively tune `motor` to the
+/// centroid of `signal_field`. Ports bluesky's multi-pass `tune_centroid`
+/// (plans.py:873).
 ///
-/// Centroid = `Σ(pos_i * sig_i) / Σ(sig_i)`. If all signals are zero
-/// (or non-numeric), the motor stops at the last scan position.
+/// Each pass scans `num` points across the current window, accumulates the
+/// centroid `Σ(xᵢ·Iᵢ) / Σ(Iᵢ)`, then re-centers a window narrowed by
+/// `step_factor` on that centroid and rescans — until the per-pass step falls
+/// below `min_step`. The motor is finally moved to the converged centroid. If a
+/// pass sees no signal (`ΣI == 0`) the plan stops without a final move, matching
+/// bluesky. With `snake = true` the scan direction alternates each pass to save
+/// return travel.
+///
+/// Requires `min_step > 0` and `step_factor > 1.0` (bluesky raises
+/// `ValueError`); otherwise the plan fails before opening a run. As in bsrs's
+/// other feedback plans, the signal is re-read plan-side via `read_dyn`, and the
+/// commanded position is used for the centroid abscissa.
 #[allow(clippy::too_many_arguments)]
 pub fn tune_centroid(
     detectors: Vec<Arc<dyn ReadableObj>>,
@@ -1524,28 +2603,59 @@ pub fn tune_centroid(
     motor_reader: Arc<dyn ReadableObj>,
     start: f64,
     stop: f64,
+    min_step: f64,
     num: usize,
+    step_factor: f64,
+    snake: bool,
 ) -> Plan {
     let signal_field = signal_field.into();
-    let step = if num > 1 {
-        (stop - start) / (num as f64 - 1.0)
-    } else {
-        0.0
+    let span = move |a: f64, b: f64| {
+        if num > 1 {
+            (b - a) / (num as f64 - 1.0)
+        } else {
+            0.0
+        }
     };
     plan_box(async_stream::stream! {
-        yield Msg::OpenRun(RunMetadata {
-            plan_name: Some("tune_centroid".into()),
-            ..Default::default()
-        });
-        let mut sum_xy = 0.0_f64;
-        let mut sum_y = 0.0_f64;
-        let mut last_pos = start;
-        for i in 0..num {
-            // Per-step rewind boundary (bluesky one_1d_step.move(): :1669).
+        if min_step <= 0.0 {
+            yield Msg::Fail("tune_centroid: min_step must be positive".into());
+            return;
+        }
+        if step_factor <= 1.0 {
+            yield Msg::Fail("tune_centroid: step_factor must be greater than 1.0".into());
+            return;
+        }
+        yield Msg::OpenRun(run_md_with_args(
+            "tune_centroid",
+            serde_json::json!({
+                "detectors": arg_names(&detectors),
+                "signal": signal_field.clone(),
+                "motor": motor.name(),
+                "start": start,
+                "stop": stop,
+                "min_step": min_step,
+                "num": num,
+                "step_factor": step_factor,
+                "snake": snake,
+            }),
+        ));
+        // Global bounds are fixed; the per-pass window shrinks inside them.
+        let low_limit = start.min(stop);
+        let high_limit = start.max(stop);
+        let mut pass_start = start;
+        let mut pass_stop = stop;
+        let mut next_pos = pass_start;
+        let mut step = span(pass_start, pass_stop);
+        let mut peak_position: Option<f64> = None;
+        let mut sum_i = 0.0_f64;
+        let mut sum_xi = 0.0_f64;
+        // step_factor > 1 guarantees the step shrinks each pass, so this
+        // terminates without an iteration cap.
+        while step.abs() >= min_step && (low_limit..=high_limit).contains(&next_pos) {
+            // Per-step rewind boundary (bluesky emits `checkpoint` before mv,
+            // plans.py:990).
             yield Msg::Checkpoint;
-            let pos = start + step * (i as f64);
-            last_pos = pos;
-            yield Msg::Set { obj: motor.clone(), value: pos, group: Some("set".into()) };
+            yield Msg::Set { obj: motor.clone(), value: next_pos, group: Some("set".into()) };
             yield Msg::Wait {
                 group: "set".into(),
                 error_on_timeout: true,
@@ -1557,26 +2667,52 @@ pub fn tune_centroid(
                 yield Msg::Read(d.clone());
             }
             yield Msg::Save;
-            if let Some(d) = detectors.first() {
+            // Re-read the signal from the first detector that carries it.
+            let mut cur_i: Option<f64> = None;
+            for d in &detectors {
                 if let Ok(map) = d.read_dyn().await {
-                    if let Some(y) = map.get(&signal_field).and_then(|rv| rv.value.as_f64()) {
-                        sum_xy += pos * y;
-                        sum_y += y;
+                    if let Some(v) = map.get(&signal_field).and_then(|rv| rv.value.as_f64()) {
+                        cur_i = Some(v);
+                        break;
                     }
                 }
             }
+            if let Some(y) = cur_i {
+                sum_i += y;
+                sum_xi += next_pos * y;
+            }
+            next_pos += step;
+            let in_range = pass_start.min(pass_stop) <= next_pos
+                && next_pos <= pass_start.max(pass_stop);
+            if !in_range {
+                if sum_i == 0.0 {
+                    // No signal this pass: give up without a final move.
+                    yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+                    return;
+                }
+                let centroid = sum_xi / sum_i;
+                peak_position = Some(centroid);
+                sum_i = 0.0;
+                sum_xi = 0.0;
+                let new_range = (pass_stop - pass_start) / step_factor;
+                pass_start = (centroid - new_range / 2.0).clamp(low_limit, high_limit);
+                pass_stop = (centroid + new_range / 2.0).clamp(low_limit, high_limit);
+                if snake {
+                    std::mem::swap(&mut pass_start, &mut pass_stop);
+                }
+                step = span(pass_start, pass_stop);
+                next_pos = pass_start;
+            }
         }
-        let target = if sum_y.abs() > f64::EPSILON {
-            sum_xy / sum_y
-        } else {
-            last_pos
-        };
-        yield Msg::Set { obj: motor.clone(), value: target, group: Some("center".into()) };
-        yield Msg::Wait {
-            group: "center".into(),
-            error_on_timeout: true,
-            timeout: None,
-        };
+        // Move to the converged centroid (bluesky's trailing `mv`).
+        if let Some(peak) = peak_position {
+            yield Msg::Set { obj: motor.clone(), value: peak, group: Some("center".into()) };
+            yield Msg::Wait {
+                group: "center".into(),
+                error_on_timeout: true,
+                timeout: None,
+            };
+        }
         yield Msg::CloseRun {
             exit_status: "success".into(),
             reason: None,
@@ -1601,6 +2737,7 @@ pub fn rel_adaptive_scan(
     max_step: f64,
     target_delta: f64,
     backstep: bool,
+    threshold: f64,
 ) -> Plan {
     let signal_field = signal_field.into();
     let reset_motor = motor.clone();
@@ -1629,10 +2766,12 @@ pub fn rel_adaptive_scan(
             max_step,
             target_delta,
             backstep,
+            threshold,
         );
         use futures::StreamExt;
         while let Some(item) = inner.next().await {
-            let crate::core::plan::PlanItem::Bare(m) = item;
+            // Internal Bare-only sub-plan: no `Respond` item to preserve.
+            let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
             yield m;
         }
     });
@@ -1667,6 +2806,44 @@ mod tests {
         }
     }
 
+    /// Minimal collectable for `fly` drain tests. `describe_collect_dyn` /
+    /// `collect_dyn` are never called by `drain` (only the engine invokes
+    /// them); the plan only carries the object inside `Msg::Collect`.
+    struct FakeCollectable(String);
+
+    impl crate::core::msg::NamedObj for FakeCollectable {
+        fn name(&self) -> &str {
+            &self.0
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CollectableObj for FakeCollectable {
+        async fn describe_collect_dyn(
+            &self,
+        ) -> Result<
+            std::collections::HashMap<
+                String,
+                std::collections::HashMap<String, crate::event_model::DataKey>,
+            >,
+            crate::core::error::BsrsError,
+        > {
+            Ok(Default::default())
+        }
+        async fn collect_dyn(
+            &self,
+        ) -> Result<
+            Vec<(
+                String,
+                std::collections::HashMap<String, serde_json::Value>,
+                std::collections::HashMap<String, f64>,
+            )>,
+            crate::core::error::BsrsError,
+        > {
+            Ok(Vec::new())
+        }
+    }
+
     /// Minimal preparable for `prepare` stub-stream tests. `prepare_dyn` is
     /// never called by `drain` (only the engine invokes it).
     struct FakePreparable(String);
@@ -1687,7 +2864,7 @@ mod tests {
     async fn drain(mut plan: Plan) -> Vec<Msg> {
         let mut out = Vec::new();
         while let Some(item) = plan.next().await {
-            let PlanItem::Bare(m) = item;
+            let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
             out.push(m);
         }
         out
@@ -1696,6 +2873,18 @@ mod tests {
     fn flyers(n: usize) -> Vec<Arc<dyn FlyableObj>> {
         (0..n)
             .map(|i| Arc::new(FakeFlyer(format!("fly{i}"))) as Arc<dyn FlyableObj>)
+            .collect()
+    }
+
+    /// `n` `(Flyable, Collectable)` pairs, both named `fly{i}`.
+    fn flyer_pairs(n: usize) -> Vec<Flyer> {
+        (0..n)
+            .map(|i| {
+                (
+                    Arc::new(FakeFlyer(format!("fly{i}"))) as Arc<dyn FlyableObj>,
+                    Arc::new(FakeCollectable(format!("fly{i}"))) as Arc<dyn CollectableObj>,
+                )
+            })
             .collect()
     }
 
@@ -1711,6 +2900,57 @@ mod tests {
             Msg::Complete { group, .. } => group.as_deref(),
             _ => None,
         }
+    }
+
+    fn collect_name(m: &Msg) -> Option<&str> {
+        match m {
+            Msg::Collect { obj, .. } => Some(obj.name()),
+            _ => None,
+        }
+    }
+
+    fn wait_group_name(m: &Msg) -> Option<&str> {
+        match m {
+            Msg::Wait { group, .. } => Some(group.as_str()),
+            _ => None,
+        }
+    }
+
+    fn colls(n: usize) -> Vec<Arc<dyn CollectableObj>> {
+        (0..n)
+            .map(|i| Arc::new(FakeCollectable(format!("det{i}"))) as Arc<dyn CollectableObj>)
+            .collect()
+    }
+
+    fn msg_kind(m: &Msg) -> &'static str {
+        match m {
+            Msg::Complete { .. } => "complete",
+            Msg::Wait { .. } => "wait",
+            Msg::Collect { .. } => "collect",
+            _ => "other",
+        }
+    }
+
+    /// Drive a `collect_while_completing`-style plan to completion, answering
+    /// each `Respond`-carried `Wait` with the next scripted `done` flag. This
+    /// substitutes for the engine (which is what fulfills a `Respond`), so the
+    /// plan's response loop runs deterministically with no real flyers/timing.
+    /// Panics if the plan issues more `Wait`s than there are scripted flags.
+    async fn drain_completing(mut plan: Plan, mut dones: std::vec::IntoIter<bool>) -> Vec<Msg> {
+        let mut out = Vec::new();
+        while let Some(item) = plan.next().await {
+            match item {
+                PlanItem::Bare(m) => out.push(m),
+                PlanItem::Respond(m, tx) => {
+                    out.push(m);
+                    let done = dones
+                        .next()
+                        .expect("plan issued more Wait responses than were scripted");
+                    let _ = tx.send(MsgResult::WaitComplete { done });
+                }
+            }
+        }
+        out
     }
 
     use crate::core::msg::{DynLocation, MovableObj, NamedObj, ReadableObj};
@@ -1805,6 +3045,121 @@ mod tests {
         }
     }
 
+    /// Readable that is ALSO stageable: its `as_stageable` returns `Some`, so a
+    /// compound plan `Stage`s it before the run and `Unstage`s it after
+    /// (PLAN-09). Contrast [`FakeReadable`], which is not stageable and so is
+    /// never staged.
+    struct StageableFake(String);
+
+    impl NamedObj for StageableFake {
+        fn name(&self) -> &str {
+            &self.0
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ReadableObj for StageableFake {
+        async fn read_dyn(
+            &self,
+        ) -> Result<HashMap<String, ReadingValue>, crate::core::error::BsrsError> {
+            Ok(HashMap::new())
+        }
+        async fn describe_dyn(
+            &self,
+        ) -> Result<HashMap<String, crate::event_model::DataKey>, crate::core::error::BsrsError>
+        {
+            Ok(HashMap::new())
+        }
+        fn as_stageable(self: Arc<Self>) -> Option<Arc<dyn StageableObj>> {
+            Some(self)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StageableObj for StageableFake {
+        async fn stage_dyn(&self) -> Result<(), crate::core::error::BsrsError> {
+            Ok(())
+        }
+        async fn unstage_dyn(&self) -> Result<(), crate::core::error::BsrsError> {
+            Ok(())
+        }
+    }
+
+    // PLAN-09: a compound plan stages its stageable detectors before the run
+    // and unstages them (LIFO) after, bracketing OpenRun/CloseRun.
+    #[tokio::test]
+    async fn count_stages_stageable_detector_around_the_run() {
+        let det: Arc<dyn ReadableObj> = Arc::new(StageableFake("sdet".into()));
+        let msgs = drain(count(vec![det], 1)).await;
+        assert!(
+            matches!(&msgs[0], Msg::Stage(o) if o.name() == "sdet"),
+            "first message must Stage the detector, got {:?}",
+            &msgs[0]
+        );
+        assert!(
+            matches!(&msgs[1], Msg::OpenRun(_)),
+            "OpenRun must follow the Stage, got {:?}",
+            &msgs[1]
+        );
+        assert!(
+            matches!(msgs.last(), Some(Msg::Unstage(o)) if o.name() == "sdet"),
+            "last message must Unstage the detector, got {:?}",
+            msgs.last()
+        );
+        let close = msgs
+            .iter()
+            .position(|m| matches!(m, Msg::CloseRun { .. }))
+            .expect("CloseRun present");
+        let unstage = msgs
+            .iter()
+            .rposition(|m| matches!(m, Msg::Unstage(_)))
+            .expect("Unstage present");
+        assert!(close < unstage, "Unstage must come after CloseRun");
+    }
+
+    // The opt-in is honoured: a plain (non-stageable) detector emits no
+    // Stage/Unstage, so existing plans over sim/test devices are unchanged.
+    #[tokio::test]
+    async fn count_does_not_stage_non_stageable_detector() {
+        let msgs = drain(count(vec![rdr("d")], 1)).await;
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, Msg::Stage(_) | Msg::Unstage(_))),
+            "a non-stageable detector must not be staged"
+        );
+    }
+
+    // The scan family stages too (via scan_1d_per_step), not just count.
+    #[tokio::test]
+    async fn scan_1d_stages_stageable_detector_before_open() {
+        let det: Arc<dyn ReadableObj> = Arc::new(StageableFake("sdet".into()));
+        let motor = Arc::new(FakeMotor {
+            name: "m".into(),
+            bias: 0.0,
+        });
+        let reader = rdr("m_rbv");
+        let msgs = drain(scan_1d(
+            vec![det],
+            motor as Arc<dyn MovableObj>,
+            reader,
+            0.0,
+            1.0,
+            2,
+        ))
+        .await;
+        assert!(
+            matches!(&msgs[0], Msg::Stage(o) if o.name() == "sdet"),
+            "scan_1d must Stage the detector first, got {:?}",
+            &msgs[0]
+        );
+        assert!(
+            matches!(msgs.last(), Some(Msg::Unstage(o)) if o.name() == "sdet"),
+            "scan_1d must Unstage the detector last, got {:?}",
+            msgs.last()
+        );
+    }
+
     /// Triggerable carried only inside `Msg::Trigger`; `trigger_dyn` is never
     /// called by `drain`.
     struct FakeTriggerable(String);
@@ -1820,6 +3175,392 @@ mod tests {
         async fn trigger_dyn(&self) -> Status {
             Status::done()
         }
+    }
+
+    /// Detector whose `read_dyn` returns a predetermined signal sequence, one
+    /// value per call (clamped to the last), under a fixed field name. Lets an
+    /// adaptive plan be driven with a deterministic signal so the resulting
+    /// motor trajectory can be asserted exactly.
+    struct SequenceDetector {
+        name: String,
+        field: String,
+        values: Vec<f64>,
+        cursor: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl SequenceDetector {
+        fn new(name: &str, field: &str, values: Vec<f64>) -> Arc<Self> {
+            Arc::new(Self {
+                name: name.into(),
+                field: field.into(),
+                values,
+                cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })
+        }
+    }
+
+    impl NamedObj for SequenceDetector {
+        fn name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ReadableObj for SequenceDetector {
+        async fn read_dyn(
+            &self,
+        ) -> Result<HashMap<String, ReadingValue>, crate::core::error::BsrsError> {
+            let i = self
+                .cursor
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .min(self.values.len().saturating_sub(1));
+            let v = self.values.get(i).copied().unwrap_or(0.0);
+            let mut map = HashMap::new();
+            map.insert(
+                self.field.clone(),
+                ReadingValue::new(serde_json::json!(v), 0.0),
+            );
+            Ok(map)
+        }
+        async fn describe_dyn(
+            &self,
+        ) -> Result<HashMap<String, crate::event_model::DataKey>, crate::core::error::BsrsError>
+        {
+            Ok(HashMap::new())
+        }
+    }
+
+    /// Collect the `value`s of every `Msg::Set` targeting motor `name`, in
+    /// order — the trajectory an adaptive plan drove the motor through.
+    fn set_targets(msgs: &[Msg], name: &str) -> Vec<f64> {
+        msgs.iter()
+            .filter_map(|m| match m {
+                Msg::Set { obj, value, .. } if obj.name() == name => Some(*value),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn adaptive_scan_rejects_invalid_step_bounds() {
+        // bluesky raises ValueError unless 0 < min_step < max_step. bsrs fails
+        // the plan before opening a run.
+        let det = SequenceDetector::new("d", "sig", vec![1.0]) as Arc<dyn ReadableObj>;
+        let m = Arc::new(FakeMotor {
+            name: "m".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let msgs = drain(adaptive_scan(
+            vec![det],
+            "sig",
+            m,
+            rdr("mr"),
+            0.0,
+            2.0,
+            0.5, // min_step
+            0.5, // max_step == min_step → invalid
+            1.0,
+            false,
+            0.8,
+        ))
+        .await;
+        assert!(
+            matches!(msgs.first(), Some(Msg::Fail(_))),
+            "expected a leading Fail, got {msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| matches!(m, Msg::OpenRun(_))),
+            "no run should open on invalid bounds"
+        );
+    }
+
+    #[tokio::test]
+    async fn adaptive_scan_initial_step_is_half_range() {
+        // First move is at `start`; the second is one initial step later, and
+        // the initial step is the half-range (max-min)/2, NOT the midpoint.
+        // Constant signal keeps the run finite and the second step exact.
+        let det = SequenceDetector::new("d", "sig", vec![5.0; 64]) as Arc<dyn ReadableObj>;
+        let m = Arc::new(FakeMotor {
+            name: "m".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let msgs = drain(adaptive_scan(
+            vec![det],
+            "sig",
+            m,
+            rdr("mr"),
+            0.0,  // start
+            10.0, // stop
+            1.0,  // min_step
+            4.0,  // max_step  → half-range = 1.5, midpoint would be 2.5
+            2.0,
+            false,
+            0.8,
+        ))
+        .await;
+        let targets = set_targets(&msgs, "m");
+        assert_eq!(targets.first().copied(), Some(0.0), "first move at start");
+        assert_eq!(
+            targets.get(1).copied(),
+            Some(1.5),
+            "second move one half-range step later"
+        );
+        // backstep disabled → the trajectory only advances.
+        assert!(
+            targets.windows(2).all(|w| w[1] >= w[0]),
+            "no backstep without backstep=true: {targets:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn adaptive_scan_backsteps_when_step_shrinks_past_threshold() {
+        // A large signal jump between the first two points forces
+        // new_step = clip(target_delta/slope, min, max) down to min_step, well
+        // below step*threshold, so with backstep=true the motor steps back
+        // over the region it overshot — a non-monotonic trajectory.
+        let det = SequenceDetector::new("d", "sig", vec![0.0, 10.0, 10.0, 10.0, 10.0, 10.0])
+            as Arc<dyn ReadableObj>;
+        let m = Arc::new(FakeMotor {
+            name: "m".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let msgs = drain(adaptive_scan(
+            vec![det],
+            "sig",
+            m,
+            rdr("mr"),
+            0.0,  // start
+            20.0, // stop
+            0.5,  // min_step  → half-range = 2.25
+            5.0,  // max_step
+            1.0,  // target_delta
+            true, // backstep
+            0.8,
+        ))
+        .await;
+        let targets = set_targets(&msgs, "m");
+        assert_eq!(targets.first().copied(), Some(0.0));
+        assert_eq!(
+            targets.get(1).copied(),
+            Some(2.25),
+            "initial half-range step"
+        );
+        // Third move steps back: pos -= old_step (2.25) then += new_step (0.5).
+        assert_eq!(
+            targets.get(2).copied(),
+            Some(0.5),
+            "backstep over the overshot region: {targets:?}"
+        );
+    }
+
+    fn create_count(msgs: &[Msg]) -> usize {
+        msgs.iter()
+            .filter(|m| matches!(m, Msg::Create { .. }))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn tune_centroid_runs_multiple_passes_and_converges() {
+        // Flat signal → each pass's centroid is the window midpoint (2.0), and
+        // the window re-centers there and narrows by step_factor until the step
+        // drops below min_step. With range 4, num 5, step_factor 3, the steps
+        // are 1.0, 0.333, 0.111 (all ≥ 0.1) then 0.037 (< 0.1): three passes,
+        // 15 points — proof the scan is multi-pass, not single-pass.
+        let det = SequenceDetector::new("d", "sig", vec![1.0]) as Arc<dyn ReadableObj>;
+        let m = Arc::new(FakeMotor {
+            name: "m".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let msgs = drain(tune_centroid(
+            vec![det],
+            "sig",
+            m,
+            rdr("mr"),
+            0.0, // start
+            4.0, // stop
+            0.1, // min_step
+            5,   // num
+            3.0, // step_factor
+            false,
+        ))
+        .await;
+        assert_eq!(create_count(&msgs), 15, "three passes of five points");
+        let targets = set_targets(&msgs, "m");
+        assert!(
+            (targets.last().copied().unwrap() - 2.0).abs() < 1e-9,
+            "final move to the converged centroid 2.0: {targets:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tune_centroid_weights_position_by_signal() {
+        // Single pass (min_step 0.5 stops after the first step of 1.0, since the
+        // next is 0.333 < 0.5). A peaked signal [0,1,3,0,0] over positions
+        // 0,1,2,3,4 gives centroid ΣxI/ΣI = (1·1 + 2·3)/(1+3) = 1.75 — distinct
+        // from the plain mean 2.0, so the weighting is exercised.
+        let det = SequenceDetector::new("d", "sig", vec![0.0, 1.0, 3.0, 0.0, 0.0])
+            as Arc<dyn ReadableObj>;
+        let m = Arc::new(FakeMotor {
+            name: "m".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let msgs = drain(tune_centroid(
+            vec![det],
+            "sig",
+            m,
+            rdr("mr"),
+            0.0,
+            4.0,
+            0.5, // min_step → only the first pass runs
+            5,
+            3.0,
+            false,
+        ))
+        .await;
+        assert_eq!(create_count(&msgs), 5, "one pass of five points");
+        let targets = set_targets(&msgs, "m");
+        assert!(
+            (targets.last().copied().unwrap() - 1.75).abs() < 1e-9,
+            "final move to the signal-weighted centroid 1.75: {targets:?}"
+        );
+    }
+
+    /// Monitorable used only inside `Msg::Monitor`; `subscribe_dyn` is never
+    /// reached by `drain` (which just collects yielded messages).
+    struct FakeMonitor(String);
+
+    impl NamedObj for FakeMonitor {
+        fn name(&self) -> &str {
+            &self.0
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ReadableObj for FakeMonitor {
+        async fn read_dyn(
+            &self,
+        ) -> Result<HashMap<String, ReadingValue>, crate::core::error::BsrsError> {
+            Ok(HashMap::new())
+        }
+        async fn describe_dyn(
+            &self,
+        ) -> Result<HashMap<String, crate::event_model::DataKey>, crate::core::error::BsrsError>
+        {
+            Ok(HashMap::new())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MonitorableObj for FakeMonitor {
+        async fn subscribe_dyn(
+            &self,
+        ) -> Result<crate::core::subscription::Subscription, crate::core::error::BsrsError>
+        {
+            Err(crate::core::error::BsrsError::Other(
+                "FakeMonitor::subscribe_dyn is never called by drain".into(),
+            ))
+        }
+    }
+
+    /// A ramp-completion predicate that reports "not done" for its first `n`
+    /// polls, then "done" — so a ramp plan takes exactly `n` in-loop samples.
+    fn done_after(n: usize) -> RampDoneFn {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        Arc::new(move || -> futures::future::BoxFuture<'static, bool> {
+            let calls = calls.clone();
+            Box::pin(async move { calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= n })
+        })
+    }
+
+    /// A ramp inner-sample plan: one `Create`/`Save` event.
+    fn one_event_inner() -> RampInnerFn {
+        Arc::new(|| {
+            plan_box(async_stream::stream! {
+                yield Msg::Create { stream_name: "primary".into() };
+                yield Msg::Save;
+            })
+        })
+    }
+
+    fn no_op_go() -> Plan {
+        plan_box(async_stream::stream! {
+            yield Msg::Null;
+        })
+    }
+
+    #[tokio::test]
+    async fn ramp_plan_samples_until_complete_with_pre_and_post() {
+        // is_complete is false for two polls then true: one pre-sample, two
+        // in-loop samples, one post-sample = four events. The monitor brackets
+        // the run.
+        let mon = Arc::new(FakeMonitor("mon".into())) as Arc<dyn MonitorableObj>;
+        let msgs = drain(ramp_plan(
+            no_op_go(),
+            mon,
+            one_event_inner(),
+            done_after(2),
+            true, // take_pre_data
+            None, // timeout
+            None, // period
+        ))
+        .await;
+        assert_eq!(create_count(&msgs), 4, "pre + 2 in-loop + post");
+        assert!(matches!(msgs.first(), Some(Msg::OpenRun(_))));
+        assert!(
+            msgs.iter().any(|m| matches!(m, Msg::Monitor { .. })),
+            "monitor installed after open"
+        );
+        assert!(
+            msgs.iter().any(|m| matches!(m, Msg::Unmonitor(_))),
+            "monitor removed before close"
+        );
+        assert!(matches!(
+            msgs.last(),
+            Some(Msg::CloseRun { exit_status, .. }) if exit_status == "success"
+        ));
+    }
+
+    #[tokio::test]
+    async fn ramp_plan_without_pre_data_skips_leading_sample() {
+        let mon = Arc::new(FakeMonitor("mon".into())) as Arc<dyn MonitorableObj>;
+        let msgs = drain(ramp_plan(
+            no_op_go(),
+            mon,
+            one_event_inner(),
+            done_after(2),
+            false, // take_pre_data
+            None,
+            None,
+        ))
+        .await;
+        assert_eq!(create_count(&msgs), 3, "2 in-loop + post, no pre-sample");
+    }
+
+    #[tokio::test]
+    async fn ramp_plan_times_out_and_fails() {
+        // A zero timeout trips after the first in-loop sample; the ramp never
+        // completes, so the run fails (bluesky RampFail) with no clean close.
+        let mon = Arc::new(FakeMonitor("mon".into())) as Arc<dyn MonitorableObj>;
+        let msgs = drain(ramp_plan(
+            no_op_go(),
+            mon,
+            one_event_inner(),
+            done_after(usize::MAX), // never completes
+            false,
+            Some(std::time::Duration::ZERO),
+            None,
+        ))
+        .await;
+        assert!(
+            msgs.iter().any(|m| matches!(m, Msg::Fail(_))),
+            "timeout fails the run: {msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(
+                |m| matches!(m, Msg::CloseRun { exit_status, .. } if exit_status == "success")
+            ),
+            "a timed-out ramp does not close successfully"
+        );
     }
 
     // Empty triggerables → no Trigger and no Wait (bluesky no_wait guard),
@@ -2158,6 +3899,8 @@ mod tests {
             2.0,
             0.5,
             8,
+            None,
+            0.0,
         );
         let (xm, ym) = motor_xy(5.0, 7.0);
         let rel = rel_spiral(
@@ -2172,6 +3915,8 @@ mod tests {
             2.0,
             0.5,
             8,
+            None,
+            0.0,
         );
         assert_xy_relative_offsets(abs, rel, 5.0, 7.0).await;
     }
@@ -2224,6 +3969,8 @@ mod tests {
             2.0,
             0.5,
             1.0,
+            None,
+            0.0,
         );
         let (xm, ym) = motor_xy(5.0, 7.0);
         let rel = rel_spiral_fermat(
@@ -2238,6 +3985,8 @@ mod tests {
             2.0,
             0.5,
             1.0,
+            None,
+            0.0,
         );
         assert_xy_relative_offsets(abs, rel, 5.0, 7.0).await;
     }
@@ -2378,7 +4127,7 @@ mod tests {
             name: "m".into(),
             bias: 0.0,
         }) as Arc<dyn MovableObj>;
-        let msgs = drain(scan(vec![], motor, rdr("m_rbv"), 0.0, 10.0, 3)).await;
+        let msgs = drain(scan_1d(vec![], motor, rdr("m_rbv"), 0.0, 10.0, 3)).await;
         assert_eq!(
             msgs.iter().filter(|m| matches!(m, Msg::Checkpoint)).count(),
             3,
@@ -2392,6 +4141,422 @@ mod tests {
                 );
             }
         }
+    }
+
+    // A custom per_shot replaces the whole shot: `count_per_shot` runs it once
+    // per repetition and emits none of the default read_shot's Checkpoint/reads.
+    #[tokio::test]
+    async fn count_per_shot_uses_custom_hook_verbatim() {
+        let d = rdr("det");
+        let per_shot: PerShot = Arc::new(|dets: Vec<Arc<dyn ReadableObj>>| {
+            plan_box(async_stream::stream! {
+                yield Msg::Create { stream_name: "custom".into() };
+                for det in &dets {
+                    yield Msg::Read(det.clone());
+                }
+                yield Msg::Save;
+            })
+        });
+        let msgs = drain(count_per_shot(vec![d], 3, Some(per_shot))).await;
+        assert_eq!(
+            msgs.iter().filter(|m| matches!(m, Msg::Checkpoint)).count(),
+            0,
+            "custom per_shot owns the shot; the default Checkpoint is gone"
+        );
+        assert_eq!(
+            msgs.iter()
+                .filter(|m| matches!(m, Msg::Create { stream_name } if stream_name == "custom"))
+                .count(),
+            3,
+            "custom shot runs once per repetition"
+        );
+        assert_eq!(
+            msgs.iter().filter(|m| matches!(m, Msg::OpenRun(_))).count(),
+            1,
+            "count still owns the run envelope"
+        );
+        assert_eq!(
+            msgs.iter()
+                .filter(|m| matches!(m, Msg::CloseRun { .. }))
+                .count(),
+            1,
+            "count still owns the run envelope"
+        );
+    }
+
+    // A scalar delay yields a time-compensated Sleep after every shot, including
+    // the last (bluesky's scalar delay is an infinite repeat).
+    #[tokio::test]
+    async fn count_ext_scalar_delay_sleeps_after_every_shot() {
+        let d = rdr("det");
+        let dt = Duration::from_millis(100);
+        let msgs = drain(count_ext(vec![d], Some(3), CountDelay::Every(dt), None)).await;
+        let sleeps: Vec<Duration> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                Msg::Sleep(s) => Some(*s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sleeps.len(), 3, "one Sleep after each of the 3 shots");
+        for s in &sleeps {
+            assert!(
+                *s > Duration::ZERO && *s <= dt,
+                "compensated sleep {s:?} must be in (0, {dt:?}]"
+            );
+        }
+    }
+
+    // `num = None` acquires indefinitely: the stream keeps producing shot bundles
+    // and never closes the run on its own.
+    #[tokio::test]
+    async fn count_ext_num_none_acquires_indefinitely() {
+        let d = rdr("det");
+        let mut plan = count_ext(vec![d], None, CountDelay::None, None);
+        let mut got = Vec::new();
+        for _ in 0..20 {
+            match plan.next().await {
+                Some(PlanItem::Bare(m) | PlanItem::Respond(m, _)) => got.push(m),
+                None => break,
+            }
+        }
+        assert_eq!(
+            got.iter().filter(|m| matches!(m, Msg::OpenRun(_))).count(),
+            1,
+            "opens the run once"
+        );
+        assert_eq!(
+            got.iter()
+                .filter(|m| matches!(m, Msg::CloseRun { .. }))
+                .count(),
+            0,
+            "never closes on its own — bounded only by the consumer"
+        );
+        assert!(
+            got.iter().filter(|m| matches!(m, Msg::Save)).count() >= 3,
+            "keeps taking shots"
+        );
+    }
+
+    // A finite `num` with too few explicit delays fails upfront, before the run
+    // opens (bluesky's ValueError).
+    #[tokio::test]
+    async fn count_ext_short_delay_sequence_fails_before_open() {
+        let d = rdr("det");
+        let seq = CountDelay::Sequence(vec![Duration::from_millis(10)]); // 1 < num-1 == 2
+        let msgs = drain(count_ext(vec![d], Some(3), seq, None)).await;
+        assert!(
+            matches!(msgs.first(), Some(Msg::Fail(_))),
+            "first Msg is Fail, got {:?}",
+            msgs.first()
+        );
+        assert_eq!(
+            msgs.iter().filter(|m| matches!(m, Msg::OpenRun(_))).count(),
+            0,
+            "no run opened on validation failure"
+        );
+    }
+
+    // An explicit delay sequence is applied per interval; when it is exhausted the
+    // run closes with no trailing sleep (bluesky's StopIteration -> break).
+    #[tokio::test]
+    async fn count_ext_delay_sequence_applies_per_interval() {
+        let d = rdr("det");
+        let seq = CountDelay::Sequence(vec![Duration::from_millis(50), Duration::from_millis(70)]);
+        let msgs = drain(count_ext(vec![d], Some(3), seq, None)).await;
+        assert_eq!(
+            msgs.iter().filter(|m| matches!(m, Msg::Save)).count(),
+            3,
+            "all 3 shots run"
+        );
+        assert_eq!(
+            msgs.iter().filter(|m| matches!(m, Msg::Sleep(_))).count(),
+            2,
+            "2 intervals delivered, no trailing sleep after the last shot"
+        );
+        assert_eq!(
+            msgs.iter()
+                .filter(|m| matches!(m, Msg::CloseRun { .. }))
+                .count(),
+            1,
+            "run closes cleanly once the sequence is exhausted"
+        );
+    }
+
+    // A custom per_step replaces the whole step and receives this step's motor
+    // targets threaded through `StepMotor`.
+    #[tokio::test]
+    async fn scan_1d_per_step_uses_custom_hook_and_threads_targets() {
+        let motor = Arc::new(FakeMotor {
+            name: "m".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let per_step: PerStep = Arc::new(
+            |_dets: Vec<Arc<dyn ReadableObj>>, motors: Vec<StepMotor>| {
+                plan_box(async_stream::stream! {
+                    for (m, _r, target) in &motors {
+                        if let Some(v) = target {
+                            yield Msg::Set { obj: m.clone(), value: *v, group: Some("custom".into()) };
+                        }
+                    }
+                })
+            },
+        );
+        let msgs = drain(scan_1d_per_step(
+            vec![],
+            motor,
+            rdr("m_rbv"),
+            0.0,
+            10.0,
+            3,
+            Some(per_step),
+        ))
+        .await;
+        assert_eq!(
+            msgs.iter().filter(|m| matches!(m, Msg::Checkpoint)).count(),
+            0,
+            "custom step omits the default Checkpoint/Create/Read/Save"
+        );
+        assert_eq!(
+            msgs.iter()
+                .filter(|m| matches!(m, Msg::Create { .. }))
+                .count(),
+            0,
+            "custom step omits the default Create bundle"
+        );
+        let sets: Vec<f64> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                Msg::Set { value, group, .. } if group.as_deref() == Some("custom") => Some(*value),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sets,
+            vec![0.0, 5.0, 10.0],
+            "each step's target is threaded through StepMotor to the hook"
+        );
+    }
+
+    // The canonical N-motor `scan` moves every axis together (inner product) and
+    // opens the run with bluesky's `plan_name = "scan"`.
+    #[tokio::test]
+    async fn scan_moves_all_axes_together_and_opens_run_named_scan() {
+        let mx = Arc::new(FakeMotor {
+            name: "x".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let my = Arc::new(FakeMotor {
+            name: "y".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let axes: Vec<ScanAxis> = vec![(mx, rdr("xr"), 0.0, 2.0), (my, rdr("yr"), 10.0, 12.0)];
+        let msgs = drain(scan(vec![], axes, 3)).await;
+        assert!(
+            matches!(&msgs[0], Msg::OpenRun(md) if md.plan_name.as_deref() == Some("scan")),
+            "N-motor scan opens plan_name=scan"
+        );
+        assert_eq!(
+            msgs.iter().filter(|m| matches!(m, Msg::Set { .. })).count(),
+            6,
+            "3 coupled points × 2 axes = 6 Sets (moved together)"
+        );
+        assert_eq!(
+            msgs.iter().filter(|m| matches!(m, Msg::Save)).count(),
+            3,
+            "3 inner-product points"
+        );
+    }
+
+    // A single-axis `scan` is an ordinary 1-D scan: same Checkpoint/Set/Save
+    // shape as the `scan_1d` convenience.
+    #[tokio::test]
+    async fn scan_single_axis_matches_scan_1d_shape() {
+        let m = || {
+            Arc::new(FakeMotor {
+                name: "m".into(),
+                bias: 0.0,
+            }) as Arc<dyn MovableObj>
+        };
+        let nd = drain(scan(vec![], vec![(m(), rdr("m_rbv"), 0.0, 10.0)], 3)).await;
+        let one_d = drain(scan_1d(vec![], m(), rdr("m_rbv"), 0.0, 10.0, 3)).await;
+        let shape = |ms: &[Msg]| {
+            (
+                ms.iter().filter(|m| matches!(m, Msg::Checkpoint)).count(),
+                ms.iter().filter(|m| matches!(m, Msg::Set { .. })).count(),
+                ms.iter().filter(|m| matches!(m, Msg::Save)).count(),
+                ms.len(),
+            )
+        };
+        assert_eq!(
+            shape(&nd),
+            shape(&one_d),
+            "single-axis scan and scan_1d emit the same Msg shape"
+        );
+    }
+
+    // scan_nd's pos_cache decision reaches the hook as each motor's StepMotor
+    // target: `Some` to command, `None` when already at position (skip). A slow
+    // axis constant across inner points is marked `None` on those points.
+    #[tokio::test]
+    async fn scan_nd_per_step_marks_unchanged_motor_none() {
+        let m1 = Arc::new(FakeMotor {
+            name: "m1".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let m2 = Arc::new(FakeMotor {
+            name: "m2".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let masks: Arc<std::sync::Mutex<Vec<Vec<bool>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let masks_c = masks.clone();
+        let per_step: PerStep = Arc::new(
+            move |_dets: Vec<Arc<dyn ReadableObj>>, motors: Vec<StepMotor>| {
+                masks_c
+                    .lock()
+                    .unwrap()
+                    .push(motors.iter().map(|(_, _, t)| t.is_some()).collect());
+                plan_box(async_stream::stream! { yield Msg::Checkpoint; })
+            },
+        );
+        let motors = vec![(m1, rdr("m1r")), (m2, rdr("m2r"))];
+        // Slow axis m1 holds 0 across the first two points, then steps to 1.
+        let points = vec![vec![0.0, 0.0], vec![0.0, 1.0], vec![1.0, 0.0]];
+        let _ = drain(scan_nd_per_step(vec![], motors, points, Some(per_step))).await;
+        let got = masks.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec![
+                vec![true, true],  // first point: pos_cache empty, both command
+                vec![false, true], // m1 holds 0 (skip), m2 steps 0->1
+                vec![true, true],  // m1 steps 0->1, m2 steps 1->0
+            ],
+            "pos_cache skip surfaces as StepMotor::None at the hook"
+        );
+    }
+
+    // Multi-motor list_scan (PLAN-28): the axes' position lists are zipped
+    // (inner product), every point commands all motors together, and the run
+    // carries plan_name "list_scan".
+    #[tokio::test]
+    async fn list_scan_nd_zips_motor_positions_inner_product() {
+        let m1 = Arc::new(FakeMotor {
+            name: "m1".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let m2 = Arc::new(FakeMotor {
+            name: "m2".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let axes: Vec<ListScanAxis> = vec![
+            (m1, rdr("m1r"), vec![0.0, 1.0, 2.0]),
+            (m2, rdr("m2r"), vec![10.0, 11.0, 12.0]),
+        ];
+        let msgs = drain(list_scan_nd(vec![], axes, None)).await;
+        assert!(
+            matches!(&msgs[0], Msg::OpenRun(md) if md.plan_name.as_deref() == Some("list_scan")),
+            "opens a list_scan run, got {:?}",
+            msgs.first()
+        );
+        // Zipped, not crossed: row i is (m1[i], m2[i]); all distinct so every
+        // motor is commanded at every one of the 3 points.
+        assert_eq!(set_targets(&msgs, "m1"), vec![0.0, 1.0, 2.0]);
+        assert_eq!(set_targets(&msgs, "m2"), vec![10.0, 11.0, 12.0]);
+    }
+
+    // Unequal list lengths fail the run before it opens (bluesky's ValueError),
+    // rather than silently visiting an empty inner_list_product trajectory.
+    #[tokio::test]
+    async fn list_scan_nd_unequal_lengths_fail_before_open() {
+        let m1 = Arc::new(FakeMotor {
+            name: "m1".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let m2 = Arc::new(FakeMotor {
+            name: "m2".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let axes: Vec<ListScanAxis> = vec![
+            (m1, rdr("m1r"), vec![0.0, 1.0]),
+            (m2, rdr("m2r"), vec![10.0]),
+        ];
+        let msgs = drain(list_scan_nd(vec![], axes, None)).await;
+        assert!(
+            matches!(msgs.first(), Some(Msg::Fail(_))),
+            "unequal list lengths must Fail first, got {msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| matches!(m, Msg::OpenRun(_))),
+            "no run should open on a length mismatch"
+        );
+    }
+
+    // Faithful to bluesky scan_nd/move_per_step: a motor is not re-commanded at
+    // a point where its target repeats the previous one (the pos_cache in
+    // scan_nd_with_md). m1 holds 0.0 across the first two points.
+    #[tokio::test]
+    async fn list_scan_nd_skips_recommanding_repeated_position() {
+        let m1 = Arc::new(FakeMotor {
+            name: "m1".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let m2 = Arc::new(FakeMotor {
+            name: "m2".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let axes: Vec<ListScanAxis> = vec![
+            (m1, rdr("m1r"), vec![0.0, 0.0, 1.0]),
+            (m2, rdr("m2r"), vec![5.0, 6.0, 7.0]),
+        ];
+        let msgs = drain(list_scan_nd(vec![], axes, None)).await;
+        // m1's middle 0.0 equals the previous target → skipped (no Set).
+        assert_eq!(set_targets(&msgs, "m1"), vec![0.0, 1.0]);
+        // m2 changes each point → commanded each point.
+        assert_eq!(set_targets(&msgs, "m2"), vec![5.0, 6.0, 7.0]);
+    }
+
+    // PLAN-25: a step scan captures its call arguments into RunStart's
+    // `plan_args` (device names for bluesky's Python reprs).
+    #[tokio::test]
+    async fn scan_1d_captures_plan_args_into_runstart() {
+        let m = Arc::new(FakeMotor {
+            name: "m".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let det = SequenceDetector::new("d", "sig", vec![1.0, 2.0, 3.0]) as Arc<dyn ReadableObj>;
+        let msgs = drain(scan_1d(vec![det], m, rdr("mr"), 0.0, 2.0, 3)).await;
+        let md = match &msgs[0] {
+            Msg::OpenRun(md) => md,
+            other => panic!("expected OpenRun, got {other:?}"),
+        };
+        let pa = md.extra.get("plan_args").expect("plan_args present");
+        assert_eq!(pa["detectors"], serde_json::json!(["d"]));
+        assert_eq!(pa["num"], serde_json::json!(3));
+        // args carry the motor's name (not the reader's), then start/stop.
+        assert_eq!(pa["args"], serde_json::json!(["m", 0.0, 2.0]));
+        assert_eq!(pa["per_step"], serde_json::json!("default"));
+    }
+
+    // PLAN-25: `count` records num and the delay (in seconds) in plan_args.
+    #[tokio::test]
+    async fn count_captures_num_and_delay_in_plan_args() {
+        let det = SequenceDetector::new("d", "sig", vec![1.0]) as Arc<dyn ReadableObj>;
+        let msgs = drain(count_ext(
+            vec![det],
+            Some(2),
+            CountDelay::Every(Duration::from_millis(500)),
+            None,
+        ))
+        .await;
+        let md = match &msgs[0] {
+            Msg::OpenRun(md) => md,
+            other => panic!("expected OpenRun, got {other:?}"),
+        };
+        let pa = md.extra.get("plan_args").expect("plan_args present");
+        assert_eq!(pa["detectors"], serde_json::json!(["d"]));
+        assert_eq!(pa["num"], serde_json::json!(2));
+        assert_eq!(pa["delay"], serde_json::json!(0.5));
     }
 
     // A delegating rel_ plan inherits the base plan's per-step checkpoints.
@@ -2439,6 +4604,56 @@ mod tests {
             6,
             "grid_scan: one Checkpoint per row (2) + one per point (4)"
         );
+    }
+
+    #[test]
+    fn snake_axes_to_flags_resolves_bluesky_spec() {
+        // None snakes nothing; All snakes every axis but the slowest (index 0);
+        // Axes(list) snakes exactly the listed 0-based indices.
+        assert_eq!(SnakeAxes::None.to_flags(3), vec![false, false, false]);
+        assert_eq!(SnakeAxes::All.to_flags(3), vec![false, true, true]);
+        assert_eq!(
+            SnakeAxes::Axes(vec![0, 2]).to_flags(3),
+            vec![true, false, true]
+        );
+    }
+
+    #[tokio::test]
+    async fn grid_scan_snake_reverses_fast_axis_positions() {
+        // 2 slow rows x 3 fast points. With snake, the fast axis (m2) runs
+        // forward on row 0 and reversed on row 1, so its Set values are
+        // [0,1,2, 2,1,0] — a continuous boustrophedon, no fly-back.
+        let m1 = Arc::new(FakeMotor {
+            name: "m1".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let m2 = Arc::new(FakeMotor {
+            name: "m2".into(),
+            bias: 0.0,
+        }) as Arc<dyn MovableObj>;
+        let msgs = drain(grid_scan_snake(
+            vec![],
+            m1,
+            rdr("m1r"),
+            0.0,
+            1.0,
+            2,
+            m2,
+            rdr("m2r"),
+            0.0,
+            2.0,
+            3,
+            true,
+        ))
+        .await;
+        let m2_targets: Vec<f64> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                Msg::Set { obj, value, .. } if obj.name() == "m2" => Some(*value),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(m2_targets, vec![0.0, 1.0, 2.0, 2.0, 1.0, 0.0]);
     }
 
     #[tokio::test]
@@ -2568,6 +4783,183 @@ mod tests {
         );
     }
 
+    // -- PLAN-10: multi-motor mv / mvr --------------------------------------
+
+    #[tokio::test]
+    async fn mv_many_fires_all_motors_into_one_group_and_waits_once() {
+        // bluesky mv(*args) sets every motor into one group and waits ONCE, so
+        // the moves run in parallel behind a single barrier.
+        struct M(&'static str);
+        impl NamedObj for M {
+            fn name(&self) -> &str {
+                self.0
+            }
+        }
+        #[async_trait::async_trait]
+        impl MovableObj for M {
+            async fn set_dyn(&self, _value: f64) -> Status {
+                Status::done()
+            }
+        }
+        let m1: Arc<dyn MovableObj> = Arc::new(M("x"));
+        let m2: Arc<dyn MovableObj> = Arc::new(M("y"));
+        let m3: Arc<dyn MovableObj> = Arc::new(M("z"));
+
+        let msgs = drain(stubs::mv_many(vec![(m1, 1.0), (m2, 2.0), (m3, 3.0)])).await;
+
+        let sets: Vec<(&str, f64, Option<&str>)> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                Msg::Set { obj, value, group } => Some((obj.name(), *value, group.as_deref())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sets,
+            vec![
+                ("x", 1.0, Some("mv")),
+                ("y", 2.0, Some("mv")),
+                ("z", 3.0, Some("mv")),
+            ],
+            "one Set per motor, all in the shared \"mv\" group, in order"
+        );
+        let waits: Vec<&str> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                Msg::Wait { group, .. } => Some(group.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(waits, vec!["mv"], "exactly one Wait, after all Sets");
+        assert!(
+            matches!(msgs.last(), Some(Msg::Wait { .. })),
+            "the single Wait is the last message (parallel barrier)"
+        );
+    }
+
+    #[tokio::test]
+    async fn mvr_many_bases_each_target_on_its_own_setpoint_then_one_wait() {
+        struct L {
+            name: &'static str,
+            setpoint: f64,
+        }
+        impl NamedObj for L {
+            fn name(&self) -> &str {
+                self.name
+            }
+        }
+        #[async_trait::async_trait]
+        impl MovableObj for L {
+            async fn set_dyn(&self, _value: f64) -> Status {
+                Status::done()
+            }
+        }
+        #[async_trait::async_trait]
+        impl crate::core::msg::LocatableObj for L {
+            async fn locate_dyn(&self) -> Result<DynLocation, crate::core::error::BsrsError> {
+                Ok(DynLocation {
+                    setpoint: self.setpoint,
+                    readback: 0.0,
+                })
+            }
+        }
+        let a: Arc<dyn crate::core::msg::LocatableObj> = Arc::new(L {
+            name: "a",
+            setpoint: 5.0,
+        });
+        let b: Arc<dyn crate::core::msg::LocatableObj> = Arc::new(L {
+            name: "b",
+            setpoint: 10.0,
+        });
+
+        let msgs = drain(stubs::mvr_many(vec![(a, 2.0), (b, -3.0)])).await;
+
+        let sets: Vec<(&str, f64)> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                Msg::Set { obj, value, group } => {
+                    assert_eq!(group.as_deref(), Some("mv"), "shared group");
+                    Some((obj.name(), *value))
+                }
+                _ => None,
+            })
+            .collect();
+        // a: 5.0 + 2.0 = 7.0 ; b: 10.0 + (-3.0) = 7.0 — each on its own setpoint.
+        assert_eq!(sets, vec![("a", 7.0), ("b", 7.0)]);
+        assert_eq!(
+            msgs.iter()
+                .filter(|m| matches!(m, Msg::Wait { .. }))
+                .count(),
+            1,
+            "one Wait for the whole group"
+        );
+        assert!(matches!(msgs.last(), Some(Msg::Wait { .. })));
+    }
+
+    #[tokio::test]
+    async fn mvr_many_locate_failure_aborts_before_any_set() {
+        // All setpoints are read BEFORE any Set is emitted, so a locate failure
+        // on any motor fails the run before a single motor starts moving.
+        struct GoodLoc;
+        impl NamedObj for GoodLoc {
+            fn name(&self) -> &str {
+                "good"
+            }
+        }
+        #[async_trait::async_trait]
+        impl MovableObj for GoodLoc {
+            async fn set_dyn(&self, _value: f64) -> Status {
+                Status::done()
+            }
+        }
+        #[async_trait::async_trait]
+        impl crate::core::msg::LocatableObj for GoodLoc {
+            async fn locate_dyn(&self) -> Result<DynLocation, crate::core::error::BsrsError> {
+                Ok(DynLocation {
+                    setpoint: 1.0,
+                    readback: 1.0,
+                })
+            }
+        }
+        struct BadLoc;
+        impl NamedObj for BadLoc {
+            fn name(&self) -> &str {
+                "bad"
+            }
+        }
+        #[async_trait::async_trait]
+        impl MovableObj for BadLoc {
+            async fn set_dyn(&self, _value: f64) -> Status {
+                Status::done()
+            }
+        }
+        #[async_trait::async_trait]
+        impl crate::core::msg::LocatableObj for BadLoc {
+            async fn locate_dyn(&self) -> Result<DynLocation, crate::core::error::BsrsError> {
+                Err(crate::core::error::BsrsError::Plan("no readback".into()))
+            }
+        }
+        let good: Arc<dyn crate::core::msg::LocatableObj> = Arc::new(GoodLoc);
+        let bad: Arc<dyn crate::core::msg::LocatableObj> = Arc::new(BadLoc);
+
+        // Good motor first, bad second: the good setpoint reads OK, but the bad
+        // locate aborts before any Set is emitted.
+        let msgs = drain(stubs::mvr_many(vec![(good, 1.0), (bad, 1.0)])).await;
+
+        assert!(
+            !msgs.iter().any(|m| matches!(m, Msg::Set { .. })),
+            "no motion may start before every setpoint is resolved"
+        );
+        assert!(
+            !msgs.iter().any(|m| matches!(m, Msg::Wait { .. })),
+            "no barrier without any motion"
+        );
+        assert!(
+            matches!(msgs.last(), Some(Msg::Fail(_))),
+            "a locate failure aborts the run via Msg::Fail"
+        );
+    }
+
     #[tokio::test]
     async fn x2x_scan_couples_motors_2to1_relative_to_readbacks() {
         // motor1 sweeps 0→4 (readback 10); motor2 sweeps the half range 0→2
@@ -2662,6 +5054,201 @@ mod tests {
         assert!(g.starts_with("complete_all-"), "got {g:?}");
         assert!(msgs.iter().all(|m| complete_group(m) == Some(g.as_str())));
         assert!(!msgs.iter().any(|m| matches!(m, Msg::Wait { .. })));
+    }
+
+    // broadcast_msg (PLAN-29): the generic typed fan applies the per-object
+    // builder to each object, in list order, and to nothing else.
+    #[tokio::test]
+    async fn broadcast_msg_fans_builder_across_objects_in_order() {
+        let objs: Vec<Arc<dyn crate::core::msg::TriggerableObj>> = (0..3)
+            .map(|i| {
+                Arc::new(FakeTriggerable(format!("t{i}")))
+                    as Arc<dyn crate::core::msg::TriggerableObj>
+            })
+            .collect();
+        let msgs = drain(stubs::broadcast_msg(objs, |o| Msg::Trigger {
+            obj: o,
+            group: Some("g".into()),
+        }))
+        .await;
+        assert_eq!(msgs.len(), 3, "one message per object, got {msgs:#?}");
+        for (i, m) in msgs.iter().enumerate() {
+            assert!(
+                matches!(m, Msg::Trigger { obj, group }
+                    if obj.name() == format!("t{i}") && group.as_deref() == Some("g")),
+                "message {i} must Trigger t{i} in group g, got {m:?}"
+            );
+        }
+    }
+
+    // broadcast_msg over an empty list yields nothing (the `for` runs zero
+    // times) — the boundary bluesky's generator also produces.
+    #[tokio::test]
+    async fn broadcast_msg_empty_objects_yields_no_messages() {
+        let objs: Vec<Arc<dyn crate::core::msg::StageableObj>> = Vec::new();
+        let msgs = drain(stubs::broadcast_msg(objs, Msg::Stage)).await;
+        assert!(msgs.is_empty(), "empty object list fans no messages");
+    }
+
+    // fly over several flyers kicks each off under one "kick" group and waits,
+    // completes each under one "complete" group and waits, then collects each —
+    // the multi-flyer generalization of bluesky's `fly` (PLAN-07).
+    #[tokio::test]
+    async fn fly_kicks_completes_then_collects_each_flyer() {
+        let msgs = drain(fly(flyer_pairs(2))).await;
+
+        // OpenRun("fly"); Kickoff×2/kick; Wait/kick; Complete×2/complete;
+        // Wait/complete; Collect×2; CloseRun.
+        assert_eq!(msgs.len(), 10, "got {msgs:#?}");
+        assert!(
+            matches!(&msgs[0], Msg::OpenRun(md) if md.plan_name.as_deref() == Some("fly")),
+            "first msg is OpenRun(fly): {:?}",
+            msgs[0]
+        );
+
+        // Both flyers kicked off first, sharing the "kick" group, then one Wait.
+        assert_eq!(kickoff_group(&msgs[1]), Some("kick"));
+        assert_eq!(kickoff_group(&msgs[2]), Some("kick"));
+        assert!(
+            matches!(&msgs[3], Msg::Wait { group, .. } if group == "kick"),
+            "msg[3] waits on kick: {:?}",
+            msgs[3]
+        );
+
+        // Then both completed under the "complete" group, then one Wait.
+        assert_eq!(complete_group(&msgs[4]), Some("complete"));
+        assert_eq!(complete_group(&msgs[5]), Some("complete"));
+        assert!(
+            matches!(&msgs[6], Msg::Wait { group, .. } if group == "complete"),
+            "msg[6] waits on complete: {:?}",
+            msgs[6]
+        );
+
+        // Each flyer's collectable is collected, in order.
+        assert_eq!(collect_name(&msgs[7]), Some("fly0"));
+        assert_eq!(collect_name(&msgs[8]), Some("fly1"));
+
+        assert!(
+            matches!(&msgs[9], Msg::CloseRun { exit_status, .. } if exit_status == "success"),
+            "last msg is a successful CloseRun: {:?}",
+            msgs[9]
+        );
+    }
+
+    // An empty flyer list opens and closes the run with nothing in between —
+    // no spurious kickoff, wait, or collect (bluesky's `for flyer in flyers`
+    // loops iterate zero times).
+    #[tokio::test]
+    async fn fly_with_no_flyers_only_opens_and_closes() {
+        let msgs = drain(fly(Vec::new())).await;
+        assert_eq!(msgs.len(), 2, "got {msgs:#?}");
+        assert!(matches!(&msgs[0], Msg::OpenRun(_)));
+        assert!(matches!(&msgs[1], Msg::CloseRun { .. }));
+    }
+
+    // collect_while_completing (PLAN-08). Boundary: the group reports done on the
+    // very first Wait (flush_period=None, flyers already finished). Every flyer is
+    // completed up front against one shared group, then a single Wait/Collect
+    // cycle runs — one collect per detector — and the loop stops. All Completes
+    // and the Wait must share the minted "complete-N" group.
+    #[tokio::test]
+    async fn collect_while_completing_single_cycle_when_done_immediately() {
+        let msgs = drain_completing(
+            stubs::collect_while_completing(flyers(2), colls(2), None, None),
+            vec![true].into_iter(),
+        )
+        .await;
+
+        // Complete×2 (shared group); Wait (same group); Collect×2 (det0, det1).
+        assert_eq!(
+            msgs.iter().map(msg_kind).collect::<Vec<_>>(),
+            vec!["complete", "complete", "wait", "collect", "collect"],
+            "got {msgs:#?}"
+        );
+        let g = complete_group(&msgs[0])
+            .expect("complete group")
+            .to_string();
+        assert!(
+            g.starts_with("complete-"),
+            "group is short_uid-minted: {g:?}"
+        );
+        assert_eq!(complete_group(&msgs[1]), Some(g.as_str()));
+        assert_eq!(
+            wait_group_name(&msgs[2]),
+            Some(g.as_str()),
+            "the Wait must target the same group the flyers complete against"
+        );
+        assert_eq!(collect_name(&msgs[3]), Some("det0"));
+        assert_eq!(collect_name(&msgs[4]), Some("det1"));
+    }
+
+    // collect_while_completing (PLAN-08). Boundary: the group is NOT done on the
+    // first two Waits (move-on flushes) and done on the third. Each Wait — the
+    // terminal one included — is followed by one collect per detector, matching
+    // bluesky's `while not done: done = wait(...); collect(...)` (the collect runs
+    // after the wait that reports done, then the loop exits).
+    #[tokio::test]
+    async fn collect_while_completing_flushes_each_period_until_done() {
+        let flush = Some(Duration::from_millis(5));
+        let msgs = drain_completing(
+            stubs::collect_while_completing(flyers(1), colls(1), flush, Some("primary".into())),
+            vec![false, false, true].into_iter(),
+        )
+        .await;
+
+        // Complete×1; then 3× (Wait, Collect) — two move-on flushes plus the
+        // terminal cycle. No extra Wait or Collect after done.
+        assert_eq!(
+            msgs.iter().map(msg_kind).collect::<Vec<_>>(),
+            vec!["complete", "wait", "collect", "wait", "collect", "wait", "collect",],
+            "got {msgs:#?}"
+        );
+        // Named-stream collects carry the requested stream name.
+        for m in msgs.iter().filter(|m| matches!(m, Msg::Collect { .. })) {
+            assert!(matches!(m, Msg::Collect { stream_name: Some(n), .. } if n == "primary"));
+        }
+    }
+
+    // collect_while_completing (PLAN-08). Boundary: the engine drops the Wait
+    // responder (the run failed before answering). The plan must stop rather than
+    // await a response that will never arrive, and must NOT emit a trailing
+    // collect after the failure.
+    #[tokio::test]
+    async fn collect_while_completing_stops_when_wait_responder_dropped() {
+        let mut plan = stubs::collect_while_completing(flyers(1), colls(1), None, None);
+        let mut kinds = Vec::new();
+        while let Some(item) = plan.next().await {
+            match item {
+                PlanItem::Bare(m) => kinds.push(msg_kind(&m)),
+                PlanItem::Respond(m, tx) => {
+                    kinds.push(msg_kind(&m));
+                    drop(tx); // engine failed the Wait: no response will come.
+                }
+            }
+        }
+        assert_eq!(
+            kinds,
+            vec!["complete", "wait"],
+            "a dropped Wait responder stops the loop with no trailing collect"
+        );
+    }
+
+    // collect_while_completing (PLAN-08). Boundary: no flyers. bluesky's
+    // `for flyer in flyers` loops zero times, so nothing is completed; the first
+    // Wait on the (empty) group reports done immediately and one flush of each
+    // detector still runs.
+    #[tokio::test]
+    async fn collect_while_completing_with_no_flyers_still_collects_once() {
+        let msgs = drain_completing(
+            stubs::collect_while_completing(Vec::new(), colls(2), None, None),
+            vec![true].into_iter(),
+        )
+        .await;
+        assert_eq!(
+            msgs.iter().map(msg_kind).collect::<Vec<_>>(),
+            vec!["wait", "collect", "collect"],
+            "no flyers: one Wait then one collect per detector, got {msgs:#?}"
+        );
     }
 
     fn preparable(name: &str) -> Arc<dyn PreparableObj> {

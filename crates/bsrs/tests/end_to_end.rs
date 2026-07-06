@@ -54,6 +54,7 @@ async fn adaptive_scan_runs_to_completion() {
         0.5,
         1.0,
         false,
+        0.8,
     );
     let result = re.run_async(plan).await.expect("adaptive_scan failed");
     assert_eq!(result.exit_status, "success");
@@ -74,11 +75,15 @@ async fn tune_centroid_moves_motor_to_computed_center() {
         motor.clone() as Arc<dyn bsrs::core::msg::ReadableObj>,
         0.0,
         4.0,
-        5,
+        0.5, // min_step
+        5,   // num
+        3.0, // step_factor
+        false,
     );
     let result = re.run_async(plan).await.expect("tune_centroid failed");
     assert_eq!(result.exit_status, "success");
-    // SoftDetector returns 0 counts → centroid undefined → motor at last_pos = 4.0
+    // SoftDetector returns 0 counts → ΣI == 0 → no final centroid move; motor
+    // stays at the last scanned position (4.0).
     let setpoint = motor.locate_dyn().await.unwrap().setpoint;
     assert!(
         (setpoint - 4.0).abs() < 1e-9 || setpoint.is_finite(),
@@ -93,7 +98,7 @@ async fn scan_plan_emits_motor_and_detector_readings() {
     let sink = Arc::new(CapturingSink::new());
     let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
 
-    let plan = bsrs::ophyd_async::scan(
+    let plan = bsrs::ophyd_async::scan_1d(
         vec![det.clone() as Arc<dyn bsrs::core::msg::ReadableObj>],
         motor.clone() as Arc<dyn bsrs::core::msg::MovableObj>,
         motor.clone() as Arc<dyn bsrs::core::msg::ReadableObj>,
@@ -119,6 +124,93 @@ async fn scan_plan_emits_motor_and_detector_readings() {
     } else {
         panic!("doc 1 was not a Descriptor");
     }
+}
+
+#[tokio::test]
+async fn scan_family_runstart_carries_scan_metadata() {
+    // PLAN-25: every scan-family RunStart must carry the device-name lists,
+    // point counts, and the `dimensions` hint bluesky injects, so a Python-side
+    // BEC/LiveTable can label axes and size the scan. Assert on the SERIALIZED
+    // RunStart (the wire document), not in-memory field placement.
+    use bsrs::core::Document::Start;
+
+    fn start_json(docs: &[bsrs::core::Document]) -> serde_json::Value {
+        match &docs[0] {
+            Start(s) => serde_json::to_value(s).expect("RunStart serializes"),
+            _ => panic!("doc 0 is not a RunStart"),
+        }
+    }
+
+    // count: a time series — detectors + point counts + the implicit `time`
+    // axis, no motors.
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    re.run_async(bsrs::ophyd_async::count(vec![SoftDetector::new("det1")], 5))
+        .await
+        .unwrap();
+    let v = start_json(&sink.snapshot().await);
+    assert_eq!(v["detectors"], serde_json::json!(["det1"]));
+    assert_eq!(v["num_points"], serde_json::json!(5));
+    assert_eq!(v["num_intervals"], serde_json::json!(4));
+    assert!(v.get("motors").is_none(), "count has no motors: {v}");
+    assert_eq!(
+        v["hints"]["dimensions"],
+        serde_json::json!([[["time"], "primary"]]),
+        "count reports the implicit time axis"
+    );
+
+    // scan: one coupled motor axis.
+    let motor = Arc::new(SoftMotor::new("m1", Some(0.0)));
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    re.run_async(bsrs::ophyd_async::scan_1d(
+        vec![SoftDetector::new("det1") as Arc<dyn bsrs::core::msg::ReadableObj>],
+        motor.clone() as Arc<dyn bsrs::core::msg::MovableObj>,
+        motor.clone() as Arc<dyn bsrs::core::msg::ReadableObj>,
+        0.0,
+        4.0,
+        5,
+    ))
+    .await
+    .unwrap();
+    let v = start_json(&sink.snapshot().await);
+    assert_eq!(v["detectors"], serde_json::json!(["det1"]));
+    assert_eq!(v["motors"], serde_json::json!(["m1"]));
+    assert_eq!(v["num_points"], serde_json::json!(5));
+    assert_eq!(
+        v["hints"]["dimensions"],
+        serde_json::json!([[["m1"], "primary"]]),
+        "one motor = one combined axis"
+    );
+
+    // grid_scan: two independent axes, one `dimensions` entry per motor.
+    let m1 = Arc::new(SoftMotor::new("m1", Some(0.0)));
+    let m2 = Arc::new(SoftMotor::new("m2", Some(0.0)));
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    re.run_async(bsrs::plans::grid_scan(
+        vec![SoftDetector::new("det1") as Arc<dyn bsrs::core::msg::ReadableObj>],
+        m1.clone() as Arc<dyn bsrs::core::msg::MovableObj>,
+        m1.clone() as Arc<dyn bsrs::core::msg::ReadableObj>,
+        0.0,
+        1.0,
+        2,
+        m2.clone() as Arc<dyn bsrs::core::msg::MovableObj>,
+        m2.clone() as Arc<dyn bsrs::core::msg::ReadableObj>,
+        0.0,
+        1.0,
+        3,
+    ))
+    .await
+    .unwrap();
+    let v = start_json(&sink.snapshot().await);
+    assert_eq!(v["motors"], serde_json::json!(["m1", "m2"]));
+    assert_eq!(v["num_points"], serde_json::json!(6), "2 × 3 grid");
+    assert_eq!(
+        v["hints"]["dimensions"],
+        serde_json::json!([[["m1"], "primary"], [["m2"], "primary"]]),
+        "a grid reports one axis per motor"
+    );
 }
 
 #[tokio::test]
@@ -209,9 +301,13 @@ async fn fly_plan_drives_standard_detector_to_completion() {
     let sink = Arc::new(CapturingSink::new());
     let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
 
-    let plan = bsrs::ophyd_async::fly(
-        det.clone() as Arc<dyn FlyableObj>,
-        det.clone() as Arc<dyn CollectableObj>,
+    // fly no longer stages its flyers (bluesky parity); stage externally, as
+    // bluesky's stage_decorator does.
+    let plan = bsrs::plans::preprocessors::stage_wrapper(
+        bsrs::ophyd_async::fly(vec![(
+            det.clone() as Arc<dyn FlyableObj>,
+            det.clone() as Arc<dyn CollectableObj>,
+        )]),
         vec![det.clone() as Arc<dyn StageableObj>],
     );
     let result = re.run_async(plan).await.expect("fly failed");
@@ -229,13 +325,21 @@ async fn fly_plan_drives_standard_detector_to_completion() {
     // it must carry the EventDescriptor UID the engine composed for the collect
     // stream — not an empty string. This is the owner-path check: the descriptor
     // is stamped by the engine (single owner), not invented by the sink.
-    let descriptor_uid = docs
+    let (descriptor_uid, descriptor_configuration) = docs
         .iter()
         .find_map(|d| match d {
-            Descriptor(desc) => Some(desc.uid.clone()),
+            Descriptor(desc) => Some((desc.uid.clone(), desc.configuration.clone())),
             _ => None,
         })
         .expect("expected an EventDescriptor from describe_collect");
+    // The collect-declared descriptor carries the detector's configuration
+    // entry (bluesky's collect path runs ensure_cached + _prepare_stream);
+    // the soft control has no config parameters, so the entry is empty.
+    assert!(
+        descriptor_configuration.contains_key("flydet"),
+        "collect descriptor has the detector's configuration entry; got keys {:?}",
+        descriptor_configuration.keys().collect::<Vec<_>>()
+    );
     let datum_descriptor = docs
         .iter()
         .find_map(|d| match d {
@@ -250,6 +354,171 @@ async fn fly_plan_drives_standard_detector_to_completion() {
     assert_eq!(
         datum_descriptor, descriptor_uid,
         "StreamDatum.descriptor must equal the collect stream's EventDescriptor uid"
+    );
+    // The fly/collect path likewise stamps the StreamResource with the run's
+    // start UID (writer emits run_start:None; engine is the single owner).
+    let run_start_uid = docs
+        .iter()
+        .find_map(|d| match d {
+            Start(s) => Some(s.uid.clone()),
+            _ => None,
+        })
+        .expect("expected a RunStart");
+    let sr_run_start = docs
+        .iter()
+        .find_map(|d| match d {
+            StreamResource(sr) => Some(sr.run_start.clone()),
+            _ => None,
+        })
+        .expect("expected a StreamResource from collect");
+    assert_eq!(
+        sr_run_start.as_deref(),
+        Some(run_start_uid.as_str()),
+        "collect StreamResource.run_start must be stamped with the run's start uid"
+    );
+    // The engine owns the sequence counter: the writer emits seq_nums {0,0},
+    // the Collect drain fills [1, 1 + width) from the stream counter and
+    // advances it by the indices width ("we do it ourselves", bluesky
+    // bundlers.py:1180); the summary index event then lands right after the
+    // datum span on the same monotonic axis.
+    let sd = docs
+        .iter()
+        .find_map(|d| match d {
+            StreamDatum(sd) => Some(sd.clone()),
+            _ => None,
+        })
+        .expect("expected a StreamDatum from collect");
+    let width = sd.indices.stop - sd.indices.start;
+    assert!(width > 0, "collect datum must cover at least one frame");
+    assert_eq!(
+        (sd.seq_nums.start, sd.seq_nums.stop),
+        (1, 1 + width),
+        "Collect drain must fill seq_nums from the stream counter"
+    );
+    let ev_seq = docs
+        .iter()
+        .find_map(|d| match d {
+            Event(ev) => Some(ev.seq_num),
+            _ => None,
+        })
+        .expect("expected the collect summary event");
+    assert_eq!(
+        ev_seq,
+        1 + width,
+        "summary event must continue the sequence axis after the datum span"
+    );
+}
+
+#[tokio::test]
+async fn step_scan_save_emits_stream_assets_stamped_with_descriptor() {
+    // ENG-02 (step half): a step scan that triggers + reads a StandardDetector
+    // which writes external assets must emit that detector's StreamResource +
+    // StreamDatum on `save`, each StreamDatum stamped with the event's
+    // EventDescriptor UID — so a separate consumer (e.g. a Tiled-writing
+    // process) can link the frame data to the event. Before the fix, `save`
+    // emitted only the bundler's inline Descriptor + Event and dropped the
+    // external-asset docs entirely (only the fly/collect path emitted them).
+    use bsrs::core::msg::{ReadableObj, StageableObj, TriggerableObj};
+
+    let det = Arc::new(bsrs::backends::soft::detector::soft_detector("stepdet"));
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+
+    let det_c = det.clone();
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        // Stage opens the writer + caches the data keys (required before read
+        // describes the stream).
+        yield bsrs::core::Msg::Stage(det_c.clone() as Arc<dyn StageableObj>);
+        yield bsrs::core::Msg::Create { stream_name: "primary".into() };
+        // Trigger writes one frame → the writer's index advances to 1.
+        yield bsrs::core::Msg::Trigger {
+            obj: det_c.clone() as Arc<dyn TriggerableObj>,
+            group: None,
+        };
+        yield bsrs::core::Msg::Read(det_c.clone() as Arc<dyn ReadableObj>);
+        yield bsrs::core::Msg::Save;
+        yield bsrs::core::Msg::Unstage(det_c.clone() as Arc<dyn StageableObj>);
+        yield bsrs::core::Msg::CloseRun {
+            exit_status: "success".into(),
+            reason: None,
+        };
+    });
+    let result = re.run_async(plan).await.expect("step plan failed");
+    assert_eq!(result.exit_status, "success");
+
+    let docs = sink.snapshot().await;
+    use bsrs::core::Document::*;
+
+    let descriptor_uid = docs
+        .iter()
+        .find_map(|d| match d {
+            Descriptor(desc) => Some(desc.uid.clone()),
+            _ => None,
+        })
+        .expect("expected an EventDescriptor from the step read");
+    let run_start_uid = docs
+        .iter()
+        .find_map(|d| match d {
+            Start(s) => Some(s.uid.clone()),
+            _ => None,
+        })
+        .expect("expected a RunStart");
+    let sr = docs
+        .iter()
+        .find_map(|d| match d {
+            StreamResource(sr) => Some(sr.clone()),
+            _ => None,
+        })
+        .expect("step save must emit a StreamResource (ENG-02)");
+    // The engine stamps the open run's start UID onto the StreamResource, which
+    // the writer emitted with run_start:None.
+    assert_eq!(
+        sr.run_start.as_deref(),
+        Some(run_start_uid.as_str()),
+        "StreamResource.run_start must be stamped with the open run's start uid"
+    );
+    let sd = docs
+        .iter()
+        .find_map(|d| match d {
+            StreamDatum(sd) => Some(sd.clone()),
+            _ => None,
+        })
+        .expect("step save must emit a StreamDatum (ENG-02)");
+    assert_eq!(
+        sd.descriptor, descriptor_uid,
+        "StreamDatum.descriptor must equal the step stream's EventDescriptor uid"
+    );
+    assert_eq!(sd.indices.start, 0, "one triggered frame → indices [0, 1)");
+    assert_eq!(sd.indices.stop, 1, "one triggered frame → indices [0, 1)");
+    // The engine owns the sequence counter: the writer emits seq_nums {0,0}
+    // and the Save drain fills [event_seq, event_seq + width) — here the
+    // first event of the stream, one index wide.
+    let ev_seq = docs
+        .iter()
+        .find_map(|d| match d {
+            Event(ev) => Some(ev.seq_num),
+            _ => None,
+        })
+        .expect("step save must emit an Event");
+    assert_eq!(ev_seq, 1, "first event of the stream");
+    assert_eq!(
+        (sd.seq_nums.start, sd.seq_nums.stop),
+        (ev_seq, ev_seq + 1),
+        "Save drain must anchor the datum's seq_nums to the composed event"
+    );
+
+    // Emit order: Descriptor → StreamResource → StreamDatum → Event.
+    let pos = |want: fn(&bsrs::core::Document) -> bool| {
+        docs.iter().position(want).expect("document missing")
+    };
+    let d_desc = pos(|d| matches!(d, Descriptor(_)));
+    let d_res = pos(|d| matches!(d, StreamResource(_)));
+    let d_datum = pos(|d| matches!(d, StreamDatum(_)));
+    let d_event = pos(|d| matches!(d, Event(_)));
+    assert!(
+        d_desc < d_res && d_res < d_datum && d_datum < d_event,
+        "emit order must be Descriptor→StreamResource→StreamDatum→Event; got {docs:?}"
     );
 }
 
@@ -477,6 +746,394 @@ async fn configure_inside_open_bundle_is_rejected() {
     assert_eq!(
         result.exit_status, "fail",
         "configure between create and save must be rejected (pre-fix: ran to \"success\")"
+    );
+}
+
+// ENG-05: a clean single-run plan records its RunStart uid in `run_uids`, is not
+// flagged interrupted, and carries no reason/exception.
+#[tokio::test]
+async fn run_result_records_uid_and_marks_clean_success() {
+    let re = RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new());
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        yield bsrs::core::Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let result = re
+        .run_async(plan)
+        .await
+        .expect("run_async returns a RunResult");
+    assert_eq!(result.exit_status, "success");
+    assert_eq!(
+        result.run_uids.len(),
+        1,
+        "one run opened -> one uid: {:?}",
+        result.run_uids
+    );
+    assert!(
+        !result.run_uids[0].is_empty(),
+        "the recorded uid is non-empty"
+    );
+    assert!(!result.interrupted, "a clean run is not interrupted");
+    assert!(
+        result.reason.is_empty(),
+        "no reason on a clean success: {:?}",
+        result.reason
+    );
+    assert!(result.exception.is_none(), "no exception on success");
+}
+
+// ENG-05: a failed run is flagged interrupted, keeps the uid of the run that had
+// opened before the failure, and carries the typed error plus a matching reason.
+#[tokio::test]
+async fn run_result_on_failure_carries_typed_exception_and_reason() {
+    use bsrs::core::error::BsrsError;
+    let re = RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new());
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        // Fail-fast: the engine turns Msg::Fail into BsrsError::Plan and the run
+        // loop catches it into RunResult{exit_status:"fail"} (not an Err).
+        yield bsrs::core::Msg::Fail("boom".into());
+        yield bsrs::core::Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let result = re
+        .run_async(plan)
+        .await
+        .expect("handler error is caught into RunResult, not surfaced as Err");
+    assert_eq!(result.exit_status, "fail");
+    assert!(result.interrupted, "a failed run is interrupted");
+    assert_eq!(
+        result.run_uids.len(),
+        1,
+        "the run opened before it failed, so its uid is recorded: {:?}",
+        result.run_uids
+    );
+    // The typed error is carried so callers can match on the variant, not just
+    // re-parse a string.
+    match &result.exception {
+        Some(BsrsError::Plan(m)) => assert_eq!(m.as_str(), "boom"),
+        other => panic!("expected a Plan exception carrying \"boom\", got {other:?}"),
+    }
+    // `reason` mirrors the exception's Display.
+    assert_eq!(result.reason, "plan logic error: boom");
+}
+
+/// Readable + Configurable device for descriptor-configuration tests: one
+/// read field `{name}_x`, one config field `{name}_gain`, a counter on
+/// config reads (to prove the run-level cache), and a `configure_dyn` that
+/// bumps the gain.
+struct ConfigReadable {
+    name: String,
+    gain: std::sync::Mutex<f64>,
+    config_reads: std::sync::atomic::AtomicU64,
+}
+
+impl ConfigReadable {
+    fn new(name: &str, gain: f64) -> Arc<Self> {
+        Arc::new(Self {
+            name: name.into(),
+            gain: std::sync::Mutex::new(gain),
+            config_reads: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+    fn number_key() -> bsrs::event_model::DataKey {
+        bsrs::event_model::DataKey {
+            source: "soft://test".into(),
+            dtype: bsrs::event_model::Dtype::Number,
+            shape: vec![],
+            dtype_numpy: None,
+            external: None,
+            units: None,
+            precision: None,
+            object_name: None,
+            dims: None,
+            limits: None,
+            choices: None,
+        }
+    }
+}
+
+impl bsrs::core::msg::NamedObj for ConfigReadable {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[async_trait::async_trait]
+impl bsrs::core::msg::ReadableObj for ConfigReadable {
+    async fn read_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, bsrs::core::reading::ReadingValue>,
+        bsrs::core::error::BsrsError,
+    > {
+        Ok(std::collections::HashMap::from([(
+            format!("{}_x", self.name),
+            bsrs::core::reading::ReadingValue {
+                value: serde_json::Value::from(1.0),
+                timestamp: 0.0,
+                alarm_severity: None,
+                message: None,
+            },
+        )]))
+    }
+    async fn describe_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, bsrs::event_model::DataKey>,
+        bsrs::core::error::BsrsError,
+    > {
+        Ok(std::collections::HashMap::from([(
+            format!("{}_x", self.name),
+            Self::number_key(),
+        )]))
+    }
+    fn as_configurable(&self) -> Option<&dyn bsrs::core::msg::ConfigurableObj> {
+        Some(self)
+    }
+}
+
+#[async_trait::async_trait]
+impl bsrs::core::msg::ConfigurableObj for ConfigReadable {
+    async fn read_configuration_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, bsrs::core::reading::ReadingValue>,
+        bsrs::core::error::BsrsError,
+    > {
+        self.config_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(std::collections::HashMap::from([(
+            format!("{}_gain", self.name),
+            bsrs::core::reading::ReadingValue {
+                value: serde_json::Value::from(*self.gain.lock().unwrap()),
+                timestamp: 42.0,
+                alarm_severity: None,
+                message: None,
+            },
+        )]))
+    }
+    async fn describe_configuration_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, bsrs::event_model::DataKey>,
+        bsrs::core::error::BsrsError,
+    > {
+        Ok(std::collections::HashMap::from([(
+            format!("{}_gain", self.name),
+            Self::number_key(),
+        )]))
+    }
+    async fn configure_dyn(
+        &self,
+        _args: bsrs::core::ConfigureArgs,
+    ) -> Result<(), bsrs::core::error::BsrsError> {
+        *self.gain.lock().unwrap() = 5.0;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn descriptor_configuration_carries_object_config_and_caches_reads() {
+    // bluesky `_prepare_stream` folds every read object's configuration into
+    // the descriptor — configurables get data/timestamps/data_keys from
+    // read/describe_configuration, non-configurables get an empty entry
+    // (bundlers.py:286-290) — and `ensure_cached` reads each object's
+    // configuration once per run (bundlers.py:93-102).
+    let cfg = ConfigReadable::new("cfgr", 2.5);
+    let plain: Arc<dyn bsrs::core::msg::ReadableObj> = Arc::new(CollidingReadable {
+        name: "plainr".into(),
+    });
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let cfg_read: Arc<dyn bsrs::core::msg::ReadableObj> = cfg.clone();
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        // Two bundles: the second proves the config cache (one read total).
+        for _ in 0..2 {
+            yield bsrs::core::Msg::Create { stream_name: "primary".into() };
+            yield bsrs::core::Msg::Read(cfg_read.clone());
+            yield bsrs::core::Msg::Read(plain.clone());
+            yield bsrs::core::Msg::Save;
+        }
+        yield bsrs::core::Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let result = re.run_async(plan).await.expect("plan failed");
+    assert_eq!(result.exit_status, "success");
+
+    let docs = sink.snapshot().await;
+    let desc = docs
+        .iter()
+        .find_map(|d| match d {
+            Document::Descriptor(d) => Some(d.clone()),
+            _ => None,
+        })
+        .expect("a descriptor was emitted");
+    let cfg_entry = desc
+        .configuration
+        .get("cfgr")
+        .expect("configurable object has a configuration entry");
+    assert_eq!(
+        cfg_entry.data.get("cfgr_gain"),
+        Some(&serde_json::Value::from(2.5))
+    );
+    assert_eq!(cfg_entry.timestamps.get("cfgr_gain"), Some(&42.0));
+    assert!(cfg_entry.data_keys.contains_key("cfgr_gain"));
+    let plain_entry = desc
+        .configuration
+        .get("plainr")
+        .expect("non-configurable object still gets a configuration entry");
+    assert!(plain_entry.data.is_empty());
+    assert!(plain_entry.data_keys.is_empty());
+    // Read twice in the run, configuration read once (run-level cache).
+    assert_eq!(
+        cfg.config_reads.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+}
+
+#[tokio::test]
+async fn configure_refreshes_configuration_for_later_descriptors() {
+    // bluesky re-runs cache_read_config on configure (bundlers.py:1209): a
+    // stream declared after the configure carries the new values, while the
+    // earlier stream's descriptor keeps the values read before it.
+    let cfg = ConfigReadable::new("cfgr", 2.5);
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let cfg_read: Arc<dyn bsrs::core::msg::ReadableObj> = cfg.clone();
+    let cfg_conf: Arc<dyn bsrs::core::msg::ConfigurableObj> = cfg.clone();
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        yield bsrs::core::Msg::Create { stream_name: "first".into() };
+        yield bsrs::core::Msg::Read(cfg_read.clone());
+        yield bsrs::core::Msg::Save;
+        // configure_dyn sets gain 2.5 → 5.0 and the engine re-caches.
+        yield bsrs::core::Msg::Configure { obj: cfg_conf.clone(), args: Default::default() };
+        yield bsrs::core::Msg::Create { stream_name: "second".into() };
+        yield bsrs::core::Msg::Read(cfg_read.clone());
+        yield bsrs::core::Msg::Save;
+        yield bsrs::core::Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let result = re.run_async(plan).await.expect("plan failed");
+    assert_eq!(result.exit_status, "success");
+
+    let docs = sink.snapshot().await;
+    let gain_of = |stream: &str| -> serde_json::Value {
+        docs.iter()
+            .find_map(|d| match d {
+                Document::Descriptor(d) if d.name.as_deref() == Some(stream) => Some(
+                    d.configuration
+                        .get("cfgr")
+                        .expect("configuration entry")
+                        .data
+                        .get("cfgr_gain")
+                        .expect("gain field")
+                        .clone(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("descriptor for stream `{stream}`"))
+    };
+    assert_eq!(gain_of("first"), serde_json::Value::from(2.5));
+    assert_eq!(gain_of("second"), serde_json::Value::from(5.0));
+}
+
+#[tokio::test]
+async fn configure_reemits_same_stream_descriptor_with_fresh_config() {
+    // Item 1 / CBEM-21 amendment: a configure between two batches of the SAME
+    // stream re-emits the stream's descriptor as a new generation carrying the
+    // fresh config, with the sequence counter unbroken — bluesky's
+    // configure-time invalidation (bundlers.py:1213-1218). Pre-fix, the second
+    // batch's events kept referencing the first descriptor and its stale
+    // configuration.
+    let cfg = ConfigReadable::new("cfgr", 2.5);
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let cfg_read: Arc<dyn bsrs::core::msg::ReadableObj> = cfg.clone();
+    let cfg_conf: Arc<dyn bsrs::core::msg::ConfigurableObj> = cfg.clone();
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        yield bsrs::core::Msg::Create { stream_name: "primary".into() };
+        yield bsrs::core::Msg::Read(cfg_read.clone());
+        yield bsrs::core::Msg::Save;
+        yield bsrs::core::Msg::Configure { obj: cfg_conf.clone(), args: Default::default() };
+        yield bsrs::core::Msg::Create { stream_name: "primary".into() };
+        yield bsrs::core::Msg::Read(cfg_read.clone());
+        yield bsrs::core::Msg::Save;
+        yield bsrs::core::Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let result = re.run_async(plan).await.expect("plan failed");
+    assert_eq!(result.exit_status, "success");
+
+    let docs = sink.snapshot().await;
+    // uid → this generation's cfgr_gain.
+    let gain_by_uid: std::collections::HashMap<String, serde_json::Value> = docs
+        .iter()
+        .filter_map(|d| match d {
+            Document::Descriptor(d) => Some((
+                d.uid.clone(),
+                d.configuration
+                    .get("cfgr")
+                    .expect("cfgr config entry")
+                    .data
+                    .get("cfgr_gain")
+                    .expect("gain field")
+                    .clone(),
+            )),
+            _ => None,
+        })
+        .collect();
+    // Two generations of the primary descriptor, old then new gain.
+    let primary_descs: Vec<&bsrs::event_model::EventDescriptor> = docs
+        .iter()
+        .filter_map(|d| match d {
+            Document::Descriptor(d) if d.name.as_deref() == Some("primary") => Some(d),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        primary_descs.len(),
+        2,
+        "configure re-emits the primary descriptor as a new generation"
+    );
+    assert_eq!(
+        gain_by_uid[&primary_descs[0].uid],
+        serde_json::Value::from(2.5)
+    );
+    assert_eq!(
+        gain_by_uid[&primary_descs[1].uid],
+        serde_json::Value::from(5.0)
+    );
+
+    // Each event references the generation current when it was composed, and
+    // the sequence counter runs 1, 2 across the descriptor change.
+    let events: Vec<&bsrs::event_model::Event> = docs
+        .iter()
+        .filter_map(|d| match d {
+            Document::Event(e) => Some(e),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(events.len(), 2);
+    assert_eq!((events[0].seq_num, events[1].seq_num), (1, 2));
+    assert_eq!(
+        gain_by_uid[&events[0].descriptor],
+        serde_json::Value::from(2.5),
+        "first event references the pre-configure generation"
+    );
+    assert_eq!(
+        gain_by_uid[&events[1].descriptor],
+        serde_json::Value::from(5.0),
+        "second event references the post-configure generation"
+    );
+
+    // Emission order: the new descriptor precedes the event that references it.
+    let pos = |pred: &dyn Fn(&Document) -> bool| docs.iter().position(pred).unwrap();
+    let new_desc_at =
+        pos(&|d| matches!(d, Document::Descriptor(x) if x.uid == primary_descs[1].uid));
+    let second_event_at = pos(&|d| matches!(d, Document::Event(e) if e.seq_num == 2));
+    assert!(
+        new_desc_at < second_event_at,
+        "the re-emitted descriptor must precede the event that references it"
     );
 }
 
@@ -1748,4 +2405,458 @@ async fn dropped_bundle_reads_do_not_leak_into_next_descriptor() {
         !event.data.contains_key("det_a"),
         "event must not carry the dropped det_a reading"
     );
+}
+
+// ENG-09: a flyer kicked off but never collected must have its buffered data
+// drained into the run before RunStop, on every finalize path (bluesky's
+// `backstop_collect` in the `_run` finally, run_engine.py:1777). A unified
+// Flyable+Collectable device (bluesky's flyer IS its own collectable) exposes
+// itself via `as_collectable`, so the engine's uncollected set can reach it.
+struct FlyCollector {
+    collects: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl bsrs::core::msg::NamedObj for FlyCollector {
+    fn name(&self) -> &str {
+        "flycoll"
+    }
+}
+#[async_trait::async_trait]
+impl bsrs::core::msg::FlyableObj for FlyCollector {
+    async fn kickoff_dyn(&self) -> bsrs::core::status::Status {
+        bsrs::core::status::Status::done()
+    }
+    async fn complete_dyn(&self) -> bsrs::core::status::Status {
+        bsrs::core::status::Status::done()
+    }
+    fn as_collectable(self: Arc<Self>) -> Option<Arc<dyn bsrs::core::msg::CollectableObj>> {
+        Some(self)
+    }
+}
+#[async_trait::async_trait]
+impl bsrs::core::msg::CollectableObj for FlyCollector {
+    async fn describe_collect_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, bsrs::event_model::DataKey>,
+        >,
+        bsrs::core::error::BsrsError,
+    > {
+        let key = bsrs::event_model::DataKey {
+            source: "soft://flycoll".into(),
+            dtype: bsrs::event_model::Dtype::Number,
+            shape: vec![],
+            dtype_numpy: None,
+            external: None,
+            units: None,
+            precision: None,
+            object_name: None,
+            dims: None,
+            limits: None,
+            choices: None,
+        };
+        Ok(std::collections::HashMap::from([(
+            "primary".to_string(),
+            std::collections::HashMap::from([("fly_val".to_string(), key)]),
+        )]))
+    }
+    async fn collect_dyn(
+        &self,
+    ) -> Result<
+        Vec<(
+            String,
+            std::collections::HashMap<String, serde_json::Value>,
+            std::collections::HashMap<String, f64>,
+        )>,
+        bsrs::core::error::BsrsError,
+    > {
+        self.collects
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(vec![(
+            "primary".to_string(),
+            std::collections::HashMap::from([("fly_val".to_string(), serde_json::json!(42.0))]),
+            std::collections::HashMap::from([("fly_val".to_string(), 1.0)]),
+        )])
+    }
+}
+
+#[tokio::test]
+async fn uncollected_flyer_is_backstop_collected_on_abort() {
+    use bsrs::core::Msg;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    let collects = Arc::new(AtomicUsize::new(0));
+    let flyer = Arc::new(FlyCollector {
+        collects: collects.clone(),
+    });
+    let sink = Arc::new(CapturingSink::new());
+    let re = Arc::new(RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]));
+
+    // Kick off, complete, then pause BEFORE any collect. The test aborts while
+    // paused: the flyer is in the uncollected set with data still buffered.
+    let fly: Arc<dyn bsrs::core::msg::FlyableObj> = flyer.clone();
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Kickoff { obj: fly.clone(), group: Some("k".into()) };
+        yield Msg::Wait { group: "k".into(), error_on_timeout: true, timeout: None };
+        yield Msg::Complete { obj: fly.clone(), group: Some("c".into()) };
+        yield Msg::Wait { group: "c".into(), error_on_timeout: true, timeout: None };
+        yield Msg::Pause { defer: false };
+        // Never reached — the abort tears the run down at the pause gate.
+        yield Msg::Collect { obj: fly.clone().as_collectable().unwrap(), stream_name: None };
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+
+    let re_run = re.clone();
+    let join = tokio::spawn(async move { re_run.run_async(plan).await });
+    for _ in 0..200 {
+        if re.is_paused() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(re.is_paused(), "engine never paused before the collect");
+    re.abort("test abort before collect");
+    let result = tokio::time::timeout(Duration::from_secs(5), join)
+        .await
+        .expect("run did not finish")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.exit_status, "abort");
+
+    // The buffered flyer data must have been drained exactly once by the
+    // backstop, and its Event must land before the RunStop.
+    assert_eq!(
+        collects.load(Ordering::SeqCst),
+        1,
+        "backstop must collect the kicked-off-but-uncollected flyer exactly once"
+    );
+    let docs = sink.snapshot().await;
+    let event_idx = docs.iter().position(|d| {
+        matches!(d, bsrs::core::Document::Event(ev) if ev.data.get("fly_val") == Some(&serde_json::json!(42.0)))
+    });
+    let stop_idx = docs
+        .iter()
+        .position(|d| matches!(d, bsrs::core::Document::Stop(_)));
+    let event_idx = event_idx.expect("backstop-drained flyer Event is missing from the stream");
+    let stop_idx = stop_idx.expect("run must still emit a RunStop");
+    assert!(
+        event_idx < stop_idx,
+        "the drained flyer Event ({event_idx}) must precede RunStop ({stop_idx})"
+    );
+    // The drained Event must reference a Descriptor already on the wire.
+    let desc_uid = match &docs[event_idx] {
+        bsrs::core::Document::Event(ev) => ev.descriptor.clone(),
+        _ => unreachable!(),
+    };
+    let desc_idx = docs
+        .iter()
+        .position(|d| matches!(d, bsrs::core::Document::Descriptor(desc) if desc.uid == desc_uid))
+        .expect("drained Event references a Descriptor that was never emitted");
+    assert!(
+        desc_idx < event_idx,
+        "the flyer stream Descriptor ({desc_idx}) must precede its Event ({event_idx})"
+    );
+}
+
+#[tokio::test]
+async fn explicitly_collected_flyer_is_not_re_drained_by_backstop() {
+    use bsrs::core::Msg;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let collects = Arc::new(AtomicUsize::new(0));
+    let flyer = Arc::new(FlyCollector {
+        collects: collects.clone(),
+    });
+    let re = RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new());
+
+    let fly: Arc<dyn bsrs::core::msg::FlyableObj> = flyer.clone();
+    let coll = flyer.clone() as Arc<dyn bsrs::core::msg::CollectableObj>;
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Kickoff { obj: fly.clone(), group: Some("k".into()) };
+        yield Msg::Wait { group: "k".into(), error_on_timeout: true, timeout: None };
+        yield Msg::Complete { obj: fly.clone(), group: Some("c".into()) };
+        yield Msg::Wait { group: "c".into(), error_on_timeout: true, timeout: None };
+        yield Msg::Collect { obj: coll, stream_name: None };
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+
+    let result = re.run_async(plan).await.unwrap();
+    assert_eq!(result.exit_status, "success");
+    // The explicit collect discards the flyer from the uncollected set, so the
+    // finalize backstop must NOT collect it a second time.
+    assert_eq!(
+        collects.load(Ordering::SeqCst),
+        1,
+        "an explicitly collected flyer must not be re-drained by the backstop"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PLAN-22: trigger_and_read wraps its reads in a contingency (except=drop,
+// else=save). A read failure mid-bundle discards the partial bundle through the
+// sanctioned Drop path and re-raises, and the failure is catchable by an outer
+// contingency (bluesky plan_stubs.py trigger_and_read).
+// ---------------------------------------------------------------------------
+
+/// A readable whose `read_dyn` always errors — stands in for a device that
+/// faults mid-acquisition.
+struct FailingReadable {
+    name: String,
+}
+
+impl bsrs::core::msg::NamedObj for FailingReadable {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[async_trait::async_trait]
+impl bsrs::core::msg::ReadableObj for FailingReadable {
+    async fn read_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, bsrs::core::reading::ReadingValue>,
+        bsrs::core::error::BsrsError,
+    > {
+        Err(bsrs::core::error::BsrsError::Plan(
+            "device read faulted".into(),
+        ))
+    }
+    async fn describe_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, bsrs::event_model::DataKey>,
+        bsrs::core::error::BsrsError,
+    > {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            format!("{}_val", self.name),
+            bsrs::event_model::DataKey {
+                source: format!("test://{}", self.name),
+                dtype: bsrs::event_model::Dtype::Number,
+                shape: vec![],
+                dtype_numpy: Some("<f8".into()),
+                external: None,
+                units: None,
+                precision: None,
+                object_name: None,
+                dims: None,
+                limits: None,
+                choices: None,
+            },
+        );
+        Ok(m)
+    }
+}
+
+#[tokio::test]
+async fn trigger_and_read_read_error_drops_bundle_and_fails() {
+    // A read fault inside trigger_and_read must discard the open bundle (no
+    // Descriptor, no Event) and fail the run — the contingency's except=drop
+    // path, then the auto_raise re-raise.
+    use bsrs::core::msg::{ReadableObj, TriggerableObj};
+    let readable: Arc<dyn ReadableObj> = Arc::new(FailingReadable {
+        name: "bad_det".into(),
+    });
+    let body = bsrs::plans::stubs::trigger_and_read(
+        Vec::<Arc<dyn TriggerableObj>>::new(),
+        vec![readable],
+        "primary",
+    );
+    let wrapped =
+        bsrs::plans::preprocessors::run_wrapper(body, bsrs::core::msg::RunMetadata::default());
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let result = re.run_async(wrapped).await.unwrap();
+
+    assert_eq!(
+        result.exit_status, "fail",
+        "re-raised read fault fails the run"
+    );
+    let docs = sink.snapshot().await;
+    assert!(
+        matches!(docs.first(), Some(Document::Start(_))),
+        "run opened"
+    );
+    assert!(
+        matches!(docs.last(), Some(Document::Stop(_))),
+        "run closed with a Stop"
+    );
+    assert!(
+        !docs.iter().any(|d| matches!(d, Document::Descriptor(_))),
+        "dropped bundle emits no Descriptor"
+    );
+    assert!(
+        !docs.iter().any(|d| matches!(d, Document::Event(_))),
+        "dropped bundle emits no Event"
+    );
+}
+
+#[tokio::test]
+async fn trigger_and_read_read_error_is_catchable_by_outer_contingency() {
+    // The re-raised read fault propagates out of trigger_and_read's own
+    // contingency and can be caught by an ENCLOSING contingency (nested
+    // Push/Pop). Here the outer wrapper swallows it (except=null, auto_raise
+    // false), so the run completes successfully — impossible under the old
+    // fail-fast model — while the faulted bundle still emits no Descriptor/Event.
+    use bsrs::core::msg::{ReadableObj, TriggerableObj};
+    let readable: Arc<dyn ReadableObj> = Arc::new(FailingReadable {
+        name: "bad_det".into(),
+    });
+    let inner = bsrs::plans::stubs::trigger_and_read(
+        Vec::<Arc<dyn TriggerableObj>>::new(),
+        vec![readable],
+        "primary",
+    );
+    let caught = bsrs::plans::preprocessors::contingency_wrapper(
+        inner,
+        Some(bsrs::plans::stubs::null()),
+        None,
+        None,
+        false, // swallow the read fault
+    );
+    let wrapped =
+        bsrs::plans::preprocessors::run_wrapper(caught, bsrs::core::msg::RunMetadata::default());
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let result = re.run_async(wrapped).await.unwrap();
+
+    assert_eq!(
+        result.exit_status, "success",
+        "outer contingency swallowed the read fault"
+    );
+    let docs = sink.snapshot().await;
+    assert!(
+        !docs.iter().any(|d| matches!(d, Document::Descriptor(_))),
+        "dropped bundle emits no Descriptor even when the fault is caught"
+    );
+    assert!(
+        !docs.iter().any(|d| matches!(d, Document::Event(_))),
+        "dropped bundle emits no Event even when the fault is caught"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ENG-12: an installed suspender that is already tripped at plan start gates
+// the run — the first message does not run until the condition clears
+// (bluesky RunEngine.__call__ prepends a wait_for on every tripped suspender).
+// ---------------------------------------------------------------------------
+
+/// A suspender whose tripped state is controlled by the test. `tripped()`
+/// returns `Some(clear-future)` iff `is_tripped` is set; the clear-future first
+/// signals `reached` (so the test knows the gate is blocking) then awaits
+/// `clear`.
+struct GateSuspender {
+    name: String,
+    is_tripped: bool,
+    reached: Arc<tokio::sync::Notify>,
+    clear: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl bsrs::engine::Suspender for GateSuspender {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn watch(&self) -> futures::future::BoxFuture<'static, ()> {
+        let clear = self.clear.clone();
+        Box::pin(async move { clear.notified().await })
+    }
+    fn tripped(&self) -> Option<futures::future::BoxFuture<'static, ()>> {
+        if !self.is_tripped {
+            return None;
+        }
+        let reached = self.reached.clone();
+        let clear = self.clear.clone();
+        Some(Box::pin(async move {
+            // Register the clear waiter, then signal the gate is blocking. The
+            // `.notified()` future is created (and thus enqueued) before we
+            // notify `reached`, so `clear.notify_one()` from the test after it
+            // observes `reached` can never be lost.
+            let wait = clear.notified();
+            reached.notify_one();
+            wait.await;
+        }))
+    }
+}
+
+#[tokio::test]
+async fn tripped_suspender_gates_plan_start_until_cleared() {
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let clear = Arc::new(tokio::sync::Notify::new());
+    let gate = Arc::new(GateSuspender {
+        name: "beam".into(),
+        is_tripped: true,
+        reached: reached.clone(),
+        clear: clear.clone(),
+    });
+
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let re = Arc::new(RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new()));
+
+    let id = re.next_suspender_id();
+    let gate_dyn: Arc<dyn bsrs::engine::Suspender> = gate;
+    let payload: Arc<dyn std::any::Any + Send + Sync> = Arc::new(gate_dyn);
+    re.install_suspender(id, payload).await.unwrap();
+
+    let started_plan = started.clone();
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        // Runs on the first poll of the plan stream — i.e. once the gate has
+        // let the run loop begin.
+        started_plan.store(true, std::sync::atomic::Ordering::SeqCst);
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        yield bsrs::core::Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+
+    let re_run = re.clone();
+    let handle = tokio::spawn(async move { re_run.run_async(plan).await });
+
+    // Deterministic: wait until the gate future is actually blocking on `clear`.
+    reached.notified().await;
+    assert!(
+        !started.load(std::sync::atomic::Ordering::SeqCst),
+        "plan must not start while the suspender is tripped"
+    );
+
+    // Clear the condition; the gate resolves and the plan runs to completion.
+    clear.notify_one();
+    let result = handle.await.unwrap().unwrap();
+    assert_eq!(result.exit_status, "success");
+    assert!(
+        started.load(std::sync::atomic::Ordering::SeqCst),
+        "plan must run once the suspender clears"
+    );
+}
+
+#[tokio::test]
+async fn untripped_suspender_does_not_gate_plan_start() {
+    // A suspender that reports `tripped() == None` at start must not delay the
+    // run — the gate returns immediately.
+    let gate = Arc::new(GateSuspender {
+        name: "beam".into(),
+        is_tripped: false,
+        reached: Arc::new(tokio::sync::Notify::new()),
+        clear: Arc::new(tokio::sync::Notify::new()),
+    });
+    let re = Arc::new(RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new()));
+    let id = re.next_suspender_id();
+    let gate_dyn: Arc<dyn bsrs::engine::Suspender> = gate;
+    let payload: Arc<dyn std::any::Any + Send + Sync> = Arc::new(gate_dyn);
+    re.install_suspender(id, payload).await.unwrap();
+
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        yield bsrs::core::Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    // Without the gate blocking, the run completes promptly; bound it so a
+    // regression that makes an un-tripped suspender block is caught as a hang.
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), re.run_async(plan))
+        .await
+        .expect("un-tripped suspender must not gate plan start")
+        .unwrap();
+    assert_eq!(result.exit_status, "success");
 }

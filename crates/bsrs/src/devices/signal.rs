@@ -377,6 +377,13 @@ where
     async fn describe_dyn(&self) -> Result<HashMap<String, DataKey>> {
         self.describe().await
     }
+    // NOTE: no `as_stageable` override. A bare `Signal` is staged indirectly as
+    // a child of the `StandardReadable` that owns it (via `add_stageable` +
+    // `StandardReadable::stage_dyn`), which is how step scans stage composite
+    // devices — not as a top-level plan detector. Overriding here would also
+    // require widening this impl's `B: SignalBackend<T>` bound to `+ 'static`
+    // (the `Arc<dyn StageableObj>` coercion needs it), a broader change than the
+    // indirect path warrants.
     fn hint_fields(&self) -> Option<Vec<String>> {
         if matches!(self.config.kind, Kind::Hinted) {
             Some(vec![self.config.name.clone()])
