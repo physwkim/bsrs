@@ -2860,3 +2860,34 @@ async fn untripped_suspender_does_not_gate_plan_start() {
         .unwrap();
     assert_eq!(result.exit_status, "success");
 }
+
+/// A sink whose `dispatch` always errors.
+struct FailingSink;
+
+#[async_trait::async_trait]
+impl DocumentSink for FailingSink {
+    async fn dispatch(&self, _doc: &bsrs::core::Document) -> bsrs::core::error::Result<()> {
+        Err(bsrs::core::error::BsrsError::Backend("sink down".into()))
+    }
+}
+
+#[tokio::test]
+async fn failing_sink_does_not_fail_run_or_starve_other_sinks() {
+    // `DocumentSink::dispatch` contract: errors are logged by the engine's
+    // fan-out, never fatal to the run — and a failing sink must not block
+    // the remaining sinks from receiving the document.
+    let det = SoftDetector::new("det1");
+    let capture = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![
+        Arc::new(FailingSink) as Arc<dyn DocumentSink>,
+        capture.clone() as Arc<dyn DocumentSink>,
+    ]);
+
+    let plan = bsrs::ophyd_async::count(vec![det.clone()], 2);
+    let result = re.run_async(plan).await.expect("plan failed");
+    assert_eq!(result.exit_status, "success");
+
+    // Start, Descriptor, 2 × Event, Stop = 5 docs reach the healthy sink.
+    let docs = capture.snapshot().await;
+    assert_eq!(docs.len(), 5, "expected 5 documents, got {}", docs.len());
+}
