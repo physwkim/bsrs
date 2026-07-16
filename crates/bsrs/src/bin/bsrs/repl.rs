@@ -788,6 +788,19 @@ pub struct ReplArgs {
 
 /// Entry point — returns process exit code.
 pub fn run(args: ReplArgs) -> i32 {
+    // Logs to stderr so they do not corrupt the readline prompt on
+    // stdout (same setup as `console::run` / `manager::run`). Without
+    // a subscriber every `tracing::warn!` in the sinks — e.g. a failed
+    // Tiled RunStop PATCH — is silently dropped.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .compact()
+        .try_init();
+
     // Bootstrap the CA backend's global client BEFORE building the
     // Lua state. The CA backend's `ca_context()` block_on's
     // `CaClient::new()` once, which panics if called from inside an
