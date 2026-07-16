@@ -59,9 +59,89 @@ pub struct LuaDevice {
     pub configurable: Option<Arc<dyn ConfigurableObj>>,
     pub collectable: Option<Arc<dyn CollectableObj>>,
     pub pausable: Option<Arc<dyn PausableObj>>,
+    /// `#[lua_methods]`-exposed methods (queue-server registry path).
+    /// Resolved by the `__index` fallback below, so the device stays a
+    /// plain userdata — usable directly as a `scan()`/`mv()`/... arg —
+    /// instead of being wrapped in a table proxy.
+    pub lua_methods: Option<crate::qs::LuaExposedEntry>,
+}
+
+/// Lua-registry key for the per-state set of `#[lua_methods]` names
+/// (`{ [method_name] = true }`). Written by the queue-server Lua
+/// builder; read by [`lua_methods_fallback`] so that only keys that are
+/// a lua-exposed method *somewhere* in the state produce a dispatch
+/// wrapper — everything else stays `nil` (no phantom callables).
+pub(crate) const LUA_EXPOSED_METHODS_KEY: &str = "bsrs.lua_exposed_methods";
+
+/// `__index` fallback behind [`LuaDevice`]'s enumerable methods table.
+///
+/// Receives `(methods_table, key)` — Lua passes the *table* being
+/// chained through, not the device — so the entry lookup happens at
+/// call time from the receiver of `dev:method(...)`. Returns a wrapper
+/// only for keys registered in [`LUA_EXPOSED_METHODS_KEY`]; unknown
+/// keys resolve to `nil` as usual.
+fn lua_methods_fallback(
+    lua: &Lua,
+    (_methods, key): (mlua::Table, mlua::String),
+) -> mlua::Result<LuaValue> {
+    let Ok(set) = lua.named_registry_value::<mlua::Table>(LUA_EXPOSED_METHODS_KEY) else {
+        return Ok(LuaValue::Nil);
+    };
+    let key = key.to_str()?.to_string();
+    if !set.get::<bool>(key.as_str()).unwrap_or(false) {
+        return Ok(LuaValue::Nil);
+    }
+    let f = lua.create_function(move |lua, args: Variadic<LuaValue>| {
+        // First arg is the receiver from `dev:method(...)`.
+        let Some(LuaValue::UserData(ud)) = args.first() else {
+            return Err(mlua::Error::RuntimeError(format!(
+                "`{key}` must be called as device:{key}(...)"
+            )));
+        };
+        let dev = ud.borrow::<LuaDevice>()?;
+        let method = dev
+            .lua_methods
+            .as_ref()
+            .and_then(|e| e.methods.iter().find(|m| m.name == key))
+            .ok_or_else(|| {
+                mlua::Error::RuntimeError(format!("{}: no #[lua_methods] method `{key}`", dev.name))
+            })?;
+        let entry = dev.lua_methods.as_ref().expect("checked above");
+        let mut json_args: Vec<serde_json::Value> =
+            Vec::with_capacity(args.len().saturating_sub(1));
+        for v in args.iter().skip(1) {
+            json_args.push(lua_value_to_json(v)?);
+        }
+        let r = (method.dispatch)(&*entry.device, &json_args).map_err(mlua::Error::RuntimeError)?;
+        json_to_lua_value(lua, &r)
+    })?;
+    Ok(LuaValue::Function(f))
 }
 
 impl UserData for LuaDevice {
+    fn add_fields<F: mlua::UserDataFields<Self>>(fields: &mut F) {
+        // Pre-seed `__index` with an *enumerable table*. mlua merges
+        // every `add_method` registration below into an existing
+        // `__index` table in place, so the REPL's completion /
+        // introspection reflection (which enumerates that table) keeps
+        // working. The table's own metatable chains lookup misses to
+        // the `#[lua_methods]` dispatcher, which is what lets a
+        // lua-exposed device stay a plain userdata — directly usable
+        // as a `scan()`/`mv()`/... argument — instead of the former
+        // table-proxy wrapper that failed every `AnyUserData`-typed
+        // plan parameter with "FromLuaConversionError: table to
+        // userdata". (Registering `MetaMethod::Index` as a *function*
+        // instead would make mlua compile `__index` into an opaque
+        // closure and break the reflection.)
+        fields.add_meta_field_with(mlua::MetaMethod::Index, |lua| {
+            let index = lua.create_table()?;
+            let meta = lua.create_table()?;
+            meta.set("__index", lua.create_function(lua_methods_fallback)?)?;
+            index.set_metatable(Some(meta))?;
+            Ok(index)
+        });
+    }
+
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("name", |_, dev, ()| Ok(dev.name.clone()));
         // dev:inspect()  -> table of current state (sync, no I/O)
@@ -1113,6 +1193,7 @@ pub fn build_lua(re: Arc<RunEngine>) -> mlua::Result<Lua> {
             configurable: None,
             collectable: None,
             pausable: None,
+            lua_methods: None,
         })
     })?;
     lua.globals().set("soft_detector", f)?;
@@ -1133,6 +1214,7 @@ pub fn build_lua(re: Arc<RunEngine>) -> mlua::Result<Lua> {
             configurable: None,
             collectable: None,
             pausable: None,
+            lua_methods: None,
         })
     })?;
     lua.globals().set("soft_motor", f)?;
@@ -1159,6 +1241,7 @@ pub fn build_lua(re: Arc<RunEngine>) -> mlua::Result<Lua> {
                 configurable: None,
                 collectable: None,
                 pausable: None,
+                lua_methods: None,
             })
         })?;
         lua.globals().set("ca_motor", f)?;
@@ -1180,6 +1263,7 @@ pub fn build_lua(re: Arc<RunEngine>) -> mlua::Result<Lua> {
                 configurable: None,
                 collectable: None,
                 pausable: None,
+                lua_methods: None,
             })
         })?;
         lua.globals().set("ca_detector", f)?;
@@ -1256,6 +1340,7 @@ pub fn build_lua(re: Arc<RunEngine>) -> mlua::Result<Lua> {
                 configurable: None,
                 collectable: None,
                 pausable: None,
+                lua_methods: None,
             })
         })?;
         lua.globals().set("pva_motor", f)?;
@@ -1277,6 +1362,7 @@ pub fn build_lua(re: Arc<RunEngine>) -> mlua::Result<Lua> {
                 configurable: None,
                 collectable: None,
                 pausable: None,
+                lua_methods: None,
             })
         })?;
         lua.globals().set("pva_detector", f)?;
@@ -1306,6 +1392,7 @@ pub fn build_lua(re: Arc<RunEngine>) -> mlua::Result<Lua> {
             configurable: None,
             collectable: None,
             pausable: Some(counter as Arc<dyn PausableObj>),
+            lua_methods: None,
         })
     })?;
     lua.globals().set("soft_pausable", f)?;

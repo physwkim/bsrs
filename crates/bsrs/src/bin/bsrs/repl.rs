@@ -175,12 +175,17 @@ fn base_keywords() -> Vec<&'static str> {
 
 /// Reflect the method names of a `UserData` value (`det1:read`, `RE:run`, ...).
 ///
-/// bsrs's `impl UserData` types register methods with `add_method` and add no
-/// fields or custom `__index`, so mlua stores the methods in an enumerable
-/// `__index` *table* on the metatable (see mlua `raw.rs`). We read it through
-/// the sanctioned `UserDataMetatable` API — no `getmetatable`, no host-side
+/// bsrs's `impl UserData` types register methods with `add_method` and keep
+/// `__index` an enumerable *table* on the metatable (mlua merges the methods
+/// into it in place — see mlua `raw.rs`; `LuaDevice` pre-seeds that table via
+/// a meta field precisely to preserve this). We read it through the
+/// sanctioned `UserDataMetatable` API — no `getmetatable`, no host-side
 /// method list to keep in sync. A userdata whose `__index` is a function
 /// (field-based) yields nothing here and falls back to curated names.
+///
+/// A `LuaDevice` additionally contributes its per-device `#[lua_methods]`
+/// names (those resolve through the methods table's own `__index` chain, so
+/// enumeration alone cannot see them).
 fn userdata_methods(ud: &mlua::AnyUserData) -> Vec<String> {
     let Ok(metatable) = ud.metatable() else {
         return Vec::new();
@@ -195,6 +200,11 @@ fn userdata_methods(ud: &mlua::AnyUserData) -> Vec<String> {
             if !s.starts_with('_') {
                 names.push(s.to_string());
             }
+        }
+    }
+    if let Ok(dev) = ud.borrow::<bsrs::host::lua_env::LuaDevice>() {
+        if let Some(entry) = &dev.lua_methods {
+            names.extend(entry.methods.iter().map(|m| m.name.to_string()));
         }
     }
     names.sort();
@@ -788,6 +798,19 @@ pub struct ReplArgs {
 
 /// Entry point — returns process exit code.
 pub fn run(args: ReplArgs) -> i32 {
+    // Logs to stderr so they do not corrupt the readline prompt on
+    // stdout (same setup as `console::run` / `manager::run`). Without
+    // a subscriber every `tracing::warn!` in the sinks — e.g. a failed
+    // Tiled RunStop PATCH — is silently dropped.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .compact()
+        .try_init();
+
     // Bootstrap the CA backend's global client BEFORE building the
     // Lua state. The CA backend's `ca_context()` block_on's
     // `CaClient::new()` once, which panics if called from inside an

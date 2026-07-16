@@ -26,9 +26,10 @@ fn rand_id() -> u64 {
 }
 
 fn bsrs_bin() -> std::path::PathBuf {
-    let target = std::env::var("CARGO_BIN_EXE_bsrs")
-        .expect("CARGO_BIN_EXE_bsrs not set; cargo test should set this");
-    std::path::PathBuf::from(target)
+    // Compile-time lookup: cargo guarantees the var while *building* an
+    // integration test, but not in the test process's runtime env
+    // (cargo 1.92 no longer exports it there).
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_bsrs"))
 }
 
 struct Manager {

@@ -20,8 +20,6 @@
 //! captured at REPL build time. Removal is best-effort via daemon
 //! shutdown; finer-grained control is future work.
 
-#![cfg(feature = "ca")]
-
 use std::sync::Arc;
 use std::time::Duration;
 

@@ -3,10 +3,11 @@ RemoteDispatcher. Verifies wire-format compatibility — bsrs emits
 the bluesky `Publisher` envelope (msgpack body), Python consumes it
 unchanged.
 
-Run:
+Run (args are `[host] [port]`, defaults `localhost 5577` — not a URI;
+the dispatcher builds `tcp://{host}:{port}` itself):
     /Users/stevek/mamba/envs/bs2026.1/bin/python \\
         examples/mini_beamline/05_remote_dispatcher.py \\
-        tcp://localhost:5577
+        localhost 5577
 """
 
 from __future__ import annotations

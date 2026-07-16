@@ -26,7 +26,7 @@ use crate::engine::DocumentSink;
 use crate::event_model::Document;
 use async_trait::async_trait;
 use serde_json::json;
-use tiled_rs::client::{Context, ContextOptions};
+use tiled_rs::client::{Context, ContextOptions, MERGE_PATCH_MIME};
 use tokio::sync::Mutex;
 use url::Url;
 
@@ -119,7 +119,13 @@ impl TiledSink {
     /// Patch the run container's metadata when RunStop arrives.
     async fn patch_run_stop(&self, run_uid: &str, stop: &serde_json::Value) -> Result<()> {
         let url = self.url(&format!("metadata/{}/{}", self.container, run_uid))?;
-        let body = json!({"metadata": {"stop": stop}});
+        // The PATCH body carries its own `content-type` discriminator
+        // (tiled selects merge-patch vs json-patch from the body, not
+        // the HTTP header) — same shape as `NodeClient::patch_metadata`.
+        let body = json!({
+            "content-type": MERGE_PATCH_MIME,
+            "metadata": {"stop": stop},
+        });
         self.ctx
             .patch_json(&url, &body)
             .await

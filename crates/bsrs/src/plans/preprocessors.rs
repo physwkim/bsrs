@@ -1083,7 +1083,7 @@ mod tests {
         assert!(
             matches!(&msgs[1], Msg::Monitor { name, .. } if name.as_deref() == Some("s_monitor")),
             "monitor stream must be named {{signal}}_monitor; got {:?}",
-            &msgs[1]
+            msgs[1]
         );
         assert!(matches!(&msgs[2], Msg::Null));
         assert!(matches!(&msgs[3], Msg::Unmonitor(_)));

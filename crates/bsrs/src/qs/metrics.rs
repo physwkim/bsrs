@@ -21,8 +21,6 @@
 //! When the feature is disabled, all hooks are no-op `inline` macros
 //! so bsrs-qs without `--features metrics` is unchanged.
 
-#![cfg(feature = "metrics")]
-
 use metrics_exporter_prometheus::PrometheusBuilder;
 use std::net::SocketAddr;
 

@@ -3094,12 +3094,12 @@ mod tests {
         assert!(
             matches!(&msgs[0], Msg::Stage(o) if o.name() == "sdet"),
             "first message must Stage the detector, got {:?}",
-            &msgs[0]
+            msgs[0]
         );
         assert!(
             matches!(&msgs[1], Msg::OpenRun(_)),
             "OpenRun must follow the Stage, got {:?}",
-            &msgs[1]
+            msgs[1]
         );
         assert!(
             matches!(msgs.last(), Some(Msg::Unstage(o)) if o.name() == "sdet"),
@@ -3151,7 +3151,7 @@ mod tests {
         assert!(
             matches!(&msgs[0], Msg::Stage(o) if o.name() == "sdet"),
             "scan_1d must Stage the detector first, got {:?}",
-            &msgs[0]
+            msgs[0]
         );
         assert!(
             matches!(msgs.last(), Some(Msg::Unstage(o)) if o.name() == "sdet"),
