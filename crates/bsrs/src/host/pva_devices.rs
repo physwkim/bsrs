@@ -21,8 +21,6 @@
 //! Unlike `ca_devices`, no separate bootstrap call is needed —
 //! `PvaClient::new()` is fully synchronous.
 
-#![cfg(feature = "pva")]
-
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;

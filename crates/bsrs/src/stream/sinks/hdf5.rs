@@ -20,8 +20,6 @@
 //! ops are confined to a dedicated `std::thread`. Frames cross the
 //! boundary via a `tokio::sync::mpsc` channel.
 
-#![cfg(feature = "hdf5")]
-
 use crate::core::error::{BsrsError, Result};
 use crate::event_model::{DataKey, Dtype, StreamDatum, StreamRange, StreamResource};
 use crate::protocols_async::{DetectorWriter, Frame, FrameSink, StreamAsset};

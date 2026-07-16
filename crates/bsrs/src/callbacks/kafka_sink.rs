@@ -25,8 +25,6 @@
 //! it in a `Mutex` and offloads each `send` to `spawn_blocking` so
 //! the tokio reactor isn't parked on the libnetwork I/O.
 
-#![cfg(feature = "kafka")]
-
 use crate::core::error::{BsrsError, Result};
 use crate::engine::DocumentSink;
 use crate::event_model::Document;

@@ -26,8 +26,6 @@
 //! pattern as `RE:run`). Safe with mlua's reentrant lock since the
 //! REPL thread re-enters its own mutex.
 
-#![cfg(feature = "tiled")]
-
 use std::sync::Arc;
 
 use mlua::{Lua, UserData, UserDataMethods};

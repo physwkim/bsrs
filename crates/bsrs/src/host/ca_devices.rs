@@ -19,8 +19,6 @@
 //!
 //! Both factories block on connect (5 s timeout) before returning.
 
-#![cfg(feature = "ca")]
-
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;

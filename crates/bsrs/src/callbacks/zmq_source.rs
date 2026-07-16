@@ -31,8 +31,6 @@
 //! `RunEngine::subscribe`'d callbacks AND any `DocumentSink`s
 //! attached to the engine — same path as engine-internal Documents.
 
-#![cfg(feature = "zmq")]
-
 use crate::core::error::{BsrsError, Result};
 use crate::engine::RunEngine;
 use crate::event_model::Document;
