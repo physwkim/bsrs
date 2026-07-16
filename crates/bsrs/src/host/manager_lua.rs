@@ -39,9 +39,9 @@
 use std::sync::{Arc, Mutex as StdMutex};
 
 use crate::engine::RunEngine;
-use crate::qs::{EvalResult, LuaEvaluator, LuaExposedEntry, Registry};
+use crate::qs::{EvalResult, LuaEvaluator, Registry};
 use async_trait::async_trait;
-use mlua::{Lua, ObjectLike, Table, Value as LuaValue, Variadic};
+use mlua::Lua;
 
 use tokio::sync::Mutex as TMutex;
 
@@ -93,6 +93,12 @@ pub fn build_shared_lua(re: Arc<RunEngine>, registry: &Registry) -> mlua::Result
     // both. Roles the registry doesn't currently track
     // (locatable, stoppable, monitorable, ...) are left None —
     // those calls error from Lua.
+    // Union of every #[lua_methods] name in this state. LuaDevice's
+    // shared `__index` fallback consults it so only real lua-exposed
+    // method names produce a dispatch wrapper (anything else stays
+    // nil); the wrapper then resolves the concrete entry from its
+    // call-time receiver.
+    let exposed = lua.create_table()?;
     for name in registry.device_names() {
         let dev = LuaDevice {
             name: name.clone(),
@@ -108,17 +114,19 @@ pub fn build_shared_lua(re: Arc<RunEngine>, registry: &Registry) -> mlua::Result
             configurable: None,
             collectable: registry.collectable(&name).cloned(),
             pausable: None,
+            // #[lua_methods] resolve via LuaDevice's __index fallback,
+            // so the device stays a plain userdata and works directly
+            // as a scan()/mv()/... argument.
+            lua_methods: registry.lua_exposed(&name).cloned(),
         };
-        // If the registry has #[lua_methods] for this name, wrap
-        // the userdata in a Lua table that adds the custom
-        // methods and falls back to the userdata for built-ins.
-        if let Some(entry) = registry.lua_exposed(&name) {
-            let proxy = make_method_proxy(&lua, dev, entry)?;
-            lua.globals().set(name.as_str(), proxy)?;
-        } else {
-            lua.globals().set(name.as_str(), dev)?;
+        if let Some(entry) = &dev.lua_methods {
+            for m in entry.methods {
+                exposed.set(m.name, true)?;
+            }
         }
+        lua.globals().set(name.as_str(), dev)?;
     }
+    lua.set_named_registry_value(crate::host::lua_env::LUA_EXPOSED_METHODS_KEY, exposed)?;
     Ok(lua)
 }
 
@@ -285,126 +293,6 @@ fn run_chunk(lua: &Lua, source: &str) -> Result<Option<String>, String> {
         }
         Err(e) => Err(format!("{e}")),
     }
-}
-
-/// Wrap a `LuaDevice` userdata in a Lua table that adds each
-/// `#[lua_methods]`-exposed method. The `__index` metamethod
-/// delegates unknown keys to the underlying userdata so the standard
-/// methods (`:read`, `:set`, `:inspect`, ...) keep working.
-fn make_method_proxy(lua: &Lua, dev: LuaDevice, entry: &LuaExposedEntry) -> mlua::Result<Table> {
-    let t = lua.create_table()?;
-    let dev_ud = lua.create_userdata(dev)?;
-    t.set("_device", dev_ud.clone())?;
-
-    // Each #[lua_method] becomes a Lua function on the table. The
-    // closure captures the device Arc (downcasted via Any in the
-    // dispatch fn) and the static method entry.
-    for method in entry.methods.iter().copied() {
-        let device_arc = entry.device.clone();
-        let f = lua.create_function(move |lua, args: Variadic<LuaValue>| {
-            // First arg is the table itself (from `dev:method(...)`);
-            // skip it. Remaining args are the user-supplied params.
-            let mut json_args: Vec<serde_json::Value> = Vec::with_capacity(args.len());
-            for v in args.iter().skip(1) {
-                json_args.push(lua_value_to_json(v)?);
-            }
-            let r =
-                (method.dispatch)(&*device_arc, &json_args).map_err(mlua::Error::RuntimeError)?;
-            json_to_lua_value(lua, &r)
-        })?;
-        t.set(method.name, f)?;
-    }
-
-    // Metatable: missing keys delegate to the userdata, with self
-    // re-bound to the userdata so existing add_method handlers see
-    // the correct receiver. Wrappers are cached on the proxy table
-    // (via raw_set) so a hot loop like `for i=1,1e6 do dx:read() end`
-    // doesn't allocate a fresh closure per iteration.
-    let meta = lua.create_table()?;
-    let dev_ud_for_meta = dev_ud.clone();
-    let __index = lua.create_function(move |lua, (proxy, key): (Table, mlua::String)| {
-        let key_str = key.to_str()?.to_string();
-        // Cache hit: a previous lookup already stored a wrapper.
-        let cached: mlua::Value = proxy.raw_get(&*key_str)?;
-        if !matches!(cached, mlua::Value::Nil) {
-            return Ok(cached);
-        }
-        // Cache miss: look up on the userdata.
-        let val: mlua::Value = dev_ud_for_meta.get(&*key_str).unwrap_or(mlua::Value::Nil);
-        if let mlua::Value::Function(f) = val {
-            let dev_for_call = dev_ud_for_meta.clone();
-            let wrapped = lua.create_function(
-                move |_lua, args: Variadic<mlua::Value>| -> mlua::Result<Variadic<mlua::Value>> {
-                    let mut new_args: Vec<mlua::Value> = Vec::with_capacity(args.len());
-                    new_args.push(mlua::Value::UserData(dev_for_call.clone()));
-                    for a in args.into_iter().skip(1) {
-                        new_args.push(a);
-                    }
-                    f.call::<Variadic<mlua::Value>>(Variadic::from_iter(new_args))
-                },
-            )?;
-            // Memoize on the proxy table so subsequent lookups hit
-            // direct table indexing (no __index call). raw_set
-            // bypasses __newindex.
-            proxy.raw_set(&*key_str, wrapped.clone())?;
-            Ok(mlua::Value::Function(wrapped))
-        } else {
-            Ok(val)
-        }
-    })?;
-    meta.set("__index", __index)?;
-    t.set_metatable(Some(meta))?;
-    Ok(t)
-}
-
-fn lua_value_to_json(v: &LuaValue) -> mlua::Result<serde_json::Value> {
-    Ok(match v {
-        LuaValue::Nil => serde_json::Value::Null,
-        LuaValue::Boolean(b) => serde_json::Value::Bool(*b),
-        LuaValue::Integer(i) => serde_json::Value::Number((*i).into()),
-        LuaValue::Number(n) => serde_json::Number::from_f64(*n)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
-        LuaValue::String(s) => {
-            serde_json::Value::String(s.to_str().map(|s| s.to_string()).unwrap_or_default())
-        }
-        other => {
-            return Err(mlua::Error::RuntimeError(format!(
-                "lua_method: unsupported arg type: {other:?}"
-            )))
-        }
-    })
-}
-
-fn json_to_lua_value(lua: &Lua, v: &serde_json::Value) -> mlua::Result<LuaValue> {
-    Ok(match v {
-        serde_json::Value::Null => LuaValue::Nil,
-        serde_json::Value::Bool(b) => LuaValue::Boolean(*b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                LuaValue::Integer(i)
-            } else if let Some(f) = n.as_f64() {
-                LuaValue::Number(f)
-            } else {
-                LuaValue::Nil
-            }
-        }
-        serde_json::Value::String(s) => LuaValue::String(lua.create_string(s)?),
-        serde_json::Value::Array(arr) => {
-            let t = lua.create_table()?;
-            for (i, x) in arr.iter().enumerate() {
-                t.set(i + 1, json_to_lua_value(lua, x)?)?;
-            }
-            LuaValue::Table(t)
-        }
-        serde_json::Value::Object(map) => {
-            let t = lua.create_table()?;
-            for (k, x) in map {
-                t.set(k.as_str(), json_to_lua_value(lua, x)?)?;
-            }
-            LuaValue::Table(t)
-        }
-    })
 }
 
 fn value_to_string(v: &mlua::Value) -> String {

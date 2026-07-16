@@ -175,12 +175,17 @@ fn base_keywords() -> Vec<&'static str> {
 
 /// Reflect the method names of a `UserData` value (`det1:read`, `RE:run`, ...).
 ///
-/// bsrs's `impl UserData` types register methods with `add_method` and add no
-/// fields or custom `__index`, so mlua stores the methods in an enumerable
-/// `__index` *table* on the metatable (see mlua `raw.rs`). We read it through
-/// the sanctioned `UserDataMetatable` API — no `getmetatable`, no host-side
+/// bsrs's `impl UserData` types register methods with `add_method` and keep
+/// `__index` an enumerable *table* on the metatable (mlua merges the methods
+/// into it in place — see mlua `raw.rs`; `LuaDevice` pre-seeds that table via
+/// a meta field precisely to preserve this). We read it through the
+/// sanctioned `UserDataMetatable` API — no `getmetatable`, no host-side
 /// method list to keep in sync. A userdata whose `__index` is a function
 /// (field-based) yields nothing here and falls back to curated names.
+///
+/// A `LuaDevice` additionally contributes its per-device `#[lua_methods]`
+/// names (those resolve through the methods table's own `__index` chain, so
+/// enumeration alone cannot see them).
 fn userdata_methods(ud: &mlua::AnyUserData) -> Vec<String> {
     let Ok(metatable) = ud.metatable() else {
         return Vec::new();
@@ -195,6 +200,11 @@ fn userdata_methods(ud: &mlua::AnyUserData) -> Vec<String> {
             if !s.starts_with('_') {
                 names.push(s.to_string());
             }
+        }
+    }
+    if let Ok(dev) = ud.borrow::<bsrs::host::lua_env::LuaDevice>() {
+        if let Some(entry) = &dev.lua_methods {
+            names.extend(entry.methods.iter().map(|m| m.name.to_string()));
         }
     }
     names.sort();
