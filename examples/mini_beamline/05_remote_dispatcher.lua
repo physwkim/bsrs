@@ -5,9 +5,10 @@
 -- the Documents arrive in the bluesky shape.
 --
 -- Usage:
---     # terminal 1: start Python subscriber
+--     # terminal 1: start Python subscriber (args are `[host] [port]`,
+--     # not a URI — the dispatcher builds `tcp://{host}:{port}` itself)
 --     ~/mamba/envs/bs2026.1/bin/python \
---         examples/mini_beamline/05_remote_dispatcher.py tcp://localhost:5577
+--         examples/mini_beamline/05_remote_dispatcher.py localhost 5577
 --
 --     # terminal 2: bsrs publishes
 --     cargo run -p bsrs-cli -- repl \
