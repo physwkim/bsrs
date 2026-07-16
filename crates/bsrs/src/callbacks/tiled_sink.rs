@@ -146,11 +146,10 @@ impl DocumentSink for TiledSink {
             }
             Document::Stop(s) => {
                 let value = serde_json::to_value(s)?;
-                // Best-effort PATCH; if the server doesn't support it
-                // we log and continue rather than fail the run.
-                if let Err(e) = self.patch_run_stop(&s.run_start, &value).await {
-                    tracing::warn!(target: "bsrs.tiled", "stop patch: {e}");
-                }
+                // Propagate on failure — the engine's fan-out logs sink
+                // errors and never fails the run on them, so no local
+                // catch (keeps Start and Stop failure paths uniform).
+                self.patch_run_stop(&s.run_start, &value).await?;
             }
             other => {
                 let name = document_name(other);

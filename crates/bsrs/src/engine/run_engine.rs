@@ -2562,7 +2562,9 @@ impl RunEngine {
                 };
                 let doc = Document::Event(ev);
                 for s in &sinks {
-                    let _ = s.dispatch(&doc).await;
+                    if let Err(e) = s.dispatch(&doc).await {
+                        tracing::warn!("document sink failed for monitor event: {e}");
+                    }
                 }
                 RunEngine::dispatch_subscribers(&subs_arc, &doc);
             }
@@ -2876,8 +2878,14 @@ impl RunEngine {
     }
 
     async fn broadcast(&self, doc: &Document) -> Result<()> {
+        // Sink errors are logged here — the fan-out is the single owner of
+        // that policy (`DocumentSink::dispatch` contract: logged, not fatal
+        // to the run) — so individual sinks propagate instead of catching.
         for s in &self.sinks {
-            let _ = s.dispatch(doc).await;
+            if let Err(e) = s.dispatch(doc).await {
+                let name = crate::callbacks::document_name(doc);
+                tracing::warn!("document sink failed for {name} doc: {e}");
+            }
         }
         // Dynamic subscribers — filtered + fanned out by the single owner.
         // Each callback is invoked synchronously; lossless w.r.t. order, but
