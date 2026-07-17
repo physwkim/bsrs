@@ -76,7 +76,7 @@ jobs:
       # Lua `tiled.*` read-side bindings, exercised through the CLI/REPL.
       - name: test bsrs --features cli,tiled
         run: cargo test -p bsrs --features cli,tiled --no-fail-fast
-      # Kafka document sink — pure-Rust kafka crate, no librdkafka.
+      # Kafka document sink — pure-Rust rskafka crate, no librdkafka.
       - name: test bsrs --features kafka
         run: cargo test -p bsrs --features kafka --no-fail-fast
       # Queue-server daemon + Prometheus metrics endpoint (metrics -> qs).

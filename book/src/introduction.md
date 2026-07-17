@@ -46,7 +46,7 @@ and tested. Notable opt-in features behind Cargo flags:
 | -------------------------------- | ------------------ | ---------------------------------------- |
 | `zmq`                            | `bsrs-callbacks` | bluesky `Publisher` envelope             |
 | `tiled`                          | `bsrs-callbacks` | HTTP register + metadata patch via tiled-client |
-| `kafka`                          | `bsrs-callbacks` | pure-Rust `kafka` crate, no librdkafka   |
+| `kafka`                          | `bsrs-callbacks` | pure-Rust `rskafka` crate, no librdkafka |
 | `hdf5`                           | `bsrs-stream`    | rust-hdf5 frame writer, NeXus layout     |
 | `pva`                            | `bsrs-stream`    | NTNDArray monitor source                 |
 | `real`                           | `bsrs-backend-epics-{ca,pva}` | live EPICS clients         |

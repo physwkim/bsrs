@@ -9,7 +9,7 @@ feature flags so the default build stays small and dependency-free.
 | ------------------ | -------- | ------------------------------------- | ------------------------------------- |
 | `bsrs-callbacks` | `zmq`    | libzmq + rmp-serde                    | bluesky `RemoteDispatcher` consumers  |
 | `bsrs-callbacks` | `tiled`  | tiled-client (HTTP)                   | Tiled catalog ingestion               |
-| `bsrs-callbacks` | `kafka`  | pure-Rust `kafka` crate               | Kafka topics, no librdkafka           |
+| `bsrs-callbacks` | `kafka`  | pure-Rust `rskafka` crate             | Kafka topics, no librdkafka           |
 
 ```sh
 cargo build -p bsrs-callbacks --features zmq,tiled,kafka
