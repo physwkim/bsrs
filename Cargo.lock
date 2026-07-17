@@ -1765,10 +1765,11 @@ checksum = "869b0adbda23651a9c5c0c3d270aac9fcb52e8622a8f2b17e57802d7791962f2"
 
 [[package]]
 name = "epics-base-rs"
-version = "0.20.4"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9350a9b0f97e098d66f3eec1b710c6e08a822e70c089879a328aa05f2ebfb3b"
+checksum = "c16a89ec4df7d0bcb7e15e66503d00b54875b3cee2dc19db2c364860eec44478"
 dependencies = [
+ "async-trait",
  "bytes",
  "chrono",
  "clap",
@@ -1787,9 +1788,9 @@ dependencies = [
 
 [[package]]
 name = "epics-ca-rs"
-version = "0.20.4"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b5b3d49bc440d3aa407ba470e2c0368c7587c5a979513d2406cacc729d02a2d"
+checksum = "7b2c544d3e386f1e314d144734eb96b43ffa8b5d234023e22f506e4a7a2987ad"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1806,13 +1807,14 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "epics-macros-rs"
-version = "0.20.3"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "afece7651f6cc6b6b52286bbf99774b968297891e532d03bf046d0d16dc0ffc3"
+checksum = "a47ae6cc1d86b7d56ec9e330b1391ba296fba9757f3cc470ad04638ee623a716"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1822,9 +1824,9 @@ dependencies = [
 
 [[package]]
 name = "epics-pva-rs"
-version = "0.20.4"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52797107d779a6ffe8b127ade1dfdcd02069913098d4d424a74835f0d5941826"
+checksum = "0f2e0c9eda8d9f1df01bdae4f5079a7e15adce94459d1e31ae85c2e24a15593e"
 dependencies = [
  "bytes",
  "chrono",
