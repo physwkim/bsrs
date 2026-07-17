@@ -23,7 +23,7 @@ required-features = ["cli"]
 default = ["ca", "pva"]
 # --- document sinks / integrations (callbacks) ---
 zmq = ["dep:zmq", "dep:rmp-serde"]
-kafka = ["dep:kafka", "dep:rmp-serde"]
+kafka = ["dep:rskafka", "dep:rmp-serde"]
 tiled = ["dep:tiled-rs", "dep:url"]
 # --- EPICS backends (real, otherwise stubs) ---
 ca = ["dep:epics-ca-rs", "dep:epics-base-rs"]
@@ -62,7 +62,7 @@ rmp-serde = { version = "1", optional = true }
 regex = { version = "1", optional = true }
 toml = { version = "0.8", optional = true }
 url = { version = "2", optional = true }
-kafka = { version = "0.10", optional = true, default-features = false, features = ["snappy"] }
+rskafka = { version = "0.6", optional = true, default-features = false }
 tiled-rs = { version = "0.1.3", default-features = false, optional = true }
 mlua = { workspace = true, optional = true }
 roxmltree = { version = "0.20", optional = true }

@@ -1,8 +1,13 @@
 //! `KafkaDocumentSink` — publish bluesky-shaped Documents to a Kafka
 //! topic. Behind the `kafka` Cargo feature.
 //!
-//! Uses the pure-Rust [`kafka`](https://crates.io/crates/kafka) crate;
-//! no librdkafka native dep.
+//! Uses the pure-Rust async [`rskafka`](https://crates.io/crates/rskafka)
+//! client; no librdkafka native dep. rskafka speaks the modern wire
+//! protocol (record batch v2, `ApiVersions` negotiation), which Kafka 4.x
+//! brokers require: KIP-896 removed the pre-2.1 client API versions the
+//! previous `kafka` (kafka-rust) client produced with, so it cannot talk
+//! to a 4.x broker at all (verified live: every produce fails and the
+//! broker drops the connection).
 //!
 //! ## Wire format
 //!
@@ -19,20 +24,31 @@
 //! first, matching the bluesky-kafka envelope used by NSLS-II /
 //! BNL ingestion services.
 //!
-//! ## Threading
+//! ## Delivery
 //!
-//! `kafka::producer::Producer` is sync and blocking. The sink wraps
-//! it in a `Mutex` and offloads each `send` to `spawn_blocking` so
-//! the tokio reactor isn't parked on the libnetwork I/O.
+//! Documents go to partition 0 of the topic. rskafka is a per-partition
+//! client by design, and one partition is what preserves the event
+//! model's total document order (start before descriptor before events)
+//! — the reason bluesky-kafka deployments run single-partition topics.
+//! Produces are acknowledged with `acks=all` (rskafka's fixed setting;
+//! the previous client asked for leader-ack only — identical on the
+//! replication-factor-1 topics this sink targets, stricter on replicated
+//! ones), and every client operation is bounded by a 5-second retry
+//! deadline, matching the old producer's 5-second ack timeout. The
+//! topic must already exist: a missing topic fails [`KafkaDocumentSink::new`]
+//! fast instead of retrying forever.
 
 use crate::core::error::{BsrsError, Result};
 use crate::engine::DocumentSink;
 use crate::event_model::Document;
 use async_trait::async_trait;
-use kafka::producer::{Producer, Record, RequiredAcks};
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::Mutex;
+use rskafka::chrono::{DateTime, Utc};
+use rskafka::client::partition::{Compression, PartitionClient, UnknownTopicHandling};
+use rskafka::client::ClientBuilder;
+use rskafka::record::Record;
+use rskafka::BackoffConfig;
+use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::callbacks::doc_name::document_name;
 
@@ -47,30 +63,36 @@ pub enum Serializer {
 
 /// Document sink that publishes to a Kafka topic.
 pub struct KafkaDocumentSink {
-    /// Wrapped Kafka producer (sync, !Send across await points; we
-    /// hold it in a `Mutex` and call `send` from `spawn_blocking`).
-    producer: Arc<Mutex<Producer>>,
-    /// Topic name.
-    topic: String,
+    /// Client for partition 0 of the configured topic; `produce` takes
+    /// `&self`, so `dispatch` needs no lock and no `spawn_blocking`.
+    partition: PartitionClient,
     /// Body serializer.
     serializer: Serializer,
 }
 
 impl KafkaDocumentSink {
-    /// Build with a list of broker addresses (e.g.
-    /// `vec!["localhost:9092"]`) and a topic name. Uses
-    /// `RequiredAcks::One` (leader-ack) and a 5-second ack timeout —
-    /// reasonable for a beamline writer that wants durable but
-    /// not-too-slow publishes.
-    pub fn new(brokers: Vec<String>, topic: impl Into<String>) -> Result<Self> {
-        let producer = Producer::from_hosts(brokers)
-            .with_ack_timeout(Duration::from_secs(5))
-            .with_required_acks(RequiredAcks::One)
-            .create()
-            .map_err(|e| BsrsError::Backend(format!("kafka producer: {e}")))?;
+    /// Connect to `brokers` (e.g. `vec!["localhost:9092"]`) and bind
+    /// partition 0 of `topic`.
+    ///
+    /// Async because the client bootstrap (metadata + `ApiVersions`
+    /// negotiation) is a network exchange. Fails when no broker is
+    /// reachable or the topic does not exist.
+    pub async fn new(brokers: Vec<String>, topic: impl Into<String>) -> Result<Self> {
+        let topic = topic.into();
+        let client = ClientBuilder::new(brokers)
+            .backoff_config(BackoffConfig {
+                deadline: Some(Duration::from_secs(5)),
+                ..Default::default()
+            })
+            .build()
+            .await
+            .map_err(|e| BsrsError::Backend(format!("kafka client: {e}")))?;
+        let partition = client
+            .partition_client(&topic, 0, UnknownTopicHandling::Error)
+            .await
+            .map_err(|e| BsrsError::Backend(format!("kafka topic {topic:?}: {e}")))?;
         Ok(Self {
-            producer: Arc::new(Mutex::new(producer)),
-            topic: topic.into(),
+            partition,
             serializer: Serializer::Json,
         })
     }
@@ -87,7 +109,7 @@ impl KafkaDocumentSink {
 }
 
 /// Free-function form of `encode_body` so unit tests can exercise the
-/// serialization without spinning up a Kafka producer.
+/// serialization without spinning up a Kafka client.
 fn encode_body(serializer: Serializer, doc: &Document) -> Result<Vec<u8>> {
     // Serialize the raw document dict (inner variant), not the adjacently
     // tagged `Document` wrapper — matches the bluesky-kafka envelope where the
@@ -103,19 +125,25 @@ fn encode_body(serializer: Serializer, doc: &Document) -> Result<Vec<u8>> {
 #[async_trait]
 impl DocumentSink for KafkaDocumentSink {
     async fn dispatch(&self, doc: &Document) -> Result<()> {
-        let body = self.encode_body(doc)?;
-        let key = document_name(doc).as_bytes().to_vec();
-        let topic = self.topic.clone();
-        let producer = self.producer.clone();
-        // Kafka producer is blocking; isolate from the reactor.
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut p = producer.blocking_lock();
-            let rec = Record::from_key_value(&topic, &key[..], &body[..]);
-            p.send(&rec)
-                .map_err(|e| BsrsError::Backend(format!("kafka send: {e}")))
-        })
-        .await
-        .map_err(|e| BsrsError::Backend(format!("kafka join: {e}")))?
+        // Producer wall-clock timestamp, built via `from_timestamp` — the
+        // chrono `clock` feature is not in this crate's dependency graph.
+        let since_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let timestamp =
+            DateTime::from_timestamp(since_epoch.as_secs() as i64, since_epoch.subsec_nanos())
+                .unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
+        let record = Record {
+            key: Some(document_name(doc).as_bytes().to_vec()),
+            value: Some(self.encode_body(doc)?),
+            headers: BTreeMap::new(),
+            timestamp,
+        };
+        self.partition
+            .produce(vec![record], Compression::NoCompression)
+            .await
+            .map_err(|e| BsrsError::Backend(format!("kafka produce: {e}")))?;
+        Ok(())
     }
 }
 

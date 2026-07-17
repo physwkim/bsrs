@@ -145,7 +145,7 @@ Plan-code translation table and full migration guide:
 | ------------------ | -------------- | --------------------------------------- |
 | `bsrs-callbacks` | `zmq`          | bluesky `Publisher` envelope            |
 | `bsrs-callbacks` | `tiled`        | HTTP register + metadata patch          |
-| `bsrs-callbacks` | `kafka`        | pure-Rust `kafka` crate, no librdkafka  |
+| `bsrs-callbacks` | `kafka`        | pure-Rust `rskafka` crate, no librdkafka |
 | `bsrs-stream`    | `hdf5`         | rust-hdf5 frame writer, NeXus layout    |
 | `bsrs-stream`    | `pva`          | NTNDArray monitor source                |
 | `bsrs-backend-epics-{ca,pva}` | `real` | live EPICS clients              |
