@@ -326,11 +326,15 @@ fn open_file(
     let instr = entry
         .create_group("instrument")
         .map_err(|e| BsrsError::Backend(format!("hdf5 sink: create instrument: {e}")))?;
-    let _det = instr
+    let det = instr
         .create_group(name)
         .map_err(|e| BsrsError::Backend(format!("hdf5 sink: create {name}: {e}")))?;
-    let dataset_path = format!("entry/instrument/{name}/data");
-    let mut builder = file
+    // Create the dataset ON the leaf group with a relative link name.
+    // `DatasetBuilder::create` documents the name as a link name within
+    // the builder's group — a file-rooted "a/b/c/data" path produces a
+    // file whose dataset link libhdf5/h5py cannot resolve (only
+    // rust-hdf5's own reader tolerates it).
+    let mut builder = det
         .new_dataset::<u8>()
         .shape([0])
         .max_shape(&[None])
@@ -339,8 +343,10 @@ fn open_file(
     if compress {
         builder = builder.deflate(4);
     }
-    let dataset = builder.create(&dataset_path).map_err(|e| {
-        BsrsError::Backend(format!("hdf5 sink: create dataset {dataset_path}: {e}"))
+    let dataset = builder.create("data").map_err(|e| {
+        BsrsError::Backend(format!(
+            "hdf5 sink: create dataset entry/instrument/{name}/data: {e}"
+        ))
     })?;
     Ok((file, dataset))
 }
