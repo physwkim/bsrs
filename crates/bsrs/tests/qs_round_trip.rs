@@ -2258,6 +2258,65 @@ fn register_failing_plan(reg: &mut Registry, name: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_stops_when_item_fails_to_build() {
+    let det = SoftDetector::new("det1");
+    let mut reg = Registry::new();
+    reg.register_readable("det1", det as Arc<dyn ReadableObj>);
+    reg.register_plan_count("count");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    rpc(&req, "environment_open", json!({}));
+    // First item builds against an unknown detector (build-time factory
+    // error); the second is runnable and must NOT be reached.
+    for item in [
+        json!({"name": "count", "args": ["no_such_det", 1]}),
+        json!({"name": "count", "args": ["det1", 1]}),
+    ] {
+        let r = rpc(&req, "queue_item_add", json!({ "item": item }));
+        assert_eq!(r["success"], true, "{r}");
+    }
+    rpc(&req, "queue_start", json!({}));
+
+    let r = poll_status(&req, |s| {
+        s["manager_state"] == "idle" && s["items_in_history"] == 1
+    })
+    .await;
+    assert_eq!(r["items_in_history"], 1, "{r}");
+    assert_eq!(
+        r["items_in_queue"], 1,
+        "queue must stop before the second item: {r}"
+    );
+    assert_eq!(r["plans_failed"], 1, "{r}");
+    assert_eq!(r["running_item_name"], Value::Null, "{r}");
+    let r = rpc(&req, "history_get", json!({}));
+    assert_eq!(r["items"][0]["result"]["exit_status"], "fail", "{r}");
+
+    // Same exit must deactivate autostart (ref: manager.py:852): clear the
+    // queue, arm autostart, add another unbuildable item.
+    rpc(&req, "queue_clear", json!({}));
+    rpc(&req, "queue_autostart", json!({"enable": true}));
+    rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": ["no_such_det", 1]}}),
+    );
+    let r = poll_status(&req, |s| {
+        s["manager_state"] == "idle" && s["items_in_history"] == 2
+    })
+    .await;
+    assert_eq!(r["items_in_history"], 2, "{r}");
+    assert_eq!(
+        r["queue_autostart_enabled"], false,
+        "a build failure must deactivate autostart: {r}"
+    );
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn env_close_rejected_while_executing_destroy_forces() {
     let mut reg = Registry::new();
     register_pausable_loop(&mut reg, "pausable_loop");
@@ -2397,7 +2456,9 @@ async fn queue_item_execute_failure_is_archived() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn autostart_runs_added_items_without_queue_start() {
+    let det = SoftDetector::new("det1");
     let mut reg = Registry::new();
+    reg.register_readable("det1", det as Arc<dyn ReadableObj>);
     reg.register_plan_count("count");
     let shutdown = spawn_server(reg);
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2410,7 +2471,7 @@ async fn autostart_runs_added_items_without_queue_start() {
     let r = rpc(
         &req,
         "queue_item_add",
-        json!({"item": {"name": "count", "args": []}}),
+        json!({"item": {"name": "count", "args": ["det1", 1]}}),
     );
     assert_eq!(r["success"], true, "{r}");
     let r = rpc(&req, "status", json!({}));
@@ -2425,6 +2486,11 @@ async fn autostart_runs_added_items_without_queue_start() {
     .await;
     assert_eq!(r["items_in_history"], 1, "item did not run: {r}");
     assert_eq!(r["items_in_queue"], 0, "{r}");
+    let hist = rpc(&req, "history_get", json!({}));
+    assert_eq!(
+        hist["items"][0]["result"]["exit_status"], "success",
+        "{hist}"
+    );
     assert_eq!(
         r["queue_autostart_enabled"], true,
         "a successful run keeps autostart armed: {r}"
@@ -2434,7 +2500,7 @@ async fn autostart_runs_added_items_without_queue_start() {
     rpc(
         &req,
         "queue_item_add",
-        json!({"item": {"name": "count", "args": []}}),
+        json!({"item": {"name": "count", "args": ["det1", 1]}}),
     );
     let r = poll_status(&req, |s| {
         s["items_in_history"] == 2 && s["manager_state"] == "idle"
@@ -2449,7 +2515,9 @@ async fn autostart_runs_added_items_without_queue_start() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn autostart_disabled_by_queue_stop_instruction() {
+    let det = SoftDetector::new("det1");
     let mut reg = Registry::new();
+    reg.register_readable("det1", det as Arc<dyn ReadableObj>);
     reg.register_plan_count("count");
     let shutdown = spawn_server(reg);
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2459,9 +2527,9 @@ async fn autostart_disabled_by_queue_stop_instruction() {
     // Load the queue while autostart is off so the layout is deterministic:
     // [count, queue_stop instruction, count].
     for item in [
-        json!({"name": "count", "args": []}),
+        json!({"name": "count", "args": ["det1", 1]}),
         json!({"item_type": "instruction", "name": "queue_stop"}),
-        json!({"name": "count", "args": []}),
+        json!({"name": "count", "args": ["det1", 1]}),
     ] {
         let r = rpc(&req, "queue_item_add", json!({ "item": item }));
         assert_eq!(r["success"], true, "{r}");

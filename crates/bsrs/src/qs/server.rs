@@ -385,6 +385,21 @@ fn rep_loop(
     Ok(())
 }
 
+/// Return the manager to idle when the queue worker exits.
+/// `disable_autostart` — true on every failure/stop exit (ref:
+/// manager.py:852,1080: a failed/interrupted plan and queue_stop
+/// deactivate autostart); false only on a normal drain to an empty
+/// queue, which keeps autostart armed (manager.py:1085).
+fn idle_out(state: &Arc<StdMutex<EngineState>>, disable_autostart: bool) {
+    let mut s = state.lock().unwrap();
+    s.state = Some(EState::Idle);
+    s.pause_pending = false;
+    s.current_plan_name = None;
+    if disable_autostart {
+        s.queue_autostart_enabled = false;
+    }
+}
+
 pub(crate) async fn execute_queue_loop(
     re: Arc<RunEngine>,
     registry: Arc<Registry>,
@@ -398,21 +413,15 @@ pub(crate) async fn execute_queue_loop(
     loop {
         // Honor queue_stop_pending: drain to idle without running the next item.
         if state.lock().unwrap().queue_stop_pending {
-            let mut s = state.lock().unwrap();
-            s.queue_stop_pending = false;
-            s.pause_pending = false;
-            // Stopping the queue deactivates autostart (ref: manager.py:1080,1161).
-            s.queue_autostart_enabled = false;
-            s.state = Some(EState::Idle);
+            state.lock().unwrap().queue_stop_pending = false;
+            idle_out(&state, true);
             return;
         }
         let item = queue.lock().unwrap().pop_front();
         let item = match item {
             Some(it) => it,
             None => {
-                let mut s = state.lock().unwrap();
-                s.state = Some(EState::Idle);
-                s.pause_pending = false;
+                idle_out(&state, false);
                 return;
             }
         };
@@ -424,6 +433,7 @@ pub(crate) async fn execute_queue_loop(
                 state.lock().unwrap().queue_stop_pending = true;
                 continue; // next iteration checks queue_stop_pending and exits
             } else {
+                // Uniform rule: any item that cannot start stops the queue.
                 tracing::error!("queue: unknown instruction: {}", item.name);
                 let reason = format!("unknown instruction: {}", item.name);
                 let archived = item.with_result(serde_json::json!({
@@ -431,42 +441,41 @@ pub(crate) async fn execute_queue_loop(
                     "reason": reason,
                 }));
                 queue.lock().unwrap().push_history(archived);
-                continue;
+                idle_out(&state, true);
+                return;
             }
         }
 
         let factory = match registry.plan(&item.name) {
             Some(f) => f.clone(),
             None => {
+                // An item that fails to start stops the queue like a failed
+                // run (ref: manager.py:847-852 — "failed" → idle + autostart
+                // disable), instead of silently skipping to the next item.
                 tracing::error!("queue: unknown plan {}", item.name);
-                let mut s = state.lock().unwrap();
-                s.state = Some(EState::ExecutingQueue);
-                s.current_plan_name = Some(item.name.clone());
-                s.plans_failed += 1;
+                state.lock().unwrap().plans_failed += 1;
                 let archived = item.clone().with_result(serde_json::json!({
                     "exit_status": "fail",
                     "reason": "unknown plan",
                 }));
-                drop(s);
                 queue.lock().unwrap().push_history(archived);
-                continue;
+                idle_out(&state, true);
+                return;
             }
         };
         let plan = match factory(&registry, &item.args) {
             Ok(p) => p,
             Err(e) => {
+                // Same rule as the unknown-plan arm above.
                 tracing::error!("queue: plan {} build failed: {e}", item.name);
-                let mut s = state.lock().unwrap();
-                s.state = Some(EState::ExecutingQueue);
-                s.current_plan_name = Some(item.name.clone());
-                s.plans_failed += 1;
+                state.lock().unwrap().plans_failed += 1;
                 let archived = item.clone().with_result(serde_json::json!({
                     "exit_status": "fail",
                     "reason": format!("plan build failed: {e}"),
                 }));
-                drop(s);
                 queue.lock().unwrap().push_history(archived);
-                continue;
+                idle_out(&state, true);
+                return;
             }
         };
         let exit_status = run_plan_item(&re, &queue, &state, &item, plan).await;
@@ -482,14 +491,9 @@ pub(crate) async fn execute_queue_loop(
             queue.lock().unwrap().push_back(item);
         }
         // On non-success, idle out (matches bluesky behaviour: queue_start
-        // halts on error). A failed/interrupted plan also deactivates
-        // autostart; a normal drain to an empty queue keeps it enabled
-        // (ref: manager.py:852,1085).
+        // halts on error) and deactivate autostart.
         if exit_status != "success" {
-            let mut s = state.lock().unwrap();
-            s.state = Some(EState::Idle);
-            s.pause_pending = false;
-            s.queue_autostart_enabled = false;
+            idle_out(&state, true);
             return;
         }
     }
@@ -583,15 +587,10 @@ pub(crate) async fn execute_single_item(
 ) {
     let _slot_guard = ClearOnDrop(task_slot.clone());
     let exit_status = run_plan_item(&re, &queue, &state, &item, plan).await;
-    let mut s = state.lock().unwrap();
-    s.state = Some(EState::Idle);
-    s.pause_pending = false;
     // A failed/interrupted item deactivates autostart, same as a queued
     // plan (ref: manager.py:852 — the plan-state path is shared between
     // queued and immediate execution).
-    if exit_status != "success" {
-        s.queue_autostart_enabled = false;
-    }
+    idle_out(&state, exit_status != "success");
 }
 
 /// RAII guard: clears the queue-task slot on drop so a future
