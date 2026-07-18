@@ -115,8 +115,26 @@ pub fn run(args: DoctorArgs) -> i32 {
             tokio::time::timeout(timeout, async { reqwest_get_status(&probe).await }).await
         });
         match r {
-            Ok(Ok(code)) if code < 500 => {
+            // 2xx/3xx: reachable and serving the API root.
+            Ok(Ok(code)) if code < 400 => {
                 print_line(Verdict::Ok, "tiled", &format!("{probe}  → HTTP {code}"));
+            }
+            // 401/403: a Tiled server is there, it just wants credentials.
+            Ok(Ok(code)) if code == 401 || code == 403 => {
+                print_line(
+                    Verdict::Ok,
+                    "tiled",
+                    &format!("{probe}  → HTTP {code} (auth required)"),
+                );
+            }
+            // Other 4xx (404, …): something answered, but not the Tiled API —
+            // a healthy Tiled never 404s its own /api/v1/ root.
+            Ok(Ok(code)) if code < 500 => {
+                print_line(
+                    Verdict::Warn,
+                    "tiled",
+                    &format!("{probe}  → HTTP {code} (no Tiled API at this URL?)"),
+                );
             }
             Ok(Ok(code)) => {
                 print_line(Verdict::Warn, "tiled", &format!("{probe}  → HTTP {code}"));
