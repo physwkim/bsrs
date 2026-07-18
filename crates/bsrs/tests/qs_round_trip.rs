@@ -2203,3 +2203,42 @@ async fn re_pause_rejected_when_no_plan_running() {
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_autostart_param_is_validated() {
+    let reg = Registry::new();
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    // Valid forms.
+    let r = rpc(&req, "queue_autostart", json!({"enable": true}));
+    assert_eq!(r["success"], true, "{r}");
+    let r = rpc(&req, "status", json!({}));
+    assert_eq!(r["queue_autostart_enabled"], true, "{r}");
+    let r = rpc(&req, "queue_autostart", json!({"option": "disable"}));
+    assert_eq!(r["success"], true, "{r}");
+    let r = rpc(&req, "status", json!({}));
+    assert_eq!(r["queue_autostart_enabled"], false, "{r}");
+
+    // Re-enable, then throw invalid requests at it: each must ERROR and
+    // must not silently flip the flag to disabled.
+    rpc(&req, "queue_autostart", json!({"enable": true}));
+    for bad in [
+        json!({}),
+        json!({"enable": "true"}),
+        json!({"option": "bogus"}),
+        json!({"option": 1}),
+    ] {
+        let r = rpc(&req, "queue_autostart", bad.clone());
+        assert_eq!(r["success"], false, "params {bad} must be rejected: {r}");
+        let r = rpc(&req, "status", json!({}));
+        assert_eq!(
+            r["queue_autostart_enabled"], true,
+            "invalid request {bad} silently changed the flag: {r}"
+        );
+    }
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}

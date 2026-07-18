@@ -176,17 +176,16 @@ pub(crate) fn dispatch(
             json!({"success": true, "msg": ""})
         }
         "queue_autostart" => {
-            let enable = req
-                .params
-                .get("enable")
-                .and_then(|v| v.as_bool())
-                .unwrap_or_else(|| {
-                    req.params
-                        .get("option")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s == "enable")
-                        .unwrap_or(false)
-                });
+            // Strict: a typo'd request must not silently disable autostart.
+            let enable = match (req.params.get("enable"), req.params.get("option")) {
+                (Some(Value::Bool(b)), _) => *b,
+                (None, Some(Value::String(s))) if s == "enable" => true,
+                (None, Some(Value::String(s))) if s == "disable" => false,
+                _ => {
+                    return err("queue_autostart: required param 'enable' (bool) \
+                         or 'option' (\"enable\"/\"disable\")")
+                }
+            };
             state.lock().unwrap().queue_autostart_enabled = enable;
             json!({"success": true, "msg": ""})
         }
