@@ -182,7 +182,15 @@ pub(crate) fn dispatch(
         "queue_item_remove_batch" => queue_item_remove_batch(&queue, &req.params),
         "queue_item_move" => queue_item_move(&queue, &req.params),
         "queue_item_move_batch" => queue_item_move_batch(&queue, &req.params),
-        "queue_item_execute" => queue_item_execute(&registry, &engine, rt, &req.params),
+        "queue_item_execute" => queue_item_execute(
+            &registry,
+            &queue,
+            &state,
+            &engine,
+            rt,
+            &queue_task,
+            &req.params,
+        ),
 
         // -- queue execution ----------------------------------------------
         "queue_start" => queue_start(&registry, &queue, &state, &engine, rt, &queue_task),
@@ -1314,14 +1322,25 @@ fn resolve_pos_q(p: Option<&Value>, q: &PlanQueue) -> usize {
 
 fn queue_item_execute(
     registry: &Arc<Registry>,
+    queue: &Arc<StdMutex<PlanQueue>>,
+    state: &Arc<StdMutex<EngineState>>,
     engine: &Arc<Mutex<Option<Arc<RunEngine>>>>,
     rt: &tokio::runtime::Handle,
+    queue_task: &Arc<StdMutex<Option<AbortHandle>>>,
     params: &Value,
 ) -> Value {
     let item = match params.get("item") {
         Some(i) => i.clone(),
         None => return err("missing 'item'"),
     };
+    if item
+        .get("item_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("plan")
+        != "plan"
+    {
+        return err("queue_item_execute: only 'plan' items are supported");
+    }
     let name = match item.get("name").and_then(|v| v.as_str()) {
         Some(n) => n.to_string(),
         None => return err("item.name required"),
@@ -1340,18 +1359,40 @@ fn queue_item_execute(
         None => return err("environment not open"),
     };
     drop(e_guard);
-    let result = rt.block_on(re.run_async(plan));
-    match result {
-        Ok(r) => json!({
-            "success": r.exit_status == "success",
-            "msg": "",
-            "exit_status": r.exit_status,
-            // Preserve the single-valued `run_uid` wire field (the most recently
-            // opened run); RunResult now carries all opened UIDs in `run_uids`.
-            "run_uid": r.run_uids.last(),
-        }),
-        Err(e) => err(format!("run failed: {e}")),
+    // Immediate execution starts only from idle (ref: manager.py:2747 "The
+    // request fails if item execution can not be started immediately").
+    let cur_state = state.lock().unwrap().state;
+    if cur_state != Some(EState::Idle) {
+        return err(format!("cannot execute item in state {cur_state:?}"));
     }
+    let mut queued = QueuedItem::plan(name, item);
+    queued.user = params
+        .get("user")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    queued.user_group = params
+        .get("user_group")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let item_echo = serde_json::to_value(&queued).unwrap();
+    // Run through the shared worker machinery in the background — the
+    // response means "execution started"; the result is archived to the
+    // plan history (ref: manager.py:2744 `_queue_item_execute_handler`).
+    let join = tokio::spawn(crate::qs::server::execute_single_item(
+        re,
+        queue.clone(),
+        state.clone(),
+        queue_task.clone(),
+        queued,
+        plan,
+    ));
+    *queue_task.lock().unwrap() = Some(join.abort_handle());
+    json!({
+        "success": true,
+        "msg": "",
+        "qsize": queue.lock().unwrap().len(),
+        "item": item_echo,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

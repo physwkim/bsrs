@@ -435,16 +435,13 @@ pub(crate) async fn execute_queue_loop(
             }
         }
 
-        {
-            let mut s = state.lock().unwrap();
-            s.state = Some(EState::ExecutingQueue);
-            s.current_plan_name = Some(item.name.clone());
-        }
         let factory = match registry.plan(&item.name) {
             Some(f) => f.clone(),
             None => {
                 tracing::error!("queue: unknown plan {}", item.name);
                 let mut s = state.lock().unwrap();
+                s.state = Some(EState::ExecutingQueue);
+                s.current_plan_name = Some(item.name.clone());
                 s.plans_failed += 1;
                 let archived = item.clone().with_result(serde_json::json!({
                     "exit_status": "fail",
@@ -460,6 +457,8 @@ pub(crate) async fn execute_queue_loop(
             Err(e) => {
                 tracing::error!("queue: plan {} build failed: {e}", item.name);
                 let mut s = state.lock().unwrap();
+                s.state = Some(EState::ExecutingQueue);
+                s.current_plan_name = Some(item.name.clone());
                 s.plans_failed += 1;
                 let archived = item.clone().with_result(serde_json::json!({
                     "exit_status": "fail",
@@ -470,58 +469,7 @@ pub(crate) async fn execute_queue_loop(
                 continue;
             }
         };
-        // Forward the queue item's submitter metadata into the run as per-call
-        // md (bluesky's `_metadata_per_call`, the highest-precedence merge
-        // layer), so keys the submitter attached land in RunStart. A non-object
-        // `meta` (or JSON null) contributes nothing. The plan supplies its own
-        // plan_name/plan_args at OpenRun, so md carries only the submitter keys.
-        let md: std::collections::HashMap<String, serde_json::Value> = item
-            .meta
-            .as_object()
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-            .unwrap_or_default();
-        let opts = RunOptions {
-            md,
-            subs: Vec::new(),
-        };
-        let run_result = re.run_async_with(plan, opts).await;
-        let exit_status = match &run_result {
-            Ok(r) => r.exit_status.clone(),
-            Err(_) => "fail".to_string(),
-        };
-        let run_uid = run_result
-            .as_ref()
-            .ok()
-            .and_then(|r| r.run_uids.last().cloned());
-        // Bookkeeping after the run.
-        {
-            let mut s = state.lock().unwrap();
-            s.plans_run += 1;
-            s.current_run_uid = run_uid.clone();
-            s.current_plan_name = None;
-            if let Some(uid) = &run_uid {
-                // Mark any prior entry for this uid as closed (shouldn't happen, but safe).
-                for entry in s.re_runs.iter_mut() {
-                    if &entry.0 == uid {
-                        entry.1 = false;
-                    }
-                }
-                s.re_runs.push((uid.clone(), false));
-                if s.re_runs.len() > 64 {
-                    let drop_n = s.re_runs.len() - 64;
-                    s.re_runs.drain(0..drop_n);
-                }
-            }
-            if exit_status == "abort" || exit_status == "fail" || exit_status == "halt" {
-                s.plans_failed += 1;
-            }
-        }
-        // Archive the item with its result.
-        let archived = item.clone().with_result(serde_json::json!({
-            "exit_status": exit_status,
-            "run_uid": run_uid,
-        }));
-        queue.lock().unwrap().push_history(archived);
+        let exit_status = run_plan_item(&re, &queue, &state, &item, plan).await;
         // Loop mode: re-enqueue at the back (bluesky's "loop" plan_queue_mode).
         if state
             .lock()
@@ -544,6 +492,105 @@ pub(crate) async fn execute_queue_loop(
             s.queue_autostart_enabled = false;
             return;
         }
+    }
+}
+
+/// Run one plan item through the worker machinery: manager state
+/// (`ExecutingQueue` + running-item fields), the run itself, run bookkeeping
+/// (`plans_run` / `plans_failed` / `re_runs`) and the history archive.
+/// Shared by the queue worker and `queue_item_execute` so an immediately
+/// executed item is accounted exactly like a queued one. Returns the exit
+/// status.
+async fn run_plan_item(
+    re: &Arc<RunEngine>,
+    queue: &Arc<StdMutex<PlanQueue>>,
+    state: &Arc<StdMutex<EngineState>>,
+    item: &crate::qs::queue::QueuedItem,
+    plan: crate::core::plan::Plan,
+) -> String {
+    {
+        let mut s = state.lock().unwrap();
+        s.state = Some(EState::ExecutingQueue);
+        s.current_plan_name = Some(item.name.clone());
+    }
+    // Forward the queue item's submitter metadata into the run as per-call
+    // md (bluesky's `_metadata_per_call`, the highest-precedence merge
+    // layer), so keys the submitter attached land in RunStart. A non-object
+    // `meta` (or JSON null) contributes nothing. The plan supplies its own
+    // plan_name/plan_args at OpenRun, so md carries only the submitter keys.
+    let md: std::collections::HashMap<String, serde_json::Value> = item
+        .meta
+        .as_object()
+        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default();
+    let opts = RunOptions {
+        md,
+        subs: Vec::new(),
+    };
+    let run_result = re.run_async_with(plan, opts).await;
+    let exit_status = match &run_result {
+        Ok(r) => r.exit_status.clone(),
+        Err(_) => "fail".to_string(),
+    };
+    let run_uid = run_result
+        .as_ref()
+        .ok()
+        .and_then(|r| r.run_uids.last().cloned());
+    // Bookkeeping after the run.
+    {
+        let mut s = state.lock().unwrap();
+        s.plans_run += 1;
+        s.current_run_uid = run_uid.clone();
+        s.current_plan_name = None;
+        if let Some(uid) = &run_uid {
+            // Mark any prior entry for this uid as closed (shouldn't happen, but safe).
+            for entry in s.re_runs.iter_mut() {
+                if &entry.0 == uid {
+                    entry.1 = false;
+                }
+            }
+            s.re_runs.push((uid.clone(), false));
+            if s.re_runs.len() > 64 {
+                let drop_n = s.re_runs.len() - 64;
+                s.re_runs.drain(0..drop_n);
+            }
+        }
+        if exit_status == "abort" || exit_status == "fail" || exit_status == "halt" {
+            s.plans_failed += 1;
+        }
+    }
+    // Archive the item with its result.
+    let archived = item.clone().with_result(serde_json::json!({
+        "exit_status": exit_status,
+        "run_uid": run_uid,
+    }));
+    queue.lock().unwrap().push_history(archived);
+    exit_status
+}
+
+/// Run a single item outside the queue (`queue_item_execute`, ref:
+/// manager.py:2744 `_queue_item_execute_handler`): the item is never
+/// queued, loop mode does not re-enqueue it, and the queue is NOT started
+/// afterwards — the manager returns to idle. Results are archived to the
+/// plan history exactly like a queued item.
+pub(crate) async fn execute_single_item(
+    re: Arc<RunEngine>,
+    queue: Arc<StdMutex<PlanQueue>>,
+    state: Arc<StdMutex<EngineState>>,
+    task_slot: Arc<StdMutex<Option<AbortHandle>>>,
+    item: crate::qs::queue::QueuedItem,
+    plan: crate::core::plan::Plan,
+) {
+    let _slot_guard = ClearOnDrop(task_slot.clone());
+    let exit_status = run_plan_item(&re, &queue, &state, &item, plan).await;
+    let mut s = state.lock().unwrap();
+    s.state = Some(EState::Idle);
+    s.pause_pending = false;
+    // A failed/interrupted item deactivates autostart, same as a queued
+    // plan (ref: manager.py:852 — the plan-state path is shared between
+    // queued and immediate execution).
+    if exit_status != "success" {
+        s.queue_autostart_enabled = false;
     }
 }
 

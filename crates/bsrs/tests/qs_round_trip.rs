@@ -2258,6 +2258,92 @@ fn register_failing_plan(reg: &mut Registry, name: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_item_execute_runs_in_background_with_bookkeeping() {
+    let mut reg = Registry::new();
+    register_pausable_loop(&mut reg, "pausable_loop");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    rpc(&req, "environment_open", json!({}));
+    // Loop mode on: an immediately-executed item must NOT be re-queued
+    // (ref: manager.py:2751-2753).
+    rpc(&req, "queue_mode_set", json!({"mode": {"loop": true}}));
+
+    // The response returns immediately with the item echo, while the
+    // plan is still running.
+    let r = rpc(
+        &req,
+        "queue_item_execute",
+        json!({"item": {"name": "pausable_loop", "args": []}}),
+    );
+    assert_eq!(r["success"], true, "{r}");
+    assert_eq!(r["item"]["name"], "pausable_loop", "{r}");
+    assert!(r["item"]["item_uid"].is_string(), "{r}");
+
+    // The control plane stays responsive while the item executes.
+    let r = poll_status(&req, |s| s["manager_state"] == "executing_queue").await;
+    assert_eq!(r["manager_state"], "executing_queue", "{r}");
+    assert_eq!(r["running_item_name"], "pausable_loop", "{r}");
+
+    // A second immediate execution is rejected while one is running.
+    let r = rpc(
+        &req,
+        "queue_item_execute",
+        json!({"item": {"name": "pausable_loop", "args": []}}),
+    );
+    assert_eq!(r["success"], false, "must reject while executing: {r}");
+
+    // Stop ends the run; the result must be archived with full bookkeeping.
+    rpc(&req, "re_stop", json!({}));
+    let r = poll_status(&req, |s| {
+        s["manager_state"] == "idle" && s["items_in_history"] == 1
+    })
+    .await;
+    assert_eq!(r["items_in_history"], 1, "result must be archived: {r}");
+    assert_eq!(r["plans_run"], 1, "{r}");
+    assert_eq!(r["items_in_queue"], 0, "loop mode must not re-queue: {r}");
+
+    let r = rpc(&req, "history_get", json!({}));
+    assert_eq!(r["items"][0]["name"], "pausable_loop", "{r}");
+    assert_eq!(r["items"][0]["result"]["exit_status"], "success", "{r}");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_item_execute_failure_is_archived() {
+    let mut reg = Registry::new();
+    register_failing_plan(&mut reg, "failing_plan");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    rpc(&req, "environment_open", json!({}));
+    let r = rpc(
+        &req,
+        "queue_item_execute",
+        json!({"item": {"name": "failing_plan", "args": []}}),
+    );
+    assert_eq!(r["success"], true, "execution start must succeed: {r}");
+
+    let r = poll_status(&req, |s| {
+        s["manager_state"] == "idle" && s["items_in_history"] == 1
+    })
+    .await;
+    assert_eq!(r["items_in_history"], 1, "{r}");
+    assert_eq!(r["plans_run"], 1, "{r}");
+    assert_eq!(r["plans_failed"], 1, "{r}");
+
+    let r = rpc(&req, "history_get", json!({}));
+    assert_eq!(r["items"][0]["result"]["exit_status"], "fail", "{r}");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn autostart_runs_added_items_without_queue_start() {
     let mut reg = Registry::new();
     reg.register_plan_count("count");
