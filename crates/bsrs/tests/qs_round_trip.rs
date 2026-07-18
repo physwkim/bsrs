@@ -2608,3 +2608,22 @@ async fn autostart_disabled_by_plan_failure() {
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
+
+// A server leaked without `shutdown()` — as any panicking test in this
+// suite effectively does — must not block the tokio runtime's drop.
+// With the rep loop on the blocking pool (pre-fix), runtime shutdown
+// waited forever for it and every assertion failure in this suite
+// presented as a whole-binary hang; on a plain thread the runtime drop
+// returns and the leaked thread dies with the process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn leaked_server_does_not_hang_test_shutdown() {
+    let mut reg = Registry::new();
+    reg.register_plan_count("count");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+    let r = rpc(&req, "ping", json!({}));
+    assert_eq!(r["success"], true, "{r}");
+    // Intentionally NO shutdown.shutdown(): the test passes iff the
+    // runtime drop after this body returns instead of hanging.
+}

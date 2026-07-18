@@ -245,9 +245,13 @@ impl Server {
         ServerBuilder::default()
     }
 
-    /// Async entry point. The REP-socket loop runs on a dedicated blocking
-    /// thread (libzmq REP is sync in the `zmq` crate). Plan execution
-    /// happens on the bsrs runtime.
+    /// Async entry point. The REP-socket loop runs on a dedicated plain
+    /// `std::thread` (libzmq REP is sync in the `zmq` crate) — NOT on the
+    /// tokio blocking pool: runtime shutdown waits for blocking-pool tasks,
+    /// so a server leaked without [`ServerShutdown::shutdown`] (e.g. a
+    /// panicking test) would deadlock the runtime drop. A plain thread is
+    /// not waited on; it exits with the process. Plan execution happens on
+    /// the bsrs runtime via the captured handle.
     pub async fn run_async(&self) -> Result<()> {
         let socket = self.socket.clone();
         let registry = self.registry.clone();
@@ -260,26 +264,32 @@ impl Server {
         let lua_evaluator = self.lua_evaluator.clone();
         let task_tracker = self.task_tracker.clone();
         let checkpoint_hook = self.checkpoint_hook.clone();
+        let rt = tokio::runtime::Handle::current();
 
-        let join = tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Handle::current();
-            rep_loop(
-                rt,
-                socket,
-                registry,
-                queue,
-                state,
-                engine,
-                document_sink,
-                queue_task,
-                permissions,
-                lua_evaluator,
-                task_tracker,
-                checkpoint_hook,
-            )
-        });
-        join.await
-            .map_err(|e| BsrsError::Backend(format!("rep loop join: {e}")))?
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("bsrs-qs-rep".into())
+            .spawn(move || {
+                let result = rep_loop(
+                    rt,
+                    socket,
+                    registry,
+                    queue,
+                    state,
+                    engine,
+                    document_sink,
+                    queue_task,
+                    permissions,
+                    lua_evaluator,
+                    task_tracker,
+                    checkpoint_hook,
+                );
+                let _ = done_tx.send(result);
+            })
+            .map_err(|e| BsrsError::Backend(format!("rep thread spawn: {e}")))?;
+        done_rx.await.map_err(|_| {
+            BsrsError::Backend("rep loop exited without a result (panicked?)".into())
+        })?
     }
 
     /// Sync entry point.

@@ -1393,7 +1393,9 @@ fn queue_item_execute(
     // Run through the shared worker machinery in the background — the
     // response means "execution started"; the result is archived to the
     // plan history (ref: manager.py:2744 `_queue_item_execute_handler`).
-    let join = tokio::spawn(crate::qs::server::execute_single_item(
+    // rt.spawn (not tokio::spawn): dispatch runs on the plain rep thread,
+    // which has no ambient runtime context.
+    let join = rt.spawn(crate::qs::server::execute_single_item(
         re,
         queue.clone(),
         state.clone(),
@@ -1437,7 +1439,9 @@ fn queue_start(
         None => return err("cannot start: a queue worker is already running"),
     };
     let generation = claim.generation();
-    let join = tokio::spawn(crate::qs::server::execute_queue_loop(
+    // rt.spawn (not tokio::spawn): dispatch runs on the plain rep thread,
+    // which has no ambient runtime context.
+    let join = rt.spawn(crate::qs::server::execute_queue_loop(
         re,
         registry.clone(),
         queue.clone(),
