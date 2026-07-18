@@ -1,12 +1,20 @@
 //! Disk-backed [`CheckpointHook`] for crash-recovery audit trails.
 //!
-//! Every `Msg::Checkpoint` the engine emits gets appended to a JSONL
-//! file (default `~/.bsrs/checkpoints.jsonl`). Every `CloseRun`
-//! appends a paired record with `exit_status` set. On daemon
-//! restart, `manager.rs` calls [`JsonlCheckpointStore::unfinished_run`]
-//! to detect runs that opened, hit at least one checkpoint, but never
-//! emitted a paired close — i.e. runs that were abandoned when the
-//! daemon went down.
+//! `Msg::Checkpoint` records are appended to a JSONL file (default
+//! `~/.bsrs/checkpoints.jsonl`); consecutive checkpoints of the same
+//! run are coalesced to at most one record per second, so file growth
+//! is bounded by plan wall-clock time, not event rate (a per-point
+//! checkpointing plan at engine speed would otherwise write millions
+//! of lines per minute). Every `CloseRun` appends a paired record with
+//! `exit_status` set, always. On daemon restart, `manager.rs` calls
+//! [`JsonlCheckpointStore::unfinished_run`] to detect a run that
+//! opened, hit at least one checkpoint, but never emitted a paired
+//! close — i.e. was abandoned when the daemon went down.
+//!
+//! Readers ([`JsonlCheckpointStore::latest`] / `unfinished_run`) look
+//! only at the file **tail**: runs are serialized per daemon, so the
+//! last record *is* the daemon's final state. Boot cost is therefore
+//! independent of journal size.
 //!
 //! Full crash-recovery (resume the plan from the last checkpoint) is
 //! still deferred — it requires plan-arg persistence and msg_cache
@@ -15,7 +23,7 @@
 //! to re-issue the plan manually.
 
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -43,6 +51,16 @@ pub struct CheckpointRecord {
     pub exit_status: Option<String>,
 }
 
+/// Minimum spacing between two appended mid-run checkpoint records of
+/// the same run. Close records (`exit_status: Some`) and the first
+/// checkpoint of a run are never throttled.
+const MID_RUN_APPEND_INTERVAL_NS: u64 = 1_000_000_000;
+
+/// How far back from EOF the tail readers scan for the last complete
+/// record. ~600 records at the current record size — far more than the
+/// one complete line they need even with a torn final write.
+const TAIL_SCAN_BYTES: u64 = 64 * 1024;
+
 /// Append-only checkpoint store. The file is opened lazily on the
 /// first append and held for the daemon's lifetime; OS writeback
 /// flushes the line buffer.
@@ -51,6 +69,9 @@ pub struct JsonlCheckpointStore {
     /// `None` until the first append succeeds. Behind a mutex so the
     /// `CheckpointHook` (Fn) can mutate it.
     file: StdMutex<Option<std::fs::File>>,
+    /// `(run_uid, timestamp_ns)` of the last appended **mid-run**
+    /// checkpoint — the throttle state for coalescing.
+    last_mid_run: StdMutex<Option<(Option<String>, u64)>>,
 }
 
 impl JsonlCheckpointStore {
@@ -59,6 +80,7 @@ impl JsonlCheckpointStore {
         Self {
             path: path.into(),
             file: StdMutex::new(None),
+            last_mid_run: StdMutex::new(None),
         }
     }
 
@@ -102,8 +124,28 @@ impl JsonlCheckpointStore {
 
     /// Wrap as a [`CheckpointHook`]. The returned `Arc` can be
     /// passed straight to `RunEngine::set_checkpoint_hook`.
+    ///
+    /// Mid-run checkpoints of the same run are coalesced to one
+    /// appended record per [`MID_RUN_APPEND_INTERVAL_NS`]; the first
+    /// checkpoint of a run and every close record (`exit_status:
+    /// Some`) are appended unconditionally.
     pub fn into_hook(self: Arc<Self>) -> CheckpointHook {
         Arc::new(move |snap: CheckpointSnapshot| {
+            if snap.exit_status.is_none() {
+                let mut last = self.last_mid_run.lock().unwrap();
+                if let Some((uid, ts)) = last.as_ref() {
+                    if *uid == snap.run_uid
+                        && snap.timestamp_ns.saturating_sub(*ts) < MID_RUN_APPEND_INTERVAL_NS
+                    {
+                        return; // coalesced
+                    }
+                }
+                *last = Some((snap.run_uid.clone(), snap.timestamp_ns));
+            } else {
+                // Run ended: reset so the next run's first checkpoint
+                // always lands.
+                *self.last_mid_run.lock().unwrap() = None;
+            }
             self.append(&CheckpointRecord {
                 timestamp_ns: snap.timestamp_ns,
                 run_uid: snap.run_uid,
@@ -113,60 +155,51 @@ impl JsonlCheckpointStore {
         })
     }
 
-    /// Return the most recent record from the file (last JSONL line).
-    /// `None` if the file is missing or empty. Errors are logged
-    /// and surfaced as `None`.
+    /// Return the most recent record (last complete JSONL line),
+    /// reading only the file tail — cost is independent of journal
+    /// size. `None` if the file is missing or empty; a torn final
+    /// line (crash mid-write) falls back to the previous complete
+    /// record. Errors are logged and surfaced as `None`.
     pub fn latest(path: &Path) -> Option<CheckpointRecord> {
-        let text = match std::fs::read_to_string(path) {
+        let tail = match read_tail(path, TAIL_SCAN_BYTES) {
             Ok(t) => t,
             Err(_) => return None,
         };
-        let last = text.lines().rev().find(|l| !l.trim().is_empty())?;
-        match serde_json::from_str(last) {
-            Ok(r) => Some(r),
-            Err(e) => {
-                tracing::warn!("checkpoint store: parse last record: {e}");
-                None
+        for line in tail.lines().rev().filter(|l| !l.trim().is_empty()) {
+            match serde_json::from_str(line) {
+                Ok(r) => return Some(r),
+                Err(e) => {
+                    tracing::warn!("checkpoint store: parse tail record: {e}");
+                }
             }
         }
+        None
     }
 
-    /// Walk the file front-to-back and return the most recent record
-    /// for a run-uid that hit at least one mid-run `Checkpoint`
-    /// (`exit_status = None`) and has **no** subsequent close record
-    /// (`exit_status = Some(...)`) for the same run-uid. That
-    /// signature is what an abandoned run leaves behind: the engine
-    /// reached a safe point and then never closed the run before the
-    /// daemon went down.
+    /// Return the abandoned run the journal ends in, if any: the run
+    /// is unfinished iff the **last** record is a mid-run checkpoint
+    /// (`exit_status = None`) with a run uid. Runs are serialized per
+    /// daemon, so the journal tail is the daemon's final state — a
+    /// run that was abandoned but *followed by later runs* is
+    /// superseded and no longer reported (the crash was already
+    /// surfaced at the boot right after it happened).
     ///
-    /// Returns `None` if the file is missing, empty, or every
+    /// Returns `None` if the file is missing, empty, or the last
     /// checkpointed run was cleanly closed.
     pub fn unfinished_run(path: &Path) -> Option<CheckpointRecord> {
-        let text = std::fs::read_to_string(path).ok()?;
-        // Most-recent-wins for each run_uid; close records remove the
-        // entry so only abandoned runs remain at the end.
-        let mut open: std::collections::HashMap<String, CheckpointRecord> =
-            std::collections::HashMap::new();
-        for line in text.lines().filter(|l| !l.trim().is_empty()) {
-            let rec: CheckpointRecord = match serde_json::from_str(line) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!("checkpoint store: parse record: {e}");
-                    continue;
-                }
-            };
-            let Some(uid) = rec.run_uid.clone() else {
-                continue;
-            };
-            if rec.exit_status.is_some() {
-                open.remove(&uid);
-            } else {
-                open.insert(uid, rec);
-            }
-        }
-        // Pick the most recent unfinished entry.
-        open.into_values().max_by_key(|r| r.timestamp_ns)
+        Self::latest(path).filter(|r| r.exit_status.is_none() && r.run_uid.is_some())
     }
+}
+
+/// Read at most `max_bytes` from the end of the file as (lossy) UTF-8.
+fn read_tail(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    let start = len.saturating_sub(max_bytes);
+    f.seek(SeekFrom::Start(start))?;
+    let mut buf = Vec::with_capacity((len - start) as usize);
+    f.read_to_end(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Default path: `$XDG_STATE_HOME/bsrs/checkpoints.jsonl` if set,
@@ -291,5 +324,114 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nonexistent.jsonl");
         assert!(JsonlCheckpointStore::latest(&path).is_none());
+    }
+
+    fn mid(uid: &str, ts: u64) -> CheckpointSnapshot {
+        CheckpointSnapshot {
+            timestamp_ns: ts,
+            run_uid: Some(uid.into()),
+            exit_status: None,
+        }
+    }
+
+    fn file_lines(path: &Path) -> usize {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count()
+    }
+
+    #[test]
+    fn mid_run_checkpoints_coalesce_within_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ckpt.jsonl");
+        let store = Arc::new(JsonlCheckpointStore::new(&path));
+        let hook = store.clone().into_hook();
+        // Sub-second checkpoints of one run collapse into the first.
+        hook(mid("r1", 0));
+        hook(mid("r1", 100_000_000));
+        hook(mid("r1", 200_000_000));
+        // ≥1 s after the last APPENDED record: lands.
+        hook(mid("r1", 1_100_000_000));
+        // Close always lands.
+        hook(CheckpointSnapshot {
+            timestamp_ns: 1_200_000_000,
+            run_uid: Some("r1".into()),
+            exit_status: Some("success".into()),
+        });
+        *store.file.lock().unwrap() = None;
+        assert_eq!(file_lines(&path), 3, "first + 1s-later + close");
+        let last = JsonlCheckpointStore::latest(&path).unwrap();
+        assert_eq!(last.exit_status.as_deref(), Some("success"));
+    }
+
+    #[test]
+    fn run_change_bypasses_the_throttle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ckpt.jsonl");
+        let store = Arc::new(JsonlCheckpointStore::new(&path));
+        let hook = store.clone().into_hook();
+        hook(mid("r1", 0));
+        hook(mid("r2", 100_000_000)); // new run: not throttled
+        *store.file.lock().unwrap() = None;
+        assert_eq!(file_lines(&path), 2);
+    }
+
+    #[test]
+    fn superseded_abandoned_run_is_not_reported() {
+        // r1 was abandoned, but r2 ran and closed cleanly afterwards:
+        // the journal ends in a clean close, so boot reports nothing.
+        // (The whole-file semantics this replaces re-warned about r1
+        // on every boot forever.)
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ckpt.jsonl");
+        let store = Arc::new(JsonlCheckpointStore::new(&path));
+        let hook = store.clone().into_hook();
+        hook(mid("r1", 1_000));
+        hook(mid("r2", 2_000_000_000));
+        hook(CheckpointSnapshot {
+            timestamp_ns: 3_000_000_000,
+            run_uid: Some("r2".into()),
+            exit_status: Some("success".into()),
+        });
+        *store.file.lock().unwrap() = None;
+        assert!(JsonlCheckpointStore::unfinished_run(&path).is_none());
+    }
+
+    #[test]
+    fn tail_read_finds_last_record_in_a_journal_larger_than_the_scan_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.jsonl");
+        let mut text = String::new();
+        for i in 0..2_000u64 {
+            text.push_str(&format!(
+                "{{\"timestamp_ns\":{},\"run_uid\":\"r{}\",\"bsrs_version\":\"0.3.0\"}}\n",
+                i * 1_000,
+                i
+            ));
+        }
+        assert!(
+            text.len() as u64 > TAIL_SCAN_BYTES,
+            "must exceed the window"
+        );
+        std::fs::write(&path, text).unwrap();
+        let last = JsonlCheckpointStore::latest(&path).expect("latest");
+        assert_eq!(last.run_uid.as_deref(), Some("r1999"));
+    }
+
+    #[test]
+    fn torn_final_line_falls_back_to_previous_record() {
+        // Crash mid-write leaves a partial last line with no newline.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("torn.jsonl");
+        std::fs::write(
+            &path,
+            "{\"timestamp_ns\":1000,\"run_uid\":\"good\",\"bsrs_version\":\"0.3.0\"}\n\
+             {\"timestamp_ns\":2000,\"run_",
+        )
+        .unwrap();
+        let last = JsonlCheckpointStore::latest(&path).expect("fallback record");
+        assert_eq!(last.run_uid.as_deref(), Some("good"));
     }
 }

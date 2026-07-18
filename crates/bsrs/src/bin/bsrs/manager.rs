@@ -49,12 +49,14 @@ pub struct ManagerArgs {
     #[arg(long)]
     permissions: Option<std::path::PathBuf>,
 
-    /// Optional path to the checkpoint JSONL file. Each
-    /// `Msg::Checkpoint` the engine emits is appended as one record
-    /// (timestamp + run_uid + bsrs version). On startup, if the
-    /// file already exists, the latest record is logged so an
-    /// operator can answer "where was the engine when the daemon
-    /// went down?". Default: `~/.bsrs/checkpoints.jsonl`.
+    /// Optional path to the checkpoint JSONL file. Engine
+    /// `Msg::Checkpoint`s are appended as records (timestamp +
+    /// run_uid + bsrs version), coalesced to at most one per second
+    /// per run; every run close is appended with its exit status. On
+    /// startup the journal tail is read (cost independent of file
+    /// size) and the latest record logged so an operator can answer
+    /// "where was the engine when the daemon went down?".
+    /// Default: `~/.bsrs/checkpoints.jsonl`.
     #[arg(long)]
     checkpoints: Option<std::path::PathBuf>,
 
