@@ -35,16 +35,18 @@ fn bsrs_bin() -> std::path::PathBuf {
 struct Manager {
     child: Child,
     control: String,
+    checkpoints: String,
 }
 
 impl Drop for Manager {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        // Also clean up the IPC socket files we used.
+        // Also clean up the IPC socket + checkpoint files we used.
         if let Some(p) = self.control.strip_prefix("ipc://") {
             let _ = std::fs::remove_file(p);
         }
+        let _ = std::fs::remove_file(&self.checkpoints);
     }
 }
 
@@ -63,6 +65,10 @@ fn spawn_manager() -> Manager {
         std::process::id(),
         id
     );
+    // Isolate the checkpoint journal: without --checkpoints the daemon
+    // reads/writes the user-global ~/.bsrs/checkpoints.jsonl, so tests
+    // would both pollute real operator state and inherit its size.
+    let checkpoints = format!("/tmp/bsrs-cli-it-{}-{}-ckpt.jsonl", std::process::id(), id);
     let child = Command::new(bsrs_bin())
         .args([
             "qs-manager",
@@ -70,6 +76,8 @@ fn spawn_manager() -> Manager {
             &control,
             "--documents",
             &documents,
+            "--checkpoints",
+            &checkpoints,
             "--soft-detectors",
             "1",
             "--soft-motors",
@@ -85,7 +93,11 @@ fn spawn_manager() -> Manager {
     while Instant::now() < deadline {
         if std::path::Path::new(path).exists() {
             sleep(Duration::from_millis(50));
-            return Manager { child, control };
+            return Manager {
+                child,
+                control,
+                checkpoints,
+            };
         }
         sleep(Duration::from_millis(20));
     }
