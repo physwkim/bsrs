@@ -401,6 +401,8 @@ pub(crate) async fn execute_queue_loop(
             let mut s = state.lock().unwrap();
             s.queue_stop_pending = false;
             s.pause_pending = false;
+            // Stopping the queue deactivates autostart (ref: manager.py:1080,1161).
+            s.queue_autostart_enabled = false;
             s.state = Some(EState::Idle);
             return;
         }
@@ -532,11 +534,14 @@ pub(crate) async fn execute_queue_loop(
             queue.lock().unwrap().push_back(item);
         }
         // On non-success, idle out (matches bluesky behaviour: queue_start
-        // halts on error).
+        // halts on error). A failed/interrupted plan also deactivates
+        // autostart; a normal drain to an empty queue keeps it enabled
+        // (ref: manager.py:852,1085).
         if exit_status != "success" {
             let mut s = state.lock().unwrap();
             s.state = Some(EState::Idle);
             s.pause_pending = false;
+            s.queue_autostart_enabled = false;
             return;
         }
     }

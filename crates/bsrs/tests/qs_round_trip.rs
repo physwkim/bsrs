@@ -2242,3 +2242,163 @@ async fn queue_autostart_param_is_validated() {
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
+
+/// Register a plan that opens a run and then fails (`Msg::Fail` → run error →
+/// exit_status "fail").
+fn register_failing_plan(reg: &mut Registry, name: &str) {
+    use bsrs::core::msg::Msg;
+    use bsrs::core::plan::plan_box;
+    let factory: bsrs::qs::PlanFactory = Arc::new(move |_reg, _args| {
+        Ok(plan_box(async_stream::stream! {
+            yield Msg::OpenRun(Default::default());
+            yield Msg::Fail("intentional test failure".into());
+        }))
+    });
+    reg.register_plan(name, factory);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn autostart_runs_added_items_without_queue_start() {
+    let mut reg = Registry::new();
+    reg.register_plan_count("count");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    // Arm autostart and queue an item before the environment exists:
+    // nothing may start yet.
+    let r = rpc(&req, "queue_autostart", json!({"enable": true}));
+    assert_eq!(r["success"], true, "{r}");
+    let r = rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": []}}),
+    );
+    assert_eq!(r["success"], true, "{r}");
+    let r = rpc(&req, "status", json!({}));
+    assert_eq!(r["items_in_queue"], 1, "no env, must not start: {r}");
+
+    // Opening the environment triggers the pending autostart — no queue_start.
+    let r = rpc(&req, "environment_open", json!({}));
+    assert_eq!(r["success"], true, "{r}");
+    let r = poll_status(&req, |s| {
+        s["items_in_history"] == 1 && s["manager_state"] == "idle"
+    })
+    .await;
+    assert_eq!(r["items_in_history"], 1, "item did not run: {r}");
+    assert_eq!(r["items_in_queue"], 0, "{r}");
+    assert_eq!(
+        r["queue_autostart_enabled"], true,
+        "a successful run keeps autostart armed: {r}"
+    );
+
+    // Adding another item while idle starts it immediately.
+    rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": []}}),
+    );
+    let r = poll_status(&req, |s| {
+        s["items_in_history"] == 2 && s["manager_state"] == "idle"
+    })
+    .await;
+    assert_eq!(r["items_in_history"], 2, "second item did not run: {r}");
+    assert_eq!(r["queue_autostart_enabled"], true, "{r}");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn autostart_disabled_by_queue_stop_instruction() {
+    let mut reg = Registry::new();
+    reg.register_plan_count("count");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    rpc(&req, "environment_open", json!({}));
+    // Load the queue while autostart is off so the layout is deterministic:
+    // [count, queue_stop instruction, count].
+    for item in [
+        json!({"name": "count", "args": []}),
+        json!({"item_type": "instruction", "name": "queue_stop"}),
+        json!({"name": "count", "args": []}),
+    ] {
+        let r = rpc(&req, "queue_item_add", json!({ "item": item }));
+        assert_eq!(r["success"], true, "{r}");
+    }
+
+    // Enabling autostart starts the queue; the instruction stops it after
+    // the first plan and must deactivate autostart (ref: manager.py:1161).
+    rpc(&req, "queue_autostart", json!({"enable": true}));
+    let r = poll_status(&req, |s| {
+        s["items_in_history"] == 2 && s["manager_state"] == "idle"
+    })
+    .await;
+    assert_eq!(r["items_in_history"], 2, "plan + instruction: {r}");
+    assert_eq!(r["items_in_queue"], 1, "third item stays queued: {r}");
+    assert_eq!(
+        r["queue_autostart_enabled"], false,
+        "queue_stop must deactivate autostart: {r}"
+    );
+
+    // With autostart off, a new item must not start anything.
+    rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": []}}),
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let r = rpc(&req, "status", json!({}));
+    assert_eq!(r["manager_state"], "idle", "{r}");
+    assert_eq!(r["items_in_queue"], 2, "{r}");
+    assert_eq!(r["items_in_history"], 2, "{r}");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn autostart_disabled_by_plan_failure() {
+    let mut reg = Registry::new();
+    reg.register_plan_count("count");
+    register_failing_plan(&mut reg, "failing_plan");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    rpc(&req, "environment_open", json!({}));
+    rpc(&req, "queue_autostart", json!({"enable": true}));
+    rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "failing_plan", "args": []}}),
+    );
+
+    let r = poll_status(&req, |s| {
+        s["items_in_history"] == 1 && s["manager_state"] == "idle"
+    })
+    .await;
+    assert_eq!(r["items_in_history"], 1, "failing plan did not run: {r}");
+    assert_eq!(r["plans_failed"], 1, "{r}");
+    assert_eq!(
+        r["queue_autostart_enabled"], false,
+        "a failed plan must deactivate autostart (ref: manager.py:852): {r}"
+    );
+
+    // With autostart off, a new item must not start anything.
+    rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": []}}),
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let r = rpc(&req, "status", json!({}));
+    assert_eq!(r["manager_state"], "idle", "{r}");
+    assert_eq!(r["items_in_queue"], 1, "{r}");
+    assert_eq!(r["items_in_history"], 1, "{r}");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}

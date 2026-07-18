@@ -143,7 +143,12 @@ pub(crate) fn dispatch(
 
         // -- environment --------------------------------------------------
         "environment_open" => {
-            env_open(document_sink, &state, &engine, rt, checkpoint_hook.as_ref())
+            let r = env_open(document_sink, &state, &engine, rt, checkpoint_hook.as_ref());
+            // Opening the env can make an armed queue runnable (ref: manager.py:563).
+            if r["success"] == true {
+                maybe_autostart(&registry, &queue, &state, &engine, rt, &queue_task);
+            }
+            r
         }
         "environment_close" => env_close(&state, &engine, rt),
         "environment_destroy" => env_destroy(&state, &engine, &queue_task, rt),
@@ -155,8 +160,22 @@ pub(crate) fn dispatch(
             queue.lock().unwrap().clear();
             json!({"success": true, "msg": ""})
         }
-        "queue_item_add" => queue_item_add(&registry, &queue, &req.params),
-        "queue_item_add_batch" => queue_item_add_batch(&registry, &queue, &req.params),
+        "queue_item_add" => {
+            let r = queue_item_add(&registry, &queue, &req.params);
+            // A new item can make an armed queue runnable (ref: manager.py:2403).
+            if r["success"] == true {
+                maybe_autostart(&registry, &queue, &state, &engine, rt, &queue_task);
+            }
+            r
+        }
+        "queue_item_add_batch" => {
+            let r = queue_item_add_batch(&registry, &queue, &req.params);
+            // Same trigger as queue_item_add (ref: manager.py:2508).
+            if r["success"] == true {
+                maybe_autostart(&registry, &queue, &state, &engine, rt, &queue_task);
+            }
+            r
+        }
         "queue_item_update" => queue_item_update(&queue, &req.params),
         "queue_item_get" => queue_item_get(&queue, &req.params),
         "queue_item_remove" => queue_item_remove(&queue, &req.params),
@@ -187,6 +206,11 @@ pub(crate) fn dispatch(
                 }
             };
             state.lock().unwrap().queue_autostart_enabled = enable;
+            // Enabling starts a runnable queue right away (ref: manager.py:1284
+            // `_autostart_enable` spawns the task, which checks immediately).
+            if enable {
+                maybe_autostart(&registry, &queue, &state, &engine, rt, &queue_task);
+            }
             json!({"success": true, "msg": ""})
         }
         "queue_mode_set" => {
@@ -1362,6 +1386,26 @@ fn queue_start(
     ));
     *task_slot.lock().unwrap() = Some(join.abort_handle());
     json!({"success": true, "msg": ""})
+}
+
+/// Event-driven autostart (ref: manager.py:1253-1306 `_autostart_task` /
+/// `_autostart_push`): every event that can make the queue runnable —
+/// item added, environment opened, autostart enabled — attempts a start.
+/// `queue_start` stays the single owner of the start transition and
+/// re-checks manager state and environment, so a losing race is just a
+/// rejected call, never a second worker.
+fn maybe_autostart(
+    registry: &Arc<Registry>,
+    queue: &Arc<StdMutex<PlanQueue>>,
+    state: &Arc<StdMutex<EngineState>>,
+    engine: &Arc<Mutex<Option<Arc<RunEngine>>>>,
+    rt: &tokio::runtime::Handle,
+    queue_task: &Arc<StdMutex<Option<AbortHandle>>>,
+) {
+    if !state.lock().unwrap().queue_autostart_enabled || queue.lock().unwrap().is_empty() {
+        return;
+    }
+    let _ = queue_start(registry, queue, state, engine, rt, queue_task);
 }
 
 fn re_pause(
