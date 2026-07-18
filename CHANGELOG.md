@@ -4,6 +4,50 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-07-18
+
+Hardening release: closes a family of queue-server correctness and shutdown
+races, resolves engine interrupt/pause edge cases, fixes the HDF5 stream writer
+and frame sources, and bounds the on-disk crash-recovery journal so it can no
+longer grow without limit.
+
+### Added
+
+- **Checkpoint journal size rotation.** The crash-recovery journal
+  (`~/.bsrs/checkpoints.jsonl`) now rotates at a byte threshold
+  (`DEFAULT_MAX_BYTES`, 4 MiB) to a single `.1` backup, bounding total on-disk
+  size to roughly twice the threshold regardless of run count.
+
+### Changed
+
+- Bumped `rust-hdf5` from 0.2 to 0.3.
+
+### Fixed
+
+- **Queue server**: stop the queue and disable autostart when an item cannot
+  start, instead of silently skipping it; a generation-stamped queue-task slot
+  closes the spawn/register/stale-clear abort-handle races; wire the documented
+  but previously never-recorded metrics (queue depth, run/document counters);
+  run the REP loop on a dedicated thread so a leaked server can no longer
+  deadlock runtime drop; guard `environment_close` against live execution and
+  validate `environment_destroy` before side effects; run `queue_item_execute`
+  through the worker machinery rather than blocking the REP thread; make
+  `queue_autostart` actually start the queue and validate its arguments instead
+  of silently disabling; reject `re_pause` when no plan is running; derive
+  paused manager/RE state live from the engine.
+- **Engine**: resolve interrupts landing inside cancellable handlers by flag
+  rather than surfacing them as plan failures; reset `deferred_pause` at run
+  start like the other interrupt flags.
+- **Stream**: create the HDF5 dataset on its leaf group instead of via a
+  file-rooted deep path (deep-path creation produced h5py-unreadable files);
+  use a `std` `Mutex` in the `FrameSource` impls so `frames()` works when called
+  from a runtime thread.
+- **Checkpoint journal**: bound the journal by wall-clock (mid-run checkpoints
+  coalesce to at most one per second per run) and read only the file tail on
+  startup, making boot cost independent of journal size.
+- **Doctor**: flag a 4xx response from the tiled probe instead of reporting
+  `[ok]`.
+
 ## [0.3.0] - 2026-07-06
 
 Feature release on top of the consolidated single-crate workspace: a much
@@ -240,5 +284,6 @@ wire- and behaviour-parity with the upstream Python projects.
 
 - `doc/gap-analysis/`: bluesky/ophyd/ophyd-async parity gap inventory.
 
+[0.4.0]: https://github.com/physwkim/bsrs/releases/tag/v0.4.0
 [0.2.0]: https://github.com/physwkim/bsrs/releases/tag/v0.2.0
 [0.1.0]: https://github.com/physwkim/bsrs/releases/tag/v0.1.0
