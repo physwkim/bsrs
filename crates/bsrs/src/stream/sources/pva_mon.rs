@@ -19,7 +19,7 @@ use epics_pva_rs::pvdata::TypedScalarArray;
 use epics_pva_rs::{PvField, PvStructure, ScalarValue};
 use futures::stream::{BoxStream, StreamExt};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -37,7 +37,9 @@ pub struct PvaMonitorSource {
     client: Arc<PvaClient>,
     seq: Arc<AtomicU64>,
     cancel: CancellationToken,
-    queue: tokio::sync::Mutex<Option<mpsc::Receiver<Frame>>>,
+    /// `frames()` is a sync trait method that may be called from inside a
+    /// tokio runtime, so this must be a std mutex (no await under the lock).
+    queue: Mutex<Option<mpsc::Receiver<Frame>>>,
 }
 
 impl PvaMonitorSource {
@@ -48,7 +50,7 @@ impl PvaMonitorSource {
             client,
             seq: Arc::new(AtomicU64::new(0)),
             cancel: CancellationToken::new(),
-            queue: tokio::sync::Mutex::new(None),
+            queue: Mutex::new(None),
         }
     }
 }
@@ -65,7 +67,7 @@ impl Drop for PvaMonitorSource {
 #[async_trait]
 impl FrameSource for PvaMonitorSource {
     fn frames(&self) -> BoxStream<'static, Frame> {
-        let mut g = self.queue.blocking_lock();
+        let mut g = self.queue.lock().unwrap();
         if let Some(rx) = g.take() {
             return tokio_stream::wrappers::ReceiverStream::new(rx).boxed();
         }
@@ -73,7 +75,7 @@ impl FrameSource for PvaMonitorSource {
     }
     async fn start(&self) -> Result<()> {
         let (tx, rx) = mpsc::channel::<Frame>(64);
-        *self.queue.lock().await = Some(rx);
+        *self.queue.lock().unwrap() = Some(rx);
         let pv = self.pv.clone();
         let client = self.client.clone();
         let seq = self.seq.clone();
