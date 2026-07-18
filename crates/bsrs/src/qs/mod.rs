@@ -96,6 +96,7 @@ mod queue;
 mod registry;
 mod server;
 mod state;
+mod task_slot;
 mod tasks;
 mod transport;
 

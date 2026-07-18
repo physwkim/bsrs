@@ -15,7 +15,6 @@ use std::sync::Mutex as StdMutex;
 use crate::engine::{CheckpointHook, DocumentSink, RunEngine};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
-use tokio::task::AbortHandle;
 
 use crate::qs::lua_eval::LuaEvaluator;
 use crate::qs::methods::{err, QsRequest};
@@ -23,6 +22,7 @@ use crate::qs::permissions::Permissions;
 use crate::qs::queue::{PlanQueue, QueuedItem};
 use crate::qs::registry::Registry;
 use crate::qs::state::{EState, EngineState};
+use crate::qs::task_slot::QueueTaskSlot;
 use crate::qs::tasks::TaskTracker;
 
 /// Top-level dispatch entry. Returns a flat bluesky-queueserver response dict.
@@ -37,7 +37,7 @@ pub(crate) fn dispatch(
     state: Arc<StdMutex<EngineState>>,
     engine: Arc<Mutex<Option<Arc<RunEngine>>>>,
     document_sink: Option<Arc<dyn DocumentSink>>,
-    queue_task: Arc<StdMutex<Option<AbortHandle>>>,
+    queue_task: Arc<QueueTaskSlot>,
     permissions: Arc<Permissions>,
     lua_evaluator: Option<Arc<dyn LuaEvaluator>>,
     task_tracker: Arc<TaskTracker>,
@@ -408,7 +408,7 @@ pub(crate) fn dispatch(
         // -- manager stop -------------------------------------------------
         "manager_stop" => {
             // Abort any in-flight queue task, then signal the rep loop to exit.
-            if let Some(h) = queue_task.lock().unwrap().take() {
+            if let Some(h) = queue_task.take() {
                 h.abort();
             }
             stop_requested.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -751,7 +751,7 @@ fn env_close(
     state: &Arc<StdMutex<EngineState>>,
     engine: &Arc<Mutex<Option<Arc<RunEngine>>>>,
     rt: &tokio::runtime::Handle,
-    queue_task: &Arc<StdMutex<Option<AbortHandle>>>,
+    queue_task: &Arc<QueueTaskSlot>,
 ) -> Value {
     let mut e = rt.block_on(engine.lock());
     let re = match e.as_ref() {
@@ -764,7 +764,7 @@ fn env_close(
     // (queue worker, single-item execute, or a local console run) and
     // the queue-worker task between items. environment_destroy is the
     // forced path.
-    if re.state() != crate::engine::EngineRunState::Idle || queue_task.lock().unwrap().is_some() {
+    if re.state() != crate::engine::EngineRunState::Idle || queue_task.is_active() {
         return err(
             "cannot close the environment while a plan or the queue is running \
              (use environment_destroy to force)",
@@ -780,7 +780,7 @@ fn env_close(
 fn env_destroy(
     state: &Arc<StdMutex<EngineState>>,
     engine: &Arc<Mutex<Option<Arc<RunEngine>>>>,
-    queue_task: &Arc<StdMutex<Option<AbortHandle>>>,
+    queue_task: &Arc<QueueTaskSlot>,
     rt: &tokio::runtime::Handle,
 ) -> Value {
     // Validate before mutating anything: with no environment there is
@@ -790,7 +790,7 @@ fn env_destroy(
         return err("no environment");
     }
     // Force-abort any running queue task before dropping the engine.
-    if let Some(h) = queue_task.lock().unwrap().take() {
+    if let Some(h) = queue_task.take() {
         h.abort();
     }
     // Set transitional state (ref: manager.py:660 MState.DESTROYING_ENVIRONMENT).
@@ -1333,7 +1333,7 @@ fn queue_item_execute(
     state: &Arc<StdMutex<EngineState>>,
     engine: &Arc<Mutex<Option<Arc<RunEngine>>>>,
     rt: &tokio::runtime::Handle,
-    queue_task: &Arc<StdMutex<Option<AbortHandle>>>,
+    queue_task: &Arc<QueueTaskSlot>,
     params: &Value,
 ) -> Value {
     let item = match params.get("item") {
@@ -1372,6 +1372,14 @@ fn queue_item_execute(
     if cur_state != Some(EState::Idle) {
         return err(format!("cannot execute item in state {cur_state:?}"));
     }
+    // The slot claim is the synchronous gate: the manager state only
+    // flips to ExecutingQueue inside the worker, so back-to-back start
+    // requests can both see Idle — but only one can claim the slot.
+    let claim = match queue_task.claim() {
+        Some(c) => c,
+        None => return err("cannot execute item: a queue worker is already running"),
+    };
+    let generation = claim.generation();
     let mut queued = QueuedItem::plan(name, item);
     queued.user = params
         .get("user")
@@ -1389,11 +1397,11 @@ fn queue_item_execute(
         re,
         queue.clone(),
         state.clone(),
-        queue_task.clone(),
+        claim,
         queued,
         plan,
     ));
-    *queue_task.lock().unwrap() = Some(join.abort_handle());
+    queue_task.register(generation, join.abort_handle());
     json!({
         "success": true,
         "msg": "",
@@ -1409,7 +1417,7 @@ fn queue_start(
     state: &Arc<StdMutex<EngineState>>,
     engine: &Arc<Mutex<Option<Arc<RunEngine>>>>,
     rt: &tokio::runtime::Handle,
-    queue_task: &Arc<StdMutex<Option<AbortHandle>>>,
+    queue_task: &Arc<QueueTaskSlot>,
 ) -> Value {
     let e_guard = rt.block_on(engine.lock());
     let re = match e_guard.as_ref() {
@@ -1421,18 +1429,22 @@ fn queue_start(
     if cur_state != Some(EState::Idle) {
         return err(format!("cannot start in state {cur_state:?}"));
     }
-    let registry = registry.clone();
-    let queue = queue.clone();
-    let state = state.clone();
-    let task_slot = queue_task.clone();
+    // The slot claim is the synchronous gate: the manager state only
+    // flips to ExecutingQueue inside the worker, so back-to-back start
+    // requests can both see Idle — but only one can claim the slot.
+    let claim = match queue_task.claim() {
+        Some(c) => c,
+        None => return err("cannot start: a queue worker is already running"),
+    };
+    let generation = claim.generation();
     let join = tokio::spawn(crate::qs::server::execute_queue_loop(
         re,
-        registry,
-        queue,
-        state,
-        task_slot.clone(),
+        registry.clone(),
+        queue.clone(),
+        state.clone(),
+        claim,
     ));
-    *task_slot.lock().unwrap() = Some(join.abort_handle());
+    queue_task.register(generation, join.abort_handle());
     json!({"success": true, "msg": ""})
 }
 
@@ -1448,7 +1460,7 @@ fn maybe_autostart(
     state: &Arc<StdMutex<EngineState>>,
     engine: &Arc<Mutex<Option<Arc<RunEngine>>>>,
     rt: &tokio::runtime::Handle,
-    queue_task: &Arc<StdMutex<Option<AbortHandle>>>,
+    queue_task: &Arc<QueueTaskSlot>,
 ) {
     if !state.lock().unwrap().queue_autostart_enabled || queue.lock().unwrap().is_empty() {
         return;

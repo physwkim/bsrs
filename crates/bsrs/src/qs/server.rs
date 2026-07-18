@@ -8,7 +8,6 @@ use crate::callbacks::ZmqDocumentSink;
 use crate::core::error::{BsrsError, Result};
 use crate::engine::{DocumentSink, RunEngine, RunOptions};
 use tokio::sync::Mutex;
-use tokio::task::AbortHandle;
 
 use crate::engine::CheckpointHook;
 use crate::qs::dispatch::dispatch;
@@ -17,6 +16,7 @@ use crate::qs::permissions::Permissions;
 use crate::qs::queue::PlanQueue;
 use crate::qs::registry::Registry;
 use crate::qs::state::{EState, EngineState};
+use crate::qs::task_slot::{QueueTaskSlot, SlotClaim};
 use crate::qs::tasks::TaskTracker;
 use crate::qs::transport::ReqRepSocket;
 
@@ -205,7 +205,7 @@ impl ServerBuilder {
             queue: Arc::new(StdMutex::new(PlanQueue::new())),
             state: Arc::new(StdMutex::new(EngineState::initial())),
             engine,
-            queue_task: Arc::new(StdMutex::new(None)),
+            queue_task: Arc::new(QueueTaskSlot::new()),
             permissions,
             lua_evaluator: self.lua_evaluator,
             task_tracker: Arc::new(TaskTracker::new()),
@@ -222,10 +222,11 @@ pub struct Server {
     queue: Arc<StdMutex<PlanQueue>>,
     state: Arc<StdMutex<EngineState>>,
     engine: Arc<Mutex<Option<Arc<RunEngine>>>>,
-    /// AbortHandle for the currently-running `execute_queue_loop`, if any.
-    /// Stored so [`ServerShutdown::shutdown`] can stop the worker mid-plan
-    /// (rule **K1**: spawned task must terminate when its owner drops).
-    queue_task: Arc<StdMutex<Option<AbortHandle>>>,
+    /// Claim slot for the currently-running queue worker
+    /// (`execute_queue_loop` / `execute_single_item`), if any. Stored so
+    /// [`ServerShutdown::shutdown`] can stop the worker mid-plan (rule
+    /// **K1**: spawned task must terminate when its owner drops).
+    queue_task: Arc<QueueTaskSlot>,
     permissions: Arc<Permissions>,
     lua_evaluator: Option<Arc<dyn LuaEvaluator>>,
     task_tracker: Arc<TaskTracker>,
@@ -314,7 +315,7 @@ impl Server {
 #[derive(Clone)]
 pub struct ServerShutdown {
     socket: ReqRepSocket,
-    queue_task: Arc<StdMutex<Option<AbortHandle>>>,
+    queue_task: Arc<QueueTaskSlot>,
 }
 
 impl ServerShutdown {
@@ -322,7 +323,7 @@ impl ServerShutdown {
     /// any in-flight queue execution task is aborted (rule **K1**).
     pub fn shutdown(&self) {
         self.socket.shutdown();
-        if let Some(h) = self.queue_task.lock().unwrap().take() {
+        if let Some(h) = self.queue_task.take() {
             h.abort();
         }
     }
@@ -342,7 +343,7 @@ fn rep_loop(
     state: Arc<StdMutex<EngineState>>,
     engine: Arc<Mutex<Option<Arc<RunEngine>>>>,
     document_sink: Option<Arc<dyn DocumentSink>>,
-    queue_task: Arc<StdMutex<Option<AbortHandle>>>,
+    queue_task: Arc<QueueTaskSlot>,
     permissions: Arc<Permissions>,
     lua_evaluator: Option<Arc<dyn LuaEvaluator>>,
     task_tracker: Arc<TaskTracker>,
@@ -379,7 +380,7 @@ fn rep_loop(
         }
     }
     // Loop exited (shutdown). Make absolutely sure the queue worker is gone.
-    if let Some(h) = queue_task.lock().unwrap().take() {
+    if let Some(h) = queue_task.take() {
         h.abort();
     }
     Ok(())
@@ -405,11 +406,12 @@ pub(crate) async fn execute_queue_loop(
     registry: Arc<Registry>,
     queue: Arc<StdMutex<PlanQueue>>,
     state: Arc<StdMutex<EngineState>>,
-    task_slot: Arc<StdMutex<Option<AbortHandle>>>,
+    claim: SlotClaim,
 ) {
-    // Always clear the slot when we exit, so the slot reflects "no live
-    // worker" and a future shutdown does not abort an unrelated handle.
-    let _slot_guard = ClearOnDrop(task_slot.clone());
+    // Hold the slot claim for the worker's whole life; its drop (normal
+    // exit or abort) releases the slot — generation-checked, so a stale
+    // worker can never clear a successor's claim.
+    let _claim = claim;
     loop {
         // Honor queue_stop_pending: drain to idle without running the next item.
         if state.lock().unwrap().queue_stop_pending {
@@ -581,26 +583,16 @@ pub(crate) async fn execute_single_item(
     re: Arc<RunEngine>,
     queue: Arc<StdMutex<PlanQueue>>,
     state: Arc<StdMutex<EngineState>>,
-    task_slot: Arc<StdMutex<Option<AbortHandle>>>,
+    claim: SlotClaim,
     item: crate::qs::queue::QueuedItem,
     plan: crate::core::plan::Plan,
 ) {
-    let _slot_guard = ClearOnDrop(task_slot.clone());
+    let _claim = claim;
     let exit_status = run_plan_item(&re, &queue, &state, &item, plan).await;
     // A failed/interrupted item deactivates autostart, same as a queued
     // plan (ref: manager.py:852 — the plan-state path is shared between
     // queued and immediate execution).
     idle_out(&state, exit_status != "success");
-}
-
-/// RAII guard: clears the queue-task slot on drop so a future
-/// `ServerShutdown::shutdown` doesn't abort an already-finished handle.
-struct ClearOnDrop(Arc<StdMutex<Option<AbortHandle>>>);
-
-impl Drop for ClearOnDrop {
-    fn drop(&mut self) {
-        *self.0.lock().unwrap() = None;
-    }
 }
 
 #[cfg(test)]
@@ -648,8 +640,10 @@ mod tests {
         queue.lock().unwrap().push_back(item);
 
         let state = Arc::new(StdMutex::new(EngineState::default()));
-        let task_slot = Arc::new(StdMutex::new(None));
-        execute_queue_loop(re.clone(), registry, queue, state, task_slot).await;
+        let slot = Arc::new(QueueTaskSlot::new());
+        let claim = slot.claim().expect("fresh slot");
+        execute_queue_loop(re.clone(), registry, queue, state, claim).await;
+        assert!(!slot.is_active(), "worker exit must release the slot");
 
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1, "exactly one run opened");
