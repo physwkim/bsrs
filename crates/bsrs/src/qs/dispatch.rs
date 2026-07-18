@@ -1373,6 +1373,12 @@ fn re_pause(
 ) -> Value {
     let e_guard = rt.block_on(engine.lock());
     if let Some(re) = e_guard.as_ref() {
+        // Pausing an idle engine would latch is_paused/deferred_pause with
+        // nothing to land on (bluesky-queueserver also rejects re_pause
+        // unless a plan is executing).
+        if re.state() == crate::engine::EngineRunState::Idle {
+            return err("re_pause: no plan is running");
+        }
         let defer = params
             .get("option")
             .and_then(|v| v.as_str())

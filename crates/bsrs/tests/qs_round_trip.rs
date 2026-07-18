@@ -2165,3 +2165,41 @@ async fn status_reports_paused_while_engine_paused() {
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn re_pause_rejected_when_no_plan_running() {
+    let mut reg = Registry::new();
+    register_pausable_loop(&mut reg, "pausable_loop");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    // Without an environment: distinct error.
+    let r = rpc(&req, "re_pause", json!({"option": "immediate"}));
+    assert_eq!(r["success"], false, "{r}");
+
+    // With an environment but nothing running: rejected, nothing latches.
+    rpc(&req, "environment_open", json!({}));
+    let r = rpc(&req, "re_pause", json!({"option": "deferred"}));
+    assert_eq!(r["success"], false, "idle engine must reject pause: {r}");
+    let r = rpc(&req, "status", json!({}));
+    assert_eq!(r["pause_pending"], false, "{r}");
+    assert_eq!(r["manager_state"], "idle", "{r}");
+
+    // A run started after the rejected pause must execute normally
+    // (no stale pause flag from the rejected request).
+    rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "pausable_loop", "args": []}}),
+    );
+    rpc(&req, "queue_start", json!({}));
+    let r = poll_status(&req, |s| s["manager_state"] == "executing_queue").await;
+    assert_eq!(r["manager_state"], "executing_queue", "{r}");
+    rpc(&req, "re_stop", json!({}));
+    let r = poll_status(&req, |s| s["manager_state"] == "idle").await;
+    assert_eq!(r["manager_state"], "idle", "{r}");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
