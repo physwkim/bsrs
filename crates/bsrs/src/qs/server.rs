@@ -167,6 +167,12 @@ impl ServerBuilder {
                 Ok(Arc::new(ZmqDocumentSink::bind(a)?) as Arc<dyn DocumentSink>)
             })
             .transpose()?;
+        // Count documents on the broadcast path
+        // (`bsrs_qs_documents_total{name=...}`): wrap the sink once here,
+        // the single place it is constructed.
+        #[cfg(feature = "metrics")]
+        let document_sink = document_sink
+            .map(|s| Arc::new(crate::qs::metrics::CountingSink::new(s)) as Arc<dyn DocumentSink>);
         // Install the Prometheus exporter if a metrics_address was
         // configured AND the feature is built. Idempotent: once
         // installed, subsequent ServerBuilder builds with the same
@@ -538,6 +544,8 @@ async fn run_plan_item(
         Ok(r) => r.exit_status.clone(),
         Err(_) => "fail".to_string(),
     };
+    #[cfg(feature = "metrics")]
+    crate::qs::metrics::run_finished(&exit_status);
     let run_uid = run_result
         .as_ref()
         .ok()
