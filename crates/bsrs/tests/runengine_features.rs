@@ -3010,3 +3010,25 @@ async fn respond_channel_delivers_reading_to_plan() {
         "Respond(Read) must deliver the device's reading to the plan inline"
     );
 }
+
+/// A deferred pause latched while the engine is idle (or left over from a
+/// run that ended before reaching a Checkpoint) must not pause the next
+/// run at its first Checkpoint — run start resets it like is_paused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_deferred_pause_does_not_pause_next_run() {
+    let re = Arc::new(RunEngine::new(vec![]));
+    // Latch a deferred pause with nothing running.
+    re.pause(true);
+
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Checkpoint;
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let result = tokio::time::timeout(Duration::from_secs(5), re.run_async(plan))
+        .await
+        .expect("run hung: stale deferred_pause paused the plan at its first Checkpoint")
+        .expect("run failed");
+    assert_eq!(result.exit_status, "success");
+    assert_eq!(re.state(), EngineRunState::Idle);
+}

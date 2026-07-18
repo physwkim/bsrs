@@ -724,6 +724,9 @@ impl RunEngine {
         // into this run's RunStop (bluesky run_engine.py:1497).
         self.interrupt_reason.lock().unwrap().clear();
         self.is_paused.store(false, Ordering::SeqCst);
+        // A deferred pause that never reached a Checkpoint before its run
+        // ended must not carry over and pause this run's first Checkpoint.
+        self.deferred_pause.store(false, Ordering::SeqCst);
         // Reset SIGINT 3-tap counter — a previous session's taps must
         // not put a fresh run into the abort/halt path on the very
         // first ctrl-c.
