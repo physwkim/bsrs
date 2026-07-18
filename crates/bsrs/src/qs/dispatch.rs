@@ -630,8 +630,26 @@ fn status_response(
 ) -> Value {
     let q = queue.lock().unwrap();
     let st = state.lock().unwrap().clone();
-    let env_exists = rt.block_on(engine.lock()).is_some();
-    let re_state = if env_exists {
+    let (env_exists, engine_paused) = {
+        let e_guard = rt.block_on(engine.lock());
+        let paused = e_guard
+            .as_ref()
+            .is_some_and(|re| re.state() == crate::engine::EngineRunState::Paused);
+        (e_guard.is_some(), paused)
+    };
+    // The engine owns pause truth: the manager-side `EState` stays
+    // `ExecutingQueue` while `run_async` is parked at the pause gate, so
+    // "paused" is derived live from the engine instead of duplicating the
+    // transition into manager state.
+    let paused_mid_run = engine_paused && st.state == Some(EState::ExecutingQueue);
+    let manager_state = if paused_mid_run {
+        EState::Paused.as_str()
+    } else {
+        st.state.map(|s| s.as_str()).unwrap_or("environment_closed")
+    };
+    let re_state = if paused_mid_run {
+        EState::Paused.as_str().to_string()
+    } else if env_exists {
         st.state.map(|s| s.as_str()).unwrap_or("idle").to_string()
     } else {
         "null".to_string()
@@ -641,7 +659,7 @@ fn status_response(
         "msg": "",
         "status_uid": uuid::Uuid::new_v4().to_string(),
         "time": crate::qs::state::now_iso8601(),
-        "manager_state": st.state.map(|s| s.as_str()).unwrap_or("environment_closed"),
+        "manager_state": manager_state,
         "manager_version": env!("CARGO_PKG_VERSION"),
         "msg_recv": "",
         "items_in_queue": q.len(),
@@ -654,7 +672,8 @@ fn status_response(
         "worker_environment_exists": env_exists,
         "worker_environment_state": if env_exists { "idle" } else { "closed" },
         "queue_stop_pending": st.queue_stop_pending,
-        "pause_pending": st.pause_pending,
+        // A landed pause is no longer pending.
+        "pause_pending": st.pause_pending && !paused_mid_run,
         "worker_background_tasks": st.worker_background_tasks,
         "queue_autostart_enabled": st.queue_autostart_enabled,
         "plan_queue_mode": st.queue_mode,

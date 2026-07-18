@@ -2089,3 +2089,79 @@ async fn no_curve_when_env_var_unset_plaintext_works() {
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
+
+/// Register a plan that checkpoints then sleeps forever — pausable at every
+/// iteration, never finishes on its own.
+fn register_pausable_loop(reg: &mut Registry, name: &str) {
+    use bsrs::core::msg::Msg;
+    use bsrs::core::plan::plan_box;
+    let factory: bsrs::qs::PlanFactory = Arc::new(move |_reg, _args| {
+        Ok(plan_box(async_stream::stream! {
+            loop {
+                yield Msg::Checkpoint;
+                yield Msg::Sleep(Duration::from_millis(20));
+            }
+        }))
+    });
+    reg.register_plan(name, factory);
+}
+
+/// Poll `status` until `pred` holds or ~3s elapse; returns the last status.
+async fn poll_status(req: &zmq::Socket, pred: impl Fn(&Value) -> bool) -> Value {
+    let mut last = json!(null);
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        last = rpc(req, "status", json!({}));
+        if pred(&last) {
+            break;
+        }
+    }
+    last
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_reports_paused_while_engine_paused() {
+    let mut reg = Registry::new();
+    register_pausable_loop(&mut reg, "pausable_loop");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    rpc(&req, "environment_open", json!({}));
+    rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "pausable_loop", "args": []}}),
+    );
+    rpc(&req, "queue_start", json!({}));
+    let r = poll_status(&req, |s| s["manager_state"] == "executing_queue").await;
+    assert_eq!(r["manager_state"], "executing_queue", "{r}");
+
+    // Deferred pause lands at the next Checkpoint; status must surface it.
+    let r = rpc(&req, "re_pause", json!({"option": "deferred"}));
+    assert_eq!(r["success"], true, "{r}");
+    let r = poll_status(&req, |s| s["manager_state"] == "paused").await;
+    assert_eq!(r["manager_state"], "paused", "{r}");
+    assert_eq!(r["re_state"], "paused", "{r}");
+    assert_eq!(
+        r["pause_pending"], false,
+        "a landed pause is not pending: {r}"
+    );
+
+    // Resume → back to executing_queue.
+    let r = rpc(&req, "re_resume", json!({}));
+    assert_eq!(r["success"], true, "{r}");
+    let r = poll_status(&req, |s| s["manager_state"] == "executing_queue").await;
+    assert_eq!(r["manager_state"], "executing_queue", "{r}");
+
+    // Immediate pause → paused again; then stop ends the run gracefully.
+    rpc(&req, "re_pause", json!({"option": "immediate"}));
+    let r = poll_status(&req, |s| s["manager_state"] == "paused").await;
+    assert_eq!(r["manager_state"], "paused", "{r}");
+    rpc(&req, "re_stop", json!({}));
+    let r = poll_status(&req, |s| s["manager_state"] == "idle").await;
+    assert_eq!(r["manager_state"], "idle", "{r}");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
