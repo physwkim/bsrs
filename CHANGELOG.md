@@ -20,6 +20,7 @@ longer grow without limit.
 
 ### Changed
 
+- Based the EPICS CA/PVA backends on `epics-rs` 0.24.2 (from 0.24.0).
 - Bumped `rust-hdf5` from 0.2 to 0.3.
 
 ### Fixed
