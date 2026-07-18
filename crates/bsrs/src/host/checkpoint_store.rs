@@ -16,6 +16,17 @@
 //! last record *is* the daemon's final state. Boot cost is therefore
 //! independent of journal size.
 //!
+//! The file is also **size-rotated**: when the current file reaches
+//! `max_bytes` (default [`DEFAULT_MAX_BYTES`]) it is renamed to a
+//! single `.1` backup and a fresh file is started, so on-disk size is
+//! bounded by `~2 * max_bytes` forever — regardless of how long the
+//! daemon runs. Rotation happens under the writer mutex inside
+//! `append`, the sole writer, so no record can interleave with the
+//! rename. Because rotation always precedes the triggering write, the
+//! newest record is always in the current file during normal
+//! operation; the readers fall back to `.1` only for the rare crash
+//! that lands in the rename/write window.
+//!
 //! Full crash-recovery (resume the plan from the last checkpoint) is
 //! still deferred — it requires plan-arg persistence and msg_cache
 //! replay which are deeper concerns. The pieces here give an operator
@@ -61,25 +72,60 @@ const MID_RUN_APPEND_INTERVAL_NS: u64 = 1_000_000_000;
 /// one complete line they need even with a torn final write.
 const TAIL_SCAN_BYTES: u64 = 64 * 1024;
 
-/// Append-only checkpoint store. The file is opened lazily on the
-/// first append and held for the daemon's lifetime; OS writeback
-/// flushes the line buffer.
+/// Default per-file rotation threshold (4 MiB). At the coalesced
+/// mid-run rate (~1 line/s while executing) this holds on the order of
+/// a day of continuous running per file; total on-disk journal is
+/// bounded by twice this (current file + one `.1` backup).
+pub const DEFAULT_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The open write handle and its current byte count, guarded together
+/// so rotation cannot leave them inconsistent.
+struct Writer {
+    /// `None` until the first append (or after a rotation) opens the
+    /// current file.
+    file: Option<std::fs::File>,
+    /// Bytes in the current file. Seeded from the file's length on
+    /// open and advanced by each successful write; the rotation gate.
+    bytes: u64,
+}
+
+/// Size-rotated, append-only checkpoint store. The current file is
+/// opened lazily on the first append and held until it reaches
+/// `max_bytes`, at which point [`append`](Self::append) rotates it to
+/// a single `.1` backup and starts fresh. OS writeback flushes the
+/// line buffer.
 pub struct JsonlCheckpointStore {
     path: PathBuf,
-    /// `None` until the first append succeeds. Behind a mutex so the
-    /// `CheckpointHook` (Fn) can mutate it.
-    file: StdMutex<Option<std::fs::File>>,
+    /// Per-file size cap before rotation (`>= 1`).
+    max_bytes: u64,
+    /// Open handle + byte count. Behind a mutex so the
+    /// `CheckpointHook` (Fn) can mutate it; also the rotation lock.
+    writer: StdMutex<Writer>,
     /// `(run_uid, timestamp_ns)` of the last appended **mid-run**
     /// checkpoint — the throttle state for coalescing.
     last_mid_run: StdMutex<Option<(Option<String>, u64)>>,
 }
 
 impl JsonlCheckpointStore {
-    /// Build a store at `path`. The file is not opened yet.
+    /// Build a store at `path` with the default rotation threshold
+    /// ([`DEFAULT_MAX_BYTES`]). The file is not opened yet.
     pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self::with_max_bytes(path, DEFAULT_MAX_BYTES)
+    }
+
+    /// Build a store with an explicit per-file rotation threshold.
+    /// When the current file reaches `max_bytes` it is rotated to a
+    /// single `.1` backup and a fresh file is started, bounding
+    /// on-disk size to `~2 * max_bytes`. `max_bytes` is clamped to at
+    /// least 1 so rotation always makes progress.
+    pub fn with_max_bytes(path: impl Into<PathBuf>, max_bytes: u64) -> Self {
         Self {
             path: path.into(),
-            file: StdMutex::new(None),
+            max_bytes: max_bytes.max(1),
+            writer: StdMutex::new(Writer {
+                file: None,
+                bytes: 0,
+            }),
             last_mid_run: StdMutex::new(None),
         }
     }
@@ -94,31 +140,78 @@ impl JsonlCheckpointStore {
                 return;
             }
         };
-        let mut g = self.file.lock().unwrap();
-        if g.is_none() {
-            // Lazy open. Create parent dir if missing.
-            if let Some(parent) = self.path.parent() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
-                    tracing::warn!("checkpoint store: mkdir {}: {e}", parent.display());
-                    return;
-                }
-            }
-            match OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.path)
-            {
-                Ok(f) => *g = Some(f),
-                Err(e) => {
-                    tracing::warn!("checkpoint store: open {}: {e}", self.path.display());
-                    return;
-                }
+        let mut w = self.writer.lock().unwrap();
+        if !self.ensure_open(&mut w) {
+            return;
+        }
+        // Rotate *before* writing so the record that crosses the
+        // threshold starts the fresh file: the current file is capped
+        // at max_bytes (+ the one record that first crossed), and
+        // total disk (current + `.1`) stays within ~2 * max_bytes.
+        if w.bytes >= self.max_bytes {
+            self.rotate(&mut w);
+            if !self.ensure_open(&mut w) {
+                return;
             }
         }
-        if let Some(f) = g.as_mut() {
-            if let Err(e) = writeln!(f, "{line}") {
-                tracing::warn!("checkpoint store: write: {e}");
+        if let Some(f) = w.file.as_mut() {
+            match writeln!(f, "{line}") {
+                Ok(()) => w.bytes += line.len() as u64 + 1,
+                Err(e) => tracing::warn!("checkpoint store: write: {e}"),
             }
+        }
+    }
+
+    /// Ensure the writer holds an open handle to the current path,
+    /// seeding the byte counter from the existing file length (so a
+    /// restart appending to a partially-filled — or already
+    /// oversized — file rotates correctly). Returns false (logged) if
+    /// the file cannot be opened.
+    fn ensure_open(&self, w: &mut Writer) -> bool {
+        if w.file.is_some() {
+            return true;
+        }
+        if let Some(parent) = self.path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                tracing::warn!("checkpoint store: mkdir {}: {e}", parent.display());
+                return false;
+            }
+        }
+        match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
+            Ok(f) => {
+                w.bytes = f.metadata().map(|m| m.len()).unwrap_or(0);
+                w.file = Some(f);
+                true
+            }
+            Err(e) => {
+                tracing::warn!("checkpoint store: open {}: {e}", self.path.display());
+                false
+            }
+        }
+    }
+
+    /// Move the current file to the `.1` backup (overwriting any prior
+    /// backup) and drop the handle so the next `ensure_open` starts a
+    /// fresh file. Called only from `append` with the writer mutex
+    /// held, so no record interleaves with the rename. A rename
+    /// failure is non-fatal and logged: the next `ensure_open`
+    /// re-opens the same path in append mode (keeping its records),
+    /// so growth stays visible rather than silently unbounded.
+    fn rotate(&self, w: &mut Writer) {
+        // Drop the handle first so the rename detaches a closed file.
+        w.file = None;
+        w.bytes = 0;
+        let backup = backup_path(&self.path);
+        if let Err(e) = std::fs::rename(&self.path, &backup) {
+            tracing::warn!(
+                "checkpoint store: rotate {} -> {}: {e}",
+                self.path.display(),
+                backup.display()
+            );
         }
     }
 
@@ -157,27 +250,21 @@ impl JsonlCheckpointStore {
 
     /// Return the most recent record (last complete JSONL line),
     /// reading only the file tail — cost is independent of journal
-    /// size. `None` if the file is missing or empty; a torn final
-    /// line (crash mid-write) falls back to the previous complete
-    /// record. Errors are logged and surfaced as `None`.
+    /// size. Consults the current file first, then the `.1` backup:
+    /// the backup only ever wins when the current file is
+    /// missing/empty, which during normal operation happens solely in
+    /// the crash-in-rotation window (rename done, fresh file not yet
+    /// written), so the fallback recovers the stranded final state
+    /// without ever masking a live record. A torn final line (crash
+    /// mid-write) falls back to the previous complete record. `None`
+    /// if neither file has a parseable record.
     pub fn latest(path: &Path) -> Option<CheckpointRecord> {
-        let tail = match read_tail(path, TAIL_SCAN_BYTES) {
-            Ok(t) => t,
-            Err(_) => return None,
-        };
-        for line in tail.lines().rev().filter(|l| !l.trim().is_empty()) {
-            match serde_json::from_str(line) {
-                Ok(r) => return Some(r),
-                Err(e) => {
-                    tracing::warn!("checkpoint store: parse tail record: {e}");
-                }
-            }
-        }
-        None
+        tail_record(path).or_else(|| tail_record(&backup_path(path)))
     }
 
     /// Return the abandoned run the journal ends in, if any: the run
-    /// is unfinished iff the **last** record is a mid-run checkpoint
+    /// is unfinished iff the **last** record ([`latest`](Self::latest),
+    /// including the `.1`-backup fallback) is a mid-run checkpoint
     /// (`exit_status = None`) with a run uid. Runs are serialized per
     /// daemon, so the journal tail is the daemon's final state — a
     /// run that was abandoned but *followed by later runs* is
@@ -189,6 +276,28 @@ impl JsonlCheckpointStore {
     pub fn unfinished_run(path: &Path) -> Option<CheckpointRecord> {
         Self::latest(path).filter(|r| r.exit_status.is_none() && r.run_uid.is_some())
     }
+}
+
+/// The single rotation backup path for `path`: `<path>.1`.
+fn backup_path(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(".1");
+    PathBuf::from(s)
+}
+
+/// Parse the last complete JSONL record from a file's tail. Reads at
+/// most the final [`TAIL_SCAN_BYTES`]; skips a torn final line.
+/// `None` if the file is missing, empty, or has no parseable record
+/// in the window.
+fn tail_record(path: &Path) -> Option<CheckpointRecord> {
+    let tail = read_tail(path, TAIL_SCAN_BYTES).ok()?;
+    for line in tail.lines().rev().filter(|l| !l.trim().is_empty()) {
+        match serde_json::from_str(line) {
+            Ok(r) => return Some(r),
+            Err(e) => tracing::warn!("checkpoint store: parse tail record: {e}"),
+        }
+    }
+    None
 }
 
 /// Read at most `max_bytes` from the end of the file as (lossy) UTF-8.
@@ -220,6 +329,16 @@ pub fn default_path() -> PathBuf {
     PathBuf::from(".bsrs_checkpoints.jsonl")
 }
 
+impl JsonlCheckpointStore {
+    /// Drop the write handle (flushing it) so a test can read the file
+    /// back through the OS. Real callers hold the store for the
+    /// daemon's lifetime and rely on OS writeback.
+    #[cfg(test)]
+    fn close_for_test(&self) {
+        self.writer.lock().unwrap().file = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,7 +360,7 @@ mod tests {
             exit_status: None,
         });
         // Force flush by dropping the file handle.
-        *store.file.lock().unwrap() = None;
+        store.close_for_test();
         let last = JsonlCheckpointStore::latest(&path).expect("latest");
         assert_eq!(last.timestamp_ns, 2_000);
         assert_eq!(last.run_uid.as_deref(), Some("r2"));
@@ -272,7 +391,7 @@ mod tests {
             run_uid: Some("r2".into()),
             exit_status: None,
         });
-        *store.file.lock().unwrap() = None;
+        store.close_for_test();
         let abandoned = JsonlCheckpointStore::unfinished_run(&path).expect("unfinished");
         assert_eq!(abandoned.run_uid.as_deref(), Some("r2"));
         assert_eq!(abandoned.timestamp_ns, 2_000);
@@ -295,7 +414,7 @@ mod tests {
             run_uid: Some("r1".into()),
             exit_status: Some("success".into()),
         });
-        *store.file.lock().unwrap() = None;
+        store.close_for_test();
         assert!(JsonlCheckpointStore::unfinished_run(&path).is_none());
     }
 
@@ -360,7 +479,7 @@ mod tests {
             run_uid: Some("r1".into()),
             exit_status: Some("success".into()),
         });
-        *store.file.lock().unwrap() = None;
+        store.close_for_test();
         assert_eq!(file_lines(&path), 3, "first + 1s-later + close");
         let last = JsonlCheckpointStore::latest(&path).unwrap();
         assert_eq!(last.exit_status.as_deref(), Some("success"));
@@ -374,7 +493,7 @@ mod tests {
         let hook = store.clone().into_hook();
         hook(mid("r1", 0));
         hook(mid("r2", 100_000_000)); // new run: not throttled
-        *store.file.lock().unwrap() = None;
+        store.close_for_test();
         assert_eq!(file_lines(&path), 2);
     }
 
@@ -395,7 +514,7 @@ mod tests {
             run_uid: Some("r2".into()),
             exit_status: Some("success".into()),
         });
-        *store.file.lock().unwrap() = None;
+        store.close_for_test();
         assert!(JsonlCheckpointStore::unfinished_run(&path).is_none());
     }
 
@@ -433,5 +552,99 @@ mod tests {
         .unwrap();
         let last = JsonlCheckpointStore::latest(&path).expect("fallback record");
         assert_eq!(last.run_uid.as_deref(), Some("good"));
+    }
+
+    #[test]
+    fn rotation_bounds_disk_and_keeps_one_backup() {
+        // Tiny cap so a handful of ~67-byte records trigger rotation.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ckpt.jsonl");
+        let store = Arc::new(JsonlCheckpointStore::with_max_bytes(&path, 200));
+        let hook = store.clone().into_hook();
+        // 20 mid-run checkpoints spaced ≥1 s so none coalesce; far more
+        // than two capped files can hold, so old records must be dropped.
+        for i in 0..20u64 {
+            hook(mid("r1", i * 1_000_000_000));
+        }
+        store.close_for_test();
+
+        let cur = std::fs::metadata(&path).unwrap().len();
+        assert!(cur <= 2 * 200, "current file exceeds the cap: {cur} bytes");
+        let backup = backup_path(&path);
+        assert!(backup.exists(), "rotation must leave a .1 backup");
+        let backup_len = std::fs::metadata(&backup).unwrap().len();
+        assert!(
+            backup_len <= 2 * 200,
+            "backup exceeds the cap: {backup_len} bytes"
+        );
+        // Old records were dropped, not merely split across more files.
+        let total = file_lines(&path) + file_lines(&backup);
+        assert!(total < 20, "expected bounded retention, got {total} lines");
+        // The reader still finds the newest record after rotations.
+        let last = JsonlCheckpointStore::latest(&path).expect("latest after rotation");
+        assert_eq!(last.timestamp_ns, 19_000_000_000);
+    }
+
+    #[test]
+    fn unfinished_detection_survives_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ckpt.jsonl");
+        let store = Arc::new(JsonlCheckpointStore::with_max_bytes(&path, 200));
+        let hook = store.clone().into_hook();
+        // Many rotations, ending mid-run (no close) — daemon went down.
+        for i in 0..30u64 {
+            hook(mid("run-x", i * 1_000_000_000));
+        }
+        store.close_for_test();
+        let ab = JsonlCheckpointStore::unfinished_run(&path).expect("unfinished after rotation");
+        assert_eq!(ab.run_uid.as_deref(), Some("run-x"));
+        assert_eq!(ab.timestamp_ns, 29_000_000_000);
+    }
+
+    #[test]
+    fn oversized_existing_file_rotates_on_first_append() {
+        // Pre-seed a file already over the cap (legacy giant journal, or
+        // a lowered threshold): the first append must rotate it away.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ckpt.jsonl");
+        let mut big = String::new();
+        for i in 0..100u64 {
+            big.push_str(&format!(
+                "{{\"timestamp_ns\":{i},\"run_uid\":\"old\",\"bsrs_version\":\"0.1.0\"}}\n"
+            ));
+        }
+        std::fs::write(&path, &big).unwrap();
+        let over = std::fs::metadata(&path).unwrap().len();
+
+        let store = Arc::new(JsonlCheckpointStore::with_max_bytes(&path, 200));
+        let hook = store.clone().into_hook();
+        hook(mid("new", 5_000_000_000));
+        store.close_for_test();
+
+        // The oversized content moved intact to `.1`; the current file
+        // holds only the new record.
+        let backup = backup_path(&path);
+        assert_eq!(std::fs::metadata(&backup).unwrap().len(), over);
+        assert_eq!(file_lines(&path), 1);
+        let last = JsonlCheckpointStore::latest(&path).unwrap();
+        assert_eq!(last.run_uid.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn reader_falls_back_to_backup_when_current_is_empty() {
+        // Crash in the rotation window: current file exists but is
+        // empty (rename done, fresh file created, killed before the
+        // write); the stranded final state lives in `.1`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ckpt.jsonl");
+        let backup = backup_path(&path);
+        std::fs::write(
+            &backup,
+            "{\"timestamp_ns\":7000,\"run_uid\":\"stranded\",\"bsrs_version\":\"0.3.0\"}\n",
+        )
+        .unwrap();
+        std::fs::write(&path, "").unwrap(); // empty current file
+        let ab = JsonlCheckpointStore::unfinished_run(&path).expect("must fall back to backup");
+        assert_eq!(ab.run_uid.as_deref(), Some("stranded"));
     }
 }
