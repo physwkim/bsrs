@@ -150,7 +150,7 @@ pub(crate) fn dispatch(
             }
             r
         }
-        "environment_close" => env_close(&state, &engine, rt),
+        "environment_close" => env_close(&state, &engine, rt, &queue_task),
         "environment_destroy" => env_destroy(&state, &engine, &queue_task, rt),
         "environment_update" => json!({"success": true, "msg": ""}),
 
@@ -751,10 +751,24 @@ fn env_close(
     state: &Arc<StdMutex<EngineState>>,
     engine: &Arc<Mutex<Option<Arc<RunEngine>>>>,
     rt: &tokio::runtime::Handle,
+    queue_task: &Arc<StdMutex<Option<AbortHandle>>>,
 ) -> Value {
     let mut e = rt.block_on(engine.lock());
-    if e.is_none() {
-        return err("no environment");
+    let re = match e.as_ref() {
+        Some(re) => re,
+        None => return err("no environment"),
+    };
+    // Orderly close succeeds only when nothing is executing (ref:
+    // manager.py:2888 "The command is rejected if a plan is running").
+    // Two owners can be executing on this engine: the engine itself
+    // (queue worker, single-item execute, or a local console run) and
+    // the queue-worker task between items. environment_destroy is the
+    // forced path.
+    if re.state() != crate::engine::EngineRunState::Idle || queue_task.lock().unwrap().is_some() {
+        return err(
+            "cannot close the environment while a plan or the queue is running \
+             (use environment_destroy to force)",
+        );
     }
     // Set transitional state (ref: manager.py:591 MState.CLOSING_ENVIRONMENT).
     state.lock().unwrap().state = Some(EState::ClosingEnvironment);
@@ -769,25 +783,18 @@ fn env_destroy(
     queue_task: &Arc<StdMutex<Option<AbortHandle>>>,
     rt: &tokio::runtime::Handle,
 ) -> Value {
+    // Validate before mutating anything: with no environment there is
+    // nothing to destroy — no task abort, no state transition.
+    let mut e = rt.block_on(engine.lock());
+    if e.is_none() {
+        return err("no environment");
+    }
     // Force-abort any running queue task before dropping the engine.
     if let Some(h) = queue_task.lock().unwrap().take() {
         h.abort();
     }
     // Set transitional state (ref: manager.py:660 MState.DESTROYING_ENVIRONMENT).
     state.lock().unwrap().state = Some(EState::DestroyingEnvironment);
-    env_close_inner(state, engine, rt)
-}
-
-fn env_close_inner(
-    state: &Arc<StdMutex<EngineState>>,
-    engine: &Arc<Mutex<Option<Arc<RunEngine>>>>,
-    rt: &tokio::runtime::Handle,
-) -> Value {
-    let mut e = rt.block_on(engine.lock());
-    if e.is_none() {
-        state.lock().unwrap().state = Some(EState::EnvironmentClosed);
-        return err("no environment");
-    }
     *e = None;
     state.lock().unwrap().state = Some(EState::EnvironmentClosed);
     json!({"success": true, "msg": ""})

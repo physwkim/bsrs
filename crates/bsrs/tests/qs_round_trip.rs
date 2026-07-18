@@ -2258,6 +2258,58 @@ fn register_failing_plan(reg: &mut Registry, name: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn env_close_rejected_while_executing_destroy_forces() {
+    let mut reg = Registry::new();
+    register_pausable_loop(&mut reg, "pausable_loop");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    // Destroy with no environment must be rejected without side effects
+    // (the pre-open manager state is "environment_closed" and must not
+    // move through destroying/closed transitions).
+    let r = rpc(&req, "environment_destroy", json!({}));
+    assert_eq!(r["success"], false, "{r}");
+    let r = rpc(&req, "status", json!({}));
+    assert_eq!(
+        r["manager_state"], "environment_closed",
+        "no-env destroy must not touch state: {r}"
+    );
+
+    rpc(&req, "environment_open", json!({}));
+    rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "pausable_loop", "args": []}}),
+    );
+    rpc(&req, "queue_start", json!({}));
+    let r = poll_status(&req, |s| s["manager_state"] == "executing_queue").await;
+    assert_eq!(r["manager_state"], "executing_queue", "{r}");
+
+    // Orderly close is rejected while a plan is running (ref: manager.py:2888).
+    let r = rpc(&req, "environment_close", json!({}));
+    assert_eq!(r["success"], false, "close must be rejected mid-run: {r}");
+    let r = rpc(&req, "status", json!({}));
+    assert_eq!(r["worker_environment_exists"], true, "{r}");
+    assert_eq!(r["manager_state"], "executing_queue", "{r}");
+
+    // environment_destroy force-kills the worker and drops the environment.
+    let r = rpc(&req, "environment_destroy", json!({}));
+    assert_eq!(r["success"], true, "{r}");
+    let r = poll_status(&req, |s| s["worker_environment_exists"] == false).await;
+    assert_eq!(r["worker_environment_exists"], false, "{r}");
+
+    // With everything idle again, orderly open + close succeed.
+    let r = rpc(&req, "environment_open", json!({}));
+    assert_eq!(r["success"], true, "{r}");
+    let r = rpc(&req, "environment_close", json!({}));
+    assert_eq!(r["success"], true, "idle close must succeed: {r}");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn queue_item_execute_runs_in_background_with_bookkeeping() {
     let mut reg = Registry::new();
     register_pausable_loop(&mut reg, "pausable_loop");
