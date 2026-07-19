@@ -145,6 +145,7 @@ enum QueueCmd {
     /// `queue_autostart` — toggle the autostart flag.
     Autostart {
         /// `enable` or `disable`.
+        #[arg(value_parser = ["enable", "disable"])]
         option: String,
     },
     /// `queue_mode_set` — set queue mode flags. The arg is a JSON object,

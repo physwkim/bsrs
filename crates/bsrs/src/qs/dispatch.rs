@@ -15,7 +15,6 @@ use std::sync::Mutex as StdMutex;
 use crate::engine::{CheckpointHook, DocumentSink, RunEngine};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
-use tokio::task::AbortHandle;
 
 use crate::qs::lua_eval::LuaEvaluator;
 use crate::qs::methods::{err, QsRequest};
@@ -23,6 +22,7 @@ use crate::qs::permissions::Permissions;
 use crate::qs::queue::{PlanQueue, QueuedItem};
 use crate::qs::registry::Registry;
 use crate::qs::state::{EState, EngineState};
+use crate::qs::task_slot::QueueTaskSlot;
 use crate::qs::tasks::TaskTracker;
 
 /// Top-level dispatch entry. Returns a flat bluesky-queueserver response dict.
@@ -37,7 +37,7 @@ pub(crate) fn dispatch(
     state: Arc<StdMutex<EngineState>>,
     engine: Arc<Mutex<Option<Arc<RunEngine>>>>,
     document_sink: Option<Arc<dyn DocumentSink>>,
-    queue_task: Arc<StdMutex<Option<AbortHandle>>>,
+    queue_task: Arc<QueueTaskSlot>,
     permissions: Arc<Permissions>,
     lua_evaluator: Option<Arc<dyn LuaEvaluator>>,
     task_tracker: Arc<TaskTracker>,
@@ -143,9 +143,14 @@ pub(crate) fn dispatch(
 
         // -- environment --------------------------------------------------
         "environment_open" => {
-            env_open(document_sink, &state, &engine, rt, checkpoint_hook.as_ref())
+            let r = env_open(document_sink, &state, &engine, rt, checkpoint_hook.as_ref());
+            // Opening the env can make an armed queue runnable (ref: manager.py:563).
+            if r["success"] == true {
+                maybe_autostart(&registry, &queue, &state, &engine, rt, &queue_task);
+            }
+            r
         }
-        "environment_close" => env_close(&state, &engine, rt),
+        "environment_close" => env_close(&state, &engine, rt, &queue_task),
         "environment_destroy" => env_destroy(&state, &engine, &queue_task, rt),
         "environment_update" => json!({"success": true, "msg": ""}),
 
@@ -155,15 +160,37 @@ pub(crate) fn dispatch(
             queue.lock().unwrap().clear();
             json!({"success": true, "msg": ""})
         }
-        "queue_item_add" => queue_item_add(&registry, &queue, &req.params),
-        "queue_item_add_batch" => queue_item_add_batch(&registry, &queue, &req.params),
+        "queue_item_add" => {
+            let r = queue_item_add(&registry, &queue, &req.params);
+            // A new item can make an armed queue runnable (ref: manager.py:2403).
+            if r["success"] == true {
+                maybe_autostart(&registry, &queue, &state, &engine, rt, &queue_task);
+            }
+            r
+        }
+        "queue_item_add_batch" => {
+            let r = queue_item_add_batch(&registry, &queue, &req.params);
+            // Same trigger as queue_item_add (ref: manager.py:2508).
+            if r["success"] == true {
+                maybe_autostart(&registry, &queue, &state, &engine, rt, &queue_task);
+            }
+            r
+        }
         "queue_item_update" => queue_item_update(&queue, &req.params),
         "queue_item_get" => queue_item_get(&queue, &req.params),
         "queue_item_remove" => queue_item_remove(&queue, &req.params),
         "queue_item_remove_batch" => queue_item_remove_batch(&queue, &req.params),
         "queue_item_move" => queue_item_move(&queue, &req.params),
         "queue_item_move_batch" => queue_item_move_batch(&queue, &req.params),
-        "queue_item_execute" => queue_item_execute(&registry, &engine, rt, &req.params),
+        "queue_item_execute" => queue_item_execute(
+            &registry,
+            &queue,
+            &state,
+            &engine,
+            rt,
+            &queue_task,
+            &req.params,
+        ),
 
         // -- queue execution ----------------------------------------------
         "queue_start" => queue_start(&registry, &queue, &state, &engine, rt, &queue_task),
@@ -176,18 +203,22 @@ pub(crate) fn dispatch(
             json!({"success": true, "msg": ""})
         }
         "queue_autostart" => {
-            let enable = req
-                .params
-                .get("enable")
-                .and_then(|v| v.as_bool())
-                .unwrap_or_else(|| {
-                    req.params
-                        .get("option")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s == "enable")
-                        .unwrap_or(false)
-                });
+            // Strict: a typo'd request must not silently disable autostart.
+            let enable = match (req.params.get("enable"), req.params.get("option")) {
+                (Some(Value::Bool(b)), _) => *b,
+                (None, Some(Value::String(s))) if s == "enable" => true,
+                (None, Some(Value::String(s))) if s == "disable" => false,
+                _ => {
+                    return err("queue_autostart: required param 'enable' (bool) \
+                         or 'option' (\"enable\"/\"disable\")")
+                }
+            };
             state.lock().unwrap().queue_autostart_enabled = enable;
+            // Enabling starts a runnable queue right away (ref: manager.py:1284
+            // `_autostart_enable` spawns the task, which checks immediately).
+            if enable {
+                maybe_autostart(&registry, &queue, &state, &engine, rt, &queue_task);
+            }
             json!({"success": true, "msg": ""})
         }
         "queue_mode_set" => {
@@ -377,7 +408,7 @@ pub(crate) fn dispatch(
         // -- manager stop -------------------------------------------------
         "manager_stop" => {
             // Abort any in-flight queue task, then signal the rep loop to exit.
-            if let Some(h) = queue_task.lock().unwrap().take() {
+            if let Some(h) = queue_task.take() {
                 h.abort();
             }
             stop_requested.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -630,8 +661,26 @@ fn status_response(
 ) -> Value {
     let q = queue.lock().unwrap();
     let st = state.lock().unwrap().clone();
-    let env_exists = rt.block_on(engine.lock()).is_some();
-    let re_state = if env_exists {
+    let (env_exists, engine_paused) = {
+        let e_guard = rt.block_on(engine.lock());
+        let paused = e_guard
+            .as_ref()
+            .is_some_and(|re| re.state() == crate::engine::EngineRunState::Paused);
+        (e_guard.is_some(), paused)
+    };
+    // The engine owns pause truth: the manager-side `EState` stays
+    // `ExecutingQueue` while `run_async` is parked at the pause gate, so
+    // "paused" is derived live from the engine instead of duplicating the
+    // transition into manager state.
+    let paused_mid_run = engine_paused && st.state == Some(EState::ExecutingQueue);
+    let manager_state = if paused_mid_run {
+        EState::Paused.as_str()
+    } else {
+        st.state.map(|s| s.as_str()).unwrap_or("environment_closed")
+    };
+    let re_state = if paused_mid_run {
+        EState::Paused.as_str().to_string()
+    } else if env_exists {
         st.state.map(|s| s.as_str()).unwrap_or("idle").to_string()
     } else {
         "null".to_string()
@@ -641,7 +690,7 @@ fn status_response(
         "msg": "",
         "status_uid": uuid::Uuid::new_v4().to_string(),
         "time": crate::qs::state::now_iso8601(),
-        "manager_state": st.state.map(|s| s.as_str()).unwrap_or("environment_closed"),
+        "manager_state": manager_state,
         "manager_version": env!("CARGO_PKG_VERSION"),
         "msg_recv": "",
         "items_in_queue": q.len(),
@@ -654,7 +703,8 @@ fn status_response(
         "worker_environment_exists": env_exists,
         "worker_environment_state": if env_exists { "idle" } else { "closed" },
         "queue_stop_pending": st.queue_stop_pending,
-        "pause_pending": st.pause_pending,
+        // A landed pause is no longer pending.
+        "pause_pending": st.pause_pending && !paused_mid_run,
         "worker_background_tasks": st.worker_background_tasks,
         "queue_autostart_enabled": st.queue_autostart_enabled,
         "plan_queue_mode": st.queue_mode,
@@ -701,10 +751,24 @@ fn env_close(
     state: &Arc<StdMutex<EngineState>>,
     engine: &Arc<Mutex<Option<Arc<RunEngine>>>>,
     rt: &tokio::runtime::Handle,
+    queue_task: &Arc<QueueTaskSlot>,
 ) -> Value {
     let mut e = rt.block_on(engine.lock());
-    if e.is_none() {
-        return err("no environment");
+    let re = match e.as_ref() {
+        Some(re) => re,
+        None => return err("no environment"),
+    };
+    // Orderly close succeeds only when nothing is executing (ref:
+    // manager.py:2888 "The command is rejected if a plan is running").
+    // Two owners can be executing on this engine: the engine itself
+    // (queue worker, single-item execute, or a local console run) and
+    // the queue-worker task between items. environment_destroy is the
+    // forced path.
+    if re.state() != crate::engine::EngineRunState::Idle || queue_task.is_active() {
+        return err(
+            "cannot close the environment while a plan or the queue is running \
+             (use environment_destroy to force)",
+        );
     }
     // Set transitional state (ref: manager.py:591 MState.CLOSING_ENVIRONMENT).
     state.lock().unwrap().state = Some(EState::ClosingEnvironment);
@@ -716,28 +780,21 @@ fn env_close(
 fn env_destroy(
     state: &Arc<StdMutex<EngineState>>,
     engine: &Arc<Mutex<Option<Arc<RunEngine>>>>,
-    queue_task: &Arc<StdMutex<Option<AbortHandle>>>,
+    queue_task: &Arc<QueueTaskSlot>,
     rt: &tokio::runtime::Handle,
 ) -> Value {
+    // Validate before mutating anything: with no environment there is
+    // nothing to destroy — no task abort, no state transition.
+    let mut e = rt.block_on(engine.lock());
+    if e.is_none() {
+        return err("no environment");
+    }
     // Force-abort any running queue task before dropping the engine.
-    if let Some(h) = queue_task.lock().unwrap().take() {
+    if let Some(h) = queue_task.take() {
         h.abort();
     }
     // Set transitional state (ref: manager.py:660 MState.DESTROYING_ENVIRONMENT).
     state.lock().unwrap().state = Some(EState::DestroyingEnvironment);
-    env_close_inner(state, engine, rt)
-}
-
-fn env_close_inner(
-    state: &Arc<StdMutex<EngineState>>,
-    engine: &Arc<Mutex<Option<Arc<RunEngine>>>>,
-    rt: &tokio::runtime::Handle,
-) -> Value {
-    let mut e = rt.block_on(engine.lock());
-    if e.is_none() {
-        state.lock().unwrap().state = Some(EState::EnvironmentClosed);
-        return err("no environment");
-    }
     *e = None;
     state.lock().unwrap().state = Some(EState::EnvironmentClosed);
     json!({"success": true, "msg": ""})
@@ -1272,14 +1329,25 @@ fn resolve_pos_q(p: Option<&Value>, q: &PlanQueue) -> usize {
 
 fn queue_item_execute(
     registry: &Arc<Registry>,
+    queue: &Arc<StdMutex<PlanQueue>>,
+    state: &Arc<StdMutex<EngineState>>,
     engine: &Arc<Mutex<Option<Arc<RunEngine>>>>,
     rt: &tokio::runtime::Handle,
+    queue_task: &Arc<QueueTaskSlot>,
     params: &Value,
 ) -> Value {
     let item = match params.get("item") {
         Some(i) => i.clone(),
         None => return err("missing 'item'"),
     };
+    if item
+        .get("item_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("plan")
+        != "plan"
+    {
+        return err("queue_item_execute: only 'plan' items are supported");
+    }
     let name = match item.get("name").and_then(|v| v.as_str()) {
         Some(n) => n.to_string(),
         None => return err("item.name required"),
@@ -1298,18 +1366,50 @@ fn queue_item_execute(
         None => return err("environment not open"),
     };
     drop(e_guard);
-    let result = rt.block_on(re.run_async(plan));
-    match result {
-        Ok(r) => json!({
-            "success": r.exit_status == "success",
-            "msg": "",
-            "exit_status": r.exit_status,
-            // Preserve the single-valued `run_uid` wire field (the most recently
-            // opened run); RunResult now carries all opened UIDs in `run_uids`.
-            "run_uid": r.run_uids.last(),
-        }),
-        Err(e) => err(format!("run failed: {e}")),
+    // Immediate execution starts only from idle (ref: manager.py:2747 "The
+    // request fails if item execution can not be started immediately").
+    let cur_state = state.lock().unwrap().state;
+    if cur_state != Some(EState::Idle) {
+        return err(format!("cannot execute item in state {cur_state:?}"));
     }
+    // The slot claim is the synchronous gate: the manager state only
+    // flips to ExecutingQueue inside the worker, so back-to-back start
+    // requests can both see Idle — but only one can claim the slot.
+    let claim = match queue_task.claim() {
+        Some(c) => c,
+        None => return err("cannot execute item: a queue worker is already running"),
+    };
+    let generation = claim.generation();
+    let mut queued = QueuedItem::plan(name, item);
+    queued.user = params
+        .get("user")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    queued.user_group = params
+        .get("user_group")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let item_echo = serde_json::to_value(&queued).unwrap();
+    // Run through the shared worker machinery in the background — the
+    // response means "execution started"; the result is archived to the
+    // plan history (ref: manager.py:2744 `_queue_item_execute_handler`).
+    // rt.spawn (not tokio::spawn): dispatch runs on the plain rep thread,
+    // which has no ambient runtime context.
+    let join = rt.spawn(crate::qs::server::execute_single_item(
+        re,
+        queue.clone(),
+        state.clone(),
+        claim,
+        queued,
+        plan,
+    ));
+    queue_task.register(generation, join.abort_handle());
+    json!({
+        "success": true,
+        "msg": "",
+        "qsize": queue.lock().unwrap().len(),
+        "item": item_echo,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1319,7 +1419,7 @@ fn queue_start(
     state: &Arc<StdMutex<EngineState>>,
     engine: &Arc<Mutex<Option<Arc<RunEngine>>>>,
     rt: &tokio::runtime::Handle,
-    queue_task: &Arc<StdMutex<Option<AbortHandle>>>,
+    queue_task: &Arc<QueueTaskSlot>,
 ) -> Value {
     let e_guard = rt.block_on(engine.lock());
     let re = match e_guard.as_ref() {
@@ -1331,19 +1431,45 @@ fn queue_start(
     if cur_state != Some(EState::Idle) {
         return err(format!("cannot start in state {cur_state:?}"));
     }
-    let registry = registry.clone();
-    let queue = queue.clone();
-    let state = state.clone();
-    let task_slot = queue_task.clone();
-    let join = tokio::spawn(crate::qs::server::execute_queue_loop(
+    // The slot claim is the synchronous gate: the manager state only
+    // flips to ExecutingQueue inside the worker, so back-to-back start
+    // requests can both see Idle — but only one can claim the slot.
+    let claim = match queue_task.claim() {
+        Some(c) => c,
+        None => return err("cannot start: a queue worker is already running"),
+    };
+    let generation = claim.generation();
+    // rt.spawn (not tokio::spawn): dispatch runs on the plain rep thread,
+    // which has no ambient runtime context.
+    let join = rt.spawn(crate::qs::server::execute_queue_loop(
         re,
-        registry,
-        queue,
-        state,
-        task_slot.clone(),
+        registry.clone(),
+        queue.clone(),
+        state.clone(),
+        claim,
     ));
-    *task_slot.lock().unwrap() = Some(join.abort_handle());
+    queue_task.register(generation, join.abort_handle());
     json!({"success": true, "msg": ""})
+}
+
+/// Event-driven autostart (ref: manager.py:1253-1306 `_autostart_task` /
+/// `_autostart_push`): every event that can make the queue runnable —
+/// item added, environment opened, autostart enabled — attempts a start.
+/// `queue_start` stays the single owner of the start transition and
+/// re-checks manager state and environment, so a losing race is just a
+/// rejected call, never a second worker.
+fn maybe_autostart(
+    registry: &Arc<Registry>,
+    queue: &Arc<StdMutex<PlanQueue>>,
+    state: &Arc<StdMutex<EngineState>>,
+    engine: &Arc<Mutex<Option<Arc<RunEngine>>>>,
+    rt: &tokio::runtime::Handle,
+    queue_task: &Arc<QueueTaskSlot>,
+) {
+    if !state.lock().unwrap().queue_autostart_enabled || queue.lock().unwrap().is_empty() {
+        return;
+    }
+    let _ = queue_start(registry, queue, state, engine, rt, queue_task);
 }
 
 fn re_pause(
@@ -1354,6 +1480,12 @@ fn re_pause(
 ) -> Value {
     let e_guard = rt.block_on(engine.lock());
     if let Some(re) = e_guard.as_ref() {
+        // Pausing an idle engine would latch is_paused/deferred_pause with
+        // nothing to land on (bluesky-queueserver also rejects re_pause
+        // unless a plan is executing).
+        if re.state() == crate::engine::EngineRunState::Idle {
+            return err("re_pause: no plan is running");
+        }
         let defer = params
             .get("option")
             .and_then(|v| v.as_str())

@@ -6,9 +6,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
 
 fn now_ns() -> u64 {
     SystemTime::now()
@@ -19,6 +18,8 @@ fn now_ns() -> u64 {
 
 /// Source that yields a fixed sequence of frames synchronously.
 pub struct VecFrameSource {
+    /// `frames()` is a sync trait method that may be called from inside a
+    /// tokio runtime, so this must be a std mutex (no await under the lock).
     frames: Mutex<Vec<Frame>>,
     /// Monotonic seq counter — kept for telemetry.
     pub seq: Arc<AtomicU64>,
@@ -51,7 +52,7 @@ impl VecFrameSource {
 #[async_trait]
 impl FrameSource for VecFrameSource {
     fn frames(&self) -> BoxStream<'static, Frame> {
-        let frames = std::mem::take(&mut *self.frames.blocking_lock());
+        let frames = std::mem::take(&mut *self.frames.lock().unwrap());
         stream::iter(frames).boxed()
     }
     async fn start(&self) -> Result<()> {
@@ -59,5 +60,25 @@ impl FrameSource for VecFrameSource {
     }
     async fn stop(&self) -> Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `frames()` must be callable from inside a tokio runtime — the
+    /// frame-source binary calls it on a runtime thread. With a tokio
+    /// mutex + `blocking_lock` this panicked ("Cannot block the current
+    /// thread from within a runtime").
+    #[tokio::test]
+    async fn frames_callable_inside_runtime() {
+        let src = VecFrameSource::new(vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")]);
+        let got: Vec<Frame> = src.frames().collect().await;
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].payload.as_ref(), b"a");
+        // Second call: the vec was drained, stream is empty.
+        let empty: Vec<Frame> = src.frames().collect().await;
+        assert!(empty.is_empty());
     }
 }

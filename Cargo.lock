@@ -765,7 +765,7 @@ dependencies = [
 
 [[package]]
 name = "bsrs"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -807,7 +807,7 @@ dependencies = [
 
 [[package]]
 name = "bsrs-derive"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1765,9 +1765,9 @@ checksum = "869b0adbda23651a9c5c0c3d270aac9fcb52e8622a8f2b17e57802d7791962f2"
 
 [[package]]
 name = "epics-base-rs"
-version = "0.24.0"
+version = "0.24.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c16a89ec4df7d0bcb7e15e66503d00b54875b3cee2dc19db2c364860eec44478"
+checksum = "adde0049aca425c2feb4ce29988ee33812099bbe6f3af712a38ca38c1c47d366"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1788,9 +1788,9 @@ dependencies = [
 
 [[package]]
 name = "epics-ca-rs"
-version = "0.24.0"
+version = "0.24.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b2c544d3e386f1e314d144734eb96b43ffa8b5d234023e22f506e4a7a2987ad"
+checksum = "06fd96c424094d1fc2cfb280bd5949ec7385bc6eb0d1d892912e3b3ba6523174"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1824,9 +1824,9 @@ dependencies = [
 
 [[package]]
 name = "epics-pva-rs"
-version = "0.24.0"
+version = "0.24.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f2e0c9eda8d9f1df01bdae4f5079a7e15adce94459d1e31ae85c2e24a15593e"
+checksum = "7281a2db2eb5242516243486f4162eac900203f9988e846af521448ad069aa13"
 dependencies = [
  "bytes",
  "chrono",
@@ -3280,7 +3280,7 @@ dependencies = [
 
 [[package]]
 name = "mini-beamline-qs"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bsrs",
@@ -4564,9 +4564,9 @@ dependencies = [
 
 [[package]]
 name = "rust-hdf5"
-version = "0.2.7"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16c1243a96ce346596e112107f7ec96af6a57d9f59d13ce0ea3888d44ccf5f17"
+checksum = "76d9a3a248d812fc26bb6342fa6c978bf08ff3c801418608854678d462b7c52c"
 dependencies = [
  "flate2",
 ]
@@ -6450,7 +6450,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

@@ -90,6 +90,11 @@ impl PlanQueue {
     }
     fn bump_queue_uid(&mut self) {
         self.queue_uid = Uuid::new_v4().to_string();
+        // Every queue mutation passes through here (it is what keeps
+        // queue_uid honest), so it is also the single owner of the
+        // depth gauge.
+        #[cfg(feature = "metrics")]
+        crate::qs::metrics::queue_depth(self.items.len());
     }
     fn bump_history_uid(&mut self) {
         self.history_uid = Uuid::new_v4().to_string();

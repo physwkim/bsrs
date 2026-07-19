@@ -314,9 +314,10 @@ fn open_file(
 ) -> Result<(rust_hdf5::H5File, rust_hdf5::H5Dataset)> {
     let file = rust_hdf5::H5File::create(path)
         .map_err(|e| BsrsError::Backend(format!("hdf5 sink create {}: {e}", path.display())))?;
-    // rust-hdf5 0.2 only supports attributes on the root file; per-group
-    // NX_class attrs would require a newer version. Mark the root with
-    // a hint and rely on the path layout for the rest.
+    // Only the root file carries NX_class hints; the groups rely on the
+    // path layout. rust-hdf5 0.3 does support per-group attributes, so a
+    // full NeXus layout (NXentry/NXinstrument/NXdetector group attrs) is
+    // now possible — not yet wired in.
     file.set_attr_string("NX_class", "NXroot").ok();
     file.set_attr_string("default", "entry").ok();
     let entry = file
@@ -325,11 +326,15 @@ fn open_file(
     let instr = entry
         .create_group("instrument")
         .map_err(|e| BsrsError::Backend(format!("hdf5 sink: create instrument: {e}")))?;
-    let _det = instr
+    let det = instr
         .create_group(name)
         .map_err(|e| BsrsError::Backend(format!("hdf5 sink: create {name}: {e}")))?;
-    let dataset_path = format!("entry/instrument/{name}/data");
-    let mut builder = file
+    // Create the dataset ON the leaf group with a relative link name.
+    // `DatasetBuilder::create` documents the name as a link name within
+    // the builder's group — a file-rooted "a/b/c/data" path produces a
+    // file whose dataset link libhdf5/h5py cannot resolve (only
+    // rust-hdf5's own reader tolerates it).
+    let mut builder = det
         .new_dataset::<u8>()
         .shape([0])
         .max_shape(&[None])
@@ -338,8 +343,10 @@ fn open_file(
     if compress {
         builder = builder.deflate(4);
     }
-    let dataset = builder.create(&dataset_path).map_err(|e| {
-        BsrsError::Backend(format!("hdf5 sink: create dataset {dataset_path}: {e}"))
+    let dataset = builder.create("data").map_err(|e| {
+        BsrsError::Backend(format!(
+            "hdf5 sink: create dataset entry/instrument/{name}/data: {e}"
+        ))
     })?;
     Ok((file, dataset))
 }

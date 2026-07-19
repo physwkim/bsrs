@@ -2089,3 +2089,541 @@ async fn no_curve_when_env_var_unset_plaintext_works() {
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
+
+/// Register a plan that checkpoints then sleeps forever — pausable at every
+/// iteration, never finishes on its own.
+fn register_pausable_loop(reg: &mut Registry, name: &str) {
+    use bsrs::core::msg::Msg;
+    use bsrs::core::plan::plan_box;
+    let factory: bsrs::qs::PlanFactory = Arc::new(move |_reg, _args| {
+        Ok(plan_box(async_stream::stream! {
+            loop {
+                yield Msg::Checkpoint;
+                yield Msg::Sleep(Duration::from_millis(20));
+            }
+        }))
+    });
+    reg.register_plan(name, factory);
+}
+
+/// Poll `status` until `pred` holds or ~3s elapse; returns the last status.
+async fn poll_status(req: &zmq::Socket, pred: impl Fn(&Value) -> bool) -> Value {
+    let mut last = json!(null);
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        last = rpc(req, "status", json!({}));
+        if pred(&last) {
+            break;
+        }
+    }
+    last
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_reports_paused_while_engine_paused() {
+    let mut reg = Registry::new();
+    register_pausable_loop(&mut reg, "pausable_loop");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    rpc(&req, "environment_open", json!({}));
+    rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "pausable_loop", "args": []}}),
+    );
+    rpc(&req, "queue_start", json!({}));
+    let r = poll_status(&req, |s| s["manager_state"] == "executing_queue").await;
+    assert_eq!(r["manager_state"], "executing_queue", "{r}");
+
+    // Deferred pause lands at the next Checkpoint; status must surface it.
+    let r = rpc(&req, "re_pause", json!({"option": "deferred"}));
+    assert_eq!(r["success"], true, "{r}");
+    let r = poll_status(&req, |s| s["manager_state"] == "paused").await;
+    assert_eq!(r["manager_state"], "paused", "{r}");
+    assert_eq!(r["re_state"], "paused", "{r}");
+    assert_eq!(
+        r["pause_pending"], false,
+        "a landed pause is not pending: {r}"
+    );
+
+    // Resume → back to executing_queue.
+    let r = rpc(&req, "re_resume", json!({}));
+    assert_eq!(r["success"], true, "{r}");
+    let r = poll_status(&req, |s| s["manager_state"] == "executing_queue").await;
+    assert_eq!(r["manager_state"], "executing_queue", "{r}");
+
+    // Immediate pause → paused again; then stop ends the run gracefully.
+    rpc(&req, "re_pause", json!({"option": "immediate"}));
+    let r = poll_status(&req, |s| s["manager_state"] == "paused").await;
+    assert_eq!(r["manager_state"], "paused", "{r}");
+    rpc(&req, "re_stop", json!({}));
+    let r = poll_status(&req, |s| s["manager_state"] == "idle").await;
+    assert_eq!(r["manager_state"], "idle", "{r}");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn re_pause_rejected_when_no_plan_running() {
+    let mut reg = Registry::new();
+    register_pausable_loop(&mut reg, "pausable_loop");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    // Without an environment: distinct error.
+    let r = rpc(&req, "re_pause", json!({"option": "immediate"}));
+    assert_eq!(r["success"], false, "{r}");
+
+    // With an environment but nothing running: rejected, nothing latches.
+    rpc(&req, "environment_open", json!({}));
+    let r = rpc(&req, "re_pause", json!({"option": "deferred"}));
+    assert_eq!(r["success"], false, "idle engine must reject pause: {r}");
+    let r = rpc(&req, "status", json!({}));
+    assert_eq!(r["pause_pending"], false, "{r}");
+    assert_eq!(r["manager_state"], "idle", "{r}");
+
+    // A run started after the rejected pause must execute normally
+    // (no stale pause flag from the rejected request).
+    rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "pausable_loop", "args": []}}),
+    );
+    rpc(&req, "queue_start", json!({}));
+    let r = poll_status(&req, |s| s["manager_state"] == "executing_queue").await;
+    assert_eq!(r["manager_state"], "executing_queue", "{r}");
+    rpc(&req, "re_stop", json!({}));
+    let r = poll_status(&req, |s| s["manager_state"] == "idle").await;
+    assert_eq!(r["manager_state"], "idle", "{r}");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_autostart_param_is_validated() {
+    let reg = Registry::new();
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    // Valid forms.
+    let r = rpc(&req, "queue_autostart", json!({"enable": true}));
+    assert_eq!(r["success"], true, "{r}");
+    let r = rpc(&req, "status", json!({}));
+    assert_eq!(r["queue_autostart_enabled"], true, "{r}");
+    let r = rpc(&req, "queue_autostart", json!({"option": "disable"}));
+    assert_eq!(r["success"], true, "{r}");
+    let r = rpc(&req, "status", json!({}));
+    assert_eq!(r["queue_autostart_enabled"], false, "{r}");
+
+    // Re-enable, then throw invalid requests at it: each must ERROR and
+    // must not silently flip the flag to disabled.
+    rpc(&req, "queue_autostart", json!({"enable": true}));
+    for bad in [
+        json!({}),
+        json!({"enable": "true"}),
+        json!({"option": "bogus"}),
+        json!({"option": 1}),
+    ] {
+        let r = rpc(&req, "queue_autostart", bad.clone());
+        assert_eq!(r["success"], false, "params {bad} must be rejected: {r}");
+        let r = rpc(&req, "status", json!({}));
+        assert_eq!(
+            r["queue_autostart_enabled"], true,
+            "invalid request {bad} silently changed the flag: {r}"
+        );
+    }
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+/// Register a plan that opens a run and then fails (`Msg::Fail` → run error →
+/// exit_status "fail").
+fn register_failing_plan(reg: &mut Registry, name: &str) {
+    use bsrs::core::msg::Msg;
+    use bsrs::core::plan::plan_box;
+    let factory: bsrs::qs::PlanFactory = Arc::new(move |_reg, _args| {
+        Ok(plan_box(async_stream::stream! {
+            yield Msg::OpenRun(Default::default());
+            yield Msg::Fail("intentional test failure".into());
+        }))
+    });
+    reg.register_plan(name, factory);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_stops_when_item_fails_to_build() {
+    let det = SoftDetector::new("det1");
+    let mut reg = Registry::new();
+    reg.register_readable("det1", det as Arc<dyn ReadableObj>);
+    reg.register_plan_count("count");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    rpc(&req, "environment_open", json!({}));
+    // First item builds against an unknown detector (build-time factory
+    // error); the second is runnable and must NOT be reached.
+    for item in [
+        json!({"name": "count", "args": ["no_such_det", 1]}),
+        json!({"name": "count", "args": ["det1", 1]}),
+    ] {
+        let r = rpc(&req, "queue_item_add", json!({ "item": item }));
+        assert_eq!(r["success"], true, "{r}");
+    }
+    rpc(&req, "queue_start", json!({}));
+
+    let r = poll_status(&req, |s| {
+        s["manager_state"] == "idle" && s["items_in_history"] == 1
+    })
+    .await;
+    assert_eq!(r["items_in_history"], 1, "{r}");
+    assert_eq!(
+        r["items_in_queue"], 1,
+        "queue must stop before the second item: {r}"
+    );
+    assert_eq!(r["plans_failed"], 1, "{r}");
+    assert_eq!(r["running_item_name"], Value::Null, "{r}");
+    let r = rpc(&req, "history_get", json!({}));
+    assert_eq!(r["items"][0]["result"]["exit_status"], "fail", "{r}");
+
+    // Same exit must deactivate autostart (ref: manager.py:852): clear the
+    // queue, arm autostart, add another unbuildable item.
+    rpc(&req, "queue_clear", json!({}));
+    rpc(&req, "queue_autostart", json!({"enable": true}));
+    rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": ["no_such_det", 1]}}),
+    );
+    let r = poll_status(&req, |s| {
+        s["manager_state"] == "idle" && s["items_in_history"] == 2
+    })
+    .await;
+    assert_eq!(r["items_in_history"], 2, "{r}");
+    assert_eq!(
+        r["queue_autostart_enabled"], false,
+        "a build failure must deactivate autostart: {r}"
+    );
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn env_close_rejected_while_executing_destroy_forces() {
+    let mut reg = Registry::new();
+    register_pausable_loop(&mut reg, "pausable_loop");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    // Destroy with no environment must be rejected without side effects
+    // (the pre-open manager state is "environment_closed" and must not
+    // move through destroying/closed transitions).
+    let r = rpc(&req, "environment_destroy", json!({}));
+    assert_eq!(r["success"], false, "{r}");
+    let r = rpc(&req, "status", json!({}));
+    assert_eq!(
+        r["manager_state"], "environment_closed",
+        "no-env destroy must not touch state: {r}"
+    );
+
+    rpc(&req, "environment_open", json!({}));
+    rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "pausable_loop", "args": []}}),
+    );
+    rpc(&req, "queue_start", json!({}));
+    let r = poll_status(&req, |s| s["manager_state"] == "executing_queue").await;
+    assert_eq!(r["manager_state"], "executing_queue", "{r}");
+
+    // Orderly close is rejected while a plan is running (ref: manager.py:2888).
+    let r = rpc(&req, "environment_close", json!({}));
+    assert_eq!(r["success"], false, "close must be rejected mid-run: {r}");
+    let r = rpc(&req, "status", json!({}));
+    assert_eq!(r["worker_environment_exists"], true, "{r}");
+    assert_eq!(r["manager_state"], "executing_queue", "{r}");
+
+    // environment_destroy force-kills the worker and drops the environment.
+    let r = rpc(&req, "environment_destroy", json!({}));
+    assert_eq!(r["success"], true, "{r}");
+    let r = poll_status(&req, |s| s["worker_environment_exists"] == false).await;
+    assert_eq!(r["worker_environment_exists"], false, "{r}");
+
+    // With everything idle again, orderly open + close succeed.
+    let r = rpc(&req, "environment_open", json!({}));
+    assert_eq!(r["success"], true, "{r}");
+    let r = rpc(&req, "environment_close", json!({}));
+    assert_eq!(r["success"], true, "idle close must succeed: {r}");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_item_execute_runs_in_background_with_bookkeeping() {
+    let mut reg = Registry::new();
+    register_pausable_loop(&mut reg, "pausable_loop");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    rpc(&req, "environment_open", json!({}));
+    // Loop mode on: an immediately-executed item must NOT be re-queued
+    // (ref: manager.py:2751-2753).
+    rpc(&req, "queue_mode_set", json!({"mode": {"loop": true}}));
+
+    // The response returns immediately with the item echo, while the
+    // plan is still running.
+    let r = rpc(
+        &req,
+        "queue_item_execute",
+        json!({"item": {"name": "pausable_loop", "args": []}}),
+    );
+    assert_eq!(r["success"], true, "{r}");
+    assert_eq!(r["item"]["name"], "pausable_loop", "{r}");
+    assert!(r["item"]["item_uid"].is_string(), "{r}");
+
+    // The control plane stays responsive while the item executes.
+    let r = poll_status(&req, |s| s["manager_state"] == "executing_queue").await;
+    assert_eq!(r["manager_state"], "executing_queue", "{r}");
+    assert_eq!(r["running_item_name"], "pausable_loop", "{r}");
+
+    // A second immediate execution is rejected while one is running.
+    let r = rpc(
+        &req,
+        "queue_item_execute",
+        json!({"item": {"name": "pausable_loop", "args": []}}),
+    );
+    assert_eq!(r["success"], false, "must reject while executing: {r}");
+
+    // Stop ends the run; the result must be archived with full bookkeeping.
+    rpc(&req, "re_stop", json!({}));
+    let r = poll_status(&req, |s| {
+        s["manager_state"] == "idle" && s["items_in_history"] == 1
+    })
+    .await;
+    assert_eq!(r["items_in_history"], 1, "result must be archived: {r}");
+    assert_eq!(r["plans_run"], 1, "{r}");
+    assert_eq!(r["items_in_queue"], 0, "loop mode must not re-queue: {r}");
+
+    let r = rpc(&req, "history_get", json!({}));
+    assert_eq!(r["items"][0]["name"], "pausable_loop", "{r}");
+    assert_eq!(r["items"][0]["result"]["exit_status"], "success", "{r}");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_item_execute_failure_is_archived() {
+    let mut reg = Registry::new();
+    register_failing_plan(&mut reg, "failing_plan");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    rpc(&req, "environment_open", json!({}));
+    let r = rpc(
+        &req,
+        "queue_item_execute",
+        json!({"item": {"name": "failing_plan", "args": []}}),
+    );
+    assert_eq!(r["success"], true, "execution start must succeed: {r}");
+
+    let r = poll_status(&req, |s| {
+        s["manager_state"] == "idle" && s["items_in_history"] == 1
+    })
+    .await;
+    assert_eq!(r["items_in_history"], 1, "{r}");
+    assert_eq!(r["plans_run"], 1, "{r}");
+    assert_eq!(r["plans_failed"], 1, "{r}");
+
+    let r = rpc(&req, "history_get", json!({}));
+    assert_eq!(r["items"][0]["result"]["exit_status"], "fail", "{r}");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn autostart_runs_added_items_without_queue_start() {
+    let det = SoftDetector::new("det1");
+    let mut reg = Registry::new();
+    reg.register_readable("det1", det as Arc<dyn ReadableObj>);
+    reg.register_plan_count("count");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    // Arm autostart and queue an item before the environment exists:
+    // nothing may start yet.
+    let r = rpc(&req, "queue_autostart", json!({"enable": true}));
+    assert_eq!(r["success"], true, "{r}");
+    let r = rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": ["det1", 1]}}),
+    );
+    assert_eq!(r["success"], true, "{r}");
+    let r = rpc(&req, "status", json!({}));
+    assert_eq!(r["items_in_queue"], 1, "no env, must not start: {r}");
+
+    // Opening the environment triggers the pending autostart — no queue_start.
+    let r = rpc(&req, "environment_open", json!({}));
+    assert_eq!(r["success"], true, "{r}");
+    let r = poll_status(&req, |s| {
+        s["items_in_history"] == 1 && s["manager_state"] == "idle"
+    })
+    .await;
+    assert_eq!(r["items_in_history"], 1, "item did not run: {r}");
+    assert_eq!(r["items_in_queue"], 0, "{r}");
+    let hist = rpc(&req, "history_get", json!({}));
+    assert_eq!(
+        hist["items"][0]["result"]["exit_status"], "success",
+        "{hist}"
+    );
+    assert_eq!(
+        r["queue_autostart_enabled"], true,
+        "a successful run keeps autostart armed: {r}"
+    );
+
+    // Adding another item while idle starts it immediately.
+    rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": ["det1", 1]}}),
+    );
+    let r = poll_status(&req, |s| {
+        s["items_in_history"] == 2 && s["manager_state"] == "idle"
+    })
+    .await;
+    assert_eq!(r["items_in_history"], 2, "second item did not run: {r}");
+    assert_eq!(r["queue_autostart_enabled"], true, "{r}");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn autostart_disabled_by_queue_stop_instruction() {
+    let det = SoftDetector::new("det1");
+    let mut reg = Registry::new();
+    reg.register_readable("det1", det as Arc<dyn ReadableObj>);
+    reg.register_plan_count("count");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    rpc(&req, "environment_open", json!({}));
+    // Load the queue while autostart is off so the layout is deterministic:
+    // [count, queue_stop instruction, count].
+    for item in [
+        json!({"name": "count", "args": ["det1", 1]}),
+        json!({"item_type": "instruction", "name": "queue_stop"}),
+        json!({"name": "count", "args": ["det1", 1]}),
+    ] {
+        let r = rpc(&req, "queue_item_add", json!({ "item": item }));
+        assert_eq!(r["success"], true, "{r}");
+    }
+
+    // Enabling autostart starts the queue; the instruction stops it after
+    // the first plan and must deactivate autostart (ref: manager.py:1161).
+    rpc(&req, "queue_autostart", json!({"enable": true}));
+    let r = poll_status(&req, |s| {
+        s["items_in_history"] == 2 && s["manager_state"] == "idle"
+    })
+    .await;
+    assert_eq!(r["items_in_history"], 2, "plan + instruction: {r}");
+    assert_eq!(r["items_in_queue"], 1, "third item stays queued: {r}");
+    assert_eq!(
+        r["queue_autostart_enabled"], false,
+        "queue_stop must deactivate autostart: {r}"
+    );
+
+    // With autostart off, a new item must not start anything.
+    rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": []}}),
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let r = rpc(&req, "status", json!({}));
+    assert_eq!(r["manager_state"], "idle", "{r}");
+    assert_eq!(r["items_in_queue"], 2, "{r}");
+    assert_eq!(r["items_in_history"], 2, "{r}");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn autostart_disabled_by_plan_failure() {
+    let mut reg = Registry::new();
+    reg.register_plan_count("count");
+    register_failing_plan(&mut reg, "failing_plan");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    rpc(&req, "environment_open", json!({}));
+    rpc(&req, "queue_autostart", json!({"enable": true}));
+    rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "failing_plan", "args": []}}),
+    );
+
+    let r = poll_status(&req, |s| {
+        s["items_in_history"] == 1 && s["manager_state"] == "idle"
+    })
+    .await;
+    assert_eq!(r["items_in_history"], 1, "failing plan did not run: {r}");
+    assert_eq!(r["plans_failed"], 1, "{r}");
+    assert_eq!(
+        r["queue_autostart_enabled"], false,
+        "a failed plan must deactivate autostart (ref: manager.py:852): {r}"
+    );
+
+    // With autostart off, a new item must not start anything.
+    rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": []}}),
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let r = rpc(&req, "status", json!({}));
+    assert_eq!(r["manager_state"], "idle", "{r}");
+    assert_eq!(r["items_in_queue"], 1, "{r}");
+    assert_eq!(r["items_in_history"], 1, "{r}");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+// A server leaked without `shutdown()` — as any panicking test in this
+// suite effectively does — must not block the tokio runtime's drop.
+// With the rep loop on the blocking pool (pre-fix), runtime shutdown
+// waited forever for it and every assertion failure in this suite
+// presented as a whole-binary hang; on a plain thread the runtime drop
+// returns and the leaked thread dies with the process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn leaked_server_does_not_hang_test_shutdown() {
+    let mut reg = Registry::new();
+    reg.register_plan_count("count");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+    let r = rpc(&req, "ping", json!({}));
+    assert_eq!(r["success"], true, "{r}");
+    // Intentionally NO shutdown.shutdown(): the test passes iff the
+    // runtime drop after this body returns instead of hanging.
+}

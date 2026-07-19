@@ -3010,3 +3010,72 @@ async fn respond_channel_delivers_reading_to_plan() {
         "Respond(Read) must deliver the device's reading to the plan inline"
     );
 }
+
+/// A deferred pause latched while the engine is idle (or left over from a
+/// run that ended before reaching a Checkpoint) must not pause the next
+/// run at its first Checkpoint — run start resets it like is_paused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_deferred_pause_does_not_pause_next_run() {
+    let re = Arc::new(RunEngine::new(vec![]));
+    // Latch a deferred pause with nothing running.
+    re.pause(true);
+
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Checkpoint;
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let result = tokio::time::timeout(Duration::from_secs(5), re.run_async(plan))
+        .await
+        .expect("run hung: stale deferred_pause paused the plan at its first Checkpoint")
+        .expect("run failed");
+    assert_eq!(result.exit_status, "success");
+    assert_eq!(re.state(), EngineRunState::Idle);
+}
+
+/// `stop`/`abort`/`halt` while the plan is parked inside a cancellable
+/// handler (`Msg::Sleep`) must resolve to the interrupt's exit status
+/// (success/abort/halt, as the between-messages checks do), not to "fail"
+/// from the handler's `Cancelled` error.
+async fn interrupt_during_sleep(
+    interrupt: impl FnOnce(&RunEngine) + Send + 'static,
+) -> bsrs::engine::RunResult {
+    let re = Arc::new(RunEngine::new(vec![]));
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Sleep(Duration::from_secs(30));
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let re2 = re.clone();
+    let run = tokio::spawn(async move { re2.run_async(plan).await });
+    // Let the plan reach the Sleep handler before interrupting.
+    while re.state() != EngineRunState::Running {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    interrupt(&re);
+    tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("run hung after interrupt during Sleep")
+        .expect("join failed")
+        .expect("run errored")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_during_sleep_exits_success() {
+    let r = interrupt_during_sleep(|re| re.stop()).await;
+    assert_eq!(r.exit_status, "success", "bluesky RE.stop closes clean");
+    assert!(r.interrupted, "a stop is still an interrupted run");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abort_during_sleep_exits_abort() {
+    let r = interrupt_during_sleep(|re| re.abort("user abort")).await;
+    assert_eq!(r.exit_status, "abort");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn halt_during_sleep_exits_halt() {
+    let r = interrupt_during_sleep(|re| re.halt("user halt")).await;
+    assert_eq!(r.exit_status, "halt");
+}

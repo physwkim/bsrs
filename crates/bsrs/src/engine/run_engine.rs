@@ -724,6 +724,9 @@ impl RunEngine {
         // into this run's RunStop (bluesky run_engine.py:1497).
         self.interrupt_reason.lock().unwrap().clear();
         self.is_paused.store(false, Ordering::SeqCst);
+        // A deferred pause that never reached a Checkpoint before its run
+        // ended must not carry over and pause this run's first Checkpoint.
+        self.deferred_pause.store(false, Ordering::SeqCst);
         // Reset SIGINT 3-tap counter — a previous session's taps must
         // not put a fresh run into the abort/halt path on the very
         // first ctrl-c.
@@ -1505,6 +1508,29 @@ impl RunEngine {
                 Ok(Some(uid)) => run_uids.push(uid),
                 Ok(None) => {}
                 Err(e) => {
+                    // A handler cancelled while an interrupt flag is set is the
+                    // interrupt *mechanism* firing (`stop`/`abort`/`halt` cancel
+                    // the token to unpark in-flight `Sleep`/`WaitFor`/status
+                    // awaits), not a plan failure: resolve the exit from the
+                    // flags exactly like the between-messages checks above, and
+                    // bypass contingency routing — a between-messages interrupt
+                    // never reaches the plan's except-path either. `Cancelled`
+                    // with no flag set (a device cancelling its own status)
+                    // falls through and stays a plan failure.
+                    if matches!(e, BsrsError::Cancelled) {
+                        if self.is_halting.load(Ordering::SeqCst) {
+                            exit_status = "halt".into();
+                            break;
+                        }
+                        if self.is_stopping.load(Ordering::SeqCst) {
+                            exit_status = "success".into();
+                            break;
+                        }
+                        if self.is_aborting.load(Ordering::SeqCst) {
+                            exit_status = "abort".into();
+                            break;
+                        }
+                    }
                     // If a `contingency_wrapper` region is active, route the
                     // error into its innermost sink and keep running instead of
                     // failing the run. The wrapper reads the sink right after it

@@ -8,7 +8,6 @@ use crate::callbacks::ZmqDocumentSink;
 use crate::core::error::{BsrsError, Result};
 use crate::engine::{DocumentSink, RunEngine, RunOptions};
 use tokio::sync::Mutex;
-use tokio::task::AbortHandle;
 
 use crate::engine::CheckpointHook;
 use crate::qs::dispatch::dispatch;
@@ -17,6 +16,7 @@ use crate::qs::permissions::Permissions;
 use crate::qs::queue::PlanQueue;
 use crate::qs::registry::Registry;
 use crate::qs::state::{EState, EngineState};
+use crate::qs::task_slot::{QueueTaskSlot, SlotClaim};
 use crate::qs::tasks::TaskTracker;
 use crate::qs::transport::ReqRepSocket;
 
@@ -167,6 +167,12 @@ impl ServerBuilder {
                 Ok(Arc::new(ZmqDocumentSink::bind(a)?) as Arc<dyn DocumentSink>)
             })
             .transpose()?;
+        // Count documents on the broadcast path
+        // (`bsrs_qs_documents_total{name=...}`): wrap the sink once here,
+        // the single place it is constructed.
+        #[cfg(feature = "metrics")]
+        let document_sink = document_sink
+            .map(|s| Arc::new(crate::qs::metrics::CountingSink::new(s)) as Arc<dyn DocumentSink>);
         // Install the Prometheus exporter if a metrics_address was
         // configured AND the feature is built. Idempotent: once
         // installed, subsequent ServerBuilder builds with the same
@@ -205,7 +211,7 @@ impl ServerBuilder {
             queue: Arc::new(StdMutex::new(PlanQueue::new())),
             state: Arc::new(StdMutex::new(EngineState::initial())),
             engine,
-            queue_task: Arc::new(StdMutex::new(None)),
+            queue_task: Arc::new(QueueTaskSlot::new()),
             permissions,
             lua_evaluator: self.lua_evaluator,
             task_tracker: Arc::new(TaskTracker::new()),
@@ -222,10 +228,11 @@ pub struct Server {
     queue: Arc<StdMutex<PlanQueue>>,
     state: Arc<StdMutex<EngineState>>,
     engine: Arc<Mutex<Option<Arc<RunEngine>>>>,
-    /// AbortHandle for the currently-running `execute_queue_loop`, if any.
-    /// Stored so [`ServerShutdown::shutdown`] can stop the worker mid-plan
-    /// (rule **K1**: spawned task must terminate when its owner drops).
-    queue_task: Arc<StdMutex<Option<AbortHandle>>>,
+    /// Claim slot for the currently-running queue worker
+    /// (`execute_queue_loop` / `execute_single_item`), if any. Stored so
+    /// [`ServerShutdown::shutdown`] can stop the worker mid-plan (rule
+    /// **K1**: spawned task must terminate when its owner drops).
+    queue_task: Arc<QueueTaskSlot>,
     permissions: Arc<Permissions>,
     lua_evaluator: Option<Arc<dyn LuaEvaluator>>,
     task_tracker: Arc<TaskTracker>,
@@ -238,9 +245,13 @@ impl Server {
         ServerBuilder::default()
     }
 
-    /// Async entry point. The REP-socket loop runs on a dedicated blocking
-    /// thread (libzmq REP is sync in the `zmq` crate). Plan execution
-    /// happens on the bsrs runtime.
+    /// Async entry point. The REP-socket loop runs on a dedicated plain
+    /// `std::thread` (libzmq REP is sync in the `zmq` crate) — NOT on the
+    /// tokio blocking pool: runtime shutdown waits for blocking-pool tasks,
+    /// so a server leaked without [`ServerShutdown::shutdown`] (e.g. a
+    /// panicking test) would deadlock the runtime drop. A plain thread is
+    /// not waited on; it exits with the process. Plan execution happens on
+    /// the bsrs runtime via the captured handle.
     pub async fn run_async(&self) -> Result<()> {
         let socket = self.socket.clone();
         let registry = self.registry.clone();
@@ -253,26 +264,32 @@ impl Server {
         let lua_evaluator = self.lua_evaluator.clone();
         let task_tracker = self.task_tracker.clone();
         let checkpoint_hook = self.checkpoint_hook.clone();
+        let rt = tokio::runtime::Handle::current();
 
-        let join = tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Handle::current();
-            rep_loop(
-                rt,
-                socket,
-                registry,
-                queue,
-                state,
-                engine,
-                document_sink,
-                queue_task,
-                permissions,
-                lua_evaluator,
-                task_tracker,
-                checkpoint_hook,
-            )
-        });
-        join.await
-            .map_err(|e| BsrsError::Backend(format!("rep loop join: {e}")))?
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("bsrs-qs-rep".into())
+            .spawn(move || {
+                let result = rep_loop(
+                    rt,
+                    socket,
+                    registry,
+                    queue,
+                    state,
+                    engine,
+                    document_sink,
+                    queue_task,
+                    permissions,
+                    lua_evaluator,
+                    task_tracker,
+                    checkpoint_hook,
+                );
+                let _ = done_tx.send(result);
+            })
+            .map_err(|e| BsrsError::Backend(format!("rep thread spawn: {e}")))?;
+        done_rx.await.map_err(|_| {
+            BsrsError::Backend("rep loop exited without a result (panicked?)".into())
+        })?
     }
 
     /// Sync entry point.
@@ -314,7 +331,7 @@ impl Server {
 #[derive(Clone)]
 pub struct ServerShutdown {
     socket: ReqRepSocket,
-    queue_task: Arc<StdMutex<Option<AbortHandle>>>,
+    queue_task: Arc<QueueTaskSlot>,
 }
 
 impl ServerShutdown {
@@ -322,7 +339,7 @@ impl ServerShutdown {
     /// any in-flight queue execution task is aborted (rule **K1**).
     pub fn shutdown(&self) {
         self.socket.shutdown();
-        if let Some(h) = self.queue_task.lock().unwrap().take() {
+        if let Some(h) = self.queue_task.take() {
             h.abort();
         }
     }
@@ -342,7 +359,7 @@ fn rep_loop(
     state: Arc<StdMutex<EngineState>>,
     engine: Arc<Mutex<Option<Arc<RunEngine>>>>,
     document_sink: Option<Arc<dyn DocumentSink>>,
-    queue_task: Arc<StdMutex<Option<AbortHandle>>>,
+    queue_task: Arc<QueueTaskSlot>,
     permissions: Arc<Permissions>,
     lua_evaluator: Option<Arc<dyn LuaEvaluator>>,
     task_tracker: Arc<TaskTracker>,
@@ -379,10 +396,25 @@ fn rep_loop(
         }
     }
     // Loop exited (shutdown). Make absolutely sure the queue worker is gone.
-    if let Some(h) = queue_task.lock().unwrap().take() {
+    if let Some(h) = queue_task.take() {
         h.abort();
     }
     Ok(())
+}
+
+/// Return the manager to idle when the queue worker exits.
+/// `disable_autostart` — true on every failure/stop exit (ref:
+/// manager.py:852,1080: a failed/interrupted plan and queue_stop
+/// deactivate autostart); false only on a normal drain to an empty
+/// queue, which keeps autostart armed (manager.py:1085).
+fn idle_out(state: &Arc<StdMutex<EngineState>>, disable_autostart: bool) {
+    let mut s = state.lock().unwrap();
+    s.state = Some(EState::Idle);
+    s.pause_pending = false;
+    s.current_plan_name = None;
+    if disable_autostart {
+        s.queue_autostart_enabled = false;
+    }
 }
 
 pub(crate) async fn execute_queue_loop(
@@ -390,27 +422,24 @@ pub(crate) async fn execute_queue_loop(
     registry: Arc<Registry>,
     queue: Arc<StdMutex<PlanQueue>>,
     state: Arc<StdMutex<EngineState>>,
-    task_slot: Arc<StdMutex<Option<AbortHandle>>>,
+    claim: SlotClaim,
 ) {
-    // Always clear the slot when we exit, so the slot reflects "no live
-    // worker" and a future shutdown does not abort an unrelated handle.
-    let _slot_guard = ClearOnDrop(task_slot.clone());
+    // Hold the slot claim for the worker's whole life; its drop (normal
+    // exit or abort) releases the slot — generation-checked, so a stale
+    // worker can never clear a successor's claim.
+    let _claim = claim;
     loop {
         // Honor queue_stop_pending: drain to idle without running the next item.
         if state.lock().unwrap().queue_stop_pending {
-            let mut s = state.lock().unwrap();
-            s.queue_stop_pending = false;
-            s.pause_pending = false;
-            s.state = Some(EState::Idle);
+            state.lock().unwrap().queue_stop_pending = false;
+            idle_out(&state, true);
             return;
         }
         let item = queue.lock().unwrap().pop_front();
         let item = match item {
             Some(it) => it,
             None => {
-                let mut s = state.lock().unwrap();
-                s.state = Some(EState::Idle);
-                s.pause_pending = false;
+                idle_out(&state, false);
                 return;
             }
         };
@@ -422,6 +451,7 @@ pub(crate) async fn execute_queue_loop(
                 state.lock().unwrap().queue_stop_pending = true;
                 continue; // next iteration checks queue_stop_pending and exits
             } else {
+                // Uniform rule: any item that cannot start stops the queue.
                 tracing::error!("queue: unknown instruction: {}", item.name);
                 let reason = format!("unknown instruction: {}", item.name);
                 let archived = item.with_result(serde_json::json!({
@@ -429,97 +459,44 @@ pub(crate) async fn execute_queue_loop(
                     "reason": reason,
                 }));
                 queue.lock().unwrap().push_history(archived);
-                continue;
+                idle_out(&state, true);
+                return;
             }
         }
 
-        {
-            let mut s = state.lock().unwrap();
-            s.state = Some(EState::ExecutingQueue);
-            s.current_plan_name = Some(item.name.clone());
-        }
         let factory = match registry.plan(&item.name) {
             Some(f) => f.clone(),
             None => {
+                // An item that fails to start stops the queue like a failed
+                // run (ref: manager.py:847-852 — "failed" → idle + autostart
+                // disable), instead of silently skipping to the next item.
                 tracing::error!("queue: unknown plan {}", item.name);
-                let mut s = state.lock().unwrap();
-                s.plans_failed += 1;
+                state.lock().unwrap().plans_failed += 1;
                 let archived = item.clone().with_result(serde_json::json!({
                     "exit_status": "fail",
                     "reason": "unknown plan",
                 }));
-                drop(s);
                 queue.lock().unwrap().push_history(archived);
-                continue;
+                idle_out(&state, true);
+                return;
             }
         };
         let plan = match factory(&registry, &item.args) {
             Ok(p) => p,
             Err(e) => {
+                // Same rule as the unknown-plan arm above.
                 tracing::error!("queue: plan {} build failed: {e}", item.name);
-                let mut s = state.lock().unwrap();
-                s.plans_failed += 1;
+                state.lock().unwrap().plans_failed += 1;
                 let archived = item.clone().with_result(serde_json::json!({
                     "exit_status": "fail",
                     "reason": format!("plan build failed: {e}"),
                 }));
-                drop(s);
                 queue.lock().unwrap().push_history(archived);
-                continue;
+                idle_out(&state, true);
+                return;
             }
         };
-        // Forward the queue item's submitter metadata into the run as per-call
-        // md (bluesky's `_metadata_per_call`, the highest-precedence merge
-        // layer), so keys the submitter attached land in RunStart. A non-object
-        // `meta` (or JSON null) contributes nothing. The plan supplies its own
-        // plan_name/plan_args at OpenRun, so md carries only the submitter keys.
-        let md: std::collections::HashMap<String, serde_json::Value> = item
-            .meta
-            .as_object()
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-            .unwrap_or_default();
-        let opts = RunOptions {
-            md,
-            subs: Vec::new(),
-        };
-        let run_result = re.run_async_with(plan, opts).await;
-        let exit_status = match &run_result {
-            Ok(r) => r.exit_status.clone(),
-            Err(_) => "fail".to_string(),
-        };
-        let run_uid = run_result
-            .as_ref()
-            .ok()
-            .and_then(|r| r.run_uids.last().cloned());
-        // Bookkeeping after the run.
-        {
-            let mut s = state.lock().unwrap();
-            s.plans_run += 1;
-            s.current_run_uid = run_uid.clone();
-            s.current_plan_name = None;
-            if let Some(uid) = &run_uid {
-                // Mark any prior entry for this uid as closed (shouldn't happen, but safe).
-                for entry in s.re_runs.iter_mut() {
-                    if &entry.0 == uid {
-                        entry.1 = false;
-                    }
-                }
-                s.re_runs.push((uid.clone(), false));
-                if s.re_runs.len() > 64 {
-                    let drop_n = s.re_runs.len() - 64;
-                    s.re_runs.drain(0..drop_n);
-                }
-            }
-            if exit_status == "abort" || exit_status == "fail" || exit_status == "halt" {
-                s.plans_failed += 1;
-            }
-        }
-        // Archive the item with its result.
-        let archived = item.clone().with_result(serde_json::json!({
-            "exit_status": exit_status,
-            "run_uid": run_uid,
-        }));
-        queue.lock().unwrap().push_history(archived);
+        let exit_status = run_plan_item(&re, &queue, &state, &item, plan).await;
         // Loop mode: re-enqueue at the back (bluesky's "loop" plan_queue_mode).
         if state
             .lock()
@@ -532,24 +509,108 @@ pub(crate) async fn execute_queue_loop(
             queue.lock().unwrap().push_back(item);
         }
         // On non-success, idle out (matches bluesky behaviour: queue_start
-        // halts on error).
+        // halts on error) and deactivate autostart.
         if exit_status != "success" {
-            let mut s = state.lock().unwrap();
-            s.state = Some(EState::Idle);
-            s.pause_pending = false;
+            idle_out(&state, true);
             return;
         }
     }
 }
 
-/// RAII guard: clears the queue-task slot on drop so a future
-/// `ServerShutdown::shutdown` doesn't abort an already-finished handle.
-struct ClearOnDrop(Arc<StdMutex<Option<AbortHandle>>>);
-
-impl Drop for ClearOnDrop {
-    fn drop(&mut self) {
-        *self.0.lock().unwrap() = None;
+/// Run one plan item through the worker machinery: manager state
+/// (`ExecutingQueue` + running-item fields), the run itself, run bookkeeping
+/// (`plans_run` / `plans_failed` / `re_runs`) and the history archive.
+/// Shared by the queue worker and `queue_item_execute` so an immediately
+/// executed item is accounted exactly like a queued one. Returns the exit
+/// status.
+async fn run_plan_item(
+    re: &Arc<RunEngine>,
+    queue: &Arc<StdMutex<PlanQueue>>,
+    state: &Arc<StdMutex<EngineState>>,
+    item: &crate::qs::queue::QueuedItem,
+    plan: crate::core::plan::Plan,
+) -> String {
+    {
+        let mut s = state.lock().unwrap();
+        s.state = Some(EState::ExecutingQueue);
+        s.current_plan_name = Some(item.name.clone());
     }
+    // Forward the queue item's submitter metadata into the run as per-call
+    // md (bluesky's `_metadata_per_call`, the highest-precedence merge
+    // layer), so keys the submitter attached land in RunStart. A non-object
+    // `meta` (or JSON null) contributes nothing. The plan supplies its own
+    // plan_name/plan_args at OpenRun, so md carries only the submitter keys.
+    let md: std::collections::HashMap<String, serde_json::Value> = item
+        .meta
+        .as_object()
+        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default();
+    let opts = RunOptions {
+        md,
+        subs: Vec::new(),
+    };
+    let run_result = re.run_async_with(plan, opts).await;
+    let exit_status = match &run_result {
+        Ok(r) => r.exit_status.clone(),
+        Err(_) => "fail".to_string(),
+    };
+    #[cfg(feature = "metrics")]
+    crate::qs::metrics::run_finished(&exit_status);
+    let run_uid = run_result
+        .as_ref()
+        .ok()
+        .and_then(|r| r.run_uids.last().cloned());
+    // Bookkeeping after the run.
+    {
+        let mut s = state.lock().unwrap();
+        s.plans_run += 1;
+        s.current_run_uid = run_uid.clone();
+        s.current_plan_name = None;
+        if let Some(uid) = &run_uid {
+            // Mark any prior entry for this uid as closed (shouldn't happen, but safe).
+            for entry in s.re_runs.iter_mut() {
+                if &entry.0 == uid {
+                    entry.1 = false;
+                }
+            }
+            s.re_runs.push((uid.clone(), false));
+            if s.re_runs.len() > 64 {
+                let drop_n = s.re_runs.len() - 64;
+                s.re_runs.drain(0..drop_n);
+            }
+        }
+        if exit_status == "abort" || exit_status == "fail" || exit_status == "halt" {
+            s.plans_failed += 1;
+        }
+    }
+    // Archive the item with its result.
+    let archived = item.clone().with_result(serde_json::json!({
+        "exit_status": exit_status,
+        "run_uid": run_uid,
+    }));
+    queue.lock().unwrap().push_history(archived);
+    exit_status
+}
+
+/// Run a single item outside the queue (`queue_item_execute`, ref:
+/// manager.py:2744 `_queue_item_execute_handler`): the item is never
+/// queued, loop mode does not re-enqueue it, and the queue is NOT started
+/// afterwards — the manager returns to idle. Results are archived to the
+/// plan history exactly like a queued item.
+pub(crate) async fn execute_single_item(
+    re: Arc<RunEngine>,
+    queue: Arc<StdMutex<PlanQueue>>,
+    state: Arc<StdMutex<EngineState>>,
+    claim: SlotClaim,
+    item: crate::qs::queue::QueuedItem,
+    plan: crate::core::plan::Plan,
+) {
+    let _claim = claim;
+    let exit_status = run_plan_item(&re, &queue, &state, &item, plan).await;
+    // A failed/interrupted item deactivates autostart, same as a queued
+    // plan (ref: manager.py:852 — the plan-state path is shared between
+    // queued and immediate execution).
+    idle_out(&state, exit_status != "success");
 }
 
 #[cfg(test)]
@@ -597,8 +658,10 @@ mod tests {
         queue.lock().unwrap().push_back(item);
 
         let state = Arc::new(StdMutex::new(EngineState::default()));
-        let task_slot = Arc::new(StdMutex::new(None));
-        execute_queue_loop(re.clone(), registry, queue, state, task_slot).await;
+        let slot = Arc::new(QueueTaskSlot::new());
+        let claim = slot.claim().expect("fresh slot");
+        execute_queue_loop(re.clone(), registry, queue, state, claim).await;
+        assert!(!slot.is_active(), "worker exit must release the slot");
 
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1, "exactly one run opened");

@@ -21,8 +21,16 @@
 //! When the feature is disabled, all hooks are no-op `inline` macros
 //! so bsrs-qs without `--features metrics` is unchanged.
 
-use metrics_exporter_prometheus::PrometheusBuilder;
 use std::net::SocketAddr;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use metrics_exporter_prometheus::PrometheusBuilder;
+
+use crate::callbacks::document_name;
+use crate::core::error::Result;
+use crate::engine::DocumentSink;
+use crate::event_model::Document;
 
 /// Initialize the Prometheus exporter on the given socket address.
 /// Idempotent; second call is a no-op (PrometheusBuilder installs a
@@ -40,19 +48,16 @@ pub fn rpc_call(method: &str) {
 }
 
 /// Record an RPC error response.
-#[allow(dead_code)]
 pub fn rpc_error(method: &str) {
     metrics::counter!("bsrs_qs_rpc_errors_total", "method" => method.to_string()).increment(1);
 }
 
 /// Update the queue-depth gauge.
-#[allow(dead_code)]
 pub fn queue_depth(depth: usize) {
     metrics::gauge!("bsrs_qs_queue_depth").set(depth as f64);
 }
 
 /// Record one finished run with its exit status.
-#[allow(dead_code)]
 pub fn run_finished(exit_status: &str) {
     metrics::counter!(
         "bsrs_qs_runs_total",
@@ -62,7 +67,29 @@ pub fn run_finished(exit_status: &str) {
 }
 
 /// Record one document by kind.
-#[allow(dead_code)]
 pub fn document(name: &str) {
     metrics::counter!("bsrs_qs_documents_total", "name" => name.to_string()).increment(1);
+}
+
+/// `DocumentSink` wrapper that counts each document by kind
+/// (`bsrs_qs_documents_total{name=...}`) before forwarding to the real
+/// broadcast sink. The server wraps its document sink with this at
+/// build time, so every document on the broadcast path is counted at
+/// exactly one place.
+pub struct CountingSink {
+    inner: Arc<dyn DocumentSink>,
+}
+
+impl CountingSink {
+    pub fn new(inner: Arc<dyn DocumentSink>) -> Self {
+        CountingSink { inner }
+    }
+}
+
+#[async_trait]
+impl DocumentSink for CountingSink {
+    async fn dispatch(&self, doc: &Document) -> Result<()> {
+        document(document_name(doc));
+        self.inner.dispatch(doc).await
+    }
 }
