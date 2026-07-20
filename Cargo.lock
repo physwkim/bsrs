@@ -765,7 +765,7 @@ dependencies = [
 
 [[package]]
 name = "bsrs"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -807,7 +807,7 @@ dependencies = [
 
 [[package]]
 name = "bsrs-derive"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3280,7 +3280,7 @@ dependencies = [
 
 [[package]]
 name = "mini-beamline-qs"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "bsrs",
