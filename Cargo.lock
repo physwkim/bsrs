@@ -765,7 +765,7 @@ dependencies = [
 
 [[package]]
 name = "bsrs"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -807,7 +807,7 @@ dependencies = [
 
 [[package]]
 name = "bsrs-derive"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1765,9 +1765,9 @@ checksum = "869b0adbda23651a9c5c0c3d270aac9fcb52e8622a8f2b17e57802d7791962f2"
 
 [[package]]
 name = "epics-base-rs"
-version = "0.24.2"
+version = "0.24.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adde0049aca425c2feb4ce29988ee33812099bbe6f3af712a38ca38c1c47d366"
+checksum = "da4a3600c22e557ca1405d7b84eeecf4e12f4dbdb49738423ebddb3e419e3392"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1788,9 +1788,9 @@ dependencies = [
 
 [[package]]
 name = "epics-ca-rs"
-version = "0.24.2"
+version = "0.24.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06fd96c424094d1fc2cfb280bd5949ec7385bc6eb0d1d892912e3b3ba6523174"
+checksum = "c266da997e00e7534853673adcda8e94a9691c8eadc80d20472010a39bc2626d"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1812,9 +1812,9 @@ dependencies = [
 
 [[package]]
 name = "epics-macros-rs"
-version = "0.24.0"
+version = "0.24.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a47ae6cc1d86b7d56ec9e330b1391ba296fba9757f3cc470ad04638ee623a716"
+checksum = "d9622c7f06ea7a787196337c25e9bc9b71e940ac9b0bdd16455b163e8191fba7"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1824,9 +1824,9 @@ dependencies = [
 
 [[package]]
 name = "epics-pva-rs"
-version = "0.24.2"
+version = "0.24.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7281a2db2eb5242516243486f4162eac900203f9988e846af521448ad069aa13"
+checksum = "f086624b4106951d5d7bf48c03f10214cb2e672ac946f4f201dbcf2cf4ab9718"
 dependencies = [
  "bytes",
  "chrono",
@@ -3280,7 +3280,7 @@ dependencies = [
 
 [[package]]
 name = "mini-beamline-qs"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "bsrs",
@@ -6450,7 +6450,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
