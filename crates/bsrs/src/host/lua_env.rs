@@ -1223,7 +1223,7 @@ pub fn build_lua(re: Arc<RunEngine>) -> mlua::Result<Lua> {
     // `ca` Cargo feature is enabled (pulls in epics-ca-rs).
     #[cfg(feature = "ca")]
     {
-        use crate::host::ca_devices::{CaDetector, CaMotor};
+        use crate::host::ca_devices::{CaDetector, CaMotor, CaPositioner};
         let f = lua.create_function(|_, (name, val_pv, rbv_pv): (String, String, String)| {
             let m = CaMotor::connect_blocking(&name, &val_pv, &rbv_pv)
                 .map_err(|e| mlua::Error::RuntimeError(format!("ca_motor: connect: {e}")))?;
@@ -1245,6 +1245,47 @@ pub fn build_lua(re: Arc<RunEngine>) -> mlua::Result<Lua> {
             })
         })?;
         lua.globals().set("ca_motor", f)?;
+
+        // ca_positioner(name, val_pv, rbv_pv, done_pv, done_value) —
+        // ophyd-PVPositioner-style axis: `set` completes when done_pv
+        // reads done_value again, not at setpoint WRITE_NOTIFY. Use
+        // for sequencer-driven pseudo axes (Kohzu DCM energy) where
+        // ca_motor would report done before the hardware moves.
+        let f =
+            lua.create_function(
+                |_,
+                 (name, val_pv, rbv_pv, done_pv, done_value): (
+                    String,
+                    String,
+                    String,
+                    String,
+                    f64,
+                )| {
+                    let p = CaPositioner::connect_blocking(
+                        &name, &val_pv, &rbv_pv, &done_pv, done_value,
+                    )
+                    .map_err(|e| {
+                        mlua::Error::RuntimeError(format!("ca_positioner: connect: {e}"))
+                    })?;
+                    Ok(LuaDevice {
+                        name,
+                        readable: Some(p.clone() as Arc<dyn ReadableObj>),
+                        movable: Some(p.clone() as Arc<dyn MovableObj>),
+                        locatable: Some(p.clone() as Arc<dyn LocatableObj>),
+                        stoppable: Some(p as Arc<dyn StoppableObj>),
+                        triggerable: None,
+                        stageable: None,
+                        monitorable: None,
+                        flyable: None,
+                        preparable: None,
+                        configurable: None,
+                        collectable: None,
+                        pausable: None,
+                        lua_methods: None,
+                    })
+                },
+            )?;
+        lua.globals().set("ca_positioner", f)?;
 
         let f = lua.create_function(|_, (name, value_pv): (String, String)| {
             let d = CaDetector::connect_blocking(&name, &value_pv)

@@ -156,6 +156,184 @@ impl StoppableObj for CaMotor {
     }
 }
 
+/// CA-backed positioner with an explicit done signal — the bsrs
+/// equivalent of ophyd's `PVPositioner`. For axes whose setpoint
+/// record completes processing immediately while an external
+/// controller (SNL sequencer, coordinated-motion box) moves the
+/// hardware afterwards; the Kohzu DCM energy axis (`BraggEAO` +
+/// `KohzuMoving`) is the canonical case. A plain [`CaMotor`] on such
+/// an axis reports the move done at WRITE_NOTIFY completion and every
+/// scan point reads a stale readback.
+///
+/// `set` puts the setpoint, then polls the done PV until it reads
+/// `done_value`.
+///
+/// Database requirement: processing the setpoint record must drive the
+/// done PV to not-done *within the same put chain* (kohzuSeq.db FLNKs
+/// `BraggEAO` → `KohzuPutMoving` → `KohzuMoving`=Busy before the
+/// WRITE_NOTIFY completes). That closes the stale-done race — the
+/// first post-put poll can never observe the pre-move done state.
+pub struct CaPositioner {
+    name: String,
+    setpoint: Arc<EpicsCaBackend<f64>>,
+    readback: Arc<EpicsCaBackend<f64>>,
+    done: Arc<EpicsCaBackend<f64>>,
+    done_pv: String,
+    rbv_pv: String,
+    done_value: f64,
+}
+
+impl CaPositioner {
+    /// Build + connect all three channels. Blocks; see
+    /// `CaMotor::connect_blocking`.
+    pub fn connect_blocking(
+        name: &str,
+        val_pv: &str,
+        rbv_pv: &str,
+        done_pv: &str,
+        done_value: f64,
+    ) -> Result<Arc<Self>> {
+        let sp = Arc::new(EpicsCaBackend::<f64>::new(val_pv));
+        let rb = Arc::new(EpicsCaBackend::<f64>::new(rbv_pv));
+        let dn = Arc::new(EpicsCaBackend::<f64>::new(done_pv));
+        let (sp_a, rb_a, dn_a) = (sp.clone(), rb.clone(), dn.clone());
+        crate::core::runtime::bsrs_runtime().block_on(async move {
+            sp_a.connect(Duration::from_secs(5)).await?;
+            rb_a.connect(Duration::from_secs(5)).await?;
+            dn_a.connect(Duration::from_secs(5)).await
+        })?;
+        Ok(Arc::new(Self {
+            name: name.to_string(),
+            setpoint: sp,
+            readback: rb,
+            done: dn,
+            done_pv: done_pv.to_string(),
+            rbv_pv: rbv_pv.to_string(),
+            done_value,
+        }))
+    }
+
+    /// Async equivalent — call from inside an existing tokio runtime.
+    pub async fn connect_async(
+        name: &str,
+        val_pv: &str,
+        rbv_pv: &str,
+        done_pv: &str,
+        done_value: f64,
+    ) -> Result<Arc<Self>> {
+        let sp = Arc::new(EpicsCaBackend::<f64>::new(val_pv));
+        let rb = Arc::new(EpicsCaBackend::<f64>::new(rbv_pv));
+        let dn = Arc::new(EpicsCaBackend::<f64>::new(done_pv));
+        sp.connect(Duration::from_secs(5)).await?;
+        rb.connect(Duration::from_secs(5)).await?;
+        dn.connect(Duration::from_secs(5)).await?;
+        Ok(Arc::new(Self {
+            name: name.to_string(),
+            setpoint: sp,
+            readback: rb,
+            done: dn,
+            done_pv: done_pv.to_string(),
+            rbv_pv: rbv_pv.to_string(),
+            done_value,
+        }))
+    }
+}
+
+impl NamedObj for CaPositioner {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn inspect_dyn(&self) -> serde_json::Value {
+        serde_json::json!({
+            "name": self.name,
+            "type": "CaPositioner",
+            "done_pv": self.done_pv,
+            "done_value": self.done_value,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl ReadableObj for CaPositioner {
+    async fn read_dyn(&self) -> Result<HashMap<String, ReadingValue>> {
+        let r = self.readback.get_reading().await?;
+        let mut out = HashMap::new();
+        out.insert(self.name.clone(), r);
+        Ok(out)
+    }
+    async fn describe_dyn(&self) -> Result<HashMap<String, DataKey>> {
+        let mut out = HashMap::new();
+        out.insert(
+            self.name.clone(),
+            DataKey {
+                source: format!("ca://{}", self.rbv_pv),
+                dtype: Dtype::Number,
+                shape: vec![],
+                dtype_numpy: Some("<f8".into()),
+                external: None,
+                units: None,
+                precision: None,
+                object_name: Some(self.name.clone()),
+                dims: None,
+                limits: None,
+                choices: None,
+            },
+        );
+        Ok(out)
+    }
+}
+
+#[async_trait::async_trait]
+impl MovableObj for CaPositioner {
+    async fn set_dyn(&self, value: f64) -> Status {
+        // Same 30 s device-layer move timeout as CaMotor, covering the
+        // put AND the done-PV wait. Done values come from int-ish
+        // records (bi/bo/mbbi), so exact f64 equality is the intended
+        // comparison.
+        let wait = async {
+            self.setpoint
+                .put(Some(value))
+                .await
+                .map_err(|e| format!("ca_positioner set: {e}"))?;
+            loop {
+                let v = self
+                    .done
+                    .get_value()
+                    .await
+                    .map_err(|e| format!("ca_positioner done read: {e}"))?;
+                if v == self.done_value {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        match tokio::time::timeout(Duration::from_secs(30), wait).await {
+            Ok(Ok(())) => Status::done(),
+            Ok(Err(e)) => Status::fail(crate::core::status::StatusError::Failed(e)),
+            Err(_) => Status::fail(crate::core::status::StatusError::Failed(format!(
+                "ca_positioner set: done PV {} did not reach {} within 30s",
+                self.done_pv, self.done_value
+            ))),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl LocatableObj for CaPositioner {
+    async fn locate_dyn(&self) -> Result<DynLocation> {
+        let setpoint = self.setpoint.get_value().await?;
+        let readback = self.readback.get_value().await?;
+        Ok(DynLocation { setpoint, readback })
+    }
+}
+
+#[async_trait::async_trait]
+impl StoppableObj for CaPositioner {
+    async fn stop_dyn(&self, _success: bool) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// CA-backed scalar detector: one Signal on a `_RBV` PV.
 pub struct CaDetector {
     name: String,

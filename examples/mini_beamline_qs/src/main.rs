@@ -128,6 +128,7 @@ async fn run(args: Args) -> i32 {
         "dcm",
         "mini:BraggEAO",
         "mini:BraggERdbkAO",
+        "mini:KohzuMoving",
         "mini:BraggThetaRdbkAO",
     )
     .await
