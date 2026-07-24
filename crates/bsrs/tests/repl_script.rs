@@ -787,11 +787,11 @@ local function p()
     coroutine.yield(msg.close_run())
 end
 RE:run(plan(p))
-print("start=" .. tostring(got))
+print("normalized=" .. tostring(got.normalized))
 "#,
     );
     assert_eq!(code, 0, "stderr: {err}");
-    assert!(out.contains("\"normalized\":true"), "out = {out}");
+    assert!(out.contains("normalized=true"), "out = {out}");
 }
 
 #[test]
@@ -808,11 +808,11 @@ local function p()
     coroutine.yield(msg.close_run())
 end
 RE:run(plan(p))
-print("start=" .. tostring(got))
+print("scan_id=" .. tostring(got.scan_id))
 "#,
     );
     assert_eq!(code, 0, "stderr: {err}");
-    assert!(out.contains("\"scan_id\":99"), "out = {out}");
+    assert!(out.contains("scan_id=99"), "out = {out}");
 }
 
 #[test]
@@ -1023,13 +1023,13 @@ local function p()
 end
 local r = RE:run(plan(p))
 print("result=" .. tostring(r))
-print("stop=" .. tostring(got_stop))
+print("stop.exit_status=" .. tostring(got_stop.exit_status))
 "#,
     );
     assert_eq!(code, 0);
     assert!(out.contains("exit_status=fail"), "out = {out}");
     assert!(
-        out.contains("\"exit_status\":\"fail\""),
+        out.contains("stop.exit_status=fail"),
         "RunStop document must carry exit_status=fail; out = {out}"
     );
 }
@@ -1275,11 +1275,11 @@ local function p()
     coroutine.yield(msg.close_run())
 end
 RE:run_async_with(plan(p), { md = { operator = "carol" } })
-print("start=" .. tostring(got))
+print("operator=" .. tostring(got.operator))
 "#,
     );
     assert_eq!(code, 0, "stderr: {err}");
-    assert!(out.contains("\"operator\":\"carol\""), "out = {out}");
+    assert!(out.contains("operator=carol"), "out = {out}");
 }
 
 #[cfg(feature = "tiled")]

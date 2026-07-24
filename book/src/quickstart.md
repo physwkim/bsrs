@@ -81,7 +81,7 @@ becomes a `yield Msg::X` in an `async_stream::stream!` block.
 
 ```lua
 RE:subscribe(function(name, body)
-    if name == "stop" then print("run finished:", body) end
+    if name == "stop" then print("run finished:", body.exit_status) end
 end)
 RE:run(count({det1}, 5))
 ```

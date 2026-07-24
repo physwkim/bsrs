@@ -730,7 +730,9 @@ impl UserData for LuaRunEngine {
         // -- callback-heavy methods --------------------------------------
 
         // subscribe(callback, [name]) -> id. callback signature:
-        //   function(name, body_json_string) ... end
+        //   function(name, body_table) ... end
+        // `body_table` is the Document body as a Lua table (bluesky
+        // passes dicts), e.g. `body.exit_status` on a "stop" doc.
         // Optional `name` filters by document type ("start" / "stop" /
         // "event" / "descriptor" / "resource" / "datum" / "event_page" /
         // "datum_page" / "stream_resource" / "stream_datum"). Pass
@@ -742,8 +744,8 @@ impl UserData for LuaRunEngine {
         // after `RE:run` returns — see [`make_lua_subscriber_cb`].
         methods.add_method(
             "subscribe",
-            |_, this, (cb, name): (mlua::Function, Option<String>)| {
-                let dcb = make_lua_subscriber_cb(cb, name);
+            |lua, this, (cb, name): (mlua::Function, Option<String>)| {
+                let dcb = make_lua_subscriber_cb(lua, cb, name)?;
                 Ok(this.re.subscribe(dcb))
             },
         );
@@ -1095,17 +1097,30 @@ static SUBSCRIBER_BUFFERS: std::sync::LazyLock<std::sync::Mutex<Vec<Arc<LuaSubsc
 ///   `drain_lua_subscriber_buffers()` (run after `RE:run`'s
 ///   `block_on` returns) replays the buffered entries on the REPL
 ///   thread.
+///
+/// The user callback receives the body as a Lua *table* (bluesky
+/// passes dicts). Internally the buffer carries the body as a JSON
+/// string (cheap to move across threads); this wrapper — the single
+/// owner of the user-facing contract, on both the `RE:subscribe` and
+/// `msg.subscribe` paths — decodes it at delivery time, always on a
+/// thread that may touch Lua.
 fn make_lua_subscriber_cb(
+    lua: &Lua,
     f: mlua::Function,
     filter: Option<String>,
-) -> crate::engine::DocumentCallback {
+) -> mlua::Result<crate::engine::DocumentCallback> {
+    let wrapper = lua.create_function(move |lua, (name, body): (String, String)| {
+        let v: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| mlua::Error::RuntimeError(format!("subscriber body decode: {e}")))?;
+        f.call::<()>((name, json_to_lua(lua, &v)))
+    })?;
     let inner = Arc::new(LuaSubscriberInner {
-        lua_fn: f,
+        lua_fn: wrapper,
         filter,
         buffer: std::sync::Mutex::new(Vec::new()),
     });
     SUBSCRIBER_BUFFERS.lock().unwrap().push(inner.clone());
-    Arc::new(move |doc: &crate::event_model::Document| {
+    Ok(Arc::new(move |doc: &crate::event_model::Document| {
         let (name, body) = document_to_name_body(doc);
         if let Some(ref f) = inner.filter {
             if f != name && f != "all" {
@@ -1127,7 +1142,7 @@ fn make_lua_subscriber_cb(
         } else {
             inner.buffer.lock().unwrap().push((name, body.to_string()));
         }
-    })
+    }))
 }
 
 /// Drain every Lua subscriber's buffered (name, body) entries by
@@ -2270,8 +2285,8 @@ fn register_msg_namespace(lua: &Lua) -> mlua::Result<()> {
     // Worker-thread emissions are buffered and replayed after RE:run.
     msg.set(
         "subscribe",
-        lua.create_function(|_, (cb, name): (mlua::Function, Option<String>)| {
-            let cb_arc: SubscribeCallback = make_lua_subscriber_cb(cb, name);
+        lua.create_function(|lua, (cb, name): (mlua::Function, Option<String>)| {
+            let cb_arc: SubscribeCallback = make_lua_subscriber_cb(lua, cb, name)?;
             // The Lua callback already filters by document name (all 10
             // names, finer than `DocFilter`); subscribe with `All` so the
             // engine passes everything through to that single filter.
