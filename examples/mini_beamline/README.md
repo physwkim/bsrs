@@ -18,6 +18,14 @@ cargo build --release -p mini-beamline --features ioc
 for pv in mini:ph:mtr.VELO mini:dot:mtrx.VELO mini:dot:mtry.VELO mini:dcm:theta.VELO; do
     caput "$pv" 5
 done
+
+# put the Kohzu DCM sequencer in Auto mode. The IOC boots in Manual
+# mode, where energy entries (BraggEAO) are computed but never
+# executed — DCM moves silently no-op. 06_dcm_energy.lua sets this
+# itself; the mini-beamline-qs daemon's `dcm` device does not, and
+# its done-PV wait (mini:KohzuMoving) times out after 30 s in
+# Manual mode.
+caput mini:KohzuModeBO Auto
 ```
 
 ## Scripts

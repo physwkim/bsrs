@@ -18,6 +18,10 @@
 //! for pv in mini:ph:mtr.VELO mini:dot:mtrx.VELO mini:dot:mtry.VELO; do
 //!     caput "$pv" 5
 //! done
+//! # put the Kohzu sequencer in Auto mode — the IOC boots in Manual
+//! # mode, where the `dcm` device's energy moves are never executed
+//! # and its done-PV wait (mini:KohzuMoving) times out after 30 s
+//! caput mini:KohzuModeBO Auto
 //!
 //! # terminal 3 — the daemon
 //! cargo run -p mini-beamline-qs --release
