@@ -1,34 +1,36 @@
 # Architecture
 
-bsrs is a Cargo workspace. Each crate has a single responsibility;
-boundaries are designed so a downstream user can swap one
-implementation without touching the others.
+bsrs is a single crate plus a proc-macro companion. Each module has a
+single responsibility; boundaries are designed so a downstream user
+can swap one implementation without touching the others.
 
-## Crate map
+## Module map
 
 ```text
-bsrs                    # umbrella re-exports + binary entry points
-├── bsrs-cli            # binary: qs-manager, qs, repl, doctor, migrate, frame-source
-├── bsrs-engine         # RunEngine, Msg, state machine, suspenders, preprocessors
-├── bsrs-plans          # bp.* / bps.* / bpp.* mirrors (count, scan, grid_scan, ...)
-├── bsrs-protocols      # Movable, Triggerable, Stageable, Readable (sync facade)
-├── bsrs-protocols-async # ophyd-async-style traits over async fns
-├── bsrs-derive         # #[derive(Device)], #[signal(...)], #[lua_methods] proc-macros
-├── bsrs-devices        # SoftMotor, SoftDetector, NDSimDetector, ...
-├── bsrs-backend-epics-ca   # SignalBackend over CA  (feature: real)
-├── bsrs-backend-epics-pva  # SignalBackend over PVA (feature: real)
-├── bsrs-callbacks      # Document sinks: jsonl, zmq, tiled, kafka
-├── bsrs-stream         # FrameSink/FrameSource: hdf5, binary, pva
-└── bsrs-qs             # bluesky-queueserver-compatible daemon
+crates/bsrs             # library + `bsrs` binary (feature: cli)
+├── core                # Msg, Status, errors, runtime
+├── engine              # RunEngine, state machine, suspenders, preprocessors
+├── event_model         # Document types: RunStart, EventDescriptor, Event, RunStop, ...
+├── plans               # bp.* / bps.* / bpp.* mirrors (count, scan, grid_scan, ...)
+├── protocols_sync      # Movable, Triggerable, Stageable, Readable (sync facade)
+├── protocols_async     # ophyd-async-style traits over async fns
+├── devices             # SoftMotor, SoftDetector, NDSimDetector, ...
+├── backends            # SignalBackend over EPICS CA / PVA (features: ca, pva)
+├── callbacks           # Document sinks: jsonl, zmq, tiled, kafka
+├── stream              # FrameSink/FrameSource: hdf5, binary, pva
+├── qs                  # bluesky-queueserver-compatible daemon (feature: qs)
+├── host                # Lua host runtime + CA/PVA devices (feature: host)
+└── bin/bsrs            # CLI: qs-manager, qs, repl, doctor, migrate, frame-source
+crates/bsrs-derive      # #[derive(Device)], #[signal(...)], #[lua_methods] proc-macros
 ```
 
-Each crate's docs lives at `doc/0N-<topic>.md` in the repo. This
+Each module's docs live at `doc/0N-<topic>.md` in the repo. This
 chapter is a high-level orientation; for protocol contracts go to
 the doc/ tree.
 
 ## The RunEngine
 
-`bsrs_engine::RunEngine` owns the dispatch loop. A plan is an
+`bsrs::engine::RunEngine` owns the dispatch loop. A plan is an
 `async_stream::Stream<Item = Msg>`; the engine drives it forward,
 matches each `Msg`, and dispatches to the right handler.
 

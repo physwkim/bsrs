@@ -2,11 +2,12 @@
 //! `ca_detector` factories that connect bsrs's `EpicsCaBackend`
 //! to a real EPICS IOC.
 //!
-//! Behind the `ca` Cargo feature so the default bsrs-cli build
-//! stays free of `epics-ca-rs`. Build with:
+//! Behind the `ca` Cargo feature (on by default) so a
+//! `--no-default-features` build stays free of `epics-ca-rs`. Run
+//! with:
 //!
 //! ```sh
-//! cargo run -p bsrs-cli --features ca -- repl --script my_scan.lua
+//! cargo run -p bsrs --features cli -- repl --script my_scan.lua
 //! ```
 //!
 //! ## Lua surface

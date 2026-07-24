@@ -10,7 +10,7 @@
 --         --catalog-uri 'sqlite:///tmp/bsrs-tiled.db' --api-key test123 &
 --
 --     # terminal 2:
---     cargo run -p bsrs-cli --features tiled -- repl \
+--     cargo run -p bsrs --features cli,tiled -- repl \
 --         --doc-tiled http://localhost:8765 \
 --         --doc-tiled-key test123 \
 --         --script examples/mini_beamline/07_tiled_sink.lua

@@ -23,7 +23,7 @@
 //! cargo run -p mini-beamline-qs --release
 //!
 //! # terminal 4 — attach a REPL
-//! cargo run -p bsrs-cli --release -- qs \
+//! cargo run -p bsrs --features cli --release -- qs \
 //!     --address tcp://localhost:60615 repl
 //! bsrs> dcm:move_energy_keV(8.0)
 //! bsrs> dcm:locate()

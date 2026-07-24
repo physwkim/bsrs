@@ -29,7 +29,7 @@
 //!   then transitions to `completed` with `exit_status` other than
 //!   `success`. Verified by
 //!   `re_abort_cancels_in_flight_lua_eval_plan` in
-//!   `bsrs-cli/tests/cli_round_trip.rs`.
+//!   `crates/bsrs/tests/cli_round_trip.rs`.
 //! - **Pure Lua loops** (`while true do ... end` with no Msg yields):
 //!   not abortable from the daemon side. The blocking thread is
 //!   stuck in mlua. Restart the daemon to recover. Future work could

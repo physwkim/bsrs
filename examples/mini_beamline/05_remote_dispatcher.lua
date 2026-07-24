@@ -11,7 +11,7 @@
 --         examples/mini_beamline/05_remote_dispatcher.py localhost 5577
 --
 --     # terminal 2: bsrs publishes
---     cargo run -p bsrs-cli -- repl \
+--     cargo run -p bsrs --features cli -- repl \
 --         --doc-zmq 'tcp://*:5577' \
 --         --script examples/mini_beamline/05_remote_dispatcher.lua
 

@@ -115,7 +115,7 @@ impl ServerBuilder {
     /// Provide a [`LuaEvaluator`] for the `lua_eval` RPC. Without
     /// this, `lua_eval` returns `NOT_IMPLEMENTED`. The evaluator
     /// shares state across calls (typical impls hold one mlua state
-    /// behind a mutex; see the bsrs-cli `manager` module).
+    /// behind a mutex; see the `bsrs` binary's `manager` module).
     pub fn lua_evaluator(mut self, ev: Arc<dyn LuaEvaluator>) -> Self {
         self.lua_evaluator = Some(ev);
         self

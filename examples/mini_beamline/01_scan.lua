@@ -7,7 +7,7 @@
 --
 --   # terminal 2: drive bsrs from Lua
 --   cd ~/codes/bsrs
---   cargo run -p bsrs-cli -- repl --script examples/mini_beamline_scan.lua
+--   cargo run -p bsrs --features cli -- repl --script examples/mini_beamline/01_scan.lua
 --
 -- Equivalent to crates/bsrs/examples/mini_beamline_scan.rs but
 -- driven through bsrs's Lua bridge — proves the same end-to-end

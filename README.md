@@ -94,24 +94,26 @@ qs> RE:run(count({det1}, 100))
 
 ## Architecture
 
-bsrs is a Cargo workspace. Each crate has a single responsibility;
-boundaries are designed so a downstream user can swap one
-implementation without touching the others.
+bsrs is a single crate plus a proc-macro companion. Each module has a
+single responsibility; boundaries are designed so a downstream user
+can swap one implementation without touching the others.
 
 ```text
-bsrs                      umbrella re-exports + binary entry points
-├── bsrs-cli              binary: qs-manager, qs, repl, doctor, migrate, frame-source
-├── bsrs-engine           RunEngine, Msg, state machine, suspenders, preprocessors
-├── bsrs-plans            bp.* / bps.* / bpp.* mirrors (count, scan, grid_scan, ...)
-├── bsrs-protocols        Movable, Triggerable, Stageable, Readable (sync facade)
-├── bsrs-protocols-async  ophyd-async-style traits over async fns
-├── bsrs-derive           #[derive(Device)], #[lua_methods] proc-macros
-├── bsrs-devices          SoftMotor, SoftDetector, NDSimDetector, ...
-├── bsrs-backend-epics-ca   SignalBackend over CA  (feature: real)
-├── bsrs-backend-epics-pva  SignalBackend over PVA (feature: real)
-├── bsrs-callbacks        Document sinks: jsonl, zmq, tiled, kafka
-├── bsrs-stream           FrameSink/FrameSource: hdf5, binary, pva
-└── bsrs-qs               bluesky-queueserver-compatible daemon
+crates/bsrs               library + `bsrs` binary (feature: cli)
+├── core                  Msg, Status, errors, runtime
+├── engine                RunEngine, state machine, suspenders, preprocessors
+├── event_model           Document types: RunStart, EventDescriptor, Event, RunStop, ...
+├── plans                 bp.* / bps.* / bpp.* mirrors (count, scan, grid_scan, ...)
+├── protocols_sync        Movable, Triggerable, Stageable, Readable (sync facade)
+├── protocols_async       ophyd-async-style traits over async fns
+├── devices               SoftMotor, SoftDetector, NDSimDetector, ...
+├── backends              SignalBackend over EPICS CA / PVA (features: ca, pva)
+├── callbacks             Document sinks: jsonl, zmq, tiled, kafka
+├── stream                FrameSink/FrameSource: hdf5, binary, pva
+├── qs                    bluesky-queueserver-compatible daemon (feature: qs)
+├── host                  Lua host runtime + CA/PVA devices (feature: host)
+└── bin/bsrs              CLI: qs-manager, qs, repl, doctor, migrate, frame-source
+crates/bsrs-derive        #[derive(Device)], #[lua_methods] proc-macros
 ```
 
 The Document plane and the frame plane are kept separate. Frame bytes
@@ -141,17 +143,20 @@ Plan-code translation table and full migration guide:
 
 ## Optional features (Cargo flags)
 
-| Crate              | Feature        | Adds                                    |
-| ------------------ | -------------- | --------------------------------------- |
-| `bsrs-callbacks` | `zmq`          | bluesky `Publisher` envelope            |
-| `bsrs-callbacks` | `tiled`        | HTTP register + metadata patch          |
-| `bsrs-callbacks` | `kafka`        | pure-Rust `rskafka` crate, no librdkafka |
-| `bsrs-stream`    | `hdf5`         | rust-hdf5 frame writer, NeXus layout    |
-| `bsrs-stream`    | `pva`          | NTNDArray monitor source                |
-| `bsrs-backend-epics-{ca,pva}` | `real` | live EPICS clients              |
-| `bsrs-qs`        | `metrics`      | Prometheus `/metrics` endpoint          |
-| `bsrs-cli`       | `tiled`        | Lua `tiled.*` read-side namespace       |
-| `bsrs-cli`       | `frame-source` | wire PVA + HDF5 into `bsrs frame-source` |
+All flags below are features of the `bsrs` crate:
+
+| Feature        | Adds                                                    |
+| -------------- | ------------------------------------------------------- |
+| `ca` / `pva`   | live EPICS CA / PVA backends (**default**; opt out for stubs) |
+| `zmq`          | bluesky `Publisher` envelope sink                       |
+| `tiled`        | HTTP register + metadata patch; Lua `tiled.*` namespace |
+| `kafka`        | pure-Rust `rskafka` crate, no librdkafka                |
+| `hdf5`         | rust-hdf5 frame writer, NeXus layout                    |
+| `qs`           | bluesky-queueserver-compatible daemon module            |
+| `metrics`      | Prometheus `/metrics` endpoint                          |
+| `host`         | Lua host runtime (mlua bridge)                          |
+| `cli`          | `bsrs` binary: qs-manager, qs, repl, doctor, migrate    |
+| `frame-source` | wire PVA + HDF5 into `bsrs frame-source`                |
 
 The default build is small and dependency-light. CI builds and tests
 each opt-in feature on every push.

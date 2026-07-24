@@ -1185,7 +1185,7 @@ fn lua_subscriber_receives_monitor_events_via_buffered_drain() {
     // mutex held by the REPL thread. With the fix, the events are
     // buffered and replayed after RE:run returns.
     //
-    // Note: bsrs-cli's `soft_detector` is not Monitorable. To test
+    // Note: the CLI's `soft_detector` is not Monitorable. To test
     // the buffered path we'd need a Monitorable backend; this test
     // instead verifies the simpler path: a subscription added before
     // RE:run completes successfully without timing out, and the
@@ -1285,8 +1285,8 @@ print("operator=" .. tostring(got.operator))
 #[cfg(feature = "tiled")]
 #[test]
 fn tiled_global_namespace_exists() {
-    // Smoke test for the tiled.* Lua surface: when the bsrs-cli
-    // binary is built with --features tiled, the global `tiled`
+    // Smoke test for the tiled.* Lua surface: when the `bsrs`
+    // binary is built with --features cli,tiled, the global `tiled`
     // table is available with `from_uri` callable. We don't reach
     // a real Tiled server here — just verify the binding compiles
     // and the namespace resolves.

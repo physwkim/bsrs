@@ -180,7 +180,7 @@ pub struct Registry {
     collectables: HashMap<String, Arc<dyn CollectableObj>>,
     /// Devices with `#[lua_methods]`-derived `LuaExposable` impls.
     /// Surfaced through the daemon's Lua state as device-specific
-    /// methods on the device global. See bsrs-cli/manager_lua.rs.
+    /// methods on the device global. See `host/manager_lua.rs`.
     lua_exposed: HashMap<String, LuaExposedEntry>,
 }
 
@@ -273,7 +273,7 @@ impl Registry {
     }
 
     /// Look up a device's lua-exposed entry by name (used by the
-    /// daemon-side Lua bridge in bsrs-cli).
+    /// daemon-side Lua bridge in `host/manager_lua.rs`).
     pub fn lua_exposed(&self, name: &str) -> Option<&LuaExposedEntry> {
         self.lua_exposed.get(name)
     }

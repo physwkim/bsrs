@@ -8,9 +8,9 @@ time, never the whole stack at once.
 
 ```text
                        bluesky / Python                bsrs / Rust
-Plan source            generators (bp.*) / Lua coro    bsrs_plans::* / Lua coro
-RunEngine              bluesky.RunEngine               bsrs_engine::RunEngine
-Devices                ophyd / ophyd-async             bsrs_devices, bsrs-protocols-async
+Plan source            generators (bp.*) / Lua coro    bsrs::plans::* / Lua coro
+RunEngine              bluesky.RunEngine               bsrs::engine::RunEngine
+Devices                ophyd / ophyd-async             bsrs::devices, bsrs::protocols_async
 Backends               pyepics / aioca / p4p           epics-ca-rs / epics-pva-rs
 Document plumbing      Publisher (ZMQ)                 ZmqDocumentSink
                        TiledWriter                     TiledSink + tiled-rs
@@ -81,24 +81,24 @@ bsrs-plans mirrors `bluesky.plans` 1:1 by name. Direct ports:
 
 | bluesky                          | bsrs                              |
 | -------------------------------- | ----------------------------------- |
-| `bp.count(dets, n)`              | `bsrs_plans::count(dets, n)`      |
-| `bp.scan(dets, m, a, b, n)`      | `bsrs_plans::scan(...)`           |
-| `bp.list_scan`, `rel_list_scan`  | `bsrs_plans::list_scan`, `rel_list_scan` |
-| `bp.grid_scan`, `rel_grid_scan`  | `bsrs_plans::grid_scan`, `rel_grid_scan` |
-| `bp.spiral_*`                    | `bsrs_plans::spiral_*`            |
-| `bp.adaptive_scan`               | `bsrs_plans::adaptive_scan`       |
-| `bp.tune_centroid`               | `bsrs_plans::tune_centroid`       |
-| `bp.fly`                         | `bsrs_plans::fly`                 |
-| `bp.ramp_plan`                   | `bsrs_plans::ramp_plan`           |
-| `bp.log_scan`                    | `bsrs_plans::log_scan`            |
-| `bps.*` (one-shot Msg helpers)   | `bsrs_plans::stubs::*`            |
-| `bpp.run_wrapper`                | `bsrs_plans::preprocessors::run_wrapper` |
+| `bp.count(dets, n)`              | `bsrs::plans::count(dets, n)`      |
+| `bp.scan(dets, m, a, b, n)`      | `bsrs::plans::scan(...)`           |
+| `bp.list_scan`, `rel_list_scan`  | `bsrs::plans::list_scan`, `rel_list_scan` |
+| `bp.grid_scan`, `rel_grid_scan`  | `bsrs::plans::grid_scan`, `rel_grid_scan` |
+| `bp.spiral_*`                    | `bsrs::plans::spiral_*`            |
+| `bp.adaptive_scan`               | `bsrs::plans::adaptive_scan`       |
+| `bp.tune_centroid`               | `bsrs::plans::tune_centroid`       |
+| `bp.fly`                         | `bsrs::plans::fly`                 |
+| `bp.ramp_plan`                   | `bsrs::plans::ramp_plan`           |
+| `bp.log_scan`                    | `bsrs::plans::log_scan`            |
+| `bps.*` (one-shot Msg helpers)   | `bsrs::plans::stubs::*`            |
+| `bpp.run_wrapper`                | `bsrs::plans::preprocessors::run_wrapper` |
 | `bpp.subs_wrapper`               | (no-op alias — see note below)      |
-| `bpp.relative_set_wrapper`       | `bsrs_plans::preprocessors::relative_set_wrapper` |
-| `bpp.baseline_wrapper`           | `bsrs_plans::preprocessors::baseline_wrapper` |
-| `bpp.contingency_wrapper`        | `bsrs_plans::preprocessors::contingency_wrapper` |
-| `bpp.finalize_wrapper`           | `bsrs_plans::preprocessors::finalize_wrapper` |
-| `bpp.configure_count_time_wrapper` | `bsrs_plans::preprocessors::configure_count_time_wrapper` |
+| `bpp.relative_set_wrapper`       | `bsrs::plans::preprocessors::relative_set_wrapper` |
+| `bpp.baseline_wrapper`           | `bsrs::plans::preprocessors::baseline_wrapper` |
+| `bpp.contingency_wrapper`        | `bsrs::plans::preprocessors::contingency_wrapper` |
+| `bpp.finalize_wrapper`           | `bsrs::plans::preprocessors::finalize_wrapper` |
+| `bpp.configure_count_time_wrapper` | `bsrs::plans::preprocessors::configure_count_time_wrapper` |
 
 > `subs_wrapper` is documented in bsrs as a no-op for parity. The
 > recommended replacement is `re.subscribe(cb)` at engine creation

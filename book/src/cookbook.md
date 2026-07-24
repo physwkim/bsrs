@@ -18,7 +18,7 @@ RE:run(bp.spiral({det1}, m1, m2, 0, 0, 1, 1, 0.1, 8))   -- last arg is integer n
 
 Not all `bp.*` plans are exposed in Lua yet (e.g. `adaptive_scan`,
 `tune_centroid` are Rust-only as of this writing). Run them from
-Rust via `bsrs_plans::adaptive_scan(...)` for now, or build the
+Rust via `bsrs::plans::adaptive_scan(...)` for now, or build the
 plan as a Lua coroutine (see below).
 
 ## mvr with baseline
@@ -48,10 +48,10 @@ locally (no Document plane bytes). The `fly_during_wrapper` is
 exposed from Rust:
 
 ```rust
-use bsrs_plans::preprocessors::fly_during_wrapper;
+use bsrs::plans::preprocessors::fly_during_wrapper;
 
 let fly_with_writer = fly_during_wrapper(
-    bsrs_plans::count(vec![pilatus.clone()], 1),
+    bsrs::plans::count(vec![pilatus.clone()], 1),
     vec![(pilatus.clone(), pilatus.clone())],   // (flyable, collectable) pair
 );
 re.run_async(fly_with_writer).await?;
@@ -99,7 +99,7 @@ qs> s:inspect()
 
 ## Lua coroutine plans
 
-For one-off scans you don't want to compile into `bsrs_plans`:
+For one-off scans you don't want to compile into `bsrs::plans`:
 
 ```lua
 local function snake_grid(detectors, mx, my, x_pts, y_pts, exposure)
@@ -172,8 +172,9 @@ qs> dx:name()                          -- inherited from NamedObj
 => "dx"
 ```
 
-The macro generates a JSON-shaped dispatch table so bsrs-cli's
-Lua bridge can wire it into the daemon's mlua state at startup.
+The macro generates a JSON-shaped dispatch table so the daemon's
+Lua bridge (`host::manager_lua`) can wire it into the mlua state at
+startup.
 
 ## Configure-time exposure
 
@@ -181,10 +182,10 @@ To set a uniform `count_time` across multiple detectors before a
 plan, use the Rust-side wrapper (Lua exposure pending):
 
 ```rust
-use bsrs_plans::preprocessors::configure_count_time_wrapper;
+use bsrs::plans::preprocessors::configure_count_time_wrapper;
 
 let plan = configure_count_time_wrapper(
-    bsrs_plans::scan(vec![det1, det2, det3], m1.clone(), m1.clone(), 0.0, 1.0, 11),
+    bsrs::plans::scan(vec![det1, det2, det3], m1.clone(), m1.clone(), 0.0, 1.0, 11),
     0.5,                                       // exposure seconds
     vec![det1, det2, det3],                    // ConfigurableObj devices
 );

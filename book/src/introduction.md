@@ -42,15 +42,15 @@ without dragging a Python interpreter onto the IOC host.
 Core engine + plan library + document sinks are production-shape
 and tested. Notable opt-in features behind Cargo flags:
 
-| Feature                          | Crate              | Notes                                    |
-| -------------------------------- | ------------------ | ---------------------------------------- |
-| `zmq`                            | `bsrs-callbacks` | bluesky `Publisher` envelope             |
-| `tiled`                          | `bsrs-callbacks` | HTTP register + metadata patch via tiled-client |
-| `kafka`                          | `bsrs-callbacks` | pure-Rust `rskafka` crate, no librdkafka |
-| `hdf5`                           | `bsrs-stream`    | rust-hdf5 frame writer, NeXus layout     |
-| `pva`                            | `bsrs-stream`    | NTNDArray monitor source                 |
-| `real`                           | `bsrs-backend-epics-{ca,pva}` | live EPICS clients         |
-| `metrics`                        | `bsrs-qs`        | Prometheus `/metrics` endpoint           |
-| `tiled` (bsrs-cli)             | `bsrs-cli`       | Lua `tiled.*` read-side namespace        |
+All flags below are features of the consolidated `bsrs` crate:
+
+| Feature                          | Notes                                    |
+| -------------------------------- | ---------------------------------------- |
+| `ca` / `pva` (**default**)       | live EPICS CA / PVA clients; `pva` also enables the NTNDArray monitor source |
+| `zmq`                            | bluesky `Publisher` envelope             |
+| `tiled`                          | HTTP register + metadata patch via tiled-rs; Lua `tiled.*` read-side namespace |
+| `kafka`                          | pure-Rust `rskafka` crate, no librdkafka |
+| `hdf5`                           | rust-hdf5 frame writer, NeXus layout     |
+| `metrics`                        | Prometheus `/metrics` endpoint           |
 
 Roadmap items still open are listed in `doc/10-roadmap.md`.

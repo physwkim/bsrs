@@ -40,7 +40,7 @@ Run any one with:
 
 ```sh
 cd ~/codes/bsrs
-cargo run -p bsrs-cli -- repl --script examples/mini_beamline/01_scan.lua
+cargo run -p bsrs --features cli -- repl --script examples/mini_beamline/01_scan.lua
 ```
 
 ## What's covered elsewhere (no script here)
