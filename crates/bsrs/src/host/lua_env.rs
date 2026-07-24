@@ -1621,7 +1621,7 @@ fn lua_value_repr(v: &LuaValue) -> String {
     }
 }
 
-fn lua_value_to_json(v: &LuaValue) -> mlua::Result<serde_json::Value> {
+pub(crate) fn lua_value_to_json(v: &LuaValue) -> mlua::Result<serde_json::Value> {
     Ok(match v {
         LuaValue::Nil => serde_json::Value::Null,
         LuaValue::Boolean(b) => serde_json::Value::Bool(*b),

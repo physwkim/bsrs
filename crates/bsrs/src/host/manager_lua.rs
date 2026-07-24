@@ -302,6 +302,12 @@ fn value_to_string(v: &mlua::Value) -> String {
         mlua::Value::Integer(i) => i.to_string(),
         mlua::Value::Number(n) => n.to_string(),
         mlua::Value::String(s) => s.to_str().map(|s| s.to_string()).unwrap_or_default(),
+        // Render tables as JSON — the mlua Debug form (`Table(Ref(0x..))`)
+        // is unreadable in the qs repl for results like `dcm:locate()`.
+        mlua::Value::Table(_) => match crate::host::lua_env::lua_value_to_json(v) {
+            Ok(j) => serde_json::to_string_pretty(&j).unwrap_or_else(|_| format!("{v:?}")),
+            Err(_) => format!("{v:?}"),
+        },
         other => format!("{other:?}"),
     }
 }
