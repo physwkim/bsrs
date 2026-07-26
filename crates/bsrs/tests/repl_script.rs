@@ -1484,3 +1484,124 @@ print(string.find(RE:md_get(), "bottom", 1, true) ~= nil)
     assert!(out.contains("ok=true"), "out = {out}");
     assert!(out.contains("true"), "leaf must survive; out = {out}");
 }
+
+// -- Lossy Lua -> JSON key encoding ------------------------------------------
+//
+// The conversions used to iterate `pairs::<String, _>().flatten()`.
+// A key that is not a Lua string did not merely skip its own entry —
+// it ended the iteration, taking every remaining entry with it, and
+// the call still reported success. Cases are one per boundary of the
+// key rules, not one per story.
+
+#[test]
+fn mixed_sequence_and_named_keys_keeps_every_entry() {
+    // `#t` is 2 but the table holds 3 entries: the array shape would
+    // be unfaithful, so this must become an object with all three.
+    let (out, err, code) = run_script(
+        r#"
+RE:md_set("mixed", {1, 2, y = 3})
+local s = RE:md_get()
+print("y=" .. tostring(string.find(s, '"y": 3', 1, true) ~= nil))
+print("one=" .. tostring(string.find(s, '"1": 1', 1, true) ~= nil))
+print("two=" .. tostring(string.find(s, '"2": 2', 1, true) ~= nil))
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("y=true"), "named key dropped; out = {out}");
+    assert!(out.contains("one=true"), "out = {out}");
+    assert!(out.contains("two=true"), "out = {out}");
+}
+
+#[test]
+fn pure_sequence_still_becomes_a_json_array() {
+    // The other side of the same boundary: keys exactly 1..#t and
+    // nothing else stays an array.
+    let (out, err, code) = run_script(
+        r#"
+RE:md_set("seq", {10, 20, 30})
+local s = RE:md_get()
+print("arr=" .. tostring(string.find(s, '"seq": [', 1, true) ~= nil))
+print("last=" .. tostring(string.find(s, "30", 1, true) ~= nil))
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("arr=true"), "out = {out}");
+    assert!(out.contains("last=true"), "out = {out}");
+}
+
+#[test]
+fn sparse_numeric_key_renders_as_its_text_form() {
+    // `#t` is 0 here, so this takes the object branch and the integer
+    // key becomes its Lua text form rather than being dropped.
+    let (out, err, code) = run_script(
+        r#"
+RE:md_set("sparse", {[10] = "a"})
+print("ten=" .. tostring(string.find(RE:md_get(), '"10": "a"', 1, true) ~= nil))
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("ten=true"), "out = {out}");
+}
+
+#[test]
+fn unrenderable_key_errors_instead_of_dropping_the_table() {
+    // A table key has no JSON form. Pre-fix this ended the iteration:
+    // the whole md value converted to `{}` and `md_set` still
+    // succeeded, silently discarding `kept` as well.
+    let (out, err, code) = run_script(
+        r#"
+local ok, e = pcall(function() RE:md_set("bad", {[{}] = 1, kept = "here"}) end)
+print("ok=" .. tostring(ok))
+print("msg=" .. tostring(e))
+print("stored=" .. tostring(string.find(RE:md_get(), "bad", 1, true) ~= nil))
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("ok=false"),
+        "must not report success; out = {out}"
+    );
+    assert!(out.contains("cannot be a JSON object key"), "out = {out}");
+    assert!(out.contains("stored=false"), "out = {out}");
+}
+
+#[test]
+fn keys_colliding_on_the_same_rendered_string_error() {
+    // `t[1]` and `t["1"]` are distinct Lua keys that render to one
+    // JSON key; keeping either would silently drop the other's value.
+    let (out, err, code) = run_script(
+        r#"
+local ok, e = pcall(function() RE:md_set("dup", {[1] = "int", ["1"] = "str"}) end)
+print("ok=" .. tostring(ok))
+print("msg=" .. tostring(e))
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("ok=false"),
+        "must not report success; out = {out}"
+    );
+    assert!(out.contains("both render to"), "out = {out}");
+}
+
+#[test]
+fn declare_stream_rejects_a_non_table_data_key_spec() {
+    // Same family on the `pairs::<String, mlua::Table>` variant: a
+    // value of the wrong type used to end the iteration too, so both
+    // `bad` *and* `good` disappeared from the descriptor.
+    let (out, err, code) = run_script(
+        r#"
+local ok, e = pcall(function()
+    return msg.declare_stream("primary", { good = { source = "s" }, bad = 42 })
+end)
+print("ok=" .. tostring(ok))
+print("msg=" .. tostring(e))
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("ok=false"),
+        "must not report success; out = {out}"
+    );
+    assert!(out.contains("must be a table"), "out = {out}");
+}

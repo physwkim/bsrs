@@ -34,8 +34,8 @@ use std::sync::Arc;
 use crate::backends::soft::{SoftDetector, SoftMotor};
 use crate::core::msg::{
     CollectableObj, ConfigurableObj, ConfigureArgs, FlyableObj, LocatableObj, MonitorableObj,
-    MovableObj, Msg, PausableObj, PreparableObj, ReadableObj, RunMetadata, StageableObj,
-    StoppableObj, SubscribeCallback, TriggerableObj,
+    MovableObj, Msg, PausableObj, PreparableObj, ReadableObj, StageableObj, StoppableObj,
+    SubscribeCallback, TriggerableObj,
 };
 use crate::core::plan::{plan_box, Plan};
 use crate::engine::{DocumentSink, RunEngine};
@@ -643,11 +643,7 @@ impl UserData for LuaRunEngine {
             Ok(())
         });
         methods.add_method("md_replace", |_, this, t: mlua::Table| {
-            let mut md = std::collections::HashMap::new();
-            for pair in t.pairs::<String, LuaValue>().flatten() {
-                md.insert(pair.0, lua_value_to_json(&pair.1)?);
-            }
-            this.re.md_replace(md);
+            this.re.md_replace(lua_table_to_json_map(&t)?);
             Ok(())
         });
         methods.add_method("is_paused", |_, this, ()| Ok(this.re.is_paused()));
@@ -830,7 +826,7 @@ impl UserData for LuaRunEngine {
                         let n: crate::engine::MdNormalizer = Arc::new(move |md| {
                             let table = json_md_to_lua_table(&lua, md.clone())?;
                             match f.call::<mlua::Table>(table) {
-                                Ok(t) => lua_table_to_json_md(&t).map_err(|e| {
+                                Ok(t) => lua_table_to_json_map(&t).map_err(|e| {
                                     crate::core::error::BsrsError::Plan(format!(
                                         "Lua md_normalizer: {e}"
                                     ))
@@ -997,11 +993,7 @@ impl UserData for LuaRunEngine {
                 // being silently dropped.
                 match opts.get::<LuaValue>("md") {
                     Ok(LuaValue::Nil) => {}
-                    Ok(LuaValue::Table(t)) => {
-                        for pair in t.pairs::<String, LuaValue>().flatten() {
-                            md.insert(pair.0, lua_value_to_json(&pair.1)?);
-                        }
-                    }
+                    Ok(LuaValue::Table(t)) => md = lua_table_to_json_map(&t)?,
                     Ok(_) => {
                         return Err(mlua::Error::RuntimeError(
                             "run_async_with: opts.md must be a table".into(),
@@ -1709,10 +1701,14 @@ fn lua_value_to_json_guarded(
             // cyclic branch would hand the engine a truncated
             // document / metadata tree — so this path errors.
             let scope = guard.enter(t)?;
-            // If table is a sequence (1..n), encode as array; else object.
-            let len = t.len()?;
-            if len > 0 {
-                let mut arr = Vec::with_capacity(len as usize);
+            let entries = lua_table_entries(t)?;
+            // A JSON array is only faithful for a *pure* sequence:
+            // keys exactly 1..len and nothing else. A table that also
+            // carries other keys (`{1, 2, y = 3}`) becomes an object,
+            // so no entry is lost.
+            let len = usize::try_from(t.len()?).unwrap_or(0);
+            if len > 0 && entries.len() == len {
+                let mut arr = Vec::with_capacity(len);
                 for i in 1..=len {
                     let v: LuaValue = t.get(i)?;
                     arr.push(lua_value_to_json_guarded(&v, scope.guard)?);
@@ -1720,14 +1716,84 @@ fn lua_value_to_json_guarded(
                 serde_json::Value::Array(arr)
             } else {
                 let mut obj = serde_json::Map::new();
-                for pair in t.clone().pairs::<String, LuaValue>().flatten() {
-                    obj.insert(pair.0, lua_value_to_json_guarded(&pair.1, scope.guard)?);
+                for (key, v) in render_object_keys(entries)? {
+                    obj.insert(key, lua_value_to_json_guarded(&v, scope.guard)?);
                 }
                 serde_json::Value::Object(obj)
             }
         }
         _ => serde_json::Value::String(format!("{v:?}")),
     })
+}
+
+/// Every `(key, value)` pair of a Lua table, keys unconverted.
+///
+/// Iterating as `pairs::<String, _>` instead does not merely skip the
+/// entries whose key is not a Lua string — the first such key ends the
+/// iteration, silently dropping every remaining entry with it.
+fn lua_table_entries(t: &mlua::Table) -> mlua::Result<Vec<(LuaValue, LuaValue)>> {
+    let mut entries = Vec::new();
+    for pair in t.clone().pairs::<LuaValue, LuaValue>() {
+        entries.push(pair?);
+    }
+    Ok(entries)
+}
+
+/// Render a Lua table key as a JSON object key. Strings pass through;
+/// numbers take their Lua text form (`t[10]` → `"10"`). Anything else
+/// has no JSON representation and is rejected rather than dropped.
+fn json_object_key(k: &LuaValue) -> mlua::Result<String> {
+    match k {
+        LuaValue::String(s) => Ok(s.to_str()?.to_string()),
+        LuaValue::Integer(i) => Ok(i.to_string()),
+        LuaValue::Number(n) => Ok(n.to_string()),
+        other => Err(mlua::Error::RuntimeError(format!(
+            "table key of type {} cannot be a JSON object key",
+            other.type_name()
+        ))),
+    }
+}
+
+/// The single owner of "these Lua entries become string keys".
+///
+/// Rejects a key that [`json_object_key`] cannot render, and rejects
+/// two distinct Lua keys that render to the same string (`t[1]` and
+/// `t["1"]`) — keeping only one of them would drop the other's value.
+fn render_object_keys(entries: Vec<(LuaValue, LuaValue)>) -> mlua::Result<Vec<(String, LuaValue)>> {
+    let mut out = Vec::with_capacity(entries.len());
+    let mut seen = std::collections::HashSet::new();
+    for (k, v) in entries {
+        let key = json_object_key(&k)?;
+        if !seen.insert(key.clone()) {
+            return Err(mlua::Error::RuntimeError(format!(
+                "table has two keys that both render to {key:?}"
+            )));
+        }
+        out.push((key, v));
+    }
+    Ok(out)
+}
+
+/// The single owner of "Lua table → string-keyed map", for every site
+/// that builds metadata, configure args, or stream data keys.
+///
+/// Keys go through [`render_object_keys`]; the caller converts each
+/// value however its own target type needs.
+fn lua_table_string_keyed(t: &mlua::Table) -> mlua::Result<Vec<(String, LuaValue)>> {
+    render_object_keys(lua_table_entries(t)?)
+}
+
+/// Convert a Lua table into a string-keyed JSON map — the md /
+/// configure-args shape. Same key rules as every other conversion,
+/// via [`lua_table_string_keyed`].
+pub(crate) fn lua_table_to_json_map(
+    t: &mlua::Table,
+) -> mlua::Result<std::collections::HashMap<String, serde_json::Value>> {
+    let mut out = std::collections::HashMap::new();
+    for (k, v) in lua_table_string_keyed(t)? {
+        out.insert(k, lua_value_to_json(&v)?);
+    }
+    Ok(out)
 }
 
 /// Build a minimal `DataKey` from a Lua table:
@@ -1919,17 +1985,6 @@ fn json_md_to_lua_table(
     Ok(table)
 }
 
-/// Convert a Lua table back into a md HashMap.
-fn lua_table_to_json_md(
-    t: &mlua::Table,
-) -> mlua::Result<std::collections::HashMap<String, serde_json::Value>> {
-    let mut out = std::collections::HashMap::new();
-    for pair in t.pairs::<String, LuaValue>().flatten() {
-        out.insert(pair.0, lua_value_to_json(&pair.1)?);
-    }
-    Ok(out)
-}
-
 /// JSON Value -> Lua Value (used for md callbacks). Nested objects
 /// become tables, arrays become 1-indexed sequence tables.
 fn json_to_lua_value(lua: &Lua, v: &serde_json::Value) -> mlua::Result<LuaValue> {
@@ -1978,21 +2033,7 @@ fn register_msg_namespace(lua: &Lua) -> mlua::Result<()> {
     msg.set(
         "open_run",
         lua.create_function(|_, meta: Option<mlua::Table>| {
-            let mut m = RunMetadata::default();
-            if let Some(t) = meta {
-                if let Ok(s) = t.get::<String>("plan_name") {
-                    m.plan_name = Some(s);
-                }
-                if let Ok(n) = t.get::<u64>("scan_id") {
-                    m.scan_id = Some(n);
-                }
-                for pair in t.pairs::<String, LuaValue>().flatten() {
-                    if pair.0 != "plan_name" && pair.0 != "scan_id" {
-                        m.extra.insert(pair.0, lua_value_to_json(&pair.1)?);
-                    }
-                }
-            }
-            Ok(LuaMsg(Msg::OpenRun(m)))
+            Ok(LuaMsg(Msg::OpenRun(lua_table_to_metadata(meta)?)))
         })?,
     )?;
     // close_run([exit_status, [reason]]) -> Msg::CloseRun
@@ -2304,10 +2345,7 @@ fn register_msg_namespace(lua: &Lua) -> mlua::Result<()> {
             let c = d.configurable.clone().ok_or_else(|| {
                 mlua::Error::RuntimeError(format!("{} is not configurable", d.name))
             })?;
-            let mut values = std::collections::HashMap::new();
-            for pair in args.pairs::<String, LuaValue>().flatten() {
-                values.insert(pair.0, lua_value_to_json(&pair.1)?);
-            }
+            let values = lua_table_to_json_map(&args)?;
             Ok(LuaMsg(Msg::Configure {
                 obj: c,
                 args: ConfigureArgs { values },
@@ -2320,9 +2358,14 @@ fn register_msg_namespace(lua: &Lua) -> mlua::Result<()> {
         "declare_stream",
         lua.create_function(|_, (stream_name, keys_t): (String, mlua::Table)| {
             let mut data_keys = std::collections::HashMap::new();
-            for pair in keys_t.pairs::<String, mlua::Table>().flatten() {
-                let dk = lua_table_to_data_key(&pair.1)?;
-                data_keys.insert(pair.0, dk);
+            for (name, spec) in lua_table_string_keyed(&keys_t)? {
+                let LuaValue::Table(spec) = spec else {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "declare_stream: data key {name:?} must be a table, got {}",
+                        spec.type_name()
+                    )));
+                };
+                data_keys.insert(name, lua_table_to_data_key(&spec)?);
             }
             Ok(LuaMsg(Msg::DeclareStream {
                 stream_name,
@@ -2720,11 +2763,11 @@ fn lua_table_to_metadata(t: Option<mlua::Table>) -> mlua::Result<crate::core::ms
     if let Ok(n) = t.get::<u64>("scan_id") {
         m.scan_id = Some(n);
     }
-    for pair in t.pairs::<String, LuaValue>().flatten() {
-        if pair.0 != "plan_name" && pair.0 != "scan_id" {
-            m.extra.insert(pair.0, lua_value_to_json(&pair.1)?);
-        }
-    }
+    // The two named fields above already carry these; everything else
+    // in the table is free-form extra metadata.
+    m.extra = lua_table_to_json_map(&t)?;
+    m.extra.remove("plan_name");
+    m.extra.remove("scan_id");
     Ok(m)
 }
 
@@ -3637,10 +3680,7 @@ fn register_bpp(lua: &Lua) -> mlua::Result<()> {
         "inject_md",
         lua.create_function(|_, (plan_ud, md_t): (mlua::AnyUserData, mlua::Table)| {
             let inner = take_inner_plan(&plan_ud)?;
-            let mut extra = std::collections::HashMap::new();
-            for pair in md_t.pairs::<String, LuaValue>().flatten() {
-                extra.insert(pair.0, lua_value_to_json(&pair.1)?);
-            }
+            let extra = lua_table_to_json_map(&md_t)?;
             Ok(wrap_prebuilt(
                 "inject_md",
                 pp::inject_md_wrapper(inner, extra),
