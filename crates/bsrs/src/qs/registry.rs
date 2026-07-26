@@ -180,7 +180,7 @@ pub struct Registry {
     collectables: HashMap<String, Arc<dyn CollectableObj>>,
     /// Devices with `#[lua_methods]`-derived `LuaExposable` impls.
     /// Surfaced through the daemon's Lua state as device-specific
-    /// methods on the device global. See bsrs-cli/manager_lua.rs.
+    /// methods on the device global. See `host/manager_lua.rs`.
     lua_exposed: HashMap<String, LuaExposedEntry>,
 }
 
@@ -214,6 +214,25 @@ impl Registry {
     ) {
         self.plans
             .insert(name.into(), RegisteredPlan { factory, meta });
+    }
+
+    /// Register a positioner under every facet it implements — readable,
+    /// movable *and* locatable.
+    ///
+    /// Prefer this over calling the per-facet `register_*` methods for a
+    /// motor. Registering a positioner facet-by-facet is how a device
+    /// ends up half-visible: the queue worker moves it but `locate()`
+    /// reports it unknown, and nothing at the registration site says a
+    /// facet is missing. Here the bound decides, so no call site can
+    /// forget one.
+    pub fn register_positioner<T>(&mut self, name: impl Into<String>, obj: Arc<T>)
+    where
+        T: ReadableObj + MovableObj + LocatableObj + 'static,
+    {
+        let name = name.into();
+        self.readables.insert(name.clone(), obj.clone());
+        self.movables.insert(name.clone(), obj.clone());
+        self.locatables.insert(name, obj);
     }
 
     /// Register a `ReadableObj` device under a name.
@@ -273,7 +292,7 @@ impl Registry {
     }
 
     /// Look up a device's lua-exposed entry by name (used by the
-    /// daemon-side Lua bridge in bsrs-cli).
+    /// daemon-side Lua bridge in `host/manager_lua.rs`).
     pub fn lua_exposed(&self, name: &str) -> Option<&LuaExposedEntry> {
         self.lua_exposed.get(name)
     }

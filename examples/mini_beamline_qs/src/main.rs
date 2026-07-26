@@ -18,12 +18,16 @@
 //! for pv in mini:ph:mtr.VELO mini:dot:mtrx.VELO mini:dot:mtry.VELO; do
 //!     caput "$pv" 5
 //! done
+//! # put the Kohzu sequencer in Auto mode — the IOC boots in Manual
+//! # mode, where the `dcm` device's energy moves are never executed
+//! # and its done-PV wait (mini:KohzuMoving) times out after 30 s
+//! caput mini:KohzuModeBO Auto
 //!
 //! # terminal 3 — the daemon
 //! cargo run -p mini-beamline-qs --release
 //!
 //! # terminal 4 — attach a REPL
-//! cargo run -p bsrs-cli --release -- qs \
+//! cargo run -p bsrs --features cli --release -- qs \
 //!     --address tcp://localhost:60615 repl
 //! bsrs> dcm:move_energy_keV(8.0)
 //! bsrs> dcm:locate()
@@ -128,6 +132,7 @@ async fn run(args: Args) -> i32 {
         "dcm",
         "mini:BraggEAO",
         "mini:BraggERdbkAO",
+        "mini:KohzuMoving",
         "mini:BraggThetaRdbkAO",
     )
     .await

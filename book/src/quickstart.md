@@ -81,7 +81,7 @@ becomes a `yield Msg::X` in an `async_stream::stream!` block.
 
 ```lua
 RE:subscribe(function(name, body)
-    if name == "stop" then print("run finished:", body) end
+    if name == "stop" then print("run finished:", body.exit_status) end
 end)
 RE:run(count({det1}, 5))
 ```
@@ -94,7 +94,7 @@ document filters: pass an optional second arg, e.g.
 ## Persist runs to disk
 
 ```lua
--- (Inside bsrs-cli the JsonlSink is the easiest writer to wire
+-- (Inside the bsrs CLI the JsonlSink is the easiest writer to wire
 -- up from Rust startup; from Lua REPL the engine has no sinks
 -- attached by default. Production setups attach sinks during
 -- `bsrs qs-manager` startup or via a small Rust glue binary.)

@@ -2,11 +2,12 @@
 //! `pva_detector` factories that connect bsrs's `EpicsPvaBackend`
 //! to a real PV Access IOC.
 //!
-//! Behind the `pva` Cargo feature so the default bsrs-cli build
-//! can opt into PVA without dragging in `epics-pva-rs`. Build with:
+//! Behind the `pva` Cargo feature (on by default) so a
+//! `--no-default-features` build stays free of `epics-pva-rs`. Run
+//! with:
 //!
 //! ```sh
-//! cargo run -p bsrs-cli -- repl --script my_scan.lua
+//! cargo run -p bsrs --features cli -- repl --script my_scan.lua
 //! ```
 //!
 //! ## Lua surface

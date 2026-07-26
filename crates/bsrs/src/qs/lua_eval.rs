@@ -1,10 +1,10 @@
 //! `LuaEvaluator` trait — abstract async hook for the `lua_eval` RPC.
 //!
-//! `bsrs-qs` itself doesn't depend on `mlua`. Instead it accepts a
-//! caller-supplied evaluator at server-build time. The `bsrs-cli`
-//! crate (which already embeds `mlua` for the local REPL) implements
-//! the trait by sharing one mlua state across the daemon — see
-//! `bsrs-cli::manager` for the wiring.
+//! The `qs` module itself doesn't depend on `mlua`. Instead it
+//! accepts a caller-supplied evaluator at server-build time. The
+//! `bsrs` binary (which already embeds `mlua` for the local REPL)
+//! implements the trait by sharing one mlua state across the daemon
+//! — see `bin/bsrs/manager.rs` for the wiring.
 //!
 //! Without an evaluator wired up, the `lua_eval` RPC returns
 //! `NOT_IMPLEMENTED`. With one wired, the RPC spawns a task and

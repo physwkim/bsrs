@@ -787,11 +787,11 @@ local function p()
     coroutine.yield(msg.close_run())
 end
 RE:run(plan(p))
-print("start=" .. tostring(got))
+print("normalized=" .. tostring(got.normalized))
 "#,
     );
     assert_eq!(code, 0, "stderr: {err}");
-    assert!(out.contains("\"normalized\":true"), "out = {out}");
+    assert!(out.contains("normalized=true"), "out = {out}");
 }
 
 #[test]
@@ -808,11 +808,11 @@ local function p()
     coroutine.yield(msg.close_run())
 end
 RE:run(plan(p))
-print("start=" .. tostring(got))
+print("scan_id=" .. tostring(got.scan_id))
 "#,
     );
     assert_eq!(code, 0, "stderr: {err}");
-    assert!(out.contains("\"scan_id\":99"), "out = {out}");
+    assert!(out.contains("scan_id=99"), "out = {out}");
 }
 
 #[test]
@@ -1023,13 +1023,13 @@ local function p()
 end
 local r = RE:run(plan(p))
 print("result=" .. tostring(r))
-print("stop=" .. tostring(got_stop))
+print("stop.exit_status=" .. tostring(got_stop.exit_status))
 "#,
     );
     assert_eq!(code, 0);
     assert!(out.contains("exit_status=fail"), "out = {out}");
     assert!(
-        out.contains("\"exit_status\":\"fail\""),
+        out.contains("stop.exit_status=fail"),
         "RunStop document must carry exit_status=fail; out = {out}"
     );
 }
@@ -1185,7 +1185,7 @@ fn lua_subscriber_receives_monitor_events_via_buffered_drain() {
     // mutex held by the REPL thread. With the fix, the events are
     // buffered and replayed after RE:run returns.
     //
-    // Note: bsrs-cli's `soft_detector` is not Monitorable. To test
+    // Note: the CLI's `soft_detector` is not Monitorable. To test
     // the buffered path we'd need a Monitorable backend; this test
     // instead verifies the simpler path: a subscription added before
     // RE:run completes successfully without timing out, and the
@@ -1275,18 +1275,18 @@ local function p()
     coroutine.yield(msg.close_run())
 end
 RE:run_async_with(plan(p), { md = { operator = "carol" } })
-print("start=" .. tostring(got))
+print("operator=" .. tostring(got.operator))
 "#,
     );
     assert_eq!(code, 0, "stderr: {err}");
-    assert!(out.contains("\"operator\":\"carol\""), "out = {out}");
+    assert!(out.contains("operator=carol"), "out = {out}");
 }
 
 #[cfg(feature = "tiled")]
 #[test]
 fn tiled_global_namespace_exists() {
-    // Smoke test for the tiled.* Lua surface: when the bsrs-cli
-    // binary is built with --features tiled, the global `tiled`
+    // Smoke test for the tiled.* Lua surface: when the `bsrs`
+    // binary is built with --features cli,tiled, the global `tiled`
     // table is available with `from_uri` callable. We don't reach
     // a real Tiled server here — just verify the binding compiles
     // and the namespace resolves.
@@ -1358,4 +1358,250 @@ print("detector.inspect ok")
     assert_eq!(code, 0, "stderr: {err}\nstdout: {out}");
     assert!(out.contains("motor.inspect ok"), "out = {out}");
     assert!(out.contains("detector.inspect ok"), "out = {out}");
+}
+
+// -- Cyclic / deeply-nested table guard --------------------------------------
+//
+// Lua tables can reference themselves (`t.self = t`, `_G._G == _G`).
+// The Lua-value walkers recurse, and a stack overflow is not
+// catchable in Rust — it aborts the process, so pre-guard each of
+// these cases killed the REPL (and would kill a qs daemon). Cases are
+// one per invariant boundary of `TableGuard`, not one per story.
+
+#[test]
+fn cyclic_table_in_md_set_errors_instead_of_aborting() {
+    let (out, err, code) = run_script(
+        r#"
+local t = {}
+t.self = t
+local ok, e = pcall(function() RE:md_set("x", t) end)
+print("ok=" .. tostring(ok))
+print("msg=" .. tostring(e))
+"#,
+    );
+    assert_eq!(code, 0, "process must survive; stderr: {err}");
+    assert!(out.contains("ok=false"), "out = {out}");
+    assert!(out.contains("cyclic table"), "out = {out}");
+}
+
+#[test]
+fn print_of_lua_globals_does_not_abort() {
+    // `_G._G == _G`: the standard environment is itself cyclic, so
+    // `print(_G)` — an operator poking around the REPL — aborted the
+    // process before the guard. (The JSON walker never reached this
+    // cycle: it rejects one of `_G`'s non-UTF-8 strings first. The
+    // repr walker tolerates those, so it walked straight into it.)
+    let (out, err, code) = run_script(
+        r#"
+print(_G)
+print("survived")
+"#,
+    );
+    assert_eq!(code, 0, "process must survive; stderr: {err}");
+    assert!(out.contains("survived"), "out = {out}");
+    assert!(out.contains("{...}"), "cycle marker expected; out = {out}");
+}
+
+#[test]
+fn print_of_cyclic_table_emits_marker_instead_of_aborting() {
+    // `print` is a debug aid: it renders what it can (marker for the
+    // cyclic branch) rather than failing the call.
+    let (out, err, code) = run_script(
+        r#"
+local t = {}
+t.self = t
+print(t)
+print("survived")
+"#,
+    );
+    assert_eq!(code, 0, "process must survive; stderr: {err}");
+    assert!(out.contains("self={...}"), "out = {out}");
+    assert!(out.contains("survived"), "out = {out}");
+}
+
+#[test]
+fn shared_subtable_on_sibling_branches_is_not_a_cycle() {
+    // Boundary that a naive "every table ever seen" guard would fail:
+    // the same table reached twice on *sibling* branches is a DAG, and
+    // both branches must serialize. The guard tracks the current path
+    // only.
+    let (out, err, code) = run_script(
+        r#"
+local shared = { v = 7 }
+local ok, e = pcall(function() RE:md_set("d", { a = shared, b = shared }) end)
+print("ok=" .. tostring(ok) .. " err=" .. tostring(e))
+print(RE:md_get())
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("ok=true"), "out = {out}");
+    // Both branches present with the value, i.e. neither was dropped.
+    assert_eq!(out.matches("\"v\": 7").count(), 2, "out = {out}");
+}
+
+#[test]
+fn deeply_nested_acyclic_table_errors_instead_of_aborting() {
+    // Acyclic but deeper than MAX_LUA_TABLE_DEPTH: the depth bound is
+    // what keeps a distinct-table chain from overflowing the stack.
+    let (out, err, code) = run_script(
+        r#"
+local root = {}
+local cur = root
+for _ = 1, 500 do
+    local nxt = {}
+    cur.next = nxt
+    cur = nxt
+end
+local ok, e = pcall(function() RE:md_set("deep", root) end)
+print("ok=" .. tostring(ok))
+print("msg=" .. tostring(e))
+"#,
+    );
+    assert_eq!(code, 0, "process must survive; stderr: {err}");
+    assert!(out.contains("ok=false"), "out = {out}");
+    assert!(out.contains("nested deeper than"), "out = {out}");
+}
+
+#[test]
+fn nesting_within_depth_limit_still_converts() {
+    // Just under the bound: normal deep-ish metadata must still work.
+    let (out, err, code) = run_script(
+        r#"
+local root = {}
+local cur = root
+for _ = 1, 60 do
+    local nxt = {}
+    cur.next = nxt
+    cur = nxt
+end
+cur.leaf = "bottom"
+local ok, e = pcall(function() RE:md_set("deep", root) end)
+print("ok=" .. tostring(ok) .. " err=" .. tostring(e))
+print(string.find(RE:md_get(), "bottom", 1, true) ~= nil)
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("ok=true"), "out = {out}");
+    assert!(out.contains("true"), "leaf must survive; out = {out}");
+}
+
+// -- Lossy Lua -> JSON key encoding ------------------------------------------
+//
+// The conversions used to iterate `pairs::<String, _>().flatten()`.
+// A key that is not a Lua string did not merely skip its own entry —
+// it ended the iteration, taking every remaining entry with it, and
+// the call still reported success. Cases are one per boundary of the
+// key rules, not one per story.
+
+#[test]
+fn mixed_sequence_and_named_keys_keeps_every_entry() {
+    // `#t` is 2 but the table holds 3 entries: the array shape would
+    // be unfaithful, so this must become an object with all three.
+    let (out, err, code) = run_script(
+        r#"
+RE:md_set("mixed", {1, 2, y = 3})
+local s = RE:md_get()
+print("y=" .. tostring(string.find(s, '"y": 3', 1, true) ~= nil))
+print("one=" .. tostring(string.find(s, '"1": 1', 1, true) ~= nil))
+print("two=" .. tostring(string.find(s, '"2": 2', 1, true) ~= nil))
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("y=true"), "named key dropped; out = {out}");
+    assert!(out.contains("one=true"), "out = {out}");
+    assert!(out.contains("two=true"), "out = {out}");
+}
+
+#[test]
+fn pure_sequence_still_becomes_a_json_array() {
+    // The other side of the same boundary: keys exactly 1..#t and
+    // nothing else stays an array.
+    let (out, err, code) = run_script(
+        r#"
+RE:md_set("seq", {10, 20, 30})
+local s = RE:md_get()
+print("arr=" .. tostring(string.find(s, '"seq": [', 1, true) ~= nil))
+print("last=" .. tostring(string.find(s, "30", 1, true) ~= nil))
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("arr=true"), "out = {out}");
+    assert!(out.contains("last=true"), "out = {out}");
+}
+
+#[test]
+fn sparse_numeric_key_renders_as_its_text_form() {
+    // `#t` is 0 here, so this takes the object branch and the integer
+    // key becomes its Lua text form rather than being dropped.
+    let (out, err, code) = run_script(
+        r#"
+RE:md_set("sparse", {[10] = "a"})
+print("ten=" .. tostring(string.find(RE:md_get(), '"10": "a"', 1, true) ~= nil))
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("ten=true"), "out = {out}");
+}
+
+#[test]
+fn unrenderable_key_errors_instead_of_dropping_the_table() {
+    // A table key has no JSON form. Pre-fix this ended the iteration:
+    // the whole md value converted to `{}` and `md_set` still
+    // succeeded, silently discarding `kept` as well.
+    let (out, err, code) = run_script(
+        r#"
+local ok, e = pcall(function() RE:md_set("bad", {[{}] = 1, kept = "here"}) end)
+print("ok=" .. tostring(ok))
+print("msg=" .. tostring(e))
+print("stored=" .. tostring(string.find(RE:md_get(), "bad", 1, true) ~= nil))
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("ok=false"),
+        "must not report success; out = {out}"
+    );
+    assert!(out.contains("cannot be a JSON object key"), "out = {out}");
+    assert!(out.contains("stored=false"), "out = {out}");
+}
+
+#[test]
+fn keys_colliding_on_the_same_rendered_string_error() {
+    // `t[1]` and `t["1"]` are distinct Lua keys that render to one
+    // JSON key; keeping either would silently drop the other's value.
+    let (out, err, code) = run_script(
+        r#"
+local ok, e = pcall(function() RE:md_set("dup", {[1] = "int", ["1"] = "str"}) end)
+print("ok=" .. tostring(ok))
+print("msg=" .. tostring(e))
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("ok=false"),
+        "must not report success; out = {out}"
+    );
+    assert!(out.contains("both render to"), "out = {out}");
+}
+
+#[test]
+fn declare_stream_rejects_a_non_table_data_key_spec() {
+    // Same family on the `pairs::<String, mlua::Table>` variant: a
+    // value of the wrong type used to end the iteration too, so both
+    // `bad` *and* `good` disappeared from the descriptor.
+    let (out, err, code) = run_script(
+        r#"
+local ok, e = pcall(function()
+    return msg.declare_stream("primary", { good = { source = "s" }, bad = 42 })
+end)
+print("ok=" .. tostring(ok))
+print("msg=" .. tostring(e))
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("ok=false"),
+        "must not report success; out = {out}"
+    );
+    assert!(out.contains("must be a table"), "out = {out}");
 }

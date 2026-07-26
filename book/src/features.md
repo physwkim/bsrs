@@ -1,21 +1,21 @@
 # Optional features
 
-bsrs is a Cargo workspace. Most opt-in functionality lives behind
-feature flags so the default build stays small and dependency-free.
+Opt-in functionality lives behind feature flags of the consolidated
+`bsrs` crate so the default build stays small and dependency-light.
 
 ## Document sinks
 
-| Crate              | Feature  | Pulls in                              | Use when                              |
-| ------------------ | -------- | ------------------------------------- | ------------------------------------- |
-| `bsrs-callbacks` | `zmq`    | libzmq + rmp-serde                    | bluesky `RemoteDispatcher` consumers  |
-| `bsrs-callbacks` | `tiled`  | tiled-client (HTTP)                   | Tiled catalog ingestion               |
-| `bsrs-callbacks` | `kafka`  | pure-Rust `rskafka` crate             | Kafka topics, no librdkafka           |
+| Feature  | Pulls in                              | Use when                              |
+| -------- | ------------------------------------- | ------------------------------------- |
+| `zmq`    | libzmq + rmp-serde                    | bluesky `RemoteDispatcher` consumers  |
+| `tiled`  | tiled-rs (HTTP)                       | Tiled catalog ingestion               |
+| `kafka`  | pure-Rust `rskafka` crate             | Kafka topics, no librdkafka           |
 
 ```sh
-cargo build -p bsrs-callbacks --features zmq,tiled,kafka
+cargo build -p bsrs --features zmq,tiled,kafka
 ```
 
-## Frame sinks (bsrs-stream)
+## Frame sinks (`stream` module)
 
 | Feature  | Pulls in              | Use when                                     |
 | -------- | --------------------- | -------------------------------------------- |
@@ -50,12 +50,12 @@ the roadmap.
 
 ## Lua read-side surface
 
-| Crate        | Feature | Adds                                       |
-| ------------ | ------- | ------------------------------------------ |
-| `bsrs-cli` | `tiled` | `tiled.from_uri(url)` Lua global + methods |
+| Feature       | Adds                                       |
+| ------------- | ------------------------------------------ |
+| `cli` + `tiled` | `tiled.from_uri(url)` Lua global + methods |
 
 ```sh
-cargo build -p bsrs-cli --features tiled
+cargo build -p bsrs --features cli,tiled
 ```
 
 Inside the REPL:

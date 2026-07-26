@@ -1,11 +1,11 @@
 //! bsrs host runtime — reusable components for embedding a bsrs
 //! `RunEngine` + queue server into a process.
 //!
-//! Split out of `bsrs-cli` (which is now a thin binary on top) so
-//! downstream binaries — e.g. a beamline-specific `qs-manager` that
-//! registers composite ophyd-style devices — can reuse the same Lua
-//! bridge and CA/PVA device factories without depending on the CLI
-//! crate.
+//! Split out of the old `bsrs-cli` crate (now the thin `bsrs`
+//! binary in `bin/bsrs`) so downstream binaries — e.g. a
+//! beamline-specific `qs-manager` that registers composite
+//! ophyd-style devices — can reuse the same Lua bridge and CA/PVA
+//! device factories without depending on the CLI.
 //!
 //! ## Surface
 //!

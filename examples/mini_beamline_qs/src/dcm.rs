@@ -1,9 +1,15 @@
 //! `Dcm` — composite device for the mini-beamline Kohzu DCM.
 //!
 //! Children:
-//! - `energy` — Bragg-energy setpoint/readback pair (`mini:BraggEAO` /
-//!   `mini:BraggERdbkAO`), driven through the Kohzu controller's
-//!   energy-↔-angle state machine.
+//! - `energy` — Bragg-energy positioner (`mini:BraggEAO` /
+//!   `mini:BraggERdbkAO`, done signal `mini:KohzuMoving`), driven
+//!   through the Kohzu controller's energy-↔-angle state machine.
+//!   A done-signal positioner is required here: the `BraggEAO` put
+//!   completes at record processing while the kohzuCtl sequencer
+//!   moves theta/y/z afterwards, so a plain `CaMotor` would report
+//!   every scan step done before the crystals move. Note the
+//!   sequencer only executes moves in Auto mode
+//!   (`mini:KohzuModeBO` = "Auto").
 //! - `theta_rbv` — read-only Bragg-angle readback
 //!   (`mini:BraggThetaRdbkAO`).
 //!
@@ -27,24 +33,29 @@ use bsrs::core::msg::{DynLocation, LocatableObj, MovableObj, NamedObj, ReadableO
 use bsrs::core::reading::ReadingValue;
 use bsrs::core::status::Status;
 use bsrs::event_model::DataKey;
-use bsrs::host::ca_devices::{CaDetector, CaMotor};
+use bsrs::host::ca_devices::{CaDetector, CaPositioner};
 
 /// Composite DCM: energy axis + theta readback.
 pub struct Dcm {
     name: String,
-    energy: Arc<CaMotor>,
+    energy: Arc<CaPositioner>,
     theta_rbv: Arc<CaDetector>,
 }
 
 impl Dcm {
     /// Connect both children. CA bootstrap must have run already.
+    /// `moving_pv` is the Kohzu busy flag (`mini:KohzuMoving`);
+    /// done_value 0.0 = "Done".
     pub async fn connect(
         name: &str,
         energy_val_pv: &str,
         energy_rbv_pv: &str,
+        moving_pv: &str,
         theta_rbv_pv: &str,
     ) -> Result<Arc<Self>> {
-        let energy = CaMotor::connect_async("dcm_energy", energy_val_pv, energy_rbv_pv).await?;
+        let energy =
+            CaPositioner::connect_async("dcm_energy", energy_val_pv, energy_rbv_pv, moving_pv, 0.0)
+                .await?;
         let theta_rbv = CaDetector::connect_async("dcm_theta_rbv", theta_rbv_pv).await?;
         Ok(Arc::new(Self {
             name: name.to_string(),

@@ -7,7 +7,7 @@
 --
 --   # terminal 2: drive bsrs from Lua
 --   cd ~/codes/bsrs
---   cargo run -p bsrs-cli -- repl --script examples/mini_beamline_scan.lua
+--   cargo run -p bsrs --features cli -- repl --script examples/mini_beamline/01_scan.lua
 --
 -- Equivalent to crates/bsrs/examples/mini_beamline_scan.rs but
 -- driven through bsrs's Lua bridge — proves the same end-to-end
@@ -65,10 +65,14 @@ print("[lua] result:", result)
 assert(string.find(result, "exit_status=success", 1, true) ~= nil,
        "expected exit_status=success in result, got: " .. tostring(result))
 
--- Subscriber-side counters: report what we observed (best-effort).
+-- Subscriber-side counters. The stop document is guaranteed to be
+-- delivered (drained) before RE:run returns, so both are hard asserts.
 print("[lua] subscriber observed " .. event_count .. " events, " ..
       "stop.exit_status=" .. tostring(exit_status_seen))
 assert(event_count == 17,
        "subscriber expected 17 Event documents, got " .. tostring(event_count))
+assert(exit_status_seen == "success",
+       "subscriber expected stop.exit_status=success, got " ..
+       tostring(exit_status_seen))
 
 print("[lua] OK")

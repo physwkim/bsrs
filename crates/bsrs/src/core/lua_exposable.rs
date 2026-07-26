@@ -4,7 +4,7 @@
 //! dependency) lets device authors annotate their `impl` blocks
 //! without pulling mlua into every device crate.
 //!
-//! The actual mlua-side wiring lives in bsrs-cli; it walks the
+//! The actual mlua-side wiring lives in `host::manager_lua`; it walks the
 //! `lua_methods()` slice and bolts each entry onto a Lua table that
 //! shadows the standard `LuaDevice` userdata.
 //!
@@ -38,8 +38,8 @@
 //! ```
 //!
 //! The `dispatch` fn signature uses serde_json values to keep mlua
-//! out of bsrs-core. The bsrs-cli adapter converts mlua values
-//! into json on the way in and out.
+//! out of the core module. The `host::manager_lua` adapter converts
+//! mlua values into json on the way in and out.
 
 use std::any::Any;
 

@@ -249,6 +249,54 @@ fn lua_eval_inspect_runs_against_running_daemon() {
 }
 
 #[test]
+fn daemon_soft_motor_is_locatable() {
+    // `--soft-motors` registered the motor as readable + movable only,
+    // so the daemon could move `m1` but `m1:locate()` reported it "is
+    // not locatable" — the device was half-visible with nothing at the
+    // registration site saying so.
+    let m = spawn_manager();
+    let (_, _, c) = run_client(&m.control, &["environment", "open"]);
+    assert_eq!(c, 0);
+
+    let (out, _err, code) = run_client(
+        &m.control,
+        &["raw", "lua_eval", r#"{"source":"m1:locate().readback"}"#],
+    );
+    assert_eq!(code, 0);
+    let task_uid = out
+        .lines()
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix(r#""task_uid": ""#)
+                .and_then(|s| s.strip_suffix(r#"""#))
+        })
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("no task_uid in: {out}"));
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut final_result: Option<String> = None;
+    while Instant::now() < deadline {
+        sleep(Duration::from_millis(80));
+        let params = format!(r#"{{"task_uid":"{task_uid}"}}"#);
+        let (out2, _, c2) = run_client(&m.control, &["raw", "task_result", &params]);
+        assert_eq!(c2, 0);
+        if out2.contains(r#""status": "completed""#) {
+            final_result = Some(out2);
+            break;
+        }
+    }
+    let r = final_result.expect("task did not complete within 3s");
+    assert!(
+        r.contains(r#""success": true"#),
+        "m1:locate() must work on a daemon-registered soft motor, got {r}"
+    );
+    assert!(
+        r.contains(r#""return_value": "0""#),
+        "expected readback=0 (m1 starts at 0.0), got {r}"
+    );
+}
+
+#[test]
 fn lua_eval_runs_count_plan_through_daemon() {
     // The killer feature: run a count plan from inside the daemon's
     // shared mlua state via lua_eval. End-to-end across REQ/REP +

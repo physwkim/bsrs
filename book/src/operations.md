@@ -69,7 +69,7 @@ bsrs uses `tracing` with the `RUST_LOG` env var:
 
 ```sh
 RUST_LOG=info                                  # default
-RUST_LOG=info,bsrs_engine=debug              # engine internals
+RUST_LOG=info,bsrs::engine=debug              # engine internals
 RUST_LOG=info,bsrs_qs=trace                  # full RPC trace
 ```
 

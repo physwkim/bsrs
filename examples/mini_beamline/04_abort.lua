@@ -9,7 +9,7 @@
 -- Sleep msg's response comes back).
 --
 -- Cleaner verification of the abort path is the integration test
--- `re_abort_cancels_in_flight_lua_eval_plan` (bsrs-cli/tests/
+-- `re_abort_cancels_in_flight_lua_eval_plan` (crates/bsrs/tests/
 -- cli_round_trip.rs); this script is the operator-facing
 -- equivalent for a quick smoke.
 

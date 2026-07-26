@@ -43,7 +43,7 @@ use std::sync::Arc;
 
 use bsrs::backends::soft::{SoftDetector, SoftMotor};
 use bsrs::callbacks::ZmqDocumentSink;
-use bsrs::core::msg::{MovableObj, ReadableObj};
+use bsrs::core::msg::ReadableObj;
 use bsrs::core::runtime::bsrs_runtime;
 use bsrs::engine::{DocumentSink, RunEngine};
 use bsrs::host::checkpoint_store::{default_path as default_ckpt_path, JsonlCheckpointStore};
@@ -116,8 +116,7 @@ pub fn run(args: ConsoleArgs) -> i32 {
     for i in 1..=args.soft_motors {
         let name = format!("m{i}");
         let motor = Arc::new(SoftMotor::new(&name, Some(0.0)));
-        registry.register_readable(&name, motor.clone() as Arc<dyn ReadableObj>);
-        registry.register_movable(&name, motor as Arc<dyn MovableObj>);
+        registry.register_positioner(&name, motor);
     }
     registry.register_plan_count("count");
 
