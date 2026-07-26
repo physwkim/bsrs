@@ -1595,7 +1595,69 @@ fn dets_table_to_readables(t: &mlua::Table) -> mlua::Result<Vec<Arc<dyn Readable
     Ok(out)
 }
 
-fn lua_value_repr(v: &LuaValue) -> String {
+/// Maximum table nesting the Lua-value walkers below will descend.
+/// Far deeper than any Document / metadata tree, shallow enough that
+/// the recursion cannot exhaust the stack.
+const MAX_LUA_TABLE_DEPTH: usize = 64;
+
+/// Cycle + depth guard for the recursive Lua-value walkers.
+///
+/// Lua tables can reference themselves — `t.self = t`, and the
+/// standard library's own `_G._G == _G` — so an unguarded recursive
+/// walk never terminates. Rust cannot catch a stack overflow: it
+/// aborts the process, which for `bsrs qs-manager` means typing `_G`
+/// at the attached REPL kills the daemon.
+///
+/// The guard tracks the tables on the *current path*, not every table
+/// ever seen: the same table reached twice on sibling branches is a
+/// DAG, not a cycle, and converts fine (JSON simply repeats it).
+/// [`MAX_LUA_TABLE_DEPTH`] additionally bounds deep-but-acyclic input,
+/// so no table can overflow the stack.
+///
+/// Recursive steps take `&mut TableGuard`, so the guard cannot be
+/// bypassed by construction — a walker has to thread it to recurse
+/// at all, and [`TableGuard::enter`] hands back an RAII scope so
+/// every exit path (including `?` out of a nested step) unwinds the
+/// path.
+#[derive(Default)]
+struct TableGuard {
+    path: Vec<*const std::ffi::c_void>,
+}
+
+impl TableGuard {
+    fn enter(&mut self, t: &mlua::Table) -> mlua::Result<TableScope<'_>> {
+        let ptr = t.to_pointer();
+        if self.path.contains(&ptr) {
+            return Err(mlua::Error::RuntimeError(
+                "cyclic table: a table references itself".into(),
+            ));
+        }
+        if self.path.len() >= MAX_LUA_TABLE_DEPTH {
+            return Err(mlua::Error::RuntimeError(format!(
+                "table nested deeper than {MAX_LUA_TABLE_DEPTH} levels"
+            )));
+        }
+        self.path.push(ptr);
+        Ok(TableScope { guard: self })
+    }
+}
+
+/// RAII scope popping one table off [`TableGuard::path`].
+struct TableScope<'g> {
+    guard: &'g mut TableGuard,
+}
+
+impl Drop for TableScope<'_> {
+    fn drop(&mut self) {
+        self.guard.path.pop();
+    }
+}
+
+pub(crate) fn lua_value_repr(v: &LuaValue) -> String {
+    lua_value_repr_guarded(v, &mut TableGuard::default())
+}
+
+fn lua_value_repr_guarded(v: &LuaValue, guard: &mut TableGuard) -> String {
     match v {
         LuaValue::Nil => "nil".into(),
         LuaValue::Boolean(b) => b.to_string(),
@@ -1606,12 +1668,19 @@ fn lua_value_repr(v: &LuaValue) -> String {
             .map(|c| c.to_string())
             .unwrap_or_else(|_| String::new()),
         LuaValue::Table(t) => {
+            // Cyclic or too deep: print a marker rather than recurse
+            // forever. `print` is a debug aid — it renders what it
+            // can instead of failing the whole call.
+            let scope = match guard.enter(t) {
+                Ok(s) => s,
+                Err(_) => return "{...}".into(),
+            };
             let mut parts = Vec::new();
             for pair in t.clone().pairs::<LuaValue, LuaValue>().flatten() {
                 parts.push(format!(
                     "{}={}",
-                    lua_value_repr(&pair.0),
-                    lua_value_repr(&pair.1)
+                    lua_value_repr_guarded(&pair.0, scope.guard),
+                    lua_value_repr_guarded(&pair.1, scope.guard)
                 ));
             }
             format!("{{{}}}", parts.join(","))
@@ -1622,6 +1691,13 @@ fn lua_value_repr(v: &LuaValue) -> String {
 }
 
 pub(crate) fn lua_value_to_json(v: &LuaValue) -> mlua::Result<serde_json::Value> {
+    lua_value_to_json_guarded(v, &mut TableGuard::default())
+}
+
+fn lua_value_to_json_guarded(
+    v: &LuaValue,
+    guard: &mut TableGuard,
+) -> mlua::Result<serde_json::Value> {
     Ok(match v {
         LuaValue::Nil => serde_json::Value::Null,
         LuaValue::Boolean(b) => serde_json::Value::Bool(*b),
@@ -1629,19 +1705,23 @@ pub(crate) fn lua_value_to_json(v: &LuaValue) -> mlua::Result<serde_json::Value>
         LuaValue::Number(n) => serde_json::Value::from(*n),
         LuaValue::String(s) => serde_json::Value::String(s.to_str()?.to_string()),
         LuaValue::Table(t) => {
+            // Unlike `print`, a conversion that silently dropped the
+            // cyclic branch would hand the engine a truncated
+            // document / metadata tree — so this path errors.
+            let scope = guard.enter(t)?;
             // If table is a sequence (1..n), encode as array; else object.
             let len = t.len()?;
             if len > 0 {
                 let mut arr = Vec::with_capacity(len as usize);
                 for i in 1..=len {
                     let v: LuaValue = t.get(i)?;
-                    arr.push(lua_value_to_json(&v)?);
+                    arr.push(lua_value_to_json_guarded(&v, scope.guard)?);
                 }
                 serde_json::Value::Array(arr)
             } else {
                 let mut obj = serde_json::Map::new();
                 for pair in t.clone().pairs::<String, LuaValue>().flatten() {
-                    obj.insert(pair.0, lua_value_to_json(&pair.1)?);
+                    obj.insert(pair.0, lua_value_to_json_guarded(&pair.1, scope.guard)?);
                 }
                 serde_json::Value::Object(obj)
             }

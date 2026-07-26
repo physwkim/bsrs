@@ -1359,3 +1359,128 @@ print("detector.inspect ok")
     assert!(out.contains("motor.inspect ok"), "out = {out}");
     assert!(out.contains("detector.inspect ok"), "out = {out}");
 }
+
+// -- Cyclic / deeply-nested table guard --------------------------------------
+//
+// Lua tables can reference themselves (`t.self = t`, `_G._G == _G`).
+// The Lua-value walkers recurse, and a stack overflow is not
+// catchable in Rust — it aborts the process, so pre-guard each of
+// these cases killed the REPL (and would kill a qs daemon). Cases are
+// one per invariant boundary of `TableGuard`, not one per story.
+
+#[test]
+fn cyclic_table_in_md_set_errors_instead_of_aborting() {
+    let (out, err, code) = run_script(
+        r#"
+local t = {}
+t.self = t
+local ok, e = pcall(function() RE:md_set("x", t) end)
+print("ok=" .. tostring(ok))
+print("msg=" .. tostring(e))
+"#,
+    );
+    assert_eq!(code, 0, "process must survive; stderr: {err}");
+    assert!(out.contains("ok=false"), "out = {out}");
+    assert!(out.contains("cyclic table"), "out = {out}");
+}
+
+#[test]
+fn print_of_lua_globals_does_not_abort() {
+    // `_G._G == _G`: the standard environment is itself cyclic, so
+    // `print(_G)` — an operator poking around the REPL — aborted the
+    // process before the guard. (The JSON walker never reached this
+    // cycle: it rejects one of `_G`'s non-UTF-8 strings first. The
+    // repr walker tolerates those, so it walked straight into it.)
+    let (out, err, code) = run_script(
+        r#"
+print(_G)
+print("survived")
+"#,
+    );
+    assert_eq!(code, 0, "process must survive; stderr: {err}");
+    assert!(out.contains("survived"), "out = {out}");
+    assert!(out.contains("{...}"), "cycle marker expected; out = {out}");
+}
+
+#[test]
+fn print_of_cyclic_table_emits_marker_instead_of_aborting() {
+    // `print` is a debug aid: it renders what it can (marker for the
+    // cyclic branch) rather than failing the call.
+    let (out, err, code) = run_script(
+        r#"
+local t = {}
+t.self = t
+print(t)
+print("survived")
+"#,
+    );
+    assert_eq!(code, 0, "process must survive; stderr: {err}");
+    assert!(out.contains("self={...}"), "out = {out}");
+    assert!(out.contains("survived"), "out = {out}");
+}
+
+#[test]
+fn shared_subtable_on_sibling_branches_is_not_a_cycle() {
+    // Boundary that a naive "every table ever seen" guard would fail:
+    // the same table reached twice on *sibling* branches is a DAG, and
+    // both branches must serialize. The guard tracks the current path
+    // only.
+    let (out, err, code) = run_script(
+        r#"
+local shared = { v = 7 }
+local ok, e = pcall(function() RE:md_set("d", { a = shared, b = shared }) end)
+print("ok=" .. tostring(ok) .. " err=" .. tostring(e))
+print(RE:md_get())
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("ok=true"), "out = {out}");
+    // Both branches present with the value, i.e. neither was dropped.
+    assert_eq!(out.matches("\"v\": 7").count(), 2, "out = {out}");
+}
+
+#[test]
+fn deeply_nested_acyclic_table_errors_instead_of_aborting() {
+    // Acyclic but deeper than MAX_LUA_TABLE_DEPTH: the depth bound is
+    // what keeps a distinct-table chain from overflowing the stack.
+    let (out, err, code) = run_script(
+        r#"
+local root = {}
+local cur = root
+for _ = 1, 500 do
+    local nxt = {}
+    cur.next = nxt
+    cur = nxt
+end
+local ok, e = pcall(function() RE:md_set("deep", root) end)
+print("ok=" .. tostring(ok))
+print("msg=" .. tostring(e))
+"#,
+    );
+    assert_eq!(code, 0, "process must survive; stderr: {err}");
+    assert!(out.contains("ok=false"), "out = {out}");
+    assert!(out.contains("nested deeper than"), "out = {out}");
+}
+
+#[test]
+fn nesting_within_depth_limit_still_converts() {
+    // Just under the bound: normal deep-ish metadata must still work.
+    let (out, err, code) = run_script(
+        r#"
+local root = {}
+local cur = root
+for _ = 1, 60 do
+    local nxt = {}
+    cur.next = nxt
+    cur = nxt
+end
+cur.leaf = "bottom"
+local ok, e = pcall(function() RE:md_set("deep", root) end)
+print("ok=" .. tostring(ok) .. " err=" .. tostring(e))
+print(string.find(RE:md_get(), "bottom", 1, true) ~= nil)
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("ok=true"), "out = {out}");
+    assert!(out.contains("true"), "leaf must survive; out = {out}");
+}

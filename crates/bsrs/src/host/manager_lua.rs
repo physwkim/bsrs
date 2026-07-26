@@ -304,9 +304,14 @@ fn value_to_string(v: &mlua::Value) -> String {
         mlua::Value::String(s) => s.to_str().map(|s| s.to_string()).unwrap_or_default(),
         // Render tables as JSON — the mlua Debug form (`Table(Ref(0x..))`)
         // is unreadable in the qs repl for results like `dcm:locate()`.
+        // Not everything is JSON-encodable (cyclic tables, non-UTF-8
+        // strings, nested functions); those fall back to the Lua repr,
+        // which renders them structurally (`{self={...}}`) rather than
+        // as an opaque pointer.
         mlua::Value::Table(_) => match crate::host::lua_env::lua_value_to_json(v) {
-            Ok(j) => serde_json::to_string_pretty(&j).unwrap_or_else(|_| format!("{v:?}")),
-            Err(_) => format!("{v:?}"),
+            Ok(j) => serde_json::to_string_pretty(&j)
+                .unwrap_or_else(|_| crate::host::lua_env::lua_value_repr(v)),
+            Err(_) => crate::host::lua_env::lua_value_repr(v),
         },
         other => format!("{other:?}"),
     }
