@@ -216,6 +216,25 @@ impl Registry {
             .insert(name.into(), RegisteredPlan { factory, meta });
     }
 
+    /// Register a positioner under every facet it implements — readable,
+    /// movable *and* locatable.
+    ///
+    /// Prefer this over calling the per-facet `register_*` methods for a
+    /// motor. Registering a positioner facet-by-facet is how a device
+    /// ends up half-visible: the queue worker moves it but `locate()`
+    /// reports it unknown, and nothing at the registration site says a
+    /// facet is missing. Here the bound decides, so no call site can
+    /// forget one.
+    pub fn register_positioner<T>(&mut self, name: impl Into<String>, obj: Arc<T>)
+    where
+        T: ReadableObj + MovableObj + LocatableObj + 'static,
+    {
+        let name = name.into();
+        self.readables.insert(name.clone(), obj.clone());
+        self.movables.insert(name.clone(), obj.clone());
+        self.locatables.insert(name, obj);
+    }
+
     /// Register a `ReadableObj` device under a name.
     pub fn register_readable(&mut self, name: impl Into<String>, obj: Arc<dyn ReadableObj>) {
         self.readables.insert(name.into(), obj);

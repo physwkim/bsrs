@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use bsrs::backends::soft::{SoftDetector, SoftMotor};
-use bsrs::core::msg::{LocatableObj, MovableObj, ReadableObj};
+use bsrs::core::msg::ReadableObj;
 use bsrs::qs::{Registry, Server};
 use clap::Args;
 use tokio::sync::Mutex as TMutex;
@@ -96,8 +96,7 @@ pub async fn run(args: ManagerArgs) -> i32 {
     for i in 1..=args.soft_motors {
         let name = format!("m{i}");
         let motor = Arc::new(SoftMotor::new(&name, Some(0.0)));
-        reg.register_readable(&name, motor.clone() as Arc<dyn ReadableObj>);
-        reg.register_movable(&name, motor as Arc<dyn MovableObj>);
+        reg.register_positioner(&name, motor);
     }
     reg.register_plan_count("count");
 
@@ -137,9 +136,7 @@ pub async fn run(args: ManagerArgs) -> i32 {
                     return 2;
                 }
             };
-            reg.register_readable(name, m.clone() as Arc<dyn ReadableObj>);
-            reg.register_movable(name, m.clone() as Arc<dyn MovableObj>);
-            reg.register_locatable(name, m as Arc<dyn LocatableObj>);
+            reg.register_positioner(name, m);
             tracing::info!(target: "bsrs-qs", "registered ca_motor {name} → {val_pv} / {rbv_pv}");
         }
         for spec in &args.ca_detector {
