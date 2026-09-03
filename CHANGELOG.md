@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-09-03
+
+A dependency-refresh release. No bsrs code, API, or behaviour changes.
+
+### Changed
+
+- Based the EPICS CA/PVA backends on `epics-rs` 0.28.1 (from 0.24.3). The
+  0.26.0 and 0.27.0 API breaks (`AcfCell`, the `PvString` record description,
+  `ClientCreds`, the `check_write_request` rename, 18 removed items) do not
+  reach anything bsrs calls. `epics-libcom-rs` and `epics-rtems-boot` enter
+  `Cargo.lock` as new transitive dependencies of `epics-base-rs`.
+
+### Fixed
+
+- Two `pva_mon` round-trip tests decode through `as_chunks` rather than
+  `chunks_exact`, which Rust 1.98's `clippy::chunks_exact_to_as_chunks` fails
+  under the `-D warnings` gate.
+
 ## [0.4.1] - 2026-07-20
 
 A dependency-refresh release. No bsrs code, API, or behaviour changes.
@@ -293,6 +311,7 @@ wire- and behaviour-parity with the upstream Python projects.
 
 - `doc/gap-analysis/`: bluesky/ophyd/ophyd-async parity gap inventory.
 
+[0.4.2]: https://github.com/physwkim/bsrs/releases/tag/v0.4.2
 [0.4.1]: https://github.com/physwkim/bsrs/releases/tag/v0.4.1
 [0.4.0]: https://github.com/physwkim/bsrs/releases/tag/v0.4.0
 [0.2.0]: https://github.com/physwkim/bsrs/releases/tag/v0.2.0
