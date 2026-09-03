@@ -4,7 +4,17 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.4.2] - 2026-09-03
+## [Unreleased]
+
+### Changed
+
+- **MSRV is now 1.94** (from a declared 1.80). The old floor had been
+  unachievable since 0.24.3: `epics-base-rs` is edition 2024, so no toolchain
+  below 1.85 can build the CA/PVA backends at all. 1.94.0 is the channel
+  `epics-rs` pins for itself, and the workspace is verified to build and test
+  on exactly that toolchain.
+
+## [0.4.2] - 2026-09-04
 
 A dependency-refresh release. No bsrs code, API, or behaviour changes.
 
@@ -311,6 +321,7 @@ wire- and behaviour-parity with the upstream Python projects.
 
 - `doc/gap-analysis/`: bluesky/ophyd/ophyd-async parity gap inventory.
 
+[Unreleased]: https://github.com/physwkim/bsrs/compare/v0.4.2...HEAD
 [0.4.2]: https://github.com/physwkim/bsrs/releases/tag/v0.4.2
 [0.4.1]: https://github.com/physwkim/bsrs/releases/tag/v0.4.1
 [0.4.0]: https://github.com/physwkim/bsrs/releases/tag/v0.4.0
