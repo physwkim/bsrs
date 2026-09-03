@@ -220,8 +220,7 @@ mod tests {
         assert_eq!(bytes.len(), 3 * std::mem::size_of::<f64>());
         // Re-decode via le_bytes.
         let mut out = Vec::new();
-        for chunk in bytes.chunks_exact(8) {
-            let arr: [u8; 8] = chunk.try_into().unwrap();
+        for &arr in bytes.as_chunks::<8>().0 {
             out.push(f64::from_le_bytes(arr));
         }
         assert_eq!(out, &[1.0, 2.5, -3.25]);
@@ -258,8 +257,7 @@ mod tests {
         assert_eq!(bytes.len(), 4 * std::mem::size_of::<f32>());
         // Verify round-trip values.
         let mut out: Vec<f32> = Vec::new();
-        for chunk in bytes.chunks_exact(4) {
-            let a: [u8; 4] = chunk.try_into().unwrap();
+        for &a in bytes.as_chunks::<4>().0 {
             out.push(f32::from_le_bytes(a));
         }
         assert_eq!(out, &[1.0, 2.0, 3.0, 4.0]);
