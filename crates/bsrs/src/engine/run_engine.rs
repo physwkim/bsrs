@@ -2565,7 +2565,14 @@ impl RunEngine {
         // Step 2: subscribe + spawn a pump that emits one Event per rx tick.
         let mut sub = obj.subscribe_dyn().await?;
         let stream_for_task = stream.clone();
-        let obj_name = obj.name().to_string();
+        // A `Subscription` yields one unkeyed reading, so the Event is keyed
+        // by the object's single described data key (the descriptor above
+        // declares it); an object describing several keys falls back to its
+        // name, as no single reading can fill more than one.
+        let event_key = match data_keys.keys().next() {
+            Some(k) if data_keys.len() == 1 => k.clone(),
+            _ => obj.name().to_string(),
+        };
         let sinks = self.sinks.clone();
         let subs_arc = self.subscribers.clone();
 
@@ -2580,8 +2587,8 @@ impl RunEngine {
                 };
                 let mut data = HashMap::new();
                 let mut timestamps = HashMap::new();
-                data.insert(obj_name.clone(), reading.value);
-                timestamps.insert(obj_name.clone(), reading.timestamp);
+                data.insert(event_key.clone(), reading.value);
+                timestamps.insert(event_key.clone(), reading.timestamp);
                 let ev = match bundle.event(&stream_for_task, data, timestamps) {
                     Some(ev) => ev,
                     None => continue,

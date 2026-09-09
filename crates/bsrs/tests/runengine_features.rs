@@ -846,11 +846,16 @@ async fn msg_fail_marks_run_failed_with_reason() {
 
 struct TestMonitor {
     name: String,
+    /// Data key used by `read_dyn` / `describe_dyn` (defaults to `name`).
+    key: String,
     tx: tokio::sync::watch::Sender<bsrs::core::reading::ReadingValue>,
 }
 
 impl TestMonitor {
     fn new(name: &str) -> Arc<Self> {
+        Self::with_key(name, name)
+    }
+    fn with_key(name: &str, key: &str) -> Arc<Self> {
         let (tx, _rx) = tokio::sync::watch::channel(bsrs::core::reading::ReadingValue {
             value: Value::from(0.0),
             timestamp: 0.0,
@@ -859,6 +864,7 @@ impl TestMonitor {
         });
         Arc::new(Self {
             name: name.into(),
+            key: key.into(),
             tx,
         })
     }
@@ -891,7 +897,7 @@ impl bsrs::core::msg::ReadableObj for TestMonitor {
     > {
         let v = self.tx.borrow().clone();
         let mut out = std::collections::HashMap::new();
-        out.insert(self.name.clone(), v);
+        out.insert(self.key.clone(), v);
         Ok(out)
     }
     async fn describe_dyn(
@@ -902,7 +908,7 @@ impl bsrs::core::msg::ReadableObj for TestMonitor {
     > {
         let mut out = std::collections::HashMap::new();
         out.insert(
-            self.name.clone(),
+            self.key.clone(),
             bsrs::event_model::DataKey {
                 source: format!("test://{}", self.name),
                 dtype: bsrs::event_model::Dtype::Number,
@@ -983,6 +989,55 @@ async fn monitor_emits_descriptor_then_events() {
         events >= 1,
         "expected at least one Event from the monitor pump"
     );
+}
+
+// The monitor pump keys each Event by the object's single described data
+// key, not by its name — a detector whose `describe` key is `<name>_counts`
+// (e.g. `SoftDetector`) must produce Events that match its own descriptor.
+#[tokio::test]
+async fn monitor_event_is_keyed_by_the_described_data_key() {
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let mon = TestMonitor::with_key("det", "det_counts");
+    let mon_for_plan: Arc<dyn bsrs::core::msg::MonitorableObj> = mon.clone();
+
+    let mon_for_drive = mon.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Monitor { obj: mon_for_plan.clone(), name: None };
+        yield Msg::Sleep(Duration::from_millis(50));
+        mon_for_drive.push(3.0, 1.0);
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::Unmonitor(mon_for_plan);
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    re.run_async(plan).await.unwrap();
+
+    let docs = sink.snapshot().await;
+    let descriptor = docs
+        .iter()
+        .find_map(|d| match d {
+            Document::Descriptor(d) => Some(d),
+            _ => None,
+        })
+        .expect("monitor descriptor");
+    assert!(descriptor.data_keys.contains_key("det_counts"));
+    let events: Vec<_> = docs
+        .iter()
+        .filter_map(|d| match d {
+            Document::Event(e) => Some(e),
+            _ => None,
+        })
+        .collect();
+    assert!(!events.is_empty(), "expected a monitor Event");
+    for ev in events {
+        assert_eq!(
+            ev.data.keys().collect::<Vec<_>>(),
+            vec!["det_counts"],
+            "Event keyed by the described data key, not the object name"
+        );
+        assert!(ev.timestamps.contains_key("det_counts"));
+    }
 }
 
 // A device that is both Monitorable and Configurable, so a `configure` can
