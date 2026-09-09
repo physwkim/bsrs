@@ -449,13 +449,32 @@ impl EngineState {
 
 /// One live monitor pump. Drops abort the pump task and (transitively)
 /// the held `Subscription`, releasing the backend slot (rule **K1**+**K2**).
+///
+/// `Msg::Unmonitor` goes through [`MonitorTask::stop`] instead of the abort:
+/// an update that reached the subscription while the object was monitored
+/// but that the pump has not consumed yet (a starved worker, a set issued
+/// just before the unmonitor) is still emitted, then the pump exits. bluesky
+/// cannot lose that update because its monitor callback is synchronous.
 struct MonitorTask {
-    abort: tokio::task::AbortHandle,
+    stop: Arc<tokio::sync::Notify>,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl MonitorTask {
+    /// Ask the pump to drain its pending update and exit, then wait for it.
+    async fn stop(mut self) {
+        self.stop.notify_one();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.await;
+        }
+    }
 }
 
 impl Drop for MonitorTask {
     fn drop(&mut self) {
-        self.abort.abort();
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
     }
 }
 
@@ -2200,7 +2219,9 @@ impl RunEngine {
             Msg::Unmonitor(obj) => {
                 // monitor_tasks is keyed by the monitored object's name (set in
                 // start_monitor), so remove the entry whose key == obj.name().
-                // MonitorTask::drop aborts the pump and drops the Subscription.
+                // The pump is stopped gracefully (MonitorTask::stop) outside the
+                // state lock: it emits an update it has not consumed yet, then
+                // drops the Subscription.
                 let mut state = self.state.lock().await;
                 // Reject an 'unmonitor' for an object that is not being monitored.
                 // bluesky's bundler raises IllegalMessageSequence ("Cannot
@@ -2221,14 +2242,17 @@ impl RunEngine {
                         obj.name()
                     )));
                 }
-                if let Some(slot) = state.run_mut(&run_key) {
-                    slot.monitor_tasks
-                        .retain(|obj_name, _| obj_name != obj.name());
+                let task = state.run_mut(&run_key).and_then(|slot| {
                     // Drop the registration too, so a later resume does not
                     // re-install a monitor the plan explicitly removed.
                     slot.monitored.remove(obj.name());
-                }
+                    slot.monitor_tasks.remove(obj.name())
+                });
                 Self::reset_checkpoint_state(&mut state);
+                drop(state);
+                if let Some(task) = task {
+                    task.stop().await;
+                }
             }
             Msg::Wait {
                 group,
@@ -2575,42 +2599,59 @@ impl RunEngine {
         };
         let sinks = self.sinks.clone();
         let subs_arc = self.subscribers.clone();
+        let stop = Arc::new(tokio::sync::Notify::new());
+        let stop_for_task = stop.clone();
 
         let handle = tokio::spawn(async move {
             loop {
-                let reading = {
-                    let r = sub.rx_mut();
-                    if r.changed().await.is_err() {
-                        return;
+                let last = tokio::select! {
+                    changed = sub.rx_mut().changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        false
                     }
-                    r.borrow_and_update().clone()
+                    _ = stop_for_task.notified() => {
+                        // Emit the update this pump never consumed, if any,
+                        // then exit.
+                        match sub.rx_mut().has_changed() {
+                            Ok(true) => true,
+                            _ => return,
+                        }
+                    }
                 };
+                let reading = sub.rx_mut().borrow_and_update().clone();
                 let mut data = HashMap::new();
                 let mut timestamps = HashMap::new();
                 data.insert(event_key.clone(), reading.value);
                 timestamps.insert(event_key.clone(), reading.timestamp);
-                let ev = match bundle.event(&stream_for_task, data, timestamps) {
-                    Some(ev) => ev,
-                    None => continue,
-                };
-                let doc = Document::Event(ev);
-                for s in &sinks {
-                    if let Err(e) = s.dispatch(&doc).await {
-                        tracing::warn!("document sink failed for monitor event: {e}");
+                if let Some(ev) = bundle.event(&stream_for_task, data, timestamps) {
+                    let doc = Document::Event(ev);
+                    for s in &sinks {
+                        if let Err(e) = s.dispatch(&doc).await {
+                            tracing::warn!("document sink failed for monitor event: {e}");
+                        }
                     }
+                    RunEngine::dispatch_subscribers(&subs_arc, &doc);
                 }
-                RunEngine::dispatch_subscribers(&subs_arc, &doc);
+                if last {
+                    return;
+                }
             }
         });
-        let abort = handle.abort_handle();
         // Key the pump by the monitored object's identity — that is what
         // Msg::Unmonitor(obj) carries — NOT by the descriptor stream name.
         // Keying by `stream` leaked the pump whenever a custom monitor name was
         // used: Unmonitor matched the key against obj.name() and never found it.
         // Stored on THIS run's slot so pause/close teardown is per-run.
         if let Some(slot) = self.state.lock().await.run_mut(run_key) {
-            slot.monitor_tasks
-                .insert(obj.name().to_string(), MonitorTask { abort });
+            slot.monitor_tasks.insert(
+                obj.name().to_string(),
+                MonitorTask {
+                    stop,
+                    handle: Some(handle),
+                },
+            );
         }
         Ok(())
     }

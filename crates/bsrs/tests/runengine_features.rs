@@ -1507,6 +1507,45 @@ async fn monitor_without_open_run_does_not_describe_the_device() {
     );
 }
 
+// An update that lands in the subscription while the object is monitored is
+// emitted even when `Unmonitor` follows it with no yield in between: the pump
+// drains its pending value before it stops instead of being aborted. Without
+// the drain a starved pump lost every update of a short scan (0 monitor
+// Events for a 3-point `monitor_during` scan under CPU load).
+#[tokio::test]
+async fn unmonitor_drains_the_update_pending_in_the_subscription() {
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let mon = TestMonitor::new("mon1");
+    let mon_for_plan: Arc<dyn bsrs::core::msg::MonitorableObj> = mon.clone();
+    let mon_for_drive = mon.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Monitor { obj: mon_for_plan.clone(), name: None };
+        // No sleep: the push and the Unmonitor reach the engine back to back.
+        mon_for_drive.push(7.0, 1.0);
+        yield Msg::Unmonitor(mon_for_plan);
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    re.run_async(plan).await.unwrap();
+
+    let docs = sink.snapshot().await;
+    let values: Vec<_> = docs
+        .iter()
+        .filter_map(|d| match d {
+            Document::Event(e) => e.data.get("mon1").cloned(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        values,
+        vec![Value::from(7.0)],
+        "the update pending at Unmonitor is emitted exactly once"
+    );
+    // The Unmonitor completed with the pump gone: the RunStop follows it.
+    assert!(matches!(docs.last(), Some(Document::Stop(_))));
+}
+
 #[tokio::test]
 async fn unmonitor_stops_pump_for_custom_named_stream() {
     // Regression: monitor_tasks is keyed by the monitored object, not the
