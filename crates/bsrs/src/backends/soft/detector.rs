@@ -1,4 +1,4 @@
-//! Soft detector — fake counts on every trigger; soft writer emits in-memory frames.
+//! Soft detector — fake counts on every read; soft writer emits in-memory frames.
 
 use crate::core::error::{BsrsError, Result};
 use crate::core::msg::{MonitorableObj, NamedObj, ReadableObj};
@@ -27,10 +27,13 @@ fn now_ts() -> f64 {
 
 /// Fake-counts detector implementing `AsyncReadable` directly (step scans).
 ///
-/// Also a [`MonitorableObj`]: every `read` (the step-scan path) and every
-/// [`SoftDetector::tick`] publishes the sampled reading to monitor
-/// subscribers, so `monitor_during` over a soft detector emits one Event per
-/// scan point.
+/// Every `read` is one acquisition: it advances the count and returns it.
+/// `count` / `scan` read without triggering (`stubs::read_shot`), so the
+/// read is the only step of their path a fake detector can count on.
+///
+/// Also a [`MonitorableObj`]: every acquisition (`read` or
+/// [`SoftDetector::tick`]) publishes the new reading, so `monitor_during`
+/// over a soft detector emits one Event per scan point.
 pub struct SoftDetector {
     name: String,
     counts: AtomicU64,
@@ -55,10 +58,10 @@ impl SoftDetector {
         })
     }
 
-    /// Bump the counter and publish it to monitor subscribers.
-    pub fn tick(&self) {
+    /// One acquisition: bump the counter and publish the new reading.
+    pub fn tick(&self) -> ReadingValue {
         self.counts.fetch_add(1, Ordering::SeqCst);
-        self.publish();
+        self.publish()
     }
 
     /// Sample the counter and store it in the monitor channel. `send_replace`
@@ -102,7 +105,7 @@ impl AsyncReadable for SoftDetector {
     }
     async fn read(&self) -> Result<HashMap<String, ReadingValue>> {
         let mut out = HashMap::new();
-        out.insert(format!("{}_counts", self.name), self.publish());
+        out.insert(format!("{}_counts", self.name), self.tick());
         Ok(out)
     }
     async fn describe(&self) -> Result<HashMap<String, DataKey>> {
@@ -383,6 +386,20 @@ mod tests {
         };
         DetectorControl::prepare(&control, info).await.unwrap();
         assert_eq!(control.target().load(Ordering::SeqCst), 7);
+    }
+
+    // Each read is an acquisition: the count advances and the monitor
+    // channel carries the value the read returned.
+    #[tokio::test]
+    async fn soft_detector_counts_every_read() {
+        let det = SoftDetector::new("det");
+        let key = "det_counts";
+        let first = AsyncReadable::read(&*det).await.unwrap();
+        let second = AsyncReadable::read(&*det).await.unwrap();
+        assert_eq!(first[key].value, serde_json::json!(1));
+        assert_eq!(second[key].value, serde_json::json!(2));
+        let sub = MonitorableObj::subscribe_dyn(&*det).await.unwrap();
+        assert_eq!(sub.rx().borrow().value, serde_json::json!(2));
     }
 
     // A subscription starts with the current count pending: monitor start
