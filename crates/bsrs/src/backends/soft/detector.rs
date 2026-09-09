@@ -1,9 +1,10 @@
 //! Soft detector — fake counts on every trigger; soft writer emits in-memory frames.
 
 use crate::core::error::{BsrsError, Result};
-use crate::core::msg::{NamedObj, ReadableObj};
+use crate::core::msg::{MonitorableObj, NamedObj, ReadableObj};
 use crate::core::reading::ReadingValue;
-use crate::core::status::Status;
+use crate::core::status::{Status, SubToken};
+use crate::core::subscription::Subscription;
 use crate::devices::StandardDetector;
 use crate::event_model::{DataKey, Dtype};
 use crate::protocols_async::{
@@ -25,23 +26,46 @@ fn now_ts() -> f64 {
 }
 
 /// Fake-counts detector implementing `AsyncReadable` directly (step scans).
+///
+/// Also a [`MonitorableObj`]: every [`SoftDetector::tick`] publishes the new
+/// count to monitor subscribers.
 pub struct SoftDetector {
     name: String,
     counts: AtomicU64,
+    /// Monitor fan-out; `tick` sends the fresh reading.
+    monitor: watch::Sender<ReadingValue>,
 }
 
 impl SoftDetector {
     /// Build with an initial counter.
     pub fn new(name: impl Into<String>) -> Arc<Self> {
+        let name = name.into();
+        let (monitor, _rx) = watch::channel(ReadingValue {
+            value: serde_json::Value::Number(0.into()),
+            timestamp: now_ts(),
+            alarm_severity: None,
+            message: None,
+        });
         Arc::new(Self {
-            name: name.into(),
+            name,
             counts: AtomicU64::new(0),
+            monitor,
         })
     }
 
-    /// Bump the counter.
+    /// Bump the counter and publish it to monitor subscribers.
     pub fn tick(&self) {
         self.counts.fetch_add(1, Ordering::SeqCst);
+        let _ = self.monitor.send(self.reading());
+    }
+
+    fn reading(&self) -> ReadingValue {
+        ReadingValue {
+            value: serde_json::Value::Number(self.counts.load(Ordering::SeqCst).into()),
+            timestamp: now_ts(),
+            alarm_severity: None,
+            message: None,
+        }
     }
 }
 
@@ -67,17 +91,8 @@ impl AsyncReadable for SoftDetector {
         &self.name
     }
     async fn read(&self) -> Result<HashMap<String, ReadingValue>> {
-        let v = self.counts.load(Ordering::SeqCst);
         let mut out = HashMap::new();
-        out.insert(
-            format!("{}_counts", self.name),
-            ReadingValue {
-                value: serde_json::Value::Number(v.into()),
-                timestamp: now_ts(),
-                alarm_severity: None,
-                message: None,
-            },
-        );
+        out.insert(format!("{}_counts", self.name), self.reading());
         Ok(out)
     }
     async fn describe(&self) -> Result<HashMap<String, DataKey>> {
@@ -112,6 +127,17 @@ impl ReadableObj for SoftDetector {
     }
     fn hint_fields(&self) -> Option<Vec<String>> {
         Some(vec![format!("{}_counts", self.name)])
+    }
+}
+
+#[async_trait]
+impl MonitorableObj for SoftDetector {
+    async fn subscribe_dyn(&self) -> Result<Subscription> {
+        // The watch sender lives as long as the detector; nothing to release.
+        Ok(Subscription::new(
+            self.monitor.subscribe(),
+            SubToken::noop(),
+        ))
     }
 }
 

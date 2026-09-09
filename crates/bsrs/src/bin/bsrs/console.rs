@@ -111,7 +111,8 @@ pub fn run(args: ConsoleArgs) -> i32 {
     for i in 1..=args.soft_detectors {
         let name = format!("det{i}");
         let det = SoftDetector::new(&name);
-        registry.register_readable(&name, det as Arc<dyn ReadableObj>);
+        registry.register_readable(&name, det.clone() as Arc<dyn ReadableObj>);
+        registry.register_monitorable(&name, det);
     }
     for i in 1..=args.soft_motors {
         let name = format!("m{i}");
