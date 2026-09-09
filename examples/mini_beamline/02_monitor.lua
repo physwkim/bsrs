@@ -2,10 +2,10 @@
 -- pulsed sinusoidal beam current updated by the IOC's background
 -- thread) over a few seconds, observe the variation.
 --
--- Equivalent to bluesky's `RE:subscribe` + `Msg::Monitor` for a
--- single signal. The PvaDetector helper in bsrs doesn't expose
--- `MonitorableObj` (ca_detector does) — for verification we just
--- call read() in a loop and check that values change.
+-- This script polls read() in a loop and checks that values change.
+-- pva_detector is also monitorable (`bpp.monitor_during(plan, {d})`
+-- streams every update as an Event); polling keeps the check
+-- independent of the engine's monitor pump.
 
 print("[monitor] connecting to mini:current via PVA...")
 local d = pva_detector("beam_current", "mini:current")
