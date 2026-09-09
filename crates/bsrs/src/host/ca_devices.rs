@@ -16,6 +16,9 @@
 //! local m = ca_motor("ph_mtr", "mini:ph:mtr.VAL", "mini:ph:mtr.RBV")
 //! local d = ca_detector("ph_det", "mini:ph:DetValue_RBV")
 //! RE:run(scan({d}, m, -8.0, 8.0, 17))
+//! -- ca_detector is monitorable: every CA update of the PV becomes an
+//! -- Event in a "<name>_monitor" stream for the run's duration.
+//! RE:run(bpp.monitor_during(scan({d}, m, -8.0, 8.0, 17), {d}))
 //! ```
 //!
 //! Both factories block on connect (5 s timeout) before returning.
@@ -28,10 +31,12 @@ use std::time::Duration;
 use crate::backends::epics_ca::EpicsCaBackend;
 use crate::core::error::Result;
 use crate::core::msg::{
-    DynLocation, LocatableObj, MovableObj, NamedObj, ReadableObj, StoppableObj,
+    DynLocation, LocatableObj, MonitorableObj, MovableObj, NamedObj, ReadableObj, StoppableObj,
 };
 use crate::core::reading::ReadingValue;
 use crate::core::status::Status;
+use crate::core::subscription::Subscription;
+use crate::devices::SignalCache;
 use crate::event_model::{DataKey, Dtype};
 // `SignalBackend` is the trait that provides connect/put/get on the
 // CA backend; pulled in via the `bsrs-protocols-async` dep that
@@ -336,24 +341,35 @@ impl StoppableObj for CaPositioner {
 }
 
 /// CA-backed scalar detector: one Signal on a `_RBV` PV.
+///
+/// Also a [`MonitorableObj`]: `Msg::Monitor` / `monitor_during_wrapper`
+/// stream every CA update of the PV as an Event. Subscriptions go through
+/// one shared [`SignalCache`] (CP-08), so N monitors of the same detector
+/// open one CA monitor, released when the last subscription drops (K2).
 pub struct CaDetector {
     name: String,
     value: Arc<EpicsCaBackend<f64>>,
+    cache: Arc<SignalCache<f64, EpicsCaBackend<f64>>>,
     seen: AtomicI64,
 }
 
 impl CaDetector {
+    fn from_connected(name: &str, value: Arc<EpicsCaBackend<f64>>) -> Arc<Self> {
+        Arc::new(Self {
+            name: name.to_string(),
+            cache: SignalCache::new(value.clone()),
+            value,
+            seen: AtomicI64::new(0),
+        })
+    }
+
     /// Build + connect. Blocks; see `CaMotor::connect_blocking`.
     pub fn connect_blocking(name: &str, value_pv: &str) -> Result<Arc<Self>> {
         let v = Arc::new(EpicsCaBackend::<f64>::new(value_pv));
         let v_for_async = v.clone();
         crate::core::runtime::bsrs_runtime()
             .block_on(async move { v_for_async.connect(Duration::from_secs(5)).await })?;
-        Ok(Arc::new(Self {
-            name: name.to_string(),
-            value: v,
-            seen: AtomicI64::new(0),
-        }))
+        Ok(Self::from_connected(name, v))
     }
 
     /// Async equivalent of `connect_blocking` — for callers
@@ -361,11 +377,7 @@ impl CaDetector {
     pub async fn connect_async(name: &str, value_pv: &str) -> Result<Arc<Self>> {
         let v = Arc::new(EpicsCaBackend::<f64>::new(value_pv));
         v.connect(Duration::from_secs(5)).await?;
-        Ok(Arc::new(Self {
-            name: name.to_string(),
-            value: v,
-            seen: AtomicI64::new(0),
-        }))
+        Ok(Self::from_connected(name, v))
     }
 }
 
@@ -410,6 +422,14 @@ impl ReadableObj for CaDetector {
             },
         );
         Ok(out)
+    }
+}
+
+#[async_trait::async_trait]
+impl MonitorableObj for CaDetector {
+    async fn subscribe_dyn(&self) -> Result<Subscription> {
+        let (rx, token) = self.cache.add_listener();
+        Ok(Subscription::new(rx, token))
     }
 }
 

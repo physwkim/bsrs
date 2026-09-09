@@ -1299,13 +1299,13 @@ pub fn build_lua(re: Arc<RunEngine>) -> mlua::Result<Lua> {
                 .map_err(|e| mlua::Error::RuntimeError(format!("ca_detector: connect: {e}")))?;
             Ok(LuaDevice {
                 name,
-                readable: Some(d as Arc<dyn ReadableObj>),
+                readable: Some(d.clone() as Arc<dyn ReadableObj>),
                 movable: None,
                 locatable: None,
                 stoppable: None,
                 triggerable: None,
                 stageable: None,
-                monitorable: None,
+                monitorable: Some(d as Arc<dyn MonitorableObj>),
                 flyable: None,
                 preparable: None,
                 configurable: None,
