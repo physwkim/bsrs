@@ -2588,15 +2588,18 @@ impl RunEngine {
 
         // Step 2: subscribe + spawn a pump that emits one Event per rx tick.
         let mut sub = obj.subscribe_dyn().await?;
+        // The subscription names the data key of its readings (ophyd-async
+        // `subscribe_reading` delivers `{name: reading}`); the descriptor
+        // declared above must carry it or the Events would not match.
+        if !data_keys.contains_key(sub.key()) {
+            return Err(BsrsError::Plan(format!(
+                "Monitor: {} streams data key {:?}, which its describe() does not declare",
+                obj.name(),
+                sub.key()
+            )));
+        }
+        let event_key = sub.key().to_string();
         let stream_for_task = stream.clone();
-        // A `Subscription` yields one unkeyed reading, so the Event is keyed
-        // by the object's single described data key (the descriptor above
-        // declares it); an object describing several keys falls back to its
-        // name, as no single reading can fill more than one.
-        let event_key = match data_keys.keys().next() {
-            Some(k) if data_keys.len() == 1 => k.clone(),
-            _ => obj.name().to_string(),
-        };
         let sinks = self.sinks.clone();
         let subs_arc = self.subscribers.clone();
         let stop = Arc::new(tokio::sync::Notify::new());

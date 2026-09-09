@@ -545,6 +545,7 @@ mod tests {
                 Ok(crate::core::subscription::Subscription::new(
                     rx,
                     crate::core::status::SubToken::noop(),
+                    "mon",
                 ))
             }
         }

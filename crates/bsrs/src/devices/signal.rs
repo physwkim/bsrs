@@ -338,7 +338,7 @@ where
         // SubToken decrements the cache's listener count on Subscription drop
         // (and tears the monitor down if it was the last and unstaged).
         let (rx, token) = self.cache().add_listener();
-        Ok(Subscription::new(rx, token))
+        Ok(Subscription::new(rx, token, self.config.name.clone()))
     }
 }
 
@@ -597,6 +597,7 @@ mod tests {
         let mon: Arc<dyn MonitorableObj> = s.clone();
 
         let mut sub = mon.subscribe_dyn().await.unwrap();
+        assert_eq!(sub.key(), "x", "keyed like describe()");
         let _sub2 = AsyncSubscribable::subscribe(&*s).await.unwrap();
         assert_eq!(
             backend.subscriber_count(),

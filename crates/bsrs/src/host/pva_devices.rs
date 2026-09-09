@@ -149,7 +149,7 @@ impl StoppableObj for PvaMotor {
 impl MonitorableObj for PvaMotor {
     async fn subscribe_dyn(&self) -> Result<Subscription> {
         let (rx, token) = self.cache.add_listener();
-        Ok(Subscription::new(rx, token))
+        Ok(Subscription::new(rx, token, self.name.clone()))
     }
 }
 
@@ -228,6 +228,6 @@ impl ReadableObj for PvaDetector {
 impl MonitorableObj for PvaDetector {
     async fn subscribe_dyn(&self) -> Result<Subscription> {
         let (rx, token) = self.cache.add_listener();
-        Ok(Subscription::new(rx, token))
+        Ok(Subscription::new(rx, token, self.name.clone()))
     }
 }

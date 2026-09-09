@@ -848,6 +848,8 @@ struct TestMonitor {
     name: String,
     /// Data key used by `read_dyn` / `describe_dyn` (defaults to `name`).
     key: String,
+    /// Data key the subscription claims (defaults to `key`).
+    sub_key: String,
     tx: tokio::sync::watch::Sender<bsrs::core::reading::ReadingValue>,
 }
 
@@ -856,6 +858,9 @@ impl TestMonitor {
         Self::with_key(name, name)
     }
     fn with_key(name: &str, key: &str) -> Arc<Self> {
+        Self::with_keys(name, key, key)
+    }
+    fn with_keys(name: &str, key: &str, sub_key: &str) -> Arc<Self> {
         let (tx, _rx) = tokio::sync::watch::channel(bsrs::core::reading::ReadingValue {
             value: Value::from(0.0),
             timestamp: 0.0,
@@ -865,6 +870,7 @@ impl TestMonitor {
         Arc::new(Self {
             name: name.into(),
             key: key.into(),
+            sub_key: sub_key.into(),
             tx,
         })
     }
@@ -936,6 +942,7 @@ impl bsrs::core::msg::MonitorableObj for TestMonitor {
         Ok(bsrs::core::subscription::Subscription::new(
             rx,
             bsrs::core::status::SubToken::noop(),
+            self.sub_key.clone(),
         ))
     }
 }
@@ -1040,6 +1047,32 @@ async fn monitor_event_is_keyed_by_the_described_data_key() {
     }
 }
 
+// A subscription whose key is not among the object's described data keys is
+// rejected when the monitor starts: its Events could not match the stream's
+// descriptor. The key comes from the device, so this is the only check the
+// engine needs.
+#[tokio::test]
+async fn monitor_rejects_a_subscription_key_the_device_does_not_describe() {
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let mon = TestMonitor::with_keys("det", "det_counts", "det");
+    let mon_for_plan: Arc<dyn bsrs::core::msg::MonitorableObj> = mon.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Monitor { obj: mon_for_plan.clone(), name: None };
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    // Handler errors surface as a failed run, as for an unmonitored Unmonitor.
+    let result = re.run_async(plan).await.unwrap();
+    assert_eq!(result.exit_status, "fail", "{result:?}");
+    assert!(result.reason.contains("does not declare"), "{result:?}");
+    let docs = sink.snapshot().await;
+    assert!(
+        !docs.iter().any(|d| matches!(d, Document::Event(_))),
+        "no Event was emitted for the rejected monitor"
+    );
+}
+
 // A device that is both Monitorable and Configurable, so a `configure` can
 // re-emit the descriptor of a stream fed by its own monitor pump — the path
 // that exercises the descriptor-before-event ordering guarantee.
@@ -1126,6 +1159,7 @@ impl bsrs::core::msg::MonitorableObj for ConfigurableMonitor {
         Ok(bsrs::core::subscription::Subscription::new(
             self.tx.subscribe(),
             bsrs::core::status::SubToken::noop(),
+            self.name.clone(),
         ))
     }
 }
@@ -1474,6 +1508,7 @@ impl bsrs::core::msg::MonitorableObj for DescribeCountingMonitor {
         Ok(bsrs::core::subscription::Subscription::new(
             self.tx.subscribe(),
             bsrs::core::status::SubToken::noop(),
+            self.name.clone(),
         ))
     }
 }

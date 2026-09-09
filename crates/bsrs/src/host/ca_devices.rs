@@ -175,7 +175,7 @@ impl StoppableObj for CaMotor {
 impl MonitorableObj for CaMotor {
     async fn subscribe_dyn(&self) -> Result<Subscription> {
         let (rx, token) = self.cache.add_listener();
-        Ok(Subscription::new(rx, token))
+        Ok(Subscription::new(rx, token, self.name.clone()))
     }
 }
 
@@ -383,7 +383,7 @@ impl StoppableObj for CaPositioner {
 impl MonitorableObj for CaPositioner {
     async fn subscribe_dyn(&self) -> Result<Subscription> {
         let (rx, token) = self.cache.add_listener();
-        Ok(Subscription::new(rx, token))
+        Ok(Subscription::new(rx, token, self.name.clone()))
     }
 }
 
@@ -476,7 +476,7 @@ impl ReadableObj for CaDetector {
 impl MonitorableObj for CaDetector {
     async fn subscribe_dyn(&self) -> Result<Subscription> {
         let (rx, token) = self.cache.add_listener();
-        Ok(Subscription::new(rx, token))
+        Ok(Subscription::new(rx, token, self.name.clone()))
     }
 }
 

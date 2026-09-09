@@ -147,6 +147,7 @@ impl MonitorableObj for SoftDetector {
         Ok(Subscription::new(
             self.monitor.subscribe(),
             SubToken::noop(),
+            format!("{}_counts", self.name),
         ))
     }
 }

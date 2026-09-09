@@ -863,7 +863,8 @@ pub trait CollectableObj: NamedObj {
 /// to seed the first Event before any rx-side updates arrive.
 #[async_trait::async_trait]
 pub trait MonitorableObj: ReadableObj {
-    /// Subscribe — engine receives a `Subscription` (rx + RAII token).
+    /// Subscribe. The `Subscription`'s key must be one of the data keys
+    /// `describe_dyn` returns: the engine keys every monitor Event by it.
     async fn subscribe_dyn(
         &self,
     ) -> Result<crate::core::subscription::Subscription, crate::core::error::BsrsError>;
