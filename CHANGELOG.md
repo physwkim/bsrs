@@ -4,6 +4,53 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Monitorable devices: `Msg::Monitor` now works end to end over the built-in
+devices, from the Rust API and from Lua. Two public signatures change, so the
+next release must be 0.5.0.
+
+### Changed
+
+- **Breaking**: `Subscription::new` takes a third argument, the data key of
+  the readings it streams, exposed as `Subscription::key`. The engine keys
+  every monitor Event by it and fails the run when `describe_dyn` does not
+  declare that key.
+- **Breaking**: `Registry::register_positioner` additionally requires
+  `MonitorableObj` and registers the object under the monitorable facet.
+- `SoftDetector::tick` returns the reading it published.
+
+### Added
+
+- `MonitorableObj` for `Signal`, `SoftDetector`, `SoftMotor`, `CaDetector`,
+  `CaMotor`, `CaPositioner`, `PvaMotor` and `PvaDetector`; motors and
+  positioners stream the readback.
+- `Registry::register_monitorable` and `Registry::monitorable`. The `bsrs`
+  binary, the qs Lua manager and `mini_beamline_qs` register soft detectors
+  under the facet, and every Lua device factory reports the `monitorable`
+  role.
+
+### Fixed
+
+- **Engine**: monitor Events are keyed by the device's described data key
+  rather than its name, so a detector's `<name>_counts` Event matches its
+  Descriptor; a monitor emits the device's current reading as its first Event
+  (a new `SignalCache` listener starts with the cached reading pending, as
+  ophyd's `subscribe(run=True)` does); `Msg::Unmonitor` delivers an update
+  still pending in the subscription before stopping the pump, where the
+  abort could drop every Event of a short `monitor_during` scan under CPU
+  load.
+- **Soft backend**: `SoftDetector` counts on every `read`, so `count` and
+  `scan` (which read without triggering) no longer report 0 at every point.
+  `SoftDetector`, `SignalCache` and `SoftDetectorControl` store into their
+  watch channels with `send_replace`, since `watch::Sender::send` drops the
+  value while no receiver is alive (a reading published before the first
+  subscriber, a staged cache with no listener, an arm before
+  `subscribe_index`).
+- **Lua**: subscribers receive worker-thread documents (monitor Events) in
+  emission order. The REPL thread replays a subscriber's buffer before each
+  of its own deliveries instead of only after `RE:run` returns.
+
 ## [0.4.2] - 2026-09-03
 
 A dependency-refresh release. No bsrs code, API, or behaviour changes.
