@@ -211,7 +211,9 @@ impl DetectorControl for SoftDetectorControl {
     }
     async fn arm(&self) -> Status {
         let new = self.arm_count.fetch_add(1, Ordering::SeqCst) + 1;
-        let _ = self.index_tx.send(new);
+        // `send_replace`: no receiver exists until `subscribe_index`, and
+        // `send` would drop the count armed before it.
+        self.index_tx.send_replace(new);
         Status::done()
     }
     async fn wait_for_idle(&self) -> Result<()> {
@@ -376,6 +378,21 @@ mod tests {
         };
         DetectorControl::prepare(&control, info).await.unwrap();
         assert_eq!(control.target().load(Ordering::SeqCst), 7);
+    }
+
+    // Boundary: `arm` before any `subscribe_index`. The channel has no
+    // receiver yet, so a plain `send` discarded the count and a later
+    // subscriber started from 0.
+    #[tokio::test]
+    async fn soft_arm_before_subscribe_is_seen_by_a_later_subscriber() {
+        let control = SoftDetectorControl::new(Duration::from_micros(0));
+        DetectorControl::arm(&control).await;
+        let rx = control.subscribe_index();
+        assert_eq!(
+            *rx.borrow(),
+            1,
+            "armed count must survive without a receiver"
+        );
     }
 
     #[tokio::test]
