@@ -61,10 +61,11 @@ impl SoftDetector {
         self.publish();
     }
 
-    /// Sample the counter and publish it to monitor subscribers.
+    /// Sample the counter and store it in the monitor channel. `send_replace`
+    /// (not `send`) so the value is kept even with no live subscriber.
     fn publish(&self) -> ReadingValue {
         let r = self.reading();
-        let _ = self.monitor.send(r.clone());
+        self.monitor.send_replace(r.clone());
         r
     }
 
