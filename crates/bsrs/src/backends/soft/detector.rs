@@ -27,12 +27,14 @@ fn now_ts() -> f64 {
 
 /// Fake-counts detector implementing `AsyncReadable` directly (step scans).
 ///
-/// Also a [`MonitorableObj`]: every [`SoftDetector::tick`] publishes the new
-/// count to monitor subscribers.
+/// Also a [`MonitorableObj`]: every `read` (the step-scan path) and every
+/// [`SoftDetector::tick`] publishes the sampled reading to monitor
+/// subscribers, so `monitor_during` over a soft detector emits one Event per
+/// scan point.
 pub struct SoftDetector {
     name: String,
     counts: AtomicU64,
-    /// Monitor fan-out; `tick` sends the fresh reading.
+    /// Monitor fan-out; `read` / `tick` store the fresh reading.
     monitor: watch::Sender<ReadingValue>,
 }
 
@@ -56,7 +58,14 @@ impl SoftDetector {
     /// Bump the counter and publish it to monitor subscribers.
     pub fn tick(&self) {
         self.counts.fetch_add(1, Ordering::SeqCst);
-        let _ = self.monitor.send(self.reading());
+        self.publish();
+    }
+
+    /// Sample the counter and publish it to monitor subscribers.
+    fn publish(&self) -> ReadingValue {
+        let r = self.reading();
+        let _ = self.monitor.send(r.clone());
+        r
     }
 
     fn reading(&self) -> ReadingValue {
@@ -92,7 +101,7 @@ impl AsyncReadable for SoftDetector {
     }
     async fn read(&self) -> Result<HashMap<String, ReadingValue>> {
         let mut out = HashMap::new();
-        out.insert(format!("{}_counts", self.name), self.reading());
+        out.insert(format!("{}_counts", self.name), self.publish());
         Ok(out)
     }
     async fn describe(&self) -> Result<HashMap<String, DataKey>> {

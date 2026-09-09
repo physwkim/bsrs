@@ -1226,26 +1226,33 @@ print("total2=" .. total)
 
 #[test]
 fn lua_monitor_during_soft_motor_emits_monitor_stream_events() {
-    // End-to-end Lua path of the monitorable facet: `soft_motor` is
-    // monitorable, `bpp.monitor_during` declares an `m1_monitor` stream,
-    // and every `set` during the scan is published as an Event of that
-    // stream (worker-thread emit, delivered through the buffered drain).
+    // End-to-end Lua path of the monitorable facet: `soft_motor` and
+    // `soft_detector` are monitorable, `bpp.monitor_during` declares an
+    // `m1_monitor` / `det1_monitor` stream for each, and every `set` /
+    // `read` during the scan is published as an Event of that stream
+    // (worker-thread emit, delivered through the buffered drain).
     let (out, err, code) = run_script(
         r#"
-local mon_desc, mon_events = nil, 0
+local desc, events = {}, { m1_monitor = 0, det1_monitor = 0 }
 RE:subscribe(function(name, body)
-    if name == "descriptor" and body.name == "m1_monitor" then
-        mon_desc = body.uid
-    elseif name == "event" and mon_desc ~= nil and body.descriptor == mon_desc then
-        mon_events = mon_events + 1
+    if name == "descriptor" and events[body.name] ~= nil then
+        desc[body.uid] = body.name
+    elseif name == "event" and desc[body.descriptor] ~= nil then
+        local stream = desc[body.descriptor]
+        events[stream] = events[stream] + 1
+        -- the Event carries the object's described data key
+        if stream == "det1_monitor" then
+            assert(body.data.det1_counts ~= nil, "det1_monitor event keyed by det1_counts")
+        end
     end
 end, "all")
 local det1 = soft_detector("det1")
 local m1 = soft_motor("m1")
 print(tostring(m1))
-RE:run(bpp.monitor_during(scan({det1}, m1, 0, 2, 3), {m1}))
-print("mon_desc=" .. tostring(mon_desc ~= nil))
-print("mon_events=" .. mon_events)
+print(tostring(det1))
+RE:run(bpp.monitor_during(scan({det1}, m1, 0, 2, 3), {m1, det1}))
+print("m1_events=" .. events.m1_monitor)
+print("det1_events=" .. events.det1_monitor)
 "#,
     );
     assert_eq!(code, 0, "stderr: {err}");
@@ -1253,15 +1260,22 @@ print("mon_events=" .. mon_events)
         out.contains("Device(m1, [readable,movable,locatable,stoppable,monitorable])"),
         "out = {out}"
     );
-    assert!(out.contains("mon_desc=true"), "out = {out}");
-    let n: i32 = out
-        .lines()
-        .find_map(|l| l.strip_prefix("mon_events="))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(-1);
-    // The watch channel coalesces sets the pump has not consumed yet, so
+    assert!(
+        out.contains("Device(det1, [readable,monitorable])"),
+        "out = {out}"
+    );
+    let count = |prefix: &str| -> i32 {
+        out.lines()
+            .find_map(|l| l.strip_prefix(prefix))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(-1)
+    };
+    // The watch channel coalesces updates the pump has not consumed yet, so
     // fewer than 3 is legal; zero means the monitor never fired.
-    assert!(n >= 1, "mon_events = {n}, out = {out}");
+    let m1 = count("m1_events=");
+    let det1 = count("det1_events=");
+    assert!(m1 >= 1, "m1_events = {m1}, out = {out}");
+    assert!(det1 >= 1, "det1_events = {det1}, out = {out}");
 }
 
 #[test]
