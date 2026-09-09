@@ -1279,6 +1279,54 @@ print("det1_events=" .. events.det1_monitor)
 }
 
 #[test]
+fn lua_subscriber_sees_worker_docs_before_the_next_repl_thread_doc() {
+    // The monitor's initial Event is emitted by the pump task (worker
+    // thread) during the sleep and buffered; the primary Event that
+    // follows is emitted on the REPL thread. The buffered entry must be
+    // delivered first, so the subscriber sees the run in emission order
+    // rather than every worker doc after every REPL-thread doc. The
+    // second monitor Event (the read's new count) races the Save that
+    // emits the primary Event, so only the first position is asserted.
+    let (out, err, code) = run_script(
+        r#"
+local desc, log = {}, {}
+RE:subscribe(function(name, body)
+    if name == "descriptor" then
+        desc[body.uid] = body.name
+    elseif name == "event" then
+        local s = desc[body.descriptor]
+        if s == "det1_monitor" then log[#log + 1] = "mon"
+        elseif s == "primary" then log[#log + 1] = "pri" end
+    end
+end, "all")
+local det1 = soft_detector("det1")
+local function p()
+    coroutine.yield(msg.open_run())
+    coroutine.yield(msg.monitor(det1, "det1_monitor"))
+    coroutine.yield(msg.sleep(0.2))
+    coroutine.yield(msg.create("primary"))
+    coroutine.yield(msg.read(det1))
+    coroutine.yield(msg.save())
+    coroutine.yield(msg.unmonitor(det1))
+    coroutine.yield(msg.close_run("success"))
+end
+print(RE:run(plan(p)))
+print("order=" .. table.concat(log, " "))
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    let order = out
+        .lines()
+        .find_map(|l| l.strip_prefix("order="))
+        .unwrap_or("");
+    let tokens: Vec<&str> = order.split_whitespace().collect();
+    assert!(
+        tokens.first() == Some(&"mon") && tokens.contains(&"pri"),
+        "the monitor Event emitted before the primary Event must reach the subscriber first: order = {order:?}, out = {out}"
+    );
+}
+
+#[test]
 fn run_async_with_rejects_non_table_md() {
     // Regression for R5-2: opts.md must be a table or nil; other
     // types must surface a clear error rather than being silently

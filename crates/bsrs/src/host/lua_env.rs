@@ -13,11 +13,12 @@
 //! `RE:subscribe` and `msg.subscribe` solve this with thread-aware
 //! routing in [`make_lua_subscriber_cb`]: same-thread callbacks fire
 //! synchronously (reentrant lock OK); other-thread callbacks push
-//! into a per-subscriber buffer and are replayed on the REPL thread
-//! after `RE:run`'s `block_on` returns (see
-//! [`drain_lua_subscriber_buffers`]). This means worker-emitted docs
-//! are still delivered to Lua subscribers, just batched to run end —
-//! sufficient for the prototype/debug workflow.
+//! into a per-subscriber buffer that is replayed on the REPL thread
+//! at the next opportunity: before the subscriber's next same-thread
+//! delivery, and after `RE:run`'s `block_on` returns (see
+//! [`drain_lua_subscriber_buffers`]). A subscriber therefore sees its
+//! documents in emission order; worker-emitted docs are only delayed
+//! until the REPL thread next emits or the run ends.
 //!
 //! The other Lua callbacks (`RE:set_input_handler`,
 //! `RE:set_md_validator`, `RE:set_md_normalizer`,
@@ -1061,15 +1062,30 @@ const BRIDGE_ERROR_CMD: &str = "_bsrs_lua_bridge_error";
 static REPL_THREAD_ID: std::sync::OnceLock<std::thread::ThreadId> = std::sync::OnceLock::new();
 
 /// Per-subscriber state: the Lua callback, an optional document-name
-/// filter, and a worker-thread buffer drained after `RE:run` returns.
+/// filter, and a worker-thread buffer drained on the REPL thread.
 struct LuaSubscriberInner {
     lua_fn: mlua::Function,
     /// Document-name filter. `None` or `"all"` matches all docs;
     /// otherwise only docs whose name equals this string fire.
     filter: Option<String>,
     /// Buffer for (name, body_json) pairs pushed by worker threads.
-    /// Drained after `RE:run` returns.
+    /// Drained by [`LuaSubscriberInner::flush`], only on the REPL thread.
     buffer: std::sync::Mutex<Vec<(&'static str, String)>>,
+}
+
+impl LuaSubscriberInner {
+    /// Deliver every buffered worker-thread entry, in push order. Must
+    /// run on the REPL thread: it calls into Lua. Errors are warned, not
+    /// propagated; a subscriber must not fail the run.
+    fn flush(&self) {
+        let entries: Vec<(&'static str, String)> =
+            std::mem::take(&mut *self.buffer.lock().unwrap());
+        for (name, body) in entries {
+            if let Err(e) = self.lua_fn.call::<()>((name, body)) {
+                tracing::warn!("Lua subscriber drain callback error: {e}");
+            }
+        }
+    }
 }
 
 /// Global registry of Lua subscribers needing post-`RE:run` drain.
@@ -1085,10 +1101,11 @@ static SUBSCRIBER_BUFFERS: std::sync::LazyLock<std::sync::Mutex<Vec<Arc<LuaSubsc
 /// - same as REPL: call the Lua fn synchronously (no deadlock — same
 ///   thread re-enters mlua's reentrant mutex)
 /// - different thread (worker — monitor pumps, suspend tasks): push
-///   `(name, body_json)` into the per-subscriber buffer; the next
-///   `drain_lua_subscriber_buffers()` (run after `RE:run`'s
-///   `block_on` returns) replays the buffered entries on the REPL
-///   thread.
+///   `(name, body_json)` into the per-subscriber buffer; the REPL
+///   thread replays it before this subscriber's next synchronous
+///   delivery, or in `drain_lua_subscriber_buffers()` after `RE:run`'s
+///   `block_on` returns. Either way the subscriber sees its documents
+///   in emission order.
 ///
 /// The user callback receives the body as a Lua *table* (bluesky
 /// passes dicts). Internally the buffer carries the body as a JSON
@@ -1126,8 +1143,11 @@ fn make_lua_subscriber_cb(
             .unwrap_or(false);
         if on_repl {
             // Same thread as REPL — mlua reentrant lock allows the
-            // call. Errors are warned (not propagated; subscribers
+            // call. Worker-thread entries buffered since the last
+            // delivery were emitted before this document, so they go
+            // first. Errors are warned (not propagated; subscribers
             // shouldn't fail the run).
+            inner.flush();
             if let Err(e) = inner.lua_fn.call::<()>((name, body.to_string())) {
                 tracing::warn!("Lua subscriber callback error: {e}");
             }
@@ -1143,13 +1163,7 @@ fn make_lua_subscriber_cb(
 fn drain_lua_subscriber_buffers() {
     let snapshot: Vec<_> = SUBSCRIBER_BUFFERS.lock().unwrap().iter().cloned().collect();
     for inner in snapshot {
-        let entries: Vec<(&'static str, String)> =
-            std::mem::take(&mut *inner.buffer.lock().unwrap());
-        for (name, body) in entries {
-            if let Err(e) = inner.lua_fn.call::<()>((name, body)) {
-                tracing::warn!("Lua subscriber drain callback error: {e}");
-            }
-        }
+        inner.flush();
     }
     // Reap entries the engine has unsubscribed (Arc strong = 1, only
     // the registry holds it).
