@@ -131,11 +131,18 @@ where
     /// Register a listener. Returns a `watch::Receiver` over the shared fan-out
     /// and a `SubToken` that decrements the listener count (and tears the
     /// monitor down if it was the last and the cache is not staged) on drop.
+    ///
+    /// When a reading is already cached the receiver starts with it pending,
+    /// so the listener's first `changed()` yields the current value: ophyd-async
+    /// `_SignalCache.subscribe` notifies a new listener at once when valid.
     pub fn add_listener(&self) -> (watch::Receiver<ReadingValue>, SubToken) {
         let mut st = self.state.lock().unwrap();
         st.listeners += 1;
         self.ensure_token(&mut st);
-        let rx = self.fanout.tx.subscribe();
+        let mut rx = self.fanout.tx.subscribe();
+        if self.fanout.has_value.load(Ordering::SeqCst) {
+            rx.mark_changed();
+        }
         drop(st);
 
         // Capture only the state + fanout handles (no backend / `B`) so the
@@ -249,6 +256,23 @@ mod tests {
             cache.cached_reading().unwrap().value,
             serde_json::json!(4.5)
         );
+    }
+
+    // Boundary: a listener added before any reading is cached waits for the
+    // first update; one added after starts with the cached reading pending
+    // (ophyd-async `_SignalCache.subscribe` notifies at once when valid).
+    #[tokio::test]
+    async fn a_listener_added_after_a_reading_starts_with_it_pending() {
+        let be = backend(0.0);
+        let cache = SignalCache::new(be.clone());
+        let (early, _t0) = cache.add_listener();
+        assert!(!early.has_changed().unwrap(), "nothing cached yet");
+
+        be.write_now(3.0);
+        let (mut late, _t1) = cache.add_listener();
+        assert!(late.has_changed().unwrap(), "cached reading is pending");
+        assert_eq!(late.borrow_and_update().value, serde_json::json!(3.0));
+        assert!(early.has_changed().unwrap(), "the update reached it too");
     }
 
     // INVARIANT boundary: listeners == 0 while staged. The fan-out watch has

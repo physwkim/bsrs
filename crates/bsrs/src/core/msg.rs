@@ -858,9 +858,11 @@ pub trait CollectableObj: NamedObj {
 }
 
 /// Anything that can be subscribed to (monitor stream). A monitorable
-/// object is also `Readable`: the engine uses `describe_dyn` / `read_dyn`
-/// to get the data keys for the monitor stream's `EventDescriptor`, and
-/// to seed the first Event before any rx-side updates arrive.
+/// object is also `Readable`: the engine uses `describe_dyn` for the monitor
+/// stream's `EventDescriptor`. A subscription made while the object holds a
+/// reading starts with it pending, so the first Event carries the current
+/// value (ophyd `subscribe(run=True)`, ophyd-async `_SignalCache.subscribe`);
+/// the engine seeds nothing itself.
 #[async_trait::async_trait]
 pub trait MonitorableObj: ReadableObj {
     /// Subscribe. The `Subscription`'s key must be one of the data keys

@@ -144,8 +144,12 @@ impl ReadableObj for SoftDetector {
 impl MonitorableObj for SoftDetector {
     async fn subscribe_dyn(&self) -> Result<Subscription> {
         // The watch sender lives as long as the detector; nothing to release.
+        // The stored count is pending so the first `changed()` yields it
+        // (ophyd `subscribe(run=True)`).
+        let mut rx = self.monitor.subscribe();
+        rx.mark_changed();
         Ok(Subscription::new(
-            self.monitor.subscribe(),
+            rx,
             SubToken::noop(),
             format!("{}_counts", self.name),
         ))
@@ -379,6 +383,18 @@ mod tests {
         };
         DetectorControl::prepare(&control, info).await.unwrap();
         assert_eq!(control.target().load(Ordering::SeqCst), 7);
+    }
+
+    // A subscription starts with the current count pending: monitor start
+    // emits the value read so far, not only the next change.
+    #[tokio::test]
+    async fn soft_detector_subscription_starts_with_the_current_count() {
+        let det = SoftDetector::new("det");
+        det.tick();
+        let mut sub = MonitorableObj::subscribe_dyn(&*det).await.unwrap();
+        assert!(sub.rx_mut().has_changed().unwrap());
+        assert_eq!(sub.rx_mut().borrow_and_update().value, serde_json::json!(1));
+        assert!(!sub.rx_mut().has_changed().unwrap(), "consumed once");
     }
 
     // Boundary: `arm` before any `subscribe_index`. The channel has no

@@ -1047,6 +1047,43 @@ async fn monitor_event_is_keyed_by_the_described_data_key() {
     }
 }
 
+// A device that already holds a reading yields it as the first monitor Event
+// with no update in between: ophyd's subscribe(run=True) and ophyd-async's
+// _SignalCache.subscribe both notify a new subscriber at once. The engine
+// seeds nothing; the Subscription arrives with the reading pending.
+#[tokio::test]
+async fn monitor_emits_the_current_reading_first() {
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let det = bsrs::backends::soft::SoftDetector::new("det");
+    det.tick();
+    det.tick();
+    let mon: Arc<dyn bsrs::core::msg::MonitorableObj> = det.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Monitor { obj: mon.clone(), name: None };
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::Unmonitor(mon);
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    re.run_async(plan).await.unwrap();
+
+    let values: Vec<_> = sink
+        .snapshot()
+        .await
+        .iter()
+        .filter_map(|d| match d {
+            Document::Event(e) => e.data.get("det_counts").cloned(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        values,
+        vec![Value::from(2)],
+        "the current count, exactly once"
+    );
+}
+
 // A subscription whose key is not among the object's described data keys is
 // rejected when the monitor starts: its Events could not match the stream's
 // descriptor. The key comes from the device, so this is the only check the
