@@ -85,7 +85,10 @@ where
         let fanout = self.fanout.clone();
         Box::new(move |v: &T, ts: f64, alarm_severity: Option<i32>| {
             if let Ok(json) = serde_json::to_value(v) {
-                let _ = fanout.tx.send(ReadingValue {
+                // `send_replace`, not `send`: a staged cache with no listener
+                // has no receiver, and `send` would drop the value while
+                // `cached_reading` keeps serving the initial null.
+                fanout.tx.send_replace(ReadingValue {
                     value: json,
                     timestamp: ts,
                     alarm_severity,
@@ -248,6 +251,25 @@ mod tests {
         );
     }
 
+    // INVARIANT boundary: listeners == 0 while staged. The fan-out watch has
+    // no receiver then, and `watch::Sender::send` drops the value in that
+    // case, so a staged-only cache served the initial null reading with
+    // `has_value` already true.
+    #[tokio::test]
+    async fn staged_cache_without_listeners_caches_the_update() {
+        let be = backend(0.0);
+        let cache = SignalCache::new(be.clone());
+        cache.set_staged(true);
+        assert_eq!(cache.listener_count(), 0);
+
+        be.write_now(4.5);
+        assert_eq!(
+            cache.cached_reading().expect("value cached").value,
+            serde_json::json!(4.5),
+            "staged-only cache must hold the latest backend value"
+        );
+    }
+
     // The backend-facing callback must thread `alarm_severity` through to the
     // cached reading. CA/PVA monitors now deliver `Some(severity)` on each
     // update; the cache previously hardcoded `None` and dropped it. The soft
@@ -256,10 +278,8 @@ mod tests {
     #[tokio::test]
     async fn callback_threads_alarm_severity_into_cache() {
         let cache = SignalCache::new(backend(0.0));
-        // Keep a live fan-out receiver so the watch retains sent values, but
-        // skip `add_listener` (it installs the backend monitor, which would
+        // Skip `add_listener` (it installs the backend monitor, which would
         // race its own None-severity updates into the channel).
-        let _rx = cache.fanout.tx.subscribe();
         let cb = cache.make_callback();
         cb(&7.5_f64, 12.0, Some(2)); // MAJOR
         let r = cache.cached_reading().expect("value cached after callback");
