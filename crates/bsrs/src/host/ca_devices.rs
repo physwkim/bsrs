@@ -44,13 +44,30 @@ use crate::event_model::{DataKey, Dtype};
 use crate::protocols_async::SignalBackend;
 
 /// CA-backed motor: setpoint (`.VAL`) + readback (`.RBV`) Signal pair.
+///
+/// Also a [`MonitorableObj`] over the readback: every CA update of `.RBV`
+/// becomes an Event, through one shared [`SignalCache`] (CP-08 / K2).
 pub struct CaMotor {
     name: String,
     setpoint: Arc<EpicsCaBackend<f64>>,
     readback: Arc<EpicsCaBackend<f64>>,
+    cache: Arc<SignalCache<f64, EpicsCaBackend<f64>>>,
 }
 
 impl CaMotor {
+    fn from_connected(
+        name: &str,
+        setpoint: Arc<EpicsCaBackend<f64>>,
+        readback: Arc<EpicsCaBackend<f64>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            name: name.to_string(),
+            setpoint,
+            cache: SignalCache::new(readback.clone()),
+            readback,
+        })
+    }
+
     /// Build + connect both channels. Blocks on bsrs's runtime; the
     /// caller must invoke this from a sync context (see
     /// `bootstrap_ca` for the recommended order).
@@ -63,11 +80,7 @@ impl CaMotor {
             sp_for_async.connect(Duration::from_secs(5)).await?;
             rb_for_async.connect(Duration::from_secs(5)).await
         })?;
-        Ok(Arc::new(Self {
-            name: name.to_string(),
-            setpoint: sp,
-            readback: rb,
-        }))
+        Ok(Self::from_connected(name, sp, rb))
     }
 
     /// Async equivalent — call from inside an existing tokio runtime
@@ -78,11 +91,7 @@ impl CaMotor {
         let rb = Arc::new(EpicsCaBackend::<f64>::new(rbv_pv));
         sp.connect(Duration::from_secs(5)).await?;
         rb.connect(Duration::from_secs(5)).await?;
-        Ok(Arc::new(Self {
-            name: name.to_string(),
-            setpoint: sp,
-            readback: rb,
-        }))
+        Ok(Self::from_connected(name, sp, rb))
     }
 }
 
@@ -162,6 +171,14 @@ impl StoppableObj for CaMotor {
     }
 }
 
+#[async_trait::async_trait]
+impl MonitorableObj for CaMotor {
+    async fn subscribe_dyn(&self) -> Result<Subscription> {
+        let (rx, token) = self.cache.add_listener();
+        Ok(Subscription::new(rx, token))
+    }
+}
+
 /// CA-backed positioner with an explicit done signal — the bsrs
 /// equivalent of ophyd's `PVPositioner`. For axes whose setpoint
 /// record completes processing immediately while an external
@@ -183,13 +200,41 @@ pub struct CaPositioner {
     name: String,
     setpoint: Arc<EpicsCaBackend<f64>>,
     readback: Arc<EpicsCaBackend<f64>>,
+    /// Monitor fan-out over `readback` (CP-08 / K2).
+    cache: Arc<SignalCache<f64, EpicsCaBackend<f64>>>,
     done: Arc<EpicsCaBackend<f64>>,
     done_pv: String,
     rbv_pv: String,
     done_value: f64,
 }
 
+/// The three channels of a [`CaPositioner`], already connected.
+struct PositionerChannels {
+    setpoint: Arc<EpicsCaBackend<f64>>,
+    readback: Arc<EpicsCaBackend<f64>>,
+    done: Arc<EpicsCaBackend<f64>>,
+}
+
 impl CaPositioner {
+    fn from_connected(
+        name: &str,
+        ch: PositionerChannels,
+        done_pv: &str,
+        rbv_pv: &str,
+        done_value: f64,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            name: name.to_string(),
+            setpoint: ch.setpoint,
+            cache: SignalCache::new(ch.readback.clone()),
+            readback: ch.readback,
+            done: ch.done,
+            done_pv: done_pv.to_string(),
+            rbv_pv: rbv_pv.to_string(),
+            done_value,
+        })
+    }
+
     /// Build + connect all three channels. Blocks; see
     /// `CaMotor::connect_blocking`.
     pub fn connect_blocking(
@@ -208,15 +253,12 @@ impl CaPositioner {
             rb_a.connect(Duration::from_secs(5)).await?;
             dn_a.connect(Duration::from_secs(5)).await
         })?;
-        Ok(Arc::new(Self {
-            name: name.to_string(),
+        let ch = PositionerChannels {
             setpoint: sp,
             readback: rb,
             done: dn,
-            done_pv: done_pv.to_string(),
-            rbv_pv: rbv_pv.to_string(),
-            done_value,
-        }))
+        };
+        Ok(Self::from_connected(name, ch, done_pv, rbv_pv, done_value))
     }
 
     /// Async equivalent — call from inside an existing tokio runtime.
@@ -233,15 +275,12 @@ impl CaPositioner {
         sp.connect(Duration::from_secs(5)).await?;
         rb.connect(Duration::from_secs(5)).await?;
         dn.connect(Duration::from_secs(5)).await?;
-        Ok(Arc::new(Self {
-            name: name.to_string(),
+        let ch = PositionerChannels {
             setpoint: sp,
             readback: rb,
             done: dn,
-            done_pv: done_pv.to_string(),
-            rbv_pv: rbv_pv.to_string(),
-            done_value,
-        }))
+        };
+        Ok(Self::from_connected(name, ch, done_pv, rbv_pv, done_value))
     }
 }
 
@@ -337,6 +376,14 @@ impl LocatableObj for CaPositioner {
 impl StoppableObj for CaPositioner {
     async fn stop_dyn(&self, _success: bool) -> Result<()> {
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl MonitorableObj for CaPositioner {
+    async fn subscribe_dyn(&self) -> Result<Subscription> {
+        let (rx, token) = self.cache.add_listener();
+        Ok(Subscription::new(rx, token))
     }
 }
 
