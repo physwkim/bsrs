@@ -393,6 +393,23 @@ where
     }
 }
 
+// -- MonitorableObj: `Msg::Monitor(signal.into())` streams the shared monitor --
+
+#[async_trait]
+impl<T, B, A> crate::core::msg::MonitorableObj for Signal<T, B, A>
+where
+    T: Clone + Send + Sync + Serialize + 'static,
+    B: SignalBackend<T>,
+    A: Readable,
+{
+    async fn subscribe_dyn(&self) -> Result<Subscription> {
+        // Same path as `AsyncSubscribable::subscribe`: one shared backend
+        // monitor (CP-08) whose slot is released when the engine drops the
+        // `Subscription` on Unmonitor / pause / run close (K2).
+        AsyncSubscribable::subscribe(self).await
+    }
+}
+
 // -- Stageable: staging a readable signal holds its shared monitor (CP-08) ----
 
 #[async_trait]
@@ -554,6 +571,49 @@ mod tests {
             backend.subscriber_count(),
             0,
             "unstaged + no listeners: torn down"
+        );
+    }
+
+    // A `Signal` is a `MonitorableObj`, so `Msg::Monitor` can carry it: the
+    // dyn subscription rides the same shared monitor as `subscribe()`, sees
+    // backend updates, and releases the backend slot when dropped (K2).
+    #[tokio::test]
+    async fn signal_is_monitorable_through_the_shared_monitor() {
+        use crate::core::msg::MonitorableObj;
+        use crate::event_model::Dtype;
+
+        let backend = Arc::new(crate::backends::soft::SoftSignalBackend::new(
+            1.0_f64,
+            Dtype::Number,
+        ));
+        let s: Arc<SignalR<f64, _>> = Arc::new(Signal::new(
+            backend.clone(),
+            SignalConfig {
+                source: "x".into(),
+                kind: Kind::Normal,
+                name: "x".into(),
+            },
+        ));
+        let mon: Arc<dyn MonitorableObj> = s.clone();
+
+        let mut sub = mon.subscribe_dyn().await.unwrap();
+        let _sub2 = AsyncSubscribable::subscribe(&*s).await.unwrap();
+        assert_eq!(
+            backend.subscriber_count(),
+            1,
+            "dyn and typed subscriptions share one backend monitor"
+        );
+
+        backend.write_now(7.0);
+        sub.rx_mut().changed().await.unwrap();
+        assert_eq!(sub.rx().borrow().value, serde_json::json!(7.0));
+
+        drop(sub);
+        drop(_sub2);
+        assert_eq!(
+            backend.subscriber_count(),
+            0,
+            "last subscription dropped: monitor torn down"
         );
     }
 }
