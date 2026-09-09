@@ -91,7 +91,7 @@ pub fn build_shared_lua(re: Arc<RunEngine>, registry: &Registry) -> mlua::Result
     // declared name. Walk the role tables; a device that appears
     // under multiple roles (motor: readable + movable) carries
     // both. Roles the registry doesn't currently track
-    // (locatable, stoppable, monitorable, ...) are left None —
+    // (stoppable, preparable, configurable, pausable) are left None —
     // those calls error from Lua.
     // Union of every #[lua_methods] name in this state. LuaDevice's
     // shared `__index` fallback consults it so only real lua-exposed
@@ -108,7 +108,7 @@ pub fn build_shared_lua(re: Arc<RunEngine>, registry: &Registry) -> mlua::Result
             stoppable: None,
             triggerable: registry.triggerable(&name).cloned(),
             stageable: registry.stageable(&name).cloned(),
-            monitorable: None,
+            monitorable: registry.monitorable(&name).cloned(),
             flyable: registry.flyable(&name).cloned(),
             preparable: None,
             configurable: None,
@@ -500,5 +500,76 @@ mod tests {
         let r = state.eval("dx:set_orientation(1.0)").await;
         assert!(r.error.is_some());
         assert!(r.error.as_deref().unwrap().contains("expected 3 args"));
+    }
+
+    // A device registered under the monitorable facet reaches the daemon Lua
+    // state with that role, so `msg.monitor` / `bpp.monitor_during` accept it
+    // (before the facet existed every registry device was published with
+    // `monitorable: None` and those calls failed with "is not monitorable").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registry_monitorable_facet_is_published_to_lua() {
+        struct Mon;
+        impl crate::core::msg::NamedObj for Mon {
+            fn name(&self) -> &str {
+                "mon"
+            }
+        }
+        #[async_trait::async_trait]
+        impl crate::core::msg::ReadableObj for Mon {
+            async fn read_dyn(
+                &self,
+            ) -> crate::core::error::Result<
+                std::collections::HashMap<String, crate::core::reading::ReadingValue>,
+            > {
+                Ok(std::collections::HashMap::new())
+            }
+            async fn describe_dyn(
+                &self,
+            ) -> crate::core::error::Result<
+                std::collections::HashMap<String, crate::event_model::DataKey>,
+            > {
+                Ok(std::collections::HashMap::new())
+            }
+        }
+        #[async_trait::async_trait]
+        impl crate::core::msg::MonitorableObj for Mon {
+            async fn subscribe_dyn(
+                &self,
+            ) -> crate::core::error::Result<crate::core::subscription::Subscription> {
+                let (_tx, rx) = tokio::sync::watch::channel(crate::core::reading::ReadingValue {
+                    value: serde_json::Value::Null,
+                    timestamp: 0.0,
+                    alarm_severity: None,
+                    message: None,
+                });
+                Ok(crate::core::subscription::Subscription::new(
+                    rx,
+                    crate::core::status::SubToken::noop(),
+                ))
+            }
+        }
+
+        let mon = Arc::new(Mon);
+        let mut reg = Registry::new();
+        reg.register_readable("mon", mon.clone());
+        reg.register_monitorable("mon", mon);
+        assert_eq!(reg.device_names(), vec!["mon".to_string()]);
+
+        let engine_slot = Arc::new(TMutex::new(Some(Arc::new(RunEngine::new(vec![])))));
+        let state = ManagerLuaState::new(engine_slot, Arc::new(reg));
+
+        let r = state.eval("tostring(mon)").await;
+        assert_eq!(
+            r.return_value.as_deref(),
+            Some("Device(mon, [readable,monitorable])"),
+            "{r:?}"
+        );
+        // Both Lua entry points that project the monitorable facet resolve.
+        let r = state.eval("msg.monitor(mon); return 'ok'").await;
+        assert!(r.error.is_none(), "{r:?}");
+        let r = state
+            .eval("bpp.monitor_during(count({mon}, 1), {mon}); return 'ok'")
+            .await;
+        assert!(r.error.is_none(), "{r:?}");
     }
 }

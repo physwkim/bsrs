@@ -154,7 +154,8 @@ pub async fn run(args: ManagerArgs) -> i32 {
                     return 2;
                 }
             };
-            reg.register_readable(name, d as Arc<dyn ReadableObj>);
+            reg.register_readable(name, d.clone() as Arc<dyn ReadableObj>);
+            reg.register_monitorable(name, d);
             tracing::info!(target: "bsrs-qs", "registered ca_detector {name} → {pv}");
         }
     }
