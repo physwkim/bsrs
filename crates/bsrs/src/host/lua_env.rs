@@ -1803,48 +1803,6 @@ pub(crate) fn lua_table_to_json_map(
     Ok(out)
 }
 
-/// Build a minimal `DataKey` from a Lua table:
-/// `{source = "...", dtype = "number"|"string"|"boolean"|"integer"|"array",
-///   shape = {1, 2, 3}, units = "...", precision = 3}`.
-fn lua_table_to_data_key(t: &mlua::Table) -> mlua::Result<crate::event_model::DataKey> {
-    let source: String = t.get("source").unwrap_or_else(|_| "lua".into());
-    let dtype_str: String = t.get("dtype").unwrap_or_else(|_| "number".into());
-    let dtype = match dtype_str.as_str() {
-        "number" => crate::event_model::Dtype::Number,
-        "string" => crate::event_model::Dtype::String,
-        "boolean" => crate::event_model::Dtype::Boolean,
-        "integer" => crate::event_model::Dtype::Integer,
-        "array" => crate::event_model::Dtype::Array,
-        other => {
-            return Err(mlua::Error::RuntimeError(format!(
-                "unknown dtype {other:?} (expected number/string/boolean/integer/array)"
-            )))
-        }
-    };
-    let shape: Vec<Option<u64>> = if let Ok(s) = t.get::<mlua::Table>("shape") {
-        let mut v = Vec::new();
-        for x in s.sequence_values::<i64>().flatten() {
-            v.push(if x < 0 { None } else { Some(x as u64) });
-        }
-        v
-    } else {
-        Vec::new()
-    };
-    Ok(crate::event_model::DataKey {
-        source,
-        dtype,
-        shape,
-        dtype_numpy: t.get::<String>("dtype_numpy").ok().map(Into::into),
-        external: None,
-        units: t.get::<String>("units").ok(),
-        precision: t.get::<i64>("precision").ok(),
-        object_name: t.get::<String>("object_name").ok(),
-        dims: None,
-        limits: None,
-        choices: None,
-    })
-}
-
 /// Required-field hints for each publishable Document kind. Used to
 /// generate friendly error messages when the Lua-supplied `body` table
 /// is missing fields, before serde gives a cryptic message.
@@ -2359,26 +2317,21 @@ fn register_msg_namespace(lua: &Lua) -> mlua::Result<()> {
             }))
         })?,
     )?;
-    // declare_stream(name, data_keys_table) — data_keys is
-    // {field = {source=, dtype="number"|"string"|..., shape={...}}, ...}
+    // declare_stream(name, {devices}, [collect]) — bluesky
+    // `declare_stream(*objs, name=, collect=False)`: the devices are
+    // described (their collect stream `name` when `collect` is true).
     msg.set(
         "declare_stream",
-        lua.create_function(|_, (stream_name, keys_t): (String, mlua::Table)| {
-            let mut data_keys = std::collections::HashMap::new();
-            for (name, spec) in lua_table_string_keyed(&keys_t)? {
-                let LuaValue::Table(spec) = spec else {
-                    return Err(mlua::Error::RuntimeError(format!(
-                        "declare_stream: data key {name:?} must be a table, got {}",
-                        spec.type_name()
-                    )));
+        lua.create_function(
+            |_, (stream_name, devs_t, collect): (String, mlua::Table, Option<bool>)| {
+                let objs = if collect.unwrap_or(false) {
+                    crate::core::msg::StreamObjs::Collectable(collectables_of(&devs_t)?)
+                } else {
+                    crate::core::msg::StreamObjs::Readable(dets(&devs_t)?)
                 };
-                data_keys.insert(name, lua_table_to_data_key(&spec)?);
-            }
-            Ok(LuaMsg(Msg::DeclareStream {
-                stream_name,
-                data_keys,
-            }))
-        })?,
+                Ok(LuaMsg(Msg::DeclareStream { stream_name, objs }))
+            },
+        )?,
     )?;
     // collect(device, [stream_name])
     msg.set(
@@ -2679,6 +2632,20 @@ fn monitors_of(t: &mlua::Table) -> mlua::Result<Vec<Arc<dyn MonitorableObj>>> {
             .clone()
             .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not monitorable", d.name)))?;
         out.push(m);
+    }
+    Ok(out)
+}
+
+fn collectables_of(t: &mlua::Table) -> mlua::Result<Vec<Arc<dyn CollectableObj>>> {
+    let mut out = Vec::new();
+    for v in t.clone().sequence_values::<mlua::AnyUserData>() {
+        let ud = v?;
+        let d = ud.borrow::<LuaDevice>()?;
+        let c = d
+            .collectable
+            .clone()
+            .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not collectable", d.name)))?;
+        out.push(c);
     }
     Ok(out)
 }

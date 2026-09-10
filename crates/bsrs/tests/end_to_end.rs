@@ -2586,6 +2586,85 @@ async fn collect_stream_descriptor_lists_the_collectors_keys() {
     assert!(desc.configuration.contains_key("flycoll"));
 }
 
+// bluesky `declare_stream(*objs, name=, collect=True)`: the stream is
+// described from each object's `describe_collect()[name]` slice, and the
+// later `Collect` reuses that descriptor instead of declaring a second one.
+#[tokio::test]
+async fn declare_stream_collect_describes_the_collect_stream_once() {
+    use bsrs::core::Msg;
+    use std::sync::atomic::AtomicUsize;
+
+    let flyer = Arc::new(FlyCollector {
+        collects: Arc::new(AtomicUsize::new(0)),
+    });
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let fly: Arc<dyn bsrs::core::msg::FlyableObj> = flyer.clone();
+    let coll: Arc<dyn bsrs::core::msg::CollectableObj> = flyer.clone();
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::DeclareStream { stream_name: "primary".into(), objs: vec![coll.clone()].into() };
+        yield Msg::Kickoff { obj: fly.clone(), group: Some("k".into()) };
+        yield Msg::Wait { group: "k".into(), error_on_timeout: true, timeout: None };
+        yield Msg::Complete { obj: fly.clone(), group: Some("c".into()) };
+        yield Msg::Wait { group: "c".into(), error_on_timeout: true, timeout: None };
+        yield Msg::Collect { obj: coll.clone(), stream_name: None };
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    re.run_async(plan).await.unwrap();
+
+    let docs = sink.snapshot().await;
+    let descs: Vec<_> = docs
+        .iter()
+        .filter_map(|d| match d {
+            bsrs::core::Document::Descriptor(d) if d.name.as_deref() == Some("primary") => Some(d),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(descs.len(), 1, "collect reuses the pre-declared descriptor");
+    assert_eq!(
+        descs[0].object_keys,
+        std::collections::HashMap::from([("flycoll".to_string(), vec!["fly_val".to_string()])])
+    );
+    assert!(descs[0].configuration.contains_key("flycoll"));
+    let events = docs
+        .iter()
+        .filter(|d| matches!(d, bsrs::core::Document::Event(e) if e.descriptor == descs[0].uid))
+        .count();
+    assert!(
+        events >= 1,
+        "collect events stamped with the declared descriptor"
+    );
+}
+
+// `collect=True` over an object that does not collect into the named stream
+// is a plan error (bluesky raises from `declare_stream`).
+#[tokio::test]
+async fn declare_stream_collect_rejects_a_stream_the_object_does_not_collect() {
+    use bsrs::core::Msg;
+    use std::sync::atomic::AtomicUsize;
+
+    let flyer = Arc::new(FlyCollector {
+        collects: Arc::new(AtomicUsize::new(0)),
+    });
+    let re = RunEngine::new(vec![]);
+    let coll: Arc<dyn bsrs::core::msg::CollectableObj> = flyer;
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::DeclareStream { stream_name: "other".into(), objs: vec![coll].into() };
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let result = re.run_async(plan).await.unwrap();
+    assert_eq!(result.exit_status, "fail");
+    assert!(
+        result
+            .reason
+            .contains("does not collect into stream \"other\""),
+        "reason: {}",
+        result.reason
+    );
+}
+
 #[tokio::test]
 async fn uncollected_flyer_is_backstop_collected_on_abort() {
     use bsrs::core::Msg;

@@ -1687,23 +1687,33 @@ print("msg=" .. tostring(e))
 }
 
 #[test]
-fn declare_stream_rejects_a_non_table_data_key_spec() {
-    // Same family on the `pairs::<String, mlua::Table>` variant: a
-    // value of the wrong type used to end the iteration too, so both
-    // `bad` *and* `good` disappeared from the descriptor.
+fn declare_stream_takes_devices_and_describes_them() {
+    // `msg.declare_stream(name, {devices})` mirrors bluesky
+    // `declare_stream(*objs, name=)`: the descriptor lists the device's keys
+    // under its name and carries its hints, the same as a read stream.
     let (out, err, code) = run_script(
         r#"
-local ok, e = pcall(function()
-    return msg.declare_stream("primary", { good = { source = "s" }, bad = 42 })
-end)
+local seen
+RE:subscribe(function(name, body)
+    if name == "descriptor" and body.name == "fly" then seen = body end
+end, "all")
+local det1 = soft_detector("det1")
+RE:run(plan(function()
+    coroutine.yield(msg.open_run({}))
+    coroutine.yield(msg.declare_stream("fly", {det1}))
+    coroutine.yield(msg.close_run("success"))
+end))
+print("keys=" .. table.concat(seen.object_keys.det1, ","))
+print("hints=" .. table.concat(seen.hints.det1.fields, ","))
+local ok, e = pcall(function() return msg.declare_stream("fly", {42}) end)
 print("ok=" .. tostring(ok))
-print("msg=" .. tostring(e))
 "#,
     );
     assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("keys=det1_counts"), "out = {out}");
+    assert!(out.contains("hints=det1_counts"), "out = {out}");
     assert!(
         out.contains("ok=false"),
-        "must not report success; out = {out}"
+        "a non-device entry is rejected; out = {out}"
     );
-    assert!(out.contains("must be a table"), "out = {out}");
 }

@@ -250,14 +250,18 @@ pub mod stubs {
         })
     }
 
-    /// `declare_stream(name, data_keys)` — pre-declare a stream descriptor.
+    /// `declare_stream(*objs, name=)` — pre-declare a stream descriptor from
+    /// the objects behind it. Pass `Vec<Arc<dyn ReadableObj>>` for a
+    /// read stream or `Vec<Arc<dyn CollectableObj>>` (bluesky `collect=True`)
+    /// for a fly-scan stream.
     pub fn declare_stream(
         stream_name: impl Into<String>,
-        data_keys: std::collections::HashMap<String, crate::event_model::DataKey>,
+        objs: impl Into<crate::core::msg::StreamObjs>,
     ) -> Plan {
         let stream_name = stream_name.into();
+        let objs = objs.into();
         plan_box(async_stream::stream! {
-            yield Msg::DeclareStream { stream_name, data_keys };
+            yield Msg::DeclareStream { stream_name, objs };
         })
     }
 

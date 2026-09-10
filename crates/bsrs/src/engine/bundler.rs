@@ -5,15 +5,15 @@ use crate::core::error::{BsrsError, Result};
 use crate::core::reading::ReadingValue;
 use crate::event_model::compose::RunBundle;
 use crate::event_model::{Configuration, DataKey, Document, EventDescriptor, PerObjectHint};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// One object's contribution to a stream descriptor: bluesky
 /// `_prepare_stream`'s `objs_dks` entry together with the per-object caches
 /// it reads (`hints`, `config_*_cache`, bundlers.py:267-290). `object` is
 /// `None` for data keys that belong to no object — the engine's own
-/// `interruptions` key, or a raw `Msg::DeclareStream` key with no
-/// `object_name` — which join the descriptor's `data_keys` and nothing else.
+/// `interruptions` key — which join the descriptor's `data_keys` and nothing
+/// else.
 pub struct StreamObject {
     /// The object's name; `None` for object-less keys.
     pub object: Option<String>,
@@ -26,27 +26,16 @@ pub struct StreamObject {
 }
 
 impl StreamObject {
-    /// Regroup bare data keys by their `object_name` annotation (bsrs devices
-    /// stamp it in `describe_dyn`), so a stream declared from raw keys still
-    /// lists each object's keys the way bluesky's object-driven
-    /// `declare_stream` does. Keys without one form the object-less entry.
-    pub fn from_data_keys(data_keys: HashMap<String, DataKey>) -> Vec<Self> {
-        let mut by_object: BTreeMap<Option<String>, HashMap<String, DataKey>> = BTreeMap::new();
-        for (key, dk) in data_keys {
-            by_object
-                .entry(dk.object_name.clone())
-                .or_default()
-                .insert(key, dk);
+    /// Data keys with no object behind them: they join the descriptor's
+    /// `data_keys` and nothing else (bluesky composes its `interruptions`
+    /// descriptor from a bare data key, run_engine.py:1880).
+    pub fn objectless(data_keys: HashMap<String, DataKey>) -> Self {
+        Self {
+            object: None,
+            data_keys,
+            hint_fields: None,
+            configuration: Configuration::default(),
         }
-        by_object
-            .into_iter()
-            .map(|(object, data_keys)| Self {
-                object,
-                data_keys,
-                hint_fields: None,
-                configuration: Configuration::default(),
-            })
-            .collect()
     }
 }
 

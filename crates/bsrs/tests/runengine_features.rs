@@ -1347,37 +1347,132 @@ async fn descriptor_object_keys_list_each_objects_read_keys() {
     );
 }
 
-// `Msg::DeclareStream` carries bare data keys; the descriptor's `object_keys`
-// come from their `object_name` annotations, keys without one join only
-// `data_keys`.
-#[tokio::test]
-async fn declare_stream_groups_object_keys_by_object_name() {
-    use bsrs::event_model::{DataKey, Dtype};
-    fn key(object: Option<&str>) -> DataKey {
-        DataKey {
-            source: "test://k".into(),
-            dtype: Dtype::Number,
-            shape: vec![],
-            dtype_numpy: None,
-            external: None,
-            units: None,
-            precision: None,
-            object_name: object.map(str::to_string),
-            dims: None,
-            limits: None,
-            choices: None,
-        }
+// A hinted, configurable readable for the `DeclareStream` tests below.
+struct HintedDet {
+    name: String,
+}
+
+impl bsrs::core::msg::NamedObj for HintedDet {
+    fn name(&self) -> &str {
+        &self.name
     }
+}
+
+#[async_trait::async_trait]
+impl bsrs::core::msg::ReadableObj for HintedDet {
+    async fn read_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, bsrs::core::reading::ReadingValue>,
+        bsrs::core::error::BsrsError,
+    > {
+        Ok(std::collections::HashMap::from([(
+            format!("{}_counts", self.name),
+            bsrs::core::reading::ReadingValue {
+                value: Value::from(1.0),
+                timestamp: 0.0,
+                alarm_severity: None,
+                message: None,
+            },
+        )]))
+    }
+    async fn describe_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, bsrs::event_model::DataKey>,
+        bsrs::core::error::BsrsError,
+    > {
+        Ok(std::collections::HashMap::from([(
+            format!("{}_counts", self.name),
+            bsrs::event_model::DataKey {
+                source: format!("test://{}", self.name),
+                dtype: bsrs::event_model::Dtype::Number,
+                shape: vec![],
+                dtype_numpy: None,
+                external: None,
+                units: None,
+                precision: None,
+                object_name: None,
+                dims: None,
+                limits: None,
+                choices: None,
+            },
+        )]))
+    }
+    fn hint_fields(&self) -> Option<Vec<String>> {
+        Some(vec![format!("{}_counts", self.name)])
+    }
+    fn as_configurable(&self) -> Option<&dyn bsrs::core::msg::ConfigurableObj> {
+        Some(self)
+    }
+}
+
+#[async_trait::async_trait]
+impl bsrs::core::msg::ConfigurableObj for HintedDet {
+    async fn read_configuration_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, bsrs::core::reading::ReadingValue>,
+        bsrs::core::error::BsrsError,
+    > {
+        Ok(std::collections::HashMap::from([(
+            format!("{}_gain", self.name),
+            bsrs::core::reading::ReadingValue {
+                value: Value::from(2.5),
+                timestamp: 0.0,
+                alarm_severity: None,
+                message: None,
+            },
+        )]))
+    }
+    async fn describe_configuration_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, bsrs::event_model::DataKey>,
+        bsrs::core::error::BsrsError,
+    > {
+        Ok(std::collections::HashMap::from([(
+            format!("{}_gain", self.name),
+            bsrs::event_model::DataKey {
+                source: format!("test://{}.gain", self.name),
+                dtype: bsrs::event_model::Dtype::Number,
+                shape: vec![],
+                dtype_numpy: None,
+                external: None,
+                units: None,
+                precision: None,
+                object_name: None,
+                dims: None,
+                limits: None,
+                choices: None,
+            },
+        )]))
+    }
+    async fn configure_dyn(
+        &self,
+        _args: bsrs::core::msg::ConfigureArgs,
+    ) -> Result<(), bsrs::core::error::BsrsError> {
+        Ok(())
+    }
+}
+
+// `Msg::DeclareStream` carries the objects behind the stream (bluesky
+// `declare_stream(*objs, name=)`), so its descriptor lists each object's
+// keys, hints and configuration exactly as the first `Save` of a `Read`
+// stream would. The raw-data-key form it replaces could carry neither
+// hints nor configuration.
+#[tokio::test]
+async fn declare_stream_describes_its_objects_with_hints_and_configuration() {
     let sink = Arc::new(CapturingSink::new());
     let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
-    let data_keys = std::collections::HashMap::from([
-        ("enc_theta".to_string(), key(Some("flyer"))),
-        ("enc_time".to_string(), key(Some("flyer"))),
-        ("loose".to_string(), key(None)),
-    ]);
+    let det_a: Arc<dyn bsrs::core::msg::ReadableObj> = Arc::new(HintedDet { name: "a".into() });
+    let det_b: Arc<dyn bsrs::core::msg::ReadableObj> = Arc::new(HintedDet { name: "b".into() });
     let plan = plan_box(async_stream::stream! {
         yield Msg::OpenRun(Default::default());
-        yield Msg::DeclareStream { stream_name: "fly".into(), data_keys };
+        yield Msg::DeclareStream {
+            stream_name: "fly".into(),
+            objs: vec![det_a.clone(), det_b.clone()].into(),
+        };
         yield Msg::CloseRun { exit_status: "success".into(), reason: None };
     });
     re.run_async(plan).await.unwrap();
@@ -1392,13 +1487,41 @@ async fn declare_stream_groups_object_keys_by_object_name() {
         .expect("fly descriptor");
     assert_eq!(
         desc.object_keys,
-        std::collections::HashMap::from([(
-            "flyer".to_string(),
-            vec!["enc_theta".to_string(), "enc_time".to_string()]
-        )])
+        std::collections::HashMap::from([
+            ("a".to_string(), vec!["a_counts".to_string()]),
+            ("b".to_string(), vec!["b_counts".to_string()]),
+        ])
     );
-    assert_eq!(desc.data_keys.len(), 3);
-    assert!(desc.hints.is_none());
+    assert_eq!(desc.data_keys["a_counts"].object_name.as_deref(), Some("a"));
+    let hints = desc.hints.as_ref().expect("hints from the objects");
+    assert_eq!(
+        hints["a"].fields.as_deref(),
+        Some(&["a_counts".to_string()][..])
+    );
+    assert_eq!(
+        hints["b"].fields.as_deref(),
+        Some(&["b_counts".to_string()][..])
+    );
+    assert_eq!(
+        desc.configuration["a"].data["a_gain"],
+        Value::from(2.5),
+        "configuration read from the object"
+    );
+    assert!(desc.configuration.contains_key("b"));
+}
+
+#[tokio::test]
+async fn declare_stream_without_open_run_is_rejected() {
+    let re = RunEngine::new(vec![]);
+    let det: Arc<dyn bsrs::core::msg::ReadableObj> = Arc::new(HintedDet { name: "a".into() });
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::DeclareStream { stream_name: "fly".into(), objs: vec![det].into() };
+    });
+    let result = re.run_async(plan).await.unwrap();
+    assert_eq!(
+        result.exit_status, "fail",
+        "DeclareStream with no open run must be rejected"
+    );
 }
 
 // The monitor pump keys each Event by the object's single described data

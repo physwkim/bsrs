@@ -117,12 +117,15 @@ pub enum Msg {
     Save,
     /// Discard the open bundle.
     Drop,
-    /// Pre-declare a stream (for fly scans without `Read`+`Save`).
+    /// Pre-declare a stream from the objects behind it (bluesky
+    /// `declare_stream(*objs, name=, collect=)`): the engine describes each
+    /// object and emits the descriptor with its hints and configuration, as
+    /// the first `Save` of a `Read` stream would.
     DeclareStream {
         /// Stream name.
         stream_name: String,
-        /// Pre-declared data keys.
-        data_keys: HashMap<String, crate::event_model::DataKey>,
+        /// The objects the stream is described from.
+        objs: StreamObjs,
     },
 
     /// Read all signals on `obj` into the open bundle.
@@ -474,12 +477,9 @@ impl Clone for Msg {
             },
             Msg::Save => Msg::Save,
             Msg::Drop => Msg::Drop,
-            Msg::DeclareStream {
-                stream_name,
-                data_keys,
-            } => Msg::DeclareStream {
+            Msg::DeclareStream { stream_name, objs } => Msg::DeclareStream {
                 stream_name: stream_name.clone(),
-                data_keys: data_keys.clone(),
+                objs: objs.clone(),
             },
             Msg::Read(o) => Msg::Read(o.clone()),
             Msg::Set { obj, value, group } => Msg::Set {
@@ -647,6 +647,32 @@ fn document_label(d: &crate::event_model::Document) -> &'static str {
 // These are intentionally object-safe and live here in bsrs-core so that the
 // `Msg` enum does not depend on the protocols crate. The concrete protocol
 // traits (`AsyncReadable`, `AsyncMovable`, ...) all extend these.
+
+/// The objects a [`Msg::DeclareStream`] is described from — bluesky's
+/// `declare_stream(*objs, name=, collect=False)` flag as a type. `Readable`
+/// describes each object with `describe_dyn` (the `Read`/`Save` stream shape);
+/// `Collectable` (bluesky `collect=True`) takes each object's
+/// `describe_collect_dyn()[stream_name]` and errors when an object does not
+/// collect into that stream.
+#[derive(Clone)]
+pub enum StreamObjs {
+    /// Describe with `describe_dyn`.
+    Readable(Vec<Arc<dyn ReadableObj>>),
+    /// Describe with `describe_collect_dyn` (fly-scan streams).
+    Collectable(Vec<Arc<dyn CollectableObj>>),
+}
+
+impl From<Vec<Arc<dyn ReadableObj>>> for StreamObjs {
+    fn from(objs: Vec<Arc<dyn ReadableObj>>) -> Self {
+        Self::Readable(objs)
+    }
+}
+
+impl From<Vec<Arc<dyn CollectableObj>>> for StreamObjs {
+    fn from(objs: Vec<Arc<dyn CollectableObj>>) -> Self {
+        Self::Collectable(objs)
+    }
+}
 
 /// Anything with a name.
 pub trait NamedObj: Send + Sync {

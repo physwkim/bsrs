@@ -2231,22 +2231,28 @@ impl RunEngine {
                 // The discarded bundle's external-asset reads go with it.
                 slot.bundle_asset_objs.clear();
             }
-            Msg::DeclareStream {
-                stream_name,
-                data_keys,
-            } => {
-                // `Msg::DeclareStream` carries raw data keys, not objects
-                // (deviation from bluesky, whose declare_stream takes the
-                // collect objects), so there is nothing to read configuration
-                // or hints from; `object_keys` comes from the keys' own
-                // `object_name` annotations. The object-driven paths
-                // (Read/save, Collect, Monitor) fill everything.
+            Msg::DeclareStream { stream_name, objs } => {
+                // bluesky `declare_stream(*objs, name=, collect=)`: describe
+                // each object (or take its `describe_collect()[name]` slice
+                // for a collect stream) and build the descriptor through the
+                // same `_prepare_stream` a `Read`/`Save` stream uses, so it
+                // carries the objects' hints and configuration. Describe
+                // before re-locking, as the Read and Collect paths do.
+                {
+                    let state = self.state.lock().await;
+                    if !state.run_open(&run_key) {
+                        return Err(BsrsError::Plan("DeclareStream with no open run".into()));
+                    }
+                }
+                let stream_objs = self
+                    .describe_stream_objs(&run_key, &stream_name, objs)
+                    .await?;
                 let descriptor = {
                     let mut state = self.state.lock().await;
                     state
                         .bundler_mut(&run_key)
                         .ok_or_else(|| BsrsError::Plan("DeclareStream with no open run".into()))?
-                        .declare_stream(stream_name, StreamObject::from_data_keys(data_keys))
+                        .declare_stream(stream_name, stream_objs)
                 };
                 self.broadcast(&Document::Descriptor(descriptor)).await?;
             }
@@ -2770,6 +2776,56 @@ impl RunEngine {
         Ok(None)
     }
 
+    /// Describe the objects a `DeclareStream` names, each with its hint fields
+    /// and configuration (bluesky `RunBundler.declare_stream`: `_describe_cache`
+    /// / `_describe_collect_cache[obj][stream]` plus `ensure_cached`).
+    async fn describe_stream_objs(
+        &self,
+        run_key: &Option<String>,
+        stream_name: &str,
+        objs: crate::core::msg::StreamObjs,
+    ) -> Result<Vec<StreamObject>> {
+        use crate::core::msg::StreamObjs;
+        let mut out = Vec::new();
+        match objs {
+            StreamObjs::Readable(objs) => {
+                for obj in objs {
+                    let data_keys = obj.describe_dyn().await?;
+                    let configuration = self
+                        .ensure_object_configuration(run_key, obj.name(), obj.as_configurable())
+                        .await?;
+                    out.push(StreamObject {
+                        object: Some(obj.name().to_string()),
+                        data_keys,
+                        hint_fields: obj.hint_fields(),
+                        configuration,
+                    });
+                }
+            }
+            StreamObjs::Collectable(objs) => {
+                for obj in objs {
+                    let mut descs = obj.describe_collect_dyn().await?;
+                    let data_keys = descs.remove(stream_name).ok_or_else(|| {
+                        BsrsError::Plan(format!(
+                            "declare_stream: {} does not collect into stream {stream_name:?}",
+                            obj.name()
+                        ))
+                    })?;
+                    let configuration = self
+                        .ensure_object_configuration(run_key, obj.name(), obj.as_configurable())
+                        .await?;
+                    out.push(StreamObject {
+                        object: Some(obj.name().to_string()),
+                        data_keys,
+                        hint_fields: None,
+                        configuration,
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// The run-cached configuration for object `name`, reading it through
     /// `configurable` on first use (empty when the object is not
     /// configurable). Cache lives on the `RunBundler` (run-scoped); the
@@ -3126,33 +3182,34 @@ impl RunEngine {
             // Declare the interruptions stream upfront when recording
             // is on at OpenRun. Bluesky declares it inside the Bundler
             // open_run path; same effect here.
-            let descriptor = if self.record_interruptions.load(Ordering::SeqCst) {
-                let mut keys = HashMap::new();
-                keys.insert(
-                    "interruption".into(),
-                    crate::event_model::DataKey {
-                        source: "RunEngine".into(),
-                        dtype: crate::event_model::Dtype::String,
-                        shape: vec![],
-                        dtype_numpy: None,
-                        external: None,
-                        units: None,
-                        precision: None,
-                        object_name: None,
-                        dims: None,
-                        limits: None,
-                        choices: None,
-                    },
-                );
-                // No object behind it: bluesky's interruptions descriptor is
-                // composed from a bare data key (run_engine.py:1880).
-                Some(
-                    bundler
-                        .declare_stream("interruptions".into(), StreamObject::from_data_keys(keys)),
-                )
-            } else {
-                None
-            };
+            let descriptor =
+                if self.record_interruptions.load(Ordering::SeqCst) {
+                    let mut keys = HashMap::new();
+                    keys.insert(
+                        "interruption".into(),
+                        crate::event_model::DataKey {
+                            source: "RunEngine".into(),
+                            dtype: crate::event_model::Dtype::String,
+                            shape: vec![],
+                            dtype_numpy: None,
+                            external: None,
+                            units: None,
+                            precision: None,
+                            object_name: None,
+                            dims: None,
+                            limits: None,
+                            choices: None,
+                        },
+                    );
+                    // No object behind it: bluesky's interruptions descriptor is
+                    // composed from a bare data key (run_engine.py:1880).
+                    Some(bundler.declare_stream(
+                        "interruptions".into(),
+                        vec![StreamObject::objectless(keys)],
+                    ))
+                } else {
+                    None
+                };
             state.runs.insert(run_key.clone(), RunSlot::new(bundler));
             descriptor
         };
