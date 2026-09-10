@@ -34,10 +34,10 @@ use crate::core::msg::{
     DynLocation, LocatableObj, MonitorableObj, MovableObj, NamedObj, ReadableObj, StoppableObj,
 };
 use crate::core::reading::ReadingValue;
-use crate::core::status::Status;
+use crate::core::status::{Status, StatusError};
 use crate::core::subscription::Subscription;
 use crate::devices::SignalCache;
-use crate::event_model::{DataKey, Dtype};
+use crate::event_model::DataKey;
 // `SignalBackend` is the trait that provides connect/put/get on the
 // CA backend; pulled in via the `bsrs-protocols-async` dep that
 // the `ca` feature toggles on.
@@ -51,6 +51,7 @@ pub struct CaMotor {
     name: String,
     setpoint: Arc<EpicsCaBackend<f64>>,
     readback: Arc<EpicsCaBackend<f64>>,
+    rbv_pv: String,
     cache: Arc<SignalCache<f64, EpicsCaBackend<f64>>>,
 }
 
@@ -59,12 +60,14 @@ impl CaMotor {
         name: &str,
         setpoint: Arc<EpicsCaBackend<f64>>,
         readback: Arc<EpicsCaBackend<f64>>,
+        rbv_pv: &str,
     ) -> Arc<Self> {
         Arc::new(Self {
             name: name.to_string(),
             setpoint,
             cache: SignalCache::new(readback.clone()),
             readback,
+            rbv_pv: rbv_pv.to_string(),
         })
     }
 
@@ -80,7 +83,7 @@ impl CaMotor {
             sp_for_async.connect(Duration::from_secs(5)).await?;
             rb_for_async.connect(Duration::from_secs(5)).await
         })?;
-        Ok(Self::from_connected(name, sp, rb))
+        Ok(Self::from_connected(name, sp, rb, rbv_pv))
     }
 
     /// Async equivalent — call from inside an existing tokio runtime
@@ -91,7 +94,7 @@ impl CaMotor {
         let rb = Arc::new(EpicsCaBackend::<f64>::new(rbv_pv));
         sp.connect(Duration::from_secs(5)).await?;
         rb.connect(Duration::from_secs(5)).await?;
-        Ok(Self::from_connected(name, sp, rb))
+        Ok(Self::from_connected(name, sp, rb, rbv_pv))
     }
 }
 
@@ -116,24 +119,10 @@ impl ReadableObj for CaMotor {
         Ok(out)
     }
     async fn describe_dyn(&self) -> Result<HashMap<String, DataKey>> {
-        let mut out = HashMap::new();
-        out.insert(
+        Ok(HashMap::from([(
             self.name.clone(),
-            DataKey {
-                source: format!("ca://{}.RBV", self.name),
-                dtype: Dtype::Number,
-                shape: vec![],
-                dtype_numpy: Some("<f8".into()),
-                external: None,
-                units: None,
-                precision: None,
-                object_name: Some(self.name.clone()),
-                dims: None,
-                limits: None,
-                choices: None,
-            },
-        );
-        Ok(out)
+            describe_pv(self.readback.as_ref(), &self.rbv_pv, &self.name).await?,
+        )]))
     }
 }
 
@@ -143,15 +132,14 @@ impl MovableObj for CaMotor {
         // The backend `put` awaits the motor settle (WRITE_NOTIFY). The
         // 30 s move-timeout lives here, at the device layer (CP-11), not
         // in the backend's channel-ensure step.
-        match tokio::time::timeout(Duration::from_secs(30), self.setpoint.put(Some(value))).await {
-            Ok(Ok(())) => Status::done(),
-            Ok(Err(e)) => Status::fail(crate::core::status::StatusError::Failed(format!(
-                "ca_motor set: {e}"
-            ))),
-            Err(_) => Status::fail(crate::core::status::StatusError::Failed(
-                "ca_motor set: timed out after 30s".into(),
-            )),
-        }
+        let setpoint = self.setpoint.clone();
+        move_status(async move {
+            match tokio::time::timeout(Duration::from_secs(30), setpoint.put(Some(value))).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(format!("ca_motor set: {e}")),
+                Err(_) => Err("ca_motor set: timed out after 30s".into()),
+            }
+        })
     }
 }
 
@@ -307,24 +295,10 @@ impl ReadableObj for CaPositioner {
         Ok(out)
     }
     async fn describe_dyn(&self) -> Result<HashMap<String, DataKey>> {
-        let mut out = HashMap::new();
-        out.insert(
+        Ok(HashMap::from([(
             self.name.clone(),
-            DataKey {
-                source: format!("ca://{}", self.rbv_pv),
-                dtype: Dtype::Number,
-                shape: vec![],
-                dtype_numpy: Some("<f8".into()),
-                external: None,
-                units: None,
-                precision: None,
-                object_name: Some(self.name.clone()),
-                dims: None,
-                limits: None,
-                choices: None,
-            },
-        );
-        Ok(out)
+            describe_pv(self.readback.as_ref(), &self.rbv_pv, &self.name).await?,
+        )]))
     }
 }
 
@@ -335,31 +309,34 @@ impl MovableObj for CaPositioner {
         // put AND the done-PV wait. Done values come from int-ish
         // records (bi/bo/mbbi), so exact f64 equality is the intended
         // comparison.
-        let wait = async {
-            self.setpoint
-                .put(Some(value))
-                .await
-                .map_err(|e| format!("ca_positioner set: {e}"))?;
-            loop {
-                let v = self
-                    .done
-                    .get_value()
+        let setpoint = self.setpoint.clone();
+        let done = self.done.clone();
+        let done_pv = self.done_pv.clone();
+        let done_value = self.done_value;
+        move_status(async move {
+            let wait = async {
+                setpoint
+                    .put(Some(value))
                     .await
-                    .map_err(|e| format!("ca_positioner done read: {e}"))?;
-                if v == self.done_value {
-                    return Ok(());
+                    .map_err(|e| format!("ca_positioner set: {e}"))?;
+                loop {
+                    let v = done
+                        .get_value()
+                        .await
+                        .map_err(|e| format!("ca_positioner done read: {e}"))?;
+                    if v == done_value {
+                        return Ok(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+            };
+            match tokio::time::timeout(Duration::from_secs(30), wait).await {
+                Ok(r) => r,
+                Err(_) => Err(format!(
+                    "ca_positioner set: done PV {done_pv} did not reach {done_value} within 30s"
+                )),
             }
-        };
-        match tokio::time::timeout(Duration::from_secs(30), wait).await {
-            Ok(Ok(())) => Status::done(),
-            Ok(Err(e)) => Status::fail(crate::core::status::StatusError::Failed(e)),
-            Err(_) => Status::fail(crate::core::status::StatusError::Failed(format!(
-                "ca_positioner set: done PV {} did not reach {} within 30s",
-                self.done_pv, self.done_value
-            ))),
-        }
+        })
     }
 }
 
@@ -396,16 +373,18 @@ impl MonitorableObj for CaPositioner {
 pub struct CaDetector {
     name: String,
     value: Arc<EpicsCaBackend<f64>>,
+    value_pv: String,
     cache: Arc<SignalCache<f64, EpicsCaBackend<f64>>>,
     seen: AtomicI64,
 }
 
 impl CaDetector {
-    fn from_connected(name: &str, value: Arc<EpicsCaBackend<f64>>) -> Arc<Self> {
+    fn from_connected(name: &str, value: Arc<EpicsCaBackend<f64>>, value_pv: &str) -> Arc<Self> {
         Arc::new(Self {
             name: name.to_string(),
             cache: SignalCache::new(value.clone()),
             value,
+            value_pv: value_pv.to_string(),
             seen: AtomicI64::new(0),
         })
     }
@@ -416,7 +395,7 @@ impl CaDetector {
         let v_for_async = v.clone();
         crate::core::runtime::bsrs_runtime()
             .block_on(async move { v_for_async.connect(Duration::from_secs(5)).await })?;
-        Ok(Self::from_connected(name, v))
+        Ok(Self::from_connected(name, v, value_pv))
     }
 
     /// Async equivalent of `connect_blocking` — for callers
@@ -424,7 +403,7 @@ impl CaDetector {
     pub async fn connect_async(name: &str, value_pv: &str) -> Result<Arc<Self>> {
         let v = Arc::new(EpicsCaBackend::<f64>::new(value_pv));
         v.connect(Duration::from_secs(5)).await?;
-        Ok(Self::from_connected(name, v))
+        Ok(Self::from_connected(name, v, value_pv))
     }
 }
 
@@ -451,24 +430,10 @@ impl ReadableObj for CaDetector {
         Ok(out)
     }
     async fn describe_dyn(&self) -> Result<HashMap<String, DataKey>> {
-        let mut out = HashMap::new();
-        out.insert(
+        Ok(HashMap::from([(
             self.name.clone(),
-            DataKey {
-                source: format!("ca://{}", self.name),
-                dtype: Dtype::Number,
-                shape: vec![],
-                dtype_numpy: Some("<f8".into()),
-                external: None,
-                units: None,
-                precision: None,
-                object_name: Some(self.name.clone()),
-                dims: None,
-                limits: None,
-                choices: None,
-            },
-        );
-        Ok(out)
+            describe_pv(self.value.as_ref(), &self.value_pv, &self.name).await?,
+        )]))
     }
 }
 
@@ -478,6 +443,39 @@ impl MonitorableObj for CaDetector {
         let (rx, token) = self.cache.add_listener();
         Ok(Subscription::new(rx, token, self.name.clone()))
     }
+}
+
+/// The data key of one `f64` PV as `object_name` reports it: the backend's
+/// `get_datakey` reads DBR_CTRL for `units`, `precision` and the limit
+/// ranges — what ophyd's `EpicsSignal.describe()` carries — and sources it
+/// as `ca://<pv>`.
+async fn describe_pv(
+    backend: &EpicsCaBackend<f64>,
+    pv: &str,
+    object_name: &str,
+) -> Result<DataKey> {
+    let mut key = backend.get_datakey(pv).await?;
+    key.object_name = Some(object_name.to_string());
+    Ok(key)
+}
+
+/// Run `mv` behind a pending [`Status`] and return the status at once. The
+/// engine's `Set` handler awaits `set_dyn` before it moves on to the next
+/// message, so a `set_dyn` that awaited the move itself would serialize a
+/// multi-axis `mv`; bluesky's `set()` returns its status immediately and the
+/// motion completes it.
+fn move_status<F>(mv: F) -> Status
+where
+    F: std::future::Future<Output = std::result::Result<(), String>> + Send + 'static,
+{
+    let (status, setter) = Status::new();
+    tokio::spawn(async move {
+        match mv.await {
+            Ok(()) => setter.success(),
+            Err(e) => setter.fail(StatusError::Failed(e)),
+        }
+    });
+    status
 }
 
 /// Bootstrap the CA backend's global client. Must be called from a
