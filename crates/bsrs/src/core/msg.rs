@@ -3,6 +3,7 @@
 //! See `bluesky/src/bluesky/run_engine.py:_command_registry` for the reference
 //! command set.
 
+use crate::core::error::Interrupt;
 use futures::future::BoxFuture;
 use serde_json::Value;
 use std::any::Any;
@@ -41,14 +42,38 @@ pub struct ConfigureArgs {
 pub type AwaitableFactory =
     Arc<dyn Fn() -> BoxFuture<'static, crate::core::error::Result<()>> + Send + Sync>;
 
-/// Error sink for a [`Msg::PushContingency`] region. While a run has one of
-/// these on its contingency stack, the engine routes a message error into the
-/// innermost sink (as its `Display` string) and keeps running, instead of
-/// failing the run — letting the plan-level `contingency_wrapper` observe the
-/// error, run its `except`/`finally` recovery, and choose whether to re-raise
-/// (via [`Msg::Fail`]). Mirrors how bluesky's generator plans catch an engine
-/// error at the `yield` point.
-pub type ContingencySink = Arc<std::sync::Mutex<Option<String>>>;
+/// What the engine threw into the plan at a `yield`: the value a
+/// `contingency_wrapper` finds in its [`ContingencySink`] right after the
+/// message it forwarded, and re-raises with [`Msg::Raise`] once its
+/// `except`/`finally` plans have run — bluesky's exception object,
+/// propagating frame by frame up the plan stack.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Thrown {
+    /// A message handler failed; the text is the error's `Display`.
+    Error(String),
+    /// A `stop`/`abort` request (`RequestStop`/`RequestAbort`), with the
+    /// caller's reason — `abort(reason)`; `stop` carries none.
+    Interrupt(Interrupt, Option<String>),
+}
+
+impl From<Thrown> for crate::core::error::BsrsError {
+    /// The error a [`Msg::Raise`] hands the run loop: an error re-raised as a
+    /// plan error carrying its text, an interrupt as `Interrupted`.
+    fn from(thrown: Thrown) -> Self {
+        match thrown {
+            Thrown::Error(text) => Self::Plan(text),
+            Thrown::Interrupt(kind, _) => Self::Interrupted(kind),
+        }
+    }
+}
+
+/// Sink of a [`Msg::PushContingency`] region. While a run has one on its
+/// contingency stack, a message error or a `stop`/`abort` request is thrown
+/// into the innermost sink and the run keeps going, instead of ending at once
+/// — so the `contingency_wrapper` that owns the sink can run its
+/// `except`/`finally` plans and re-raise with [`Msg::Raise`]. Mirrors how a
+/// bluesky generator plan catches an exception at its `yield`.
+pub type ContingencySink = Arc<std::sync::Mutex<Option<Thrown>>>;
 
 /// The complete set of commands that plans can issue. Closed enum + `Custom`.
 #[non_exhaustive]
@@ -275,6 +300,12 @@ pub enum Msg {
     /// panicking the async task.
     Fail(String),
 
+    /// Re-raise what a contingency region caught, once its `except`/`finally`
+    /// plans have run: the engine throws it into the next enclosing region, or
+    /// ends the run with it — `fail` for an error, the interrupt's exit status
+    /// for a `stop`/`abort`. Emitted only by `contingency_wrapper`.
+    Raise(Thrown),
+
     /// Resume after a deferred pause / suspend.
     Resume,
 
@@ -389,6 +420,7 @@ impl Msg {
                 | Msg::Subscribe { .. }
                 | Msg::Unsubscribe(_)
                 | Msg::Fail(_)
+                | Msg::Raise(_)
                 | Msg::PushContingency(_)
                 | Msg::PopContingency
                 | Msg::Null
@@ -520,6 +552,7 @@ impl Clone for Msg {
             },
             Msg::Unsubscribe(id) => Msg::Unsubscribe(*id),
             Msg::Fail(reason) => Msg::Fail(reason.clone()),
+            Msg::Raise(thrown) => Msg::Raise(thrown.clone()),
             Msg::Resume => Msg::Resume,
             Msg::InstallSuspender { id, suspender } => Msg::InstallSuspender {
                 id: *id,
@@ -578,6 +611,7 @@ impl std::fmt::Debug for Msg {
             Msg::Subscribe { filter, .. } => write!(f, "Subscribe(<cb>, {filter:?})"),
             Msg::Unsubscribe(id) => write!(f, "Unsubscribe({id})"),
             Msg::Fail(reason) => write!(f, "Fail({reason:?})"),
+            Msg::Raise(thrown) => write!(f, "Raise({thrown:?})"),
             Msg::Resume => write!(f, "Resume"),
             Msg::InstallSuspender { id, .. } => write!(f, "InstallSuspender({id})"),
             Msg::RemoveSuspender { id } => write!(f, "RemoveSuspender({id})"),

@@ -2714,7 +2714,7 @@ async fn trigger_and_read_read_error_is_catchable_by_outer_contingency() {
     );
     let caught = bsrs::plans::preprocessors::contingency_wrapper(
         inner,
-        Some(bsrs::plans::stubs::null()),
+        Some(Box::new(|_| bsrs::plans::stubs::null())),
         None,
         None,
         false, // swallow the read fault

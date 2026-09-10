@@ -5,7 +5,7 @@
 
 use crate::core::msg::{
     CollectableObj, FlyableObj, LocatableObj, MonitorableObj, Msg, ReadableObj, RunMetadata,
-    StageableObj,
+    StageableObj, Thrown,
 };
 use crate::core::plan::{plan_items, Plan, PlanItem};
 use futures::StreamExt;
@@ -15,12 +15,17 @@ use std::sync::{Arc, Mutex};
 
 /// Drain a `Plan` stream into a Vec of messages. Useful when a wrapper
 /// needs random access (e.g. `relative_set_wrapper` rewrites Set values).
+/// The contingency bookkeeping a `finalize_wrapper`/`contingency_wrapper`
+/// emits (`PushContingency`/`PopContingency`) is dropped: it never reaches a
+/// device, and the sequences asserted on are the device-facing ones.
 #[allow(dead_code)]
 async fn drain(mut plan: Plan) -> Vec<Msg> {
     let mut out = Vec::new();
     while let Some(item) = plan.next().await {
         let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
-        out.push(m);
+        if !matches!(m, Msg::PushContingency(_) | Msg::PopContingency) {
+            out.push(m);
+        }
     }
     out
 }
@@ -79,18 +84,33 @@ pub fn pchain(plans: Vec<Plan>) -> Plan {
     })
 }
 
-/// `run_wrapper(plan, md)` — bookend `plan` with `OpenRun(md)` and
-/// `CloseRun("success")`. If the inner plan already has its own
-/// open/close (e.g. it was the body of a higher-level plan), this will
-/// emit nested run messages — caller's responsibility.
+/// `run_wrapper(plan, md)` — enclose `plan` in `OpenRun`/`CloseRun`. Ports
+/// bluesky's `run_wrapper` (preprocessors.py:352): the close is issued from a
+/// [`contingency_wrapper`], so a plan that errors closes its run `fail` with
+/// the error as reason, and one interrupted by `stop`/`abort` closes it with
+/// the interrupt's exit status — before any enclosing `finalize_wrapper`
+/// cleanup runs, and with the error or interrupt still propagating after.
+/// (bluesky's `close_run(exit_status=e.exit_status)` leaves the reason empty
+/// on an interrupt; bsrs threads the caller's `abort(reason)` onto it.)
 pub fn run_wrapper(inner: Plan, md: RunMetadata) -> Plan {
     plan_items(async_stream::stream! {
         yield PlanItem::from(Msg::OpenRun(md));
-        let mut inner = inner;
-        while let Some(item) = inner.next().await {
+        let except: ExceptPlan = Box::new(|thrown| {
+            let (exit_status, reason) = match thrown {
+                Thrown::Error(text) => ("fail".to_string(), Some(text)),
+                Thrown::Interrupt(kind, reason) => (kind.exit_status().to_string(), reason),
+            };
+            plan_items(async_stream::stream! {
+                yield PlanItem::from(Msg::CloseRun { exit_status, reason });
+            })
+        });
+        let close = plan_items(async_stream::stream! {
+            yield PlanItem::from(Msg::CloseRun { exit_status: "success".into(), reason: None });
+        });
+        let mut guarded = contingency_wrapper(inner, Some(except), Some(close), None, true);
+        while let Some(item) = guarded.next().await {
             yield item;
         }
-        yield PlanItem::from(Msg::CloseRun { exit_status: "success".into(), reason: None });
     })
 }
 
@@ -108,17 +128,20 @@ pub fn inject_md_wrapper(inner: Plan, md_extra: HashMap<String, Value>) -> Plan 
     })
 }
 
-/// `rewindable_wrapper(plan, on)` — wrap `plan` with a `Rewindable(on)`
-/// at the start and `Rewindable(prev)` at the end. The "previous" state
-/// is unknown to the wrapper so we restore to `true` (the default).
+/// `rewindable_wrapper(plan, on)` — `Rewindable(on)` before `plan`, and
+/// `Rewindable(true)` after it whatever way it ends: bluesky restores the
+/// captured previous state through `finalize_wrapper` (preprocessors.py:748).
+/// The previous state is unknown to this wrapper, so it restores the default.
 pub fn rewindable_wrapper(inner: Plan, on: bool) -> Plan {
+    let restore = plan_items(async_stream::stream! {
+        yield PlanItem::from(Msg::Rewindable(true));
+    });
     plan_items(async_stream::stream! {
         yield PlanItem::from(Msg::Rewindable(on));
-        let mut inner = inner;
-        while let Some(item) = inner.next().await {
+        let mut guarded = finalize_wrapper(inner, restore);
+        while let Some(item) = guarded.next().await {
             yield item;
         }
-        yield PlanItem::from(Msg::Rewindable(true));
     })
 }
 
@@ -196,9 +219,13 @@ pub fn monitor_during_wrapper(inner: Plan, signals: Vec<Arc<dyn MonitorableObj>>
 }
 
 /// `stage_wrapper(plan, devices)` — `Stage` each device before the inner
-/// plan, `Unstage` (LIFO) after. Same envelope contract as bluesky.
+/// plan, `Unstage` (LIFO) after it whatever way it ends: bluesky composes the
+/// unstage through `finalize_wrapper` (preprocessors.py:1014), so an aborted
+/// or failed plan unstages from inside the plan, before any enclosing
+/// cleanup, rather than leaving it to the engine's run-end teardown.
 pub fn stage_wrapper(inner: Plan, devices: Vec<Arc<dyn StageableObj>>) -> Plan {
-    plan_items(async_stream::stream! {
+    let unstage_devices = devices.clone();
+    let staged = plan_items(async_stream::stream! {
         for d in &devices {
             yield PlanItem::from(Msg::Stage(d.clone()));
         }
@@ -206,10 +233,13 @@ pub fn stage_wrapper(inner: Plan, devices: Vec<Arc<dyn StageableObj>>) -> Plan {
         while let Some(item) = inner.next().await {
             yield item;
         }
-        for d in devices.into_iter().rev() {
+    });
+    let unstage = plan_items(async_stream::stream! {
+        for d in unstage_devices.into_iter().rev() {
             yield PlanItem::from(Msg::Unstage(d));
         }
-    })
+    });
+    finalize_wrapper(staged, unstage)
 }
 
 /// `baseline_wrapper(plan, devices, name)` — reads each device once into the
@@ -248,20 +278,13 @@ pub fn baseline_wrapper(
 }
 
 /// `finalize_wrapper(plan, final_plan)` — run `final_plan` after `plan`
-/// regardless of outcome. (This is a *plan-level* bracket; it does not
-/// catch panics or engine-side aborts on its own. The engine's own
-/// cleanup chain — unstage / stop_movables — runs separately.)
+/// whatever way it ends: normal completion, a message error, or a `stop`/
+/// `abort` the engine threw into the plan — Python's `try`/`finally`
+/// (preprocessors.py:509). The error or interrupt keeps propagating once
+/// `final_plan` has run. Only `halt` skips it: the engine drops the plan, as
+/// `PlanHalt` (a `GeneratorExit`) lets no cleanup yield.
 pub fn finalize_wrapper(inner: Plan, final_plan: Plan) -> Plan {
-    plan_items(async_stream::stream! {
-        let mut inner = inner;
-        while let Some(item) = inner.next().await {
-            yield item;
-        }
-        let mut fin = final_plan;
-        while let Some(item) = fin.next().await {
-            yield item;
-        }
-    })
+    contingency_wrapper(inner, None, None, Some(final_plan), true)
 }
 
 /// `subs_wrapper(plan, subs)` — prepend a setup sequence that registers
@@ -351,21 +374,24 @@ pub fn print_summary_wrapper(inner: Plan) -> Plan {
 }
 
 /// `suspend_wrapper(plan, suspender)` — install `suspender` for the
-/// duration of `plan`, remove on exit. Mirrors bluesky's
-/// `suspend_wrapper`.
+/// duration of `plan`, remove on exit whatever way the plan ends: bluesky
+/// composes the removal through `finalize_wrapper` (preprocessors.py:461).
 pub fn suspend_wrapper(inner: Plan, suspender: Arc<dyn crate::core::Suspender>) -> Plan {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(1);
     let id = SEQ.fetch_add(1, Ordering::Relaxed);
-    plan_items(async_stream::stream! {
+    let installed = plan_items(async_stream::stream! {
         let any: Arc<dyn std::any::Any + Send + Sync> = Arc::new(suspender.clone());
         yield PlanItem::from(Msg::InstallSuspender { id, suspender: any });
         let mut inner = inner;
         while let Some(item) = inner.next().await {
             yield item;
         }
+    });
+    let remove = plan_items(async_stream::stream! {
         yield PlanItem::from(Msg::RemoveSuspender { id });
-    })
+    });
+    finalize_wrapper(installed, remove)
 }
 
 /// `fly_during_wrapper(plan, flyers)` — `Kickoff` each `(flyer, collectable)`
@@ -428,39 +454,41 @@ pub fn fly_during_wrapper(
     )
 }
 
+/// The `except_plan` of a [`contingency_wrapper`]: builds the recovery plan
+/// from what was thrown, as bluesky's `except_plan(e)` receives the exception.
+pub type ExceptPlan = Box<dyn FnOnce(Thrown) -> Plan + Send + 'static>;
+
 /// `contingency_wrapper(plan, except_plan, else_plan, final_plan, auto_raise)`
 /// — bluesky's full try/except/else/finally plan bracket
-/// (preprocessors.py:508). Unlike [`finalize_wrapper`] (a pure stream bracket
-/// that only appends `final_plan` when `plan` completes normally), this observes
-/// a message *error* mid-plan and branches on it:
+/// (preprocessors.py:572). It observes what the engine throws into the plan
+/// at a `yield` — a message error, or a `stop`/`abort` request (bluesky's
+/// `RequestStop`/`RequestAbort`, both `Exception`s) — and branches on it:
 ///
-/// - `except_plan` runs when a message in `plan` errored. After it runs, the
-///   original error is re-raised iff `auto_raise` (bluesky's default `True`),
-///   so the run still fails; `auto_raise = false` swallows the error and the
-///   run continues. A `None` `except_plan` re-raises unconditionally.
-/// - `else_plan` runs when `plan` completed with no error.
+/// - `except_plan(thrown)` runs when something was thrown. After it runs, the
+///   value is re-raised iff `auto_raise` (bluesky's default `True`), so the
+///   run still fails or the interrupt still ends it; `auto_raise = false`
+///   swallows it and the run continues. A `None` `except_plan` re-raises
+///   unconditionally.
+/// - `else_plan` runs when `plan` completed with nothing thrown.
 /// - `final_plan` runs on both paths, before any re-raise propagates — matching
 ///   Python `finally` executing before the exception leaves the block.
 ///
-/// The error observation is powered by the engine's contingency stack: this
-/// wrapper pushes an error sink ([`Msg::PushContingency`]) around `plan`, so a
-/// message error is routed into the sink (and the run kept alive) instead of
-/// failing immediately; the wrapper reads the sink right after forwarding the
-/// offending message. `except`/`else`/`final` run *outside* this wrapper's own
-/// contingency (it pops first), so an error in them propagates outward.
+/// The observation is powered by the engine's contingency stack: this wrapper
+/// pushes a sink ([`Msg::PushContingency`]) around `plan`, so a message error
+/// or an interrupt is written into the innermost sink (and the run kept alive)
+/// instead of ending the run at once; the wrapper reads the sink right after
+/// forwarding the message it landed on. `except`/`else`/`final` run *outside*
+/// this wrapper's own region (it pops first), so a value thrown during them
+/// propagates outward. The re-raise is [`Msg::Raise`], which the engine throws
+/// into the next enclosing region or ends the run with — `fail` for an error,
+/// the interrupt's exit status for a `stop`/`abort`.
 ///
-/// Deviation from bluesky: `except_plan` is a pre-built `Plan`, not a function
-/// of the exception — bsrs surfaces the error only as a reason string, threaded
-/// onto the re-raised [`Msg::Fail`]. Recovery plans that only need to clean up
-/// (e.g. `drop`) do not need the value.
-///
-/// Engine-teardown paths (abort/halt dropping the plan future) are bsrs's
-/// analogue of `GeneratorExit`: the wrapper's future is dropped, so nothing
-/// after the suspended `yield` runs — `final_plan` is skipped, matching
-/// bluesky's `cleanup = False` branch.
+/// `halt` is not thrown: the engine drops the plan, so nothing after the
+/// suspended `yield` runs and `final_plan` is skipped — bluesky's
+/// `GeneratorExit` branch (`cleanup = False`).
 pub fn contingency_wrapper(
     inner: Plan,
-    except_plan: Option<Plan>,
+    except_plan: Option<ExceptPlan>,
     else_plan: Option<Plan>,
     final_plan: Option<Plan>,
     auto_raise: bool,
@@ -469,38 +497,38 @@ pub fn contingency_wrapper(
         let sink: crate::core::msg::ContingencySink = Arc::new(Mutex::new(None));
         yield PlanItem::from(Msg::PushContingency(sink.clone()));
 
-        // try: forward `inner`. A message error under this contingency is
-        // written into `sink` by the engine (which keeps running); we detect it
-        // right after forwarding the offending message.
-        let mut errored: Option<String> = None;
+        // try: forward `inner`. What the engine throws under this region is
+        // written into `sink` (and the run keeps going); we find it right after
+        // forwarding the message it landed on.
+        let mut thrown: Option<Thrown> = None;
         let mut inner = inner;
         while let Some(item) = inner.next().await {
             yield item;
-            if let Some(e) = sink.lock().unwrap().take() {
-                errored = Some(e);
+            if let Some(t) = sink.lock().unwrap().take() {
+                thrown = Some(t);
                 break;
             }
         }
 
-        // Leave our contingency region before running recovery, so an error in
+        // Leave our region before running recovery, so a value thrown during
         // the except/else/finally plans propagates outward (to an enclosing
-        // contingency, or fails the run) rather than looping back into us.
+        // region, or ends the run) rather than looping back into us.
         yield PlanItem::from(Msg::PopContingency);
 
         // except / else — mutually exclusive.
-        let mut reraise: Option<String> = None;
-        match errored {
-            Some(reason) => match except_plan {
-                Some(ep) => {
-                    let mut ep = ep;
+        let mut reraise: Option<Thrown> = None;
+        match thrown {
+            Some(t) => match except_plan {
+                Some(build) => {
+                    let mut ep = build(t.clone());
                     while let Some(item) = ep.next().await {
                         yield item;
                     }
                     if auto_raise {
-                        reraise = Some(reason);
+                        reraise = Some(t);
                     }
                 }
-                None => reraise = Some(reason),
+                None => reraise = Some(t),
             },
             None => {
                 if let Some(ep) = else_plan {
@@ -520,33 +548,36 @@ pub fn contingency_wrapper(
             }
         }
 
-        if let Some(reason) = reraise {
-            yield PlanItem::from(Msg::Fail(reason));
+        if let Some(t) = reraise {
+            yield PlanItem::from(Msg::Raise(t));
         }
     })
 }
 
+/// The motors a `reset_positions_wrapper` moved, each with the setpoint to
+/// restore, in first-moved order.
+type MovedPositions = Vec<(Arc<dyn crate::core::msg::MovableObj>, f64)>;
+
 /// `reset_positions_wrapper(plan, motors)` — capture each motor's position
-/// *lazily* at its **first** `Set`, run the inner plan, then issue `mv` back to
-/// the captured position for each motor that was actually moved, in first-moved
-/// order. Mirrors bluesky's `reset_positions_wrapper`, whose `insert_reads`
-/// populates an `OrderedDict` at the first set per motor
+/// *lazily* at its **first** `Set`, run the inner plan, then `mv` each moved
+/// motor back to its captured position, in first-moved order — whatever way
+/// the plan ends. Mirrors bluesky's `reset_positions_wrapper`, whose
+/// `insert_reads` populates an `OrderedDict` at the first set per motor
 /// (preprocessors.py:1177-1189) and whose `reset()` replays those positions in
-/// insertion order (preprocessors.py:1191-1197). Eager capture at wrapper entry
-/// diverged twice: it restored *every* listed motor even if the plan never moved
-/// it, and it snapshotted at entry rather than at the moment of first motion.
-///
-/// The trailing reset runs only when the inner stream completes normally; the
-/// engine's one-way plan stream cannot deliver an abort back into this wrapper,
-/// so an engine-side abort skips the reset (unlike bluesky's `finalize_wrapper`
-/// composition). That gap is a property of the stream model, not this capture.
+/// insertion order from a `finalize_wrapper` (preprocessors.py:1200), so an
+/// aborted plan still restores what it moved. Eager capture at wrapper entry
+/// diverged twice: it restored *every* listed motor even if the plan never
+/// moved it, and it snapshotted at entry rather than at the moment of first
+/// motion.
 pub fn reset_positions_wrapper(inner: Plan, motors: Vec<Arc<dyn LocatableObj>>) -> Plan {
-    plan_items(async_stream::stream! {
+    // Positions to restore, captured lazily at first `Set`, in first-moved
+    // order; shared with the reset plan, which reads them once `inner` ends.
+    let initial: Arc<Mutex<MovedPositions>> = Arc::new(Mutex::new(Vec::new()));
+    let captured = initial.clone();
+    let watched = plan_items(async_stream::stream! {
         let by_name: HashMap<String, Arc<dyn LocatableObj>> =
             motors.iter().map(|m| (m.name().to_string(), m.clone())).collect();
-        // Positions to restore, captured lazily at first `Set`, in first-moved
-        // order. `seen` gates the one-shot capture per eligible motor.
-        let mut initial: Vec<(Arc<dyn crate::core::msg::MovableObj>, f64)> = Vec::new();
+        // `seen` gates the one-shot capture per eligible motor.
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut inner = inner;
         while let Some(item) = inner.next().await {
@@ -556,7 +587,7 @@ pub fn reset_positions_wrapper(inner: Plan, motors: Vec<Arc<dyn LocatableObj>>) 
                         .get(obj.name())
                         .expect("guard ensures the motor is eligible");
                     if let Ok(loc) = motor.locate_dyn().await {
-                        initial.push((
+                        captured.lock().unwrap().push((
                             motor.clone() as Arc<dyn crate::core::msg::MovableObj>,
                             loc.setpoint,
                         ));
@@ -565,11 +596,15 @@ pub fn reset_positions_wrapper(inner: Plan, motors: Vec<Arc<dyn LocatableObj>>) 
             }
             yield item;
         }
-        for (mv_obj, val) in initial {
+    });
+    let reset = plan_items(async_stream::stream! {
+        let moved = std::mem::take(&mut *initial.lock().unwrap());
+        for (mv_obj, val) in moved {
             yield PlanItem::from(Msg::Set { obj: mv_obj, value: val, group: Some("reset".into()) });
         }
         yield PlanItem::from(Msg::Wait { group: "reset".into(), error_on_timeout: true, timeout: None });
-    })
+    });
+    finalize_wrapper(watched, reset)
 }
 
 /// `configure_count_time_wrapper(plan, time, detectors)` — yields a
@@ -607,18 +642,21 @@ pub fn configure_count_time_wrapper(
 /// `lazily_stage_wrapper(plan, devices)` — stage each device on its
 /// **first** `Read` / `Set` / `Trigger` / `Configure` reference instead
 /// of upfront. Devices that the inner plan never touches are not staged
-/// (and not unstaged). At the end of the inner plan, unstage everything
-/// that was lazily staged, in LIFO order.
+/// (and not unstaged). Once the inner plan ends — whatever way — unstage
+/// everything that was lazily staged, in LIFO order.
 ///
-/// Mirrors `bluesky.preprocessors.lazily_stage_wrapper`. Useful for
-/// generic plans where the device list is large but the actual touch
-/// set per run is sparse.
+/// Mirrors `bluesky.preprocessors.lazily_stage_wrapper`, whose unstage runs
+/// from a `finalize_wrapper` (preprocessors.py:977). Useful for generic plans
+/// where the device list is large but the actual touch set per run is sparse.
 pub fn lazily_stage_wrapper(inner: Plan, devices: Vec<Arc<dyn StageableObj>>) -> Plan {
     use std::collections::HashSet;
-    plan_items(async_stream::stream! {
+    // Devices staged so far, in stage order; shared with the unstage plan,
+    // which drains them once `inner` ends.
+    let staged: Arc<Mutex<Vec<Arc<dyn StageableObj>>>> = Arc::new(Mutex::new(Vec::new()));
+    let staging = staged.clone();
+    let watched = plan_items(async_stream::stream! {
         let by_name: HashMap<String, Arc<dyn StageableObj>> =
             devices.into_iter().map(|d| (d.name().to_string(), d)).collect();
-        let mut staged: Vec<Arc<dyn StageableObj>> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         let mut inner = inner;
         while let Some(item) = inner.next().await {
@@ -633,16 +671,20 @@ pub fn lazily_stage_wrapper(inner: Plan, devices: Vec<Arc<dyn StageableObj>>) ->
                 if seen.insert(name.to_string()) {
                     if let Some(d) = by_name.get(name) {
                         yield PlanItem::from(Msg::Stage(d.clone()));
-                        staged.push(d.clone());
+                        staging.lock().unwrap().push(d.clone());
                     }
                 }
             }
             yield item;
         }
+    });
+    let unstage = plan_items(async_stream::stream! {
+        let staged = std::mem::take(&mut *staged.lock().unwrap());
         for d in staged.into_iter().rev() {
             yield PlanItem::from(Msg::Unstage(d));
         }
-    })
+    });
+    finalize_wrapper(watched, unstage)
 }
 
 /// `set_run_key_wrapper(plan, run_key)` — for every `OpenRun` the inner

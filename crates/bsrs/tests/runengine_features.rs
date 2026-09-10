@@ -2794,6 +2794,11 @@ fn bump_plan(counter: Arc<AtomicUsize>) -> Plan {
     })
 }
 
+/// `bump_plan` as a `contingency_wrapper` except-plan (ignores what was thrown).
+fn bump_except(counter: Arc<AtomicUsize>) -> bsrs::plans::preprocessors::ExceptPlan {
+    Box::new(move |_| bump_plan(counter))
+}
+
 /// A plan that always errors when the engine runs it.
 fn boom_plan() -> Plan {
     plan_box(async_stream::stream! {
@@ -2822,7 +2827,7 @@ async fn contingency_wrapper_runs_except_and_finally_then_reraises_on_error() {
 
     let guarded = bsrs::plans::preprocessors::contingency_wrapper(
         boom_plan(),
-        Some(bump_plan(except_ran.clone())),
+        Some(bump_except(except_ran.clone())),
         Some(bump_plan(else_ran.clone())),
         Some(bump_plan(final_ran.clone())),
         true,
@@ -2850,7 +2855,7 @@ async fn contingency_wrapper_runs_else_and_finally_on_success() {
     let inner = plan_box(async_stream::stream! { yield Msg::Null; });
     let guarded = bsrs::plans::preprocessors::contingency_wrapper(
         inner,
-        Some(bump_plan(except_ran.clone())),
+        Some(bump_except(except_ran.clone())),
         Some(bump_plan(else_ran.clone())),
         Some(bump_plan(final_ran.clone())),
         true,
@@ -2874,7 +2879,7 @@ async fn contingency_wrapper_auto_raise_false_swallows_error() {
 
     let guarded = bsrs::plans::preprocessors::contingency_wrapper(
         boom_plan(),
-        Some(bump_plan(except_ran.clone())),
+        Some(bump_except(except_ran.clone())),
         None,
         None,
         false, // swallow: do not re-raise after except
@@ -3244,4 +3249,323 @@ async fn abort_during_sleep_exits_abort() {
 async fn halt_during_sleep_exits_halt() {
     let r = interrupt_during_sleep(|re| re.halt("user halt")).await;
     assert_eq!(r.exit_status, "halt");
+}
+
+// ---------------------------------------------------------------------------
+// `stop`/`abort` are thrown into the plan (bluesky `RequestStop`/`RequestAbort`
+// thrown at the generator's `yield`), so `finalize_wrapper`/`contingency_wrapper`
+// cleanup runs and the run closes with the interrupt's status once it
+// propagates out; `halt` drops the plan (`PlanHalt`, no cleanup yields).
+// ---------------------------------------------------------------------------
+
+/// A one-message plan that appends `step` to `log` when the engine processes it.
+fn note_plan(log: Arc<StdMutex<Vec<&'static str>>>, step: &'static str) -> Plan {
+    plan_box(async_stream::stream! {
+        let log = log.clone();
+        let factory: bsrs::core::msg::AwaitableFactory = Arc::new(move || {
+            let log = log.clone();
+            Box::pin(async move {
+                log.lock().unwrap().push(step);
+                Ok(())
+            })
+        });
+        yield Msg::WaitFor { factories: vec![factory], timeout: None };
+    })
+}
+
+/// A run whose body parks in a 30 s `Sleep`: `OpenRun`, `Sleep`, `CloseRun`.
+fn sleeping_run() -> Plan {
+    plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Sleep(Duration::from_secs(30));
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    })
+}
+
+/// Run `plan`, fire `interrupt` once the engine is parked inside a handler,
+/// and return the result.
+async fn interrupt_running(
+    plan: Plan,
+    interrupt: impl FnOnce(&RunEngine) + Send + 'static,
+) -> bsrs::engine::RunResult {
+    let re = Arc::new(RunEngine::new(vec![]));
+    let re2 = re.clone();
+    let run = tokio::spawn(async move { re2.run_async(plan).await });
+    while re.state() != EngineRunState::Running {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    interrupt(&re);
+    tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("run hung after interrupt")
+        .expect("join failed")
+        .expect("run errored")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abort_runs_finalize_cleanup_then_exits_abort() {
+    let log = Arc::new(StdMutex::new(Vec::new()));
+    let plan = bsrs::plans::preprocessors::finalize_wrapper(
+        sleeping_run(),
+        note_plan(log.clone(), "cleanup"),
+    );
+    let r = interrupt_running(plan, |re| re.abort("user abort")).await;
+    assert_eq!(r.exit_status, "abort");
+    assert_eq!(r.reason, "user abort");
+    assert!(r.interrupted);
+    assert_eq!(*log.lock().unwrap(), vec!["cleanup"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_runs_finalize_cleanup_then_exits_success() {
+    let log = Arc::new(StdMutex::new(Vec::new()));
+    let plan = bsrs::plans::preprocessors::finalize_wrapper(
+        sleeping_run(),
+        note_plan(log.clone(), "cleanup"),
+    );
+    let r = interrupt_running(plan, |re| re.stop()).await;
+    assert_eq!(r.exit_status, "success", "bluesky RE.stop closes clean");
+    assert!(r.interrupted);
+    assert_eq!(*log.lock().unwrap(), vec!["cleanup"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn halt_skips_finalize_cleanup() {
+    let log = Arc::new(StdMutex::new(Vec::new()));
+    let plan = bsrs::plans::preprocessors::finalize_wrapper(
+        sleeping_run(),
+        note_plan(log.clone(), "cleanup"),
+    );
+    let r = interrupt_running(plan, |re| re.halt("user halt")).await;
+    assert_eq!(r.exit_status, "halt");
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "PlanHalt lets no cleanup run"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abort_unwinds_nested_finalize_wrappers_innermost_first() {
+    let log = Arc::new(StdMutex::new(Vec::new()));
+    let inner = bsrs::plans::preprocessors::finalize_wrapper(
+        sleeping_run(),
+        note_plan(log.clone(), "inner"),
+    );
+    let plan = bsrs::plans::preprocessors::finalize_wrapper(inner, note_plan(log.clone(), "outer"));
+    let r = interrupt_running(plan, |re| re.abort("user abort")).await;
+    assert_eq!(r.exit_status, "abort");
+    assert_eq!(*log.lock().unwrap(), vec!["inner", "outer"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn error_in_abort_cleanup_exits_fail() {
+    // bluesky: an exception raised from the `finally` block replaces the
+    // `RequestAbort` propagating through it, and `_run` exits "fail".
+    let plan = bsrs::plans::preprocessors::finalize_wrapper(sleeping_run(), boom_plan());
+    let r = interrupt_running(plan, |re| re.abort("user abort")).await;
+    assert_eq!(r.exit_status, "fail");
+    assert!(r.reason.contains("boom"), "reason: {}", r.reason);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn second_abort_during_cleanup_interrupts_the_cleanup() {
+    // The cleanup itself parks in a Sleep; a second abort must reach it (the
+    // token renewed at the first throw is cancelled again) and end the run.
+    let log = Arc::new(StdMutex::new(Vec::new()));
+    let cleanup = plan_box(async_stream::stream! {
+        yield Msg::Sleep(Duration::from_secs(30));
+    });
+    let cleanup = bsrs::plans::preprocessors::pchain(vec![
+        note_plan(log.clone(), "cleanup-start"),
+        cleanup,
+        note_plan(log.clone(), "cleanup-end"),
+    ]);
+    let plan = bsrs::plans::preprocessors::finalize_wrapper(sleeping_run(), cleanup);
+    let re = Arc::new(RunEngine::new(vec![]));
+    let re2 = re.clone();
+    let run = tokio::spawn(async move { re2.run_async(plan).await });
+    while re.state() != EngineRunState::Running {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    re.abort("first");
+    while log.lock().unwrap().is_empty() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    re.abort("second");
+    let r = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("run hung: second abort did not reach the cleanup Sleep")
+        .unwrap()
+        .unwrap();
+    assert_eq!(r.exit_status, "abort");
+    assert_eq!(*log.lock().unwrap(), vec!["cleanup-start"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abort_while_paused_runs_cleanup_without_rewind() {
+    let log = Arc::new(StdMutex::new(Vec::new()));
+    let body = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Checkpoint;
+    });
+    let body = bsrs::plans::preprocessors::pchain(vec![
+        body,
+        note_plan(log.clone(), "point"),
+        plan_box(async_stream::stream! {
+            yield Msg::Pause { defer: false };
+        }),
+        note_plan(log.clone(), "after-pause"),
+        plan_box(async_stream::stream! {
+            yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+        }),
+    ]);
+    let plan =
+        bsrs::plans::preprocessors::finalize_wrapper(body, note_plan(log.clone(), "cleanup"));
+    let re = Arc::new(RunEngine::new(vec![]));
+    let re2 = re.clone();
+    let run = tokio::spawn(async move { re2.run_async(plan).await });
+    while !re.is_paused() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    re.abort("while paused");
+    let r = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("run hung after abort while paused")
+        .unwrap()
+        .unwrap();
+    assert_eq!(r.exit_status, "abort");
+    // "point" is not replayed (no rewind on abort) and the plan does not
+    // continue past the pause; only the cleanup runs.
+    assert_eq!(*log.lock().unwrap(), vec!["point", "cleanup"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_wrapper_closes_run_with_abort_status_before_outer_cleanup() {
+    // bluesky's run_wrapper closes the run from its except-plan with the
+    // interrupt's exit status, so the RunStop precedes an enclosing finalize's
+    // cleanup messages.
+    let sink = Arc::new(CapturingSink::new());
+    let stops_at_cleanup = Arc::new(AtomicU64::new(u64::MAX));
+    let cleanup = {
+        let sink = sink.clone();
+        let seen = stops_at_cleanup.clone();
+        plan_box(async_stream::stream! {
+            let factory: bsrs::core::msg::AwaitableFactory = Arc::new(move || {
+                let sink = sink.clone();
+                let seen = seen.clone();
+                Box::pin(async move {
+                    let stops = sink
+                        .snapshot()
+                        .await
+                        .iter()
+                        .filter(|d| matches!(d, Document::Stop(_)))
+                        .count();
+                    seen.store(stops as u64, Ordering::SeqCst);
+                    Ok(())
+                })
+            });
+            yield Msg::WaitFor { factories: vec![factory], timeout: None };
+        })
+    };
+    let body = plan_box(async_stream::stream! {
+        yield Msg::Sleep(Duration::from_secs(30));
+    });
+    let plan = bsrs::plans::preprocessors::finalize_wrapper(
+        bsrs::plans::preprocessors::run_wrapper(body, Default::default()),
+        cleanup,
+    );
+    let re = Arc::new(RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]));
+    let re2 = re.clone();
+    let run = tokio::spawn(async move { re2.run_async(plan).await });
+    while re.state() != EngineRunState::Running {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    re.abort("user abort");
+    let r = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("run hung after abort")
+        .unwrap()
+        .unwrap();
+    assert_eq!(r.exit_status, "abort");
+    assert_eq!(
+        stops_at_cleanup.load(Ordering::SeqCst),
+        1,
+        "the RunStop must be emitted before the outer cleanup runs"
+    );
+    let docs = sink.snapshot().await;
+    let stop = docs
+        .iter()
+        .find_map(|d| match d {
+            Document::Stop(s) => Some(s.clone()),
+            _ => None,
+        })
+        .expect("a RunStop was emitted");
+    assert_eq!(stop.exit_status, bsrs::event_model::ExitStatus::Abort);
+    assert_eq!(stop.reason.as_deref(), Some("user abort"));
+}
+
+#[tokio::test]
+async fn contingency_wrapper_except_plan_receives_what_was_thrown() {
+    let got: Arc<StdMutex<Option<bsrs::core::Thrown>>> = Arc::new(StdMutex::new(None));
+    let except: bsrs::plans::preprocessors::ExceptPlan = {
+        let got = got.clone();
+        Box::new(move |thrown| {
+            *got.lock().unwrap() = Some(thrown);
+            plan_box(async_stream::stream! {
+                yield Msg::Null;
+            })
+        })
+    };
+    let guarded = bsrs::plans::preprocessors::contingency_wrapper(
+        boom_plan(),
+        Some(except),
+        None,
+        None,
+        false,
+    );
+    let re = RunEngine::new(vec![]);
+    let result = re.run_async(drain_into(guarded)).await.unwrap();
+    assert_eq!(result.exit_status, "success");
+    let thrown = got.lock().unwrap().take();
+    match thrown {
+        Some(bsrs::core::Thrown::Error(text)) => assert!(text.contains("boom"), "{text}"),
+        other => panic!("except_plan got {other:?}"),
+    }
+}
+
+/// A stageable whose `unstage_dyn` appends "unstage" to a log.
+struct LogStage(Arc<StdMutex<Vec<&'static str>>>);
+impl bsrs::core::msg::NamedObj for LogStage {
+    fn name(&self) -> &str {
+        "log_stage"
+    }
+}
+#[async_trait::async_trait]
+impl bsrs::core::msg::StageableObj for LogStage {
+    async fn stage_dyn(&self) -> Result<(), bsrs::core::error::BsrsError> {
+        Ok(())
+    }
+    async fn unstage_dyn(&self) -> Result<(), bsrs::core::error::BsrsError> {
+        self.0.lock().unwrap().push("unstage");
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stage_wrapper_unstages_from_the_plan_on_abort() {
+    // bluesky's stage_wrapper unstages from a finalize_wrapper, so on abort the
+    // Unstage runs from inside the plan — before an enclosing finalize's
+    // cleanup — not from the engine's run-end teardown (which would run after).
+    let log = Arc::new(StdMutex::new(Vec::new()));
+    let dev: Arc<dyn bsrs::core::msg::StageableObj> = Arc::new(LogStage(log.clone()));
+    let staged = bsrs::plans::preprocessors::stage_wrapper(sleeping_run(), vec![dev]);
+    let plan =
+        bsrs::plans::preprocessors::finalize_wrapper(staged, note_plan(log.clone(), "cleanup"));
+    let r = interrupt_running(plan, |re| re.abort("user abort")).await;
+    assert_eq!(r.exit_status, "abort");
+    assert_eq!(*log.lock().unwrap(), vec!["unstage", "cleanup"]);
 }

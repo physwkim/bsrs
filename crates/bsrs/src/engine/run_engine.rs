@@ -20,8 +20,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use crate::core::error::{BsrsError, Result};
-use crate::core::msg::{Msg, MsgResult, RunMetadata, SubscriptionId};
+use crate::core::error::{BsrsError, Interrupt, Result};
+use crate::core::msg::{Msg, MsgResult, RunMetadata, SubscriptionId, Thrown};
 use crate::core::plan::{Plan, PlanItem};
 use crate::core::status::{Status, StatusError};
 use crate::event_model::compose::RunBundle;
@@ -240,6 +240,11 @@ pub struct RunEngine {
     is_aborting: AtomicBool,
     is_halting: AtomicBool,
     is_stopping: AtomicBool,
+    /// Count of `stop`/`abort`/`halt` requests. The run loop remembers the
+    /// count as of the request it last acted on, so it can tell a new request
+    /// from the one already unwinding the plan — a second `abort` during
+    /// cleanup is a second interrupt. Bumped only by `request_interrupt`.
+    interrupt_seq: AtomicU64,
     /// Caller-supplied reason for an interrupt (`abort`/`halt`), surfaced on
     /// the `RunStop` document of the closed run. Single owner of the interrupt
     /// reason: the interrupt entry points write it, `run_loop` reads it when
@@ -339,13 +344,13 @@ struct EngineState {
     /// bluesky's `_temp_callback_ids` — entries are removed
     /// automatically when the run ends.
     temp_subscribers: Vec<SubscriptionId>,
-    /// Active `contingency_wrapper` error sinks, innermost last (a LIFO stack).
-    /// While non-empty, a message error is written into the top sink (as its
-    /// `Display` string) and the run keeps going, rather than failing — so the
-    /// wrapper that pushed it can run its `except`/`finally` recovery and decide
-    /// whether to re-raise via `Msg::Fail`. Pushed by `Msg::PushContingency`,
-    /// popped by `Msg::PopContingency`; the equivalent of the exception
-    /// propagating to the nearest enclosing generator `try` in bluesky.
+    /// Active `contingency_wrapper` sinks, innermost last (a LIFO stack).
+    /// While non-empty, a message error or a `stop`/`abort` request is thrown
+    /// into the top sink and the run keeps going, rather than ending — so the
+    /// wrapper that pushed it can run its `except`/`finally` recovery and
+    /// re-raise via `Msg::Raise`. Pushed by `Msg::PushContingency`, popped by
+    /// `Msg::PopContingency`; the equivalent of the exception propagating to
+    /// the nearest enclosing generator `try` in bluesky.
     contingency_stack: Vec<crate::core::msg::ContingencySink>,
     msg_cache: VecDeque<Msg>,
     replay_queue: VecDeque<Msg>,
@@ -618,6 +623,15 @@ fn pack_external_assets(
     Ok(width.unwrap_or(0))
 }
 
+/// An interrupt request the run loop has not acted on yet.
+enum InterruptRequest {
+    /// `halt`: drop the plan, no cleanup message runs.
+    Halt,
+    /// `stop`/`abort`: throw the interrupt into the plan's innermost
+    /// contingency region so its cleanup runs.
+    Throw(Interrupt),
+}
+
 impl RunEngine {
     /// Construct a fresh RunEngine with the given sinks.
     pub fn new(sinks: Vec<Arc<dyn DocumentSink>>) -> Self {
@@ -634,6 +648,7 @@ impl RunEngine {
             is_aborting: AtomicBool::new(false),
             is_halting: AtomicBool::new(false),
             is_stopping: AtomicBool::new(false),
+            interrupt_seq: AtomicU64::new(0),
             interrupt_reason: StdMutex::new(String::new()),
             sigint_count: AtomicU8::new(0),
             suspender_count: AtomicU64::new(0),
@@ -739,6 +754,10 @@ impl RunEngine {
         self.is_aborting.store(false, Ordering::SeqCst);
         self.is_halting.store(false, Ordering::SeqCst);
         self.is_stopping.store(false, Ordering::SeqCst);
+        // Interrupt requests up to here belonged to the previous run; one that
+        // arrives from now on (even during the suspender gate below) is this
+        // run's to act on.
+        let thrown_seq = self.interrupt_seq.load(Ordering::SeqCst);
         // Clear any interrupt reason left by a previous run so it cannot leak
         // into this run's RunStop (bluesky run_engine.py:1497).
         self.interrupt_reason.lock().unwrap().clear();
@@ -799,14 +818,14 @@ impl RunEngine {
 
         let timeout = *self.loop_timeout.lock().unwrap();
         let outcome = match timeout {
-            Some(d) => match tokio::time::timeout(d, self.run_loop(plan)).await {
+            Some(d) => match tokio::time::timeout(d, self.run_loop(plan, thrown_seq)).await {
                 Ok(r) => r,
                 Err(_) => {
                     self.cancel.lock().unwrap().cancel();
                     Err(BsrsError::Timeout(d))
                 }
             },
-            None => self.run_loop(plan).await,
+            None => self.run_loop(plan, thrown_seq).await,
         };
         // Cleanup: stop touched movables / flyers, unstage anything
         // still staged, drop suspenders. Mirrors bluesky's `_run`
@@ -1175,9 +1194,10 @@ impl RunEngine {
     pub fn abort(&self, reason: impl Into<String>) {
         *self.interrupt_reason.lock().unwrap() = reason.into();
         self.is_aborting.store(true, Ordering::SeqCst);
-        self.is_paused.store(false, Ordering::SeqCst);
-        self.cancel.lock().unwrap().cancel();
-        self.permit.notify_waiters();
+        // An abort supersedes a stop still unwinding (bluesky's `_state` simply
+        // becomes "aborting"); a stop never downgrades an abort.
+        self.is_stopping.store(false, Ordering::SeqCst);
+        self.request_interrupt();
     }
 
     /// External: halt — like abort but skips run-level cleanup. The `reason` is
@@ -1186,9 +1206,7 @@ impl RunEngine {
         *self.interrupt_reason.lock().unwrap() = reason.into();
         self.is_halting.store(true, Ordering::SeqCst);
         self.is_aborting.store(true, Ordering::SeqCst);
-        self.is_paused.store(false, Ordering::SeqCst);
-        self.cancel.lock().unwrap().cancel();
-        self.permit.notify_waiters();
+        self.request_interrupt();
     }
 
     /// External: graceful stop — like abort, but the run closes with
@@ -1196,8 +1214,22 @@ impl RunEngine {
     pub fn stop(&self) {
         self.is_stopping.store(true, Ordering::SeqCst);
         self.is_aborting.store(true, Ordering::SeqCst);
+        self.request_interrupt();
+    }
+
+    /// Single owner of "an interrupt was requested", called by `stop`/`abort`/
+    /// `halt` once their flags are set. Wakes the run loop wherever it is
+    /// parked: clears the pause so a paused loop wakes through `permit`, and
+    /// cancels the run's token so a handler racing it (`Sleep`, `WaitFor`)
+    /// returns. The request is counted under the token lock, so the loop never
+    /// observes the cancelled token without the count that explains it.
+    fn request_interrupt(&self) {
         self.is_paused.store(false, Ordering::SeqCst);
-        self.cancel.lock().unwrap().cancel();
+        {
+            let token = self.cancel.lock().unwrap();
+            self.interrupt_seq.fetch_add(1, Ordering::SeqCst);
+            token.cancel();
+        }
         self.permit.notify_waiters();
     }
 
@@ -1480,44 +1512,38 @@ impl RunEngine {
         }
     }
 
-    async fn run_loop(&self, plan: Plan) -> Result<RunResult> {
+    async fn run_loop(&self, plan: Plan, mut thrown_seq: u64) -> Result<RunResult> {
         let plan = Mutex::new(plan);
         // Every RunStart UID opened during this call, in open order (bluesky
         // accumulates `_run_start_uids` in `_open_run`); `handle` returns a UID
         // exactly once per `Msg::OpenRun`, so no de-duplication is needed.
         let mut run_uids: Vec<String> = Vec::new();
-        let mut exit_status = String::from("no-run");
-
-        let resolve_exit = |this: &Self, current: &mut String| {
-            if this.is_halting.load(Ordering::SeqCst) {
-                *current = "halt".into();
-            } else if this.is_stopping.load(Ordering::SeqCst) {
-                *current = "success".into();
-            } else if this.is_aborting.load(Ordering::SeqCst) {
-                *current = "abort".into();
-            }
-        };
 
         loop {
-            let (msg, responder) = match self.next_msg(&plan).await {
-                Some(pair) => pair,
-                None => {
-                    resolve_exit(self, &mut exit_status);
-                    break;
+            self.pause_gate(thrown_seq).await;
+            // A `stop`/`abort`/`halt` requested since the last message. bluesky's
+            // `_run` throws `RequestStop`/`RequestAbort` into the plan so the
+            // `finally`/`except` blocks of its wrappers issue their cleanup
+            // messages (run_engine.py:1730-1740, 1586-1600), and drops the plan
+            // on `halt` (`PlanHalt` is a `GeneratorExit`: no cleanup may yield).
+            // Here the request is thrown into the innermost contingency region;
+            // a plan with none has nothing to catch it and is dropped.
+            match self.take_interrupt(&mut thrown_seq) {
+                Some(InterruptRequest::Halt) => {
+                    return self.end_interrupted(run_uids, "halt").await;
                 }
+                Some(InterruptRequest::Throw(kind)) => {
+                    let thrown = Thrown::Interrupt(kind, self.stop_reason());
+                    if !self.throw_into_plan(thrown).await {
+                        return self.end_interrupted(run_uids, kind.exit_status()).await;
+                    }
+                    continue;
+                }
+                None => {}
+            }
+            let Some((msg, responder)) = self.pull_msg(&plan).await else {
+                break;
             };
-            if self.is_halting.load(Ordering::SeqCst) {
-                exit_status = "halt".into();
-                break;
-            }
-            if self.is_stopping.load(Ordering::SeqCst) {
-                exit_status = "success".into();
-                break;
-            }
-            if self.is_aborting.load(Ordering::SeqCst) {
-                exit_status = "abort".into();
-                break;
-            }
             tracing::debug!("RE msg: {:?}", &msg);
             // msg_hook sees every Msg before dispatch (bluesky run_engine.py:1645).
             if let Some(h) = self.msg_hook.lock().unwrap().clone() {
@@ -1527,56 +1553,48 @@ impl RunEngine {
                 Ok(Some(uid)) => run_uids.push(uid),
                 Ok(None) => {}
                 Err(e) => {
-                    // A handler cancelled while an interrupt flag is set is the
-                    // interrupt *mechanism* firing (`stop`/`abort`/`halt` cancel
-                    // the token to unpark in-flight `Sleep`/`WaitFor`/status
-                    // awaits), not a plan failure: resolve the exit from the
-                    // flags exactly like the between-messages checks above, and
-                    // bypass contingency routing — a between-messages interrupt
-                    // never reaches the plan's except-path either. `Cancelled`
-                    // with no flag set (a device cancelling its own status)
-                    // falls through and stays a plan failure.
-                    if matches!(e, BsrsError::Cancelled) {
-                        if self.is_halting.load(Ordering::SeqCst) {
-                            exit_status = "halt".into();
-                            break;
-                        }
-                        if self.is_stopping.load(Ordering::SeqCst) {
-                            exit_status = "success".into();
-                            break;
-                        }
-                        if self.is_aborting.load(Ordering::SeqCst) {
-                            exit_status = "abort".into();
-                            break;
-                        }
-                    }
-                    // If a `contingency_wrapper` region is active, route the
-                    // error into its innermost sink and keep running instead of
-                    // failing the run. The wrapper reads the sink right after it
-                    // forwarded the offending message, runs its `except`/`finally`
-                    // recovery, and re-raises via `Msg::Fail` if it chooses to.
-                    // This is bsrs's stand-in for an exception surfacing at a
-                    // generator `yield` inside a Python `try` block.
-                    let routed = {
-                        let state = self.state.lock().await;
-                        match state.contingency_stack.last() {
-                            Some(sink) => {
-                                *sink.lock().unwrap() = Some(format!("{e}"));
-                                true
+                    // What the plan sees at its `yield`. A handler cancelled while
+                    // an interrupt request is outstanding is that request arriving
+                    // (`stop`/`abort`/`halt` cancel the token to unpark an in-flight
+                    // `Sleep`/`WaitFor`), not a plan failure; `Cancelled` with no
+                    // request outstanding (a device cancelling its own status)
+                    // stays one. `Interrupted` is a `Msg::Raise` of an interrupt a
+                    // wrapper finished unwinding: it keeps propagating outward.
+                    let thrown = match &e {
+                        BsrsError::Cancelled => match self.take_interrupt(&mut thrown_seq) {
+                            None => Thrown::Error(e.to_string()),
+                            Some(InterruptRequest::Halt) => {
+                                return self.end_interrupted(run_uids, "halt").await;
                             }
-                            None => false,
+                            Some(InterruptRequest::Throw(kind)) => {
+                                Thrown::Interrupt(kind, self.stop_reason())
+                            }
+                        },
+                        BsrsError::Interrupted(kind) => {
+                            Thrown::Interrupt(*kind, self.stop_reason())
                         }
+                        _ => Thrown::Error(e.to_string()),
                     };
-                    if routed {
-                        tracing::debug!("plan error routed to contingency: {e}");
+                    if self.throw_into_plan(thrown.clone()).await {
+                        tracing::debug!("thrown into the plan: {thrown:?}");
                         continue;
                     }
-                    tracing::error!("plan error: {e}");
-                    exit_status = "fail".into();
-                    self.drain_and_close("fail", Some(format!("{e}"))).await?;
-                    // Move the error itself into the result so callers can match
-                    // on its variant (bluesky's `RunEngineResult.exception`).
-                    return Ok(self.build_result(run_uids, exit_status, Some(e)));
+                    // Nothing in the plan catches it: the run ends the way the
+                    // value leaving bluesky's plan stack ends `_run` — an
+                    // interrupt with its exit status, an error as `fail`.
+                    return match thrown {
+                        Thrown::Interrupt(kind, _) => {
+                            self.end_interrupted(run_uids, kind.exit_status()).await
+                        }
+                        Thrown::Error(text) => {
+                            tracing::error!("plan error: {text}");
+                            self.drain_and_close("fail", Some(text)).await?;
+                            // Move the error itself into the result so callers can
+                            // match on its variant (bluesky's
+                            // `RunEngineResult.exception`).
+                            Ok(self.build_result(run_uids, "fail".into(), Some(e)))
+                        }
+                    };
                 }
             }
             // Hand the engine's result back to a `Respond`-issuing plan so it can
@@ -1589,39 +1607,88 @@ impl RunEngine {
             }
         }
 
-        // Close the open run with the right status. `stop` and the natural-end
-        // case both close as "success".
-        if exit_status == "abort" || exit_status == "halt" {
-            // Reason comes from the caller (`abort(reason)` / `halt(reason)`),
-            // not a hardcoded string — bluesky threads `_reason` onto the stop
-            // document (run_engine.py:1792).
-            let reason = self.stop_reason();
-            self.drain_and_close(&exit_status, reason).await?;
-            return Ok(self.build_result(run_uids, exit_status, None));
-        }
-        if exit_status == "success" && self.is_stopping.load(Ordering::SeqCst) {
-            // `stop()` sets no reason, so this resolves to `None` (bluesky's
-            // default `_reason = ""`), not a hardcoded "user-requested stop".
-            self.drain_and_close("success", self.stop_reason()).await?;
-            return Ok(self.build_result(run_uids, exit_status, None));
-        }
-
-        // Normal exit: close any open run as success.
+        // The plan stream ended — bluesky's `StopIteration`, "success" even
+        // after an interrupt a wrapper chose to swallow: close any open run.
         let still_open = self.state.lock().await.any_run_open();
-        if still_open {
+        let exit_status = if still_open {
             self.drain_and_close("success", None).await?;
-            exit_status = "success".into();
-        } else if !run_uids.is_empty() && exit_status == "no-run" {
-            exit_status = "success".into();
-        }
-
-        Ok(self.build_result(run_uids, exit_status, None))
+            "success"
+        } else if run_uids.is_empty() {
+            "no-run"
+        } else {
+            "success"
+        };
+        Ok(self.build_result(run_uids, exit_status.into(), None))
     }
 
-    /// Pull the next message: handle pause gating, replay queue, then plan.
-    async fn next_msg(&self, plan: &Mutex<Plan>) -> Option<(Msg, PlanResponder)> {
-        // Pause gate
-        while self.is_paused.load(Ordering::SeqCst) && !self.is_aborting.load(Ordering::SeqCst) {
+    /// End the run on a `stop`/`abort`/`halt` nothing in the plan caught: close
+    /// every open run with the interrupt's exit status and the caller's reason
+    /// (`abort(reason)`, threaded onto the RunStop as bluesky's `_reason`,
+    /// run_engine.py:1792).
+    async fn end_interrupted(&self, run_uids: Vec<String>, exit_status: &str) -> Result<RunResult> {
+        self.drain_and_close(exit_status, self.stop_reason())
+            .await?;
+        Ok(self.build_result(run_uids, exit_status.to_string(), None))
+    }
+
+    /// Consume the interrupt request outstanding since `thrown_seq`, if any,
+    /// and renew the cancel token: the request cancelled the token to unpark
+    /// the handler it interrupted, and the cleanup messages the plan issues in
+    /// response must not inherit that cancellation. A later request cancels the
+    /// new token and counts again, so a second `abort` during cleanup is a
+    /// second interrupt — as bluesky throws a second `RequestAbort` into the
+    /// `finally` block.
+    fn take_interrupt(&self, thrown_seq: &mut u64) -> Option<InterruptRequest> {
+        let mut token = self.cancel.lock().unwrap();
+        let seq = self.interrupt_seq.load(Ordering::SeqCst);
+        if seq == *thrown_seq {
+            return None;
+        }
+        *thrown_seq = seq;
+        *token = CancellationToken::new();
+        Some(if self.is_halting.load(Ordering::SeqCst) {
+            InterruptRequest::Halt
+        } else if self.is_stopping.load(Ordering::SeqCst) {
+            InterruptRequest::Throw(Interrupt::Stop)
+        } else {
+            InterruptRequest::Throw(Interrupt::Abort)
+        })
+    }
+
+    /// Is an interrupt request outstanding that the loop has not acted on?
+    fn interrupt_pending(&self, thrown_seq: u64) -> bool {
+        self.interrupt_seq.load(Ordering::SeqCst) != thrown_seq
+    }
+
+    /// Throw `thrown` into the plan: hand it to the innermost contingency
+    /// region, whose `contingency_wrapper` reads it right after the message it
+    /// forwarded and runs its `except`/`finally` plans. A rewind replay in
+    /// progress dies with it — bluesky throws into the replay generator first,
+    /// which has no handler (run_engine.py:1586-1600). Returns `false` when no
+    /// region is active: the plan has nothing to catch it and the caller ends
+    /// the run.
+    async fn throw_into_plan(&self, thrown: Thrown) -> bool {
+        let mut state = self.state.lock().await;
+        let Some(sink) = state.contingency_stack.last() else {
+            return false;
+        };
+        *sink.lock().unwrap() = Some(thrown);
+        state.replay_queue.clear();
+        true
+    }
+
+    /// Park the run loop while the engine is paused. Entering: `on_pause_enter`
+    /// stops the touched movables/flyers and quiesces Pausables, then the
+    /// suspender's `pre_plan` runs. Woken by `resume`: `on_resume` arms the
+    /// rewind and resumes Pausables, then the `post_plan` runs. Woken by a
+    /// `stop`/`abort`/`halt` request instead: nothing is rewound or resumed —
+    /// the caller throws the request into the plan — and only the monitors
+    /// suspended on pause are restored, as bluesky's `_run` restores them after
+    /// its permit wait whatever woke it (run_engine.py:1536-1538) while
+    /// `_rewind` and `Pausable.resume` belong to `resume()` alone
+    /// (run_engine.py:994-1016).
+    async fn pause_gate(&self, thrown_seq: u64) {
+        while self.is_paused.load(Ordering::SeqCst) {
             // Arm the resume notification BEFORE the (possibly slow)
             // pause-enter + pre_plan work. `permit` is a bare `Notify` whose
             // `notify_waiters` drops the wakeup if no waiter is registered yet,
@@ -1646,6 +1713,10 @@ impl RunEngine {
             if self.is_paused.load(Ordering::SeqCst) {
                 resumed.await;
             }
+            if self.interrupt_pending(thrown_seq) {
+                self.restore_monitors().await;
+                return;
+            }
             self.on_resume().await;
             // post_plan: run after Pausable resume + monitor restore and before
             // the rewind replay drains, mirroring bluesky's post_plan.
@@ -1654,17 +1725,18 @@ impl RunEngine {
                 self.run_injected_plan(post()).await;
             }
         }
-        if self.is_aborting.load(Ordering::SeqCst) {
-            return None;
-        }
-        // Replay queue first
+    }
+
+    /// The next message to handle: the rewind replay first, then the plan
+    /// stream (caching what a later rewind may replay). `None` once the plan
+    /// stream has ended.
+    async fn pull_msg(&self, plan: &Mutex<Plan>) -> Option<(Msg, PlanResponder)> {
         {
             let mut state = self.state.lock().await;
             if let Some(m) = state.replay_queue.pop_front() {
                 return Some((m, None));
             }
         }
-        // Plan stream
         let item = {
             let mut p = plan.lock().await;
             p.next().await
@@ -1676,7 +1748,6 @@ impl RunEngine {
             // cloned, and a resumed replay would have no channel to answer.
             PlanItem::Respond(m, tx) => return Some((m, Some(tx))),
         };
-        // Cache if rewindable
         {
             let mut state = self.state.lock().await;
             if state.rewindable && m.is_cacheable() {
@@ -1796,11 +1867,16 @@ impl RunEngine {
                 tracing::warn!("resume_dyn failed for {}: {e}", p.name());
             }
         }
-        // Re-install the monitors suspended on pause, per run. Mirrors bluesky
-        // `restore_monitors` (re-subscribe from the kept `_monitor_params`,
-        // bundlers.py:665-666). `start_monitor` is idempotent on the descriptor
-        // (the stream was already declared), so this re-subscribes the device
-        // and respawns the pump without re-emitting the Descriptor.
+        self.restore_monitors().await;
+        self.record_interruption("resume").await;
+    }
+
+    /// Re-install the monitors suspended on pause, per run. Mirrors bluesky
+    /// `restore_monitors` (re-subscribe from the kept `_monitor_params`,
+    /// bundlers.py:665-666). `start_monitor` is idempotent on the descriptor
+    /// (the stream was already declared), so this re-subscribes the device
+    /// and respawns the pump without re-emitting the Descriptor.
+    async fn restore_monitors(&self) {
         let specs: Vec<(Option<String>, MonitorSpec)> = {
             let state = self.state.lock().await;
             state
@@ -1822,7 +1898,6 @@ impl RunEngine {
                 tracing::warn!("restore monitor failed for {}: {e}", spec.obj.name());
             }
         }
-        self.record_interruption("resume").await;
     }
 
     // -- handler ------------------------------------------------------------
@@ -2509,6 +2584,9 @@ impl RunEngine {
             Msg::Null => {}
             Msg::Fail(reason) => {
                 return Err(BsrsError::Plan(reason));
+            }
+            Msg::Raise(thrown) => {
+                return Err(thrown.into());
             }
             Msg::PushContingency(sink) => {
                 // Clear any stale error before arming, so this region starts

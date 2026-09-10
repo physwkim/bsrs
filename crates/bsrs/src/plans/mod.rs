@@ -726,7 +726,7 @@ pub mod stubs {
             };
             let guarded = preprocessors::contingency_wrapper(
                 read_plan,
-                Some(drop_bundle()),
+                Some(Box::new(|_| drop_bundle())),
                 Some(save()),
                 None,
                 true,
@@ -2861,11 +2861,17 @@ mod tests {
         }
     }
 
+    /// The plan's messages, without the contingency bookkeeping a
+    /// `finalize_wrapper`/`contingency_wrapper` emits (`PushContingency`/
+    /// `PopContingency`): it never reaches a device, and the sequences
+    /// asserted on are the device-facing ones.
     async fn drain(mut plan: Plan) -> Vec<Msg> {
         let mut out = Vec::new();
         while let Some(item) = plan.next().await {
             let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
-            out.push(m);
+            if !matches!(m, Msg::PushContingency(_) | Msg::PopContingency) {
+                out.push(m);
+            }
         }
         out
     }
@@ -2940,6 +2946,7 @@ mod tests {
         let mut out = Vec::new();
         while let Some(item) = plan.next().await {
             match item {
+                PlanItem::Bare(Msg::PushContingency(_) | Msg::PopContingency) => {}
                 PlanItem::Bare(m) => out.push(m),
                 PlanItem::Respond(m, tx) => {
                     out.push(m);
