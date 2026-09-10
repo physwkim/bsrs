@@ -3569,3 +3569,172 @@ async fn stage_wrapper_unstages_from_the_plan_on_abort() {
     assert_eq!(r.exit_status, "abort");
     assert_eq!(*log.lock().unwrap(), vec!["unstage", "cleanup"]);
 }
+
+// -- Pause interrupts the message in flight -----------------------------------
+//
+// bluesky's `_request_pause_coro` cancels the `_run` task (run_engine.py:856),
+// so a pause requested while the engine is parked in `wait` reaches
+// `stop_on_pause` while the motor is still moving; the rewind on resume then
+// re-issues the interrupted messages from the last checkpoint.
+
+/// A movable whose moves never complete on their own: every `set_dyn` hands
+/// back a pending status and keeps its setter for the test to resolve.
+struct PendingMovable {
+    name: String,
+    sets: AtomicU64,
+    stops: AtomicU64,
+    setters: StdMutex<Vec<bsrs::core::status::StatusSetter>>,
+}
+
+impl PendingMovable {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.into(),
+            sets: AtomicU64::new(0),
+            stops: AtomicU64::new(0),
+            setters: StdMutex::new(Vec::new()),
+        }
+    }
+    fn sets(&self) -> u64 {
+        self.sets.load(Ordering::SeqCst)
+    }
+    fn stops(&self) -> u64 {
+        self.stops.load(Ordering::SeqCst)
+    }
+    /// Moves issued and still pending.
+    fn pending(&self) -> usize {
+        self.setters.lock().unwrap().len()
+    }
+    fn complete_all(&self) {
+        for setter in self.setters.lock().unwrap().drain(..) {
+            setter.success();
+        }
+    }
+}
+
+impl bsrs::core::msg::NamedObj for PendingMovable {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[async_trait::async_trait]
+impl bsrs::core::msg::MovableObj for PendingMovable {
+    async fn set_dyn(&self, _value: f64) -> bsrs::core::status::Status {
+        let (status, setter) = bsrs::core::status::Status::new();
+        self.setters.lock().unwrap().push(setter);
+        self.sets.fetch_add(1, Ordering::SeqCst);
+        status
+    }
+    async fn stop_on_pause(&self, _success: bool) -> Result<(), bsrs::core::error::BsrsError> {
+        self.stops.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// `Checkpoint`, then a grouped `Set` + `Wait` on `dev` inside a run.
+fn set_and_wait(dev: &Arc<PendingMovable>) -> Plan {
+    let mover: Arc<dyn bsrs::core::msg::MovableObj> = dev.clone();
+    plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Checkpoint;
+        yield Msg::Set { obj: mover.clone(), value: 1.0, group: Some("g".into()) };
+        yield Msg::Wait { group: "g".into(), error_on_timeout: true, timeout: None };
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    })
+}
+
+#[tokio::test]
+async fn pause_interrupts_an_in_flight_wait() {
+    let dev = Arc::new(PendingMovable::new("m1"));
+    let re = Arc::new(RunEngine::new(vec![]));
+    let re2 = re.clone();
+    let plan = set_and_wait(&dev);
+    let join = tokio::spawn(async move { re2.run_async(plan).await });
+    {
+        let dev = dev.clone();
+        wait_until("first Set issued", move || dev.sets() == 1).await;
+    }
+    // The engine is now parked in `Wait` on a move that never completes.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    re.pause(false);
+    {
+        let dev = dev.clone();
+        wait_until("stop_on_pause fired", move || dev.stops() >= 1).await;
+    }
+    assert_eq!(
+        dev.pending(),
+        1,
+        "stop_on_pause must reach the motor while its move is still pending"
+    );
+    assert_eq!(re.state(), EngineRunState::Paused);
+    re.resume();
+    // The rewind re-issues the Set from the checkpoint; the replayed Wait then
+    // completes once the test resolves the moves.
+    {
+        let dev = dev.clone();
+        wait_until("Set replayed after resume", move || dev.sets() == 2).await;
+    }
+    dev.complete_all();
+    let result = tokio::time::timeout(Duration::from_secs(5), join)
+        .await
+        .expect("run did not finish after resume")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.exit_status, "success");
+    // One stop from the pause, one from the run-end stop walk (bluesky's
+    // `_stop_movable_objects` in `_run`'s `finally`); the replayed Set added
+    // none.
+    assert_eq!(dev.stops(), 2);
+}
+
+/// A `resume` that lands before the run loop reaches the pause gate must not
+/// make the gate skip the request: the pause cancelled the in-flight `Wait`,
+/// and only the rewind on the way out of the gate replays it.
+#[tokio::test]
+async fn resume_racing_the_pause_still_stops_and_rewinds() {
+    let dev = Arc::new(PendingMovable::new("m1"));
+    let re = Arc::new(RunEngine::new(vec![]));
+    let re2 = re.clone();
+    let plan = set_and_wait(&dev);
+    let join = tokio::spawn(async move { re2.run_async(plan).await });
+    {
+        let dev = dev.clone();
+        wait_until("first Set issued", move || dev.sets() == 1).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    re.pause(false);
+    re.resume();
+    {
+        let dev = dev.clone();
+        wait_until("Set replayed after resume", move || dev.sets() == 2).await;
+    }
+    assert_eq!(dev.stops(), 1, "the pause still stopped the motor");
+    dev.complete_all();
+    let result = tokio::time::timeout(Duration::from_secs(5), join)
+        .await
+        .expect("run did not finish after resume")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.exit_status, "success");
+}
+
+/// The ungrouped `Set` awaits its status inline; an abort must unpark it the
+/// way it unparks `Wait`.
+#[tokio::test]
+async fn abort_interrupts_an_inline_set_await() {
+    let dev = Arc::new(PendingMovable::new("m1"));
+    let mover: Arc<dyn bsrs::core::msg::MovableObj> = dev.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Set { obj: mover.clone(), value: 1.0, group: None };
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let r = interrupt_running(plan, |re| re.abort("user abort")).await;
+    assert_eq!(r.exit_status, "abort");
+    assert_eq!(
+        dev.pending(),
+        1,
+        "the move was still pending when the abort landed"
+    );
+}

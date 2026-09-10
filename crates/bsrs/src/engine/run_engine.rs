@@ -245,6 +245,14 @@ pub struct RunEngine {
     /// from the one already unwinding the plan — a second `abort` during
     /// cleanup is a second interrupt. Bumped only by `request_interrupt`.
     interrupt_seq: AtomicU64,
+    /// Count of pause/suspend requests, the pause-side twin of `interrupt_seq`:
+    /// the run loop remembers the count as of the request it last acted on, so
+    /// a handler unparked by the request's token cancellation is recognised as
+    /// pausing rather than failing, and so a `resume` that lands before the
+    /// loop reaches the pause gate cannot make the gate skip the request (the
+    /// rewind on the way out is what replays the interrupted message). Bumped
+    /// only by `mark_paused`.
+    pause_seq: AtomicU64,
     /// Caller-supplied reason for an interrupt (`abort`/`halt`), surfaced on
     /// the `RunStop` document of the closed run. Single owner of the interrupt
     /// reason: the interrupt entry points write it, `run_loop` reads it when
@@ -649,6 +657,7 @@ impl RunEngine {
             is_halting: AtomicBool::new(false),
             is_stopping: AtomicBool::new(false),
             interrupt_seq: AtomicU64::new(0),
+            pause_seq: AtomicU64::new(0),
             interrupt_reason: StdMutex::new(String::new()),
             sigint_count: AtomicU8::new(0),
             suspender_count: AtomicU64::new(0),
@@ -762,6 +771,7 @@ impl RunEngine {
         // into this run's RunStop (bluesky run_engine.py:1497).
         self.interrupt_reason.lock().unwrap().clear();
         self.is_paused.store(false, Ordering::SeqCst);
+        let pause_seen = self.pause_seq.load(Ordering::SeqCst);
         // A deferred pause that never reached a Checkpoint before its run
         // ended must not carry over and pause this run's first Checkpoint.
         self.deferred_pause.store(false, Ordering::SeqCst);
@@ -818,14 +828,16 @@ impl RunEngine {
 
         let timeout = *self.loop_timeout.lock().unwrap();
         let outcome = match timeout {
-            Some(d) => match tokio::time::timeout(d, self.run_loop(plan, thrown_seq)).await {
-                Ok(r) => r,
-                Err(_) => {
-                    self.cancel.lock().unwrap().cancel();
-                    Err(BsrsError::Timeout(d))
+            Some(d) => {
+                match tokio::time::timeout(d, self.run_loop(plan, thrown_seq, pause_seen)).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        self.cancel.lock().unwrap().cancel();
+                        Err(BsrsError::Timeout(d))
+                    }
                 }
-            },
-            None => self.run_loop(plan, thrown_seq).await,
+            }
+            None => self.run_loop(plan, thrown_seq, pause_seen).await,
         };
         // Cleanup: stop touched movables / flyers, unstage anything
         // still staged, drop suspenders. Mirrors bluesky's `_run`
@@ -1162,17 +1174,28 @@ impl RunEngine {
     }
 
     /// Single owner of the `is_paused: false → true` transition. Stores the
-    /// flag and signals `pause_notify` so installed-`Suspender` watchers can
-    /// re-arm on the pause edge. Every site that pauses the engine routes
-    /// through here so no watcher misses a suspension.
+    /// flag, counts the request under the token lock and cancels the run's
+    /// token so a handler parked in `Wait`/`Sleep`/`WaitFor` (or an inline
+    /// status await) returns at once — bluesky's `_request_pause_coro` and
+    /// `_request_suspend` both cancel the `_run` task (run_engine.py:856,
+    /// :1253), which is what lets `stop_on_pause` reach a motor while it is
+    /// still moving. Then signals `pause_notify` so installed-`Suspender`
+    /// watchers can re-arm on the pause edge. Every site that pauses the
+    /// engine routes through here so no watcher misses a suspension.
     fn mark_paused(&self) {
         self.is_paused.store(true, Ordering::SeqCst);
+        {
+            let token = self.cancel.lock().unwrap();
+            self.pause_seq.fetch_add(1, Ordering::SeqCst);
+            token.cancel();
+        }
         self.pause_notify.notify_waiters();
     }
 
     /// External: request a pause. If `defer = true`, the pause takes effect at
-    /// the next `Checkpoint`; otherwise immediately at the top of the message
-    /// loop.
+    /// the next `Checkpoint`; otherwise immediately, interrupting the message
+    /// in flight. The interrupted message is not lost: the rewind on resume
+    /// replays from the last checkpoint.
     pub fn pause(&self, defer: bool) {
         if defer {
             self.deferred_pause.store(true, Ordering::SeqCst);
@@ -1512,7 +1535,12 @@ impl RunEngine {
         }
     }
 
-    async fn run_loop(&self, plan: Plan, mut thrown_seq: u64) -> Result<RunResult> {
+    async fn run_loop(
+        &self,
+        plan: Plan,
+        mut thrown_seq: u64,
+        mut pause_seen: u64,
+    ) -> Result<RunResult> {
         let plan = Mutex::new(plan);
         // Every RunStart UID opened during this call, in open order (bluesky
         // accumulates `_run_start_uids` in `_open_run`); `handle` returns a UID
@@ -1520,7 +1548,7 @@ impl RunEngine {
         let mut run_uids: Vec<String> = Vec::new();
 
         loop {
-            self.pause_gate(thrown_seq).await;
+            self.pause_gate(thrown_seq, &mut pause_seen).await;
             // A `stop`/`abort`/`halt` requested since the last message. bluesky's
             // `_run` throws `RequestStop`/`RequestAbort` into the plan so the
             // `finally`/`except` blocks of its wrappers issue their cleanup
@@ -1556,12 +1584,18 @@ impl RunEngine {
                     // What the plan sees at its `yield`. A handler cancelled while
                     // an interrupt request is outstanding is that request arriving
                     // (`stop`/`abort`/`halt` cancel the token to unpark an in-flight
-                    // `Sleep`/`WaitFor`), not a plan failure; `Cancelled` with no
-                    // request outstanding (a device cancelling its own status)
-                    // stays one. `Interrupted` is a `Msg::Raise` of an interrupt a
-                    // wrapper finished unwinding: it keeps propagating outward.
+                    // `Sleep`/`Wait`/`WaitFor`), not a plan failure; one cancelled
+                    // by a pause request is the pause landing mid-message —
+                    // bluesky's `_run` bounces to the top of its loop on a
+                    // `CancelledError` in the "pausing" state (run_engine.py:
+                    // 1710-1716) — and the pause gate takes it from here.
+                    // `Cancelled` with no request outstanding (a device cancelling
+                    // its own status) stays a failure. `Interrupted` is a
+                    // `Msg::Raise` of an interrupt a wrapper finished unwinding: it
+                    // keeps propagating outward.
                     let thrown = match &e {
                         BsrsError::Cancelled => match self.take_interrupt(&mut thrown_seq) {
+                            None if self.pause_pending(pause_seen) => continue,
                             None => Thrown::Error(e.to_string()),
                             Some(InterruptRequest::Halt) => {
                                 return self.end_interrupted(run_uids, "halt").await;
@@ -1660,6 +1694,25 @@ impl RunEngine {
         self.interrupt_seq.load(Ordering::SeqCst) != thrown_seq
     }
 
+    /// Is a pause request outstanding that the pause gate has not acted on?
+    fn pause_pending(&self, pause_seen: u64) -> bool {
+        self.pause_seq.load(Ordering::SeqCst) != pause_seen
+    }
+
+    /// Consume the pause requests outstanding since `pause_seen` and renew the
+    /// cancel token they cancelled, so the messages handled next — a
+    /// suspender's `pre_plan`/`post_plan`, the replay after resume — do not
+    /// inherit the cancellation that unparked the interrupted handler. A pause
+    /// requested after this cancels the new token and counts again.
+    fn ack_pause(&self, pause_seen: &mut u64) {
+        let mut token = self.cancel.lock().unwrap();
+        let seq = self.pause_seq.load(Ordering::SeqCst);
+        if seq != *pause_seen {
+            *pause_seen = seq;
+            *token = CancellationToken::new();
+        }
+    }
+
     /// Throw `thrown` into the plan: hand it to the innermost contingency
     /// region, whose `contingency_wrapper` reads it right after the message it
     /// forwarded and runs its `except`/`finally` plans. A rewind replay in
@@ -1677,18 +1730,23 @@ impl RunEngine {
         true
     }
 
-    /// Park the run loop while the engine is paused. Entering: `on_pause_enter`
-    /// stops the touched movables/flyers and quiesces Pausables, then the
-    /// suspender's `pre_plan` runs. Woken by `resume`: `on_resume` arms the
-    /// rewind and resumes Pausables, then the `post_plan` runs. Woken by a
+    /// Park the run loop on a pause request. Entering: `on_pause_enter` stops
+    /// the touched movables/flyers and quiesces Pausables, then the suspender's
+    /// `pre_plan` runs. Woken by `resume`: `on_resume` arms the rewind and
+    /// resumes Pausables, then the `post_plan` runs. Woken by a
     /// `stop`/`abort`/`halt` request instead: nothing is rewound or resumed —
     /// the caller throws the request into the plan — and only the monitors
     /// suspended on pause are restored, as bluesky's `_run` restores them after
     /// its permit wait whatever woke it (run_engine.py:1536-1538) while
     /// `_rewind` and `Pausable.resume` belong to `resume()` alone
     /// (run_engine.py:994-1016).
-    async fn pause_gate(&self, thrown_seq: u64) {
-        while self.is_paused.load(Ordering::SeqCst) {
+    ///
+    /// The gate is entered for every request counted since the last pass, not
+    /// for the `is_paused` flag alone: the request may have unparked a handler
+    /// mid-message, and only the rewind on the way out replays that message —
+    /// a `resume` that already cleared the flag must still pass through here.
+    async fn pause_gate(&self, thrown_seq: u64, pause_seen: &mut u64) {
+        while self.pause_pending(*pause_seen) {
             // Arm the resume notification BEFORE the (possibly slow)
             // pause-enter + pre_plan work. `permit` is a bare `Notify` whose
             // `notify_waiters` drops the wakeup if no waiter is registered yet,
@@ -1700,6 +1758,10 @@ impl RunEngine {
             tokio::pin!(resumed);
             resumed.as_mut().enable();
 
+            // Take the request and renew the token it cancelled before any
+            // message is handled on its behalf (the stop walk's devices, the
+            // pre_plan).
+            self.ack_pause(pause_seen);
             self.on_pause_enter().await;
             // pre_plan: run after the motor-stop / Pausable walk and before the
             // suspend wait, driven through the same handlers as the main plan.
@@ -1713,6 +1775,10 @@ impl RunEngine {
             if self.is_paused.load(Ordering::SeqCst) {
                 resumed.await;
             }
+            // A pause requested while already parked is absorbed here rather
+            // than re-entering the gate after this resume: bluesky rejects
+            // `request_pause` in the paused state (run_engine.py:840-841).
+            self.ack_pause(pause_seen);
             if self.interrupt_pending(thrown_seq) {
                 self.restore_monitors().await;
                 return;
@@ -3063,12 +3129,22 @@ impl RunEngine {
                     .push(status);
                 Ok(())
             }
-            None => match status.await {
-                Ok(()) => Ok(()),
-                Err(StatusError::Cancelled) => Err(BsrsError::Cancelled),
-                Err(StatusError::Timeout) => Err(BsrsError::Timeout(Duration::from_secs(0))),
-                Err(StatusError::Failed(s)) => Err(BsrsError::Backend(s)),
-            },
+            None => {
+                // The ungrouped form awaits inline, so it is parked exactly as
+                // `wait_group` is and must be unparked the same way: a
+                // pause/stop/abort cancels the token.
+                let token = self.cancel.lock().unwrap().clone();
+                let outcome = tokio::select! {
+                    r = status => r,
+                    _ = token.cancelled() => return Err(BsrsError::Cancelled),
+                };
+                match outcome {
+                    Ok(()) => Ok(()),
+                    Err(StatusError::Cancelled) => Err(BsrsError::Cancelled),
+                    Err(StatusError::Timeout) => Err(BsrsError::Timeout(Duration::from_secs(0))),
+                    Err(StatusError::Failed(s)) => Err(BsrsError::Backend(s)),
+                }
+            }
         }
     }
 
@@ -3097,6 +3173,13 @@ impl RunEngine {
         // timeout and can be restored to the group below. A clone shares the
         // same status state, so awaiting it observes the same completion.
         let waited = members.clone();
+        // A pause/stop/abort cancels the run's token to unpark this wait —
+        // bluesky's `_request_pause_coro` cancels the `_run` task parked in
+        // `_wait` (run_engine.py:856) — so `stop_on_pause` reaches a motor while
+        // it is still moving. The members are not restored on cancellation: as
+        // in bluesky, where the popped futures are simply lost, the rewind on
+        // resume re-issues the messages that created them.
+        let token = self.cancel.lock().unwrap().clone();
         let fut = async move {
             // Await every member *concurrently*, returning as soon as the first
             // one fails — bluesky `_wait` runs the group through asyncio
@@ -3110,14 +3193,16 @@ impl RunEngine {
             // `error_on_timeout` suppresses only `WaitForTimeoutError`
             // (run_engine.py:2341-2346) while a `FailedStatus` always raises
             // (:2384).
-            futures::future::try_join_all(waited)
-                .await
-                .map(|_| ())
-                .map_err(|e| match e {
-                    StatusError::Cancelled => BsrsError::Cancelled,
-                    StatusError::Timeout => BsrsError::Timeout(Duration::from_secs(0)),
-                    StatusError::Failed(s) => BsrsError::Backend(s),
-                })
+            let all = futures::future::try_join_all(waited);
+            let joined = tokio::select! {
+                r = all => r,
+                _ = token.cancelled() => return Err(BsrsError::Cancelled),
+            };
+            joined.map(|_| ()).map_err(|e| match e {
+                StatusError::Cancelled => BsrsError::Cancelled,
+                StatusError::Timeout => BsrsError::Timeout(Duration::from_secs(0)),
+                StatusError::Failed(s) => BsrsError::Backend(s),
+            })
         };
         match timeout {
             Some(d) => match tokio::time::timeout(d, fut).await {
@@ -3372,6 +3457,36 @@ mod tests {
         match result {
             Ok(Err(BsrsError::Backend(msg))) => assert_eq!(msg, "boom"),
             other => panic!("expected a prompt Backend(\"boom\") failure, got {other:?}"),
+        }
+    }
+
+    /// A cancelled run token unparks a `wait` on a member that never completes:
+    /// this is how a pause reaches `stop_on_pause` while the motor is still
+    /// moving (bluesky's `_request_pause_coro` cancels the `_run` task inside
+    /// `_wait`, run_engine.py:856).
+    #[tokio::test]
+    async fn wait_group_returns_cancelled_when_the_run_token_is_cancelled() {
+        let re = RunEngine::new(Vec::new());
+        let (pending, _keep) = Status::new();
+        {
+            let mut state = re.state.lock().await;
+            state.groups.insert(
+                "g".into(),
+                WaitGroup {
+                    members: vec![pending],
+                },
+            );
+        }
+        let token = re.cancel.lock().unwrap().clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            token.cancel();
+        });
+        let result =
+            tokio::time::timeout(Duration::from_millis(500), re.wait_group("g", true, None)).await;
+        match result {
+            Ok(Err(BsrsError::Cancelled)) => {}
+            other => panic!("expected Cancelled once the token is cancelled, got {other:?}"),
         }
     }
 
