@@ -1279,10 +1279,126 @@ async fn monitor_emits_descriptor_then_events() {
         "monitor descriptor has the object's configuration entry; got keys {:?}",
         descriptors[0].configuration.keys().collect::<Vec<_>>()
     );
+    // ... and lists the object's keys, like any `_prepare_stream` descriptor.
+    assert_eq!(
+        descriptors[0].object_keys.get("mon1"),
+        Some(&vec!["mon1".to_string()]),
+        "monitor descriptor object_keys: {:?}",
+        descriptors[0].object_keys
+    );
     assert!(
         events >= 1,
         "expected at least one Event from the monitor pump"
     );
+}
+
+// A descriptor's `object_keys[obj]` is the object's read keys — bluesky
+// `_prepare_stream`: `object_keys[obj.name] = list(dks)` — for every object
+// read, hinted or not; `hints[obj].fields` is the separate hint. Every key
+// carries its object's name. Before F4 `object_keys` was filled from the
+// hint fields, so an unhinted object had no entry at all.
+#[tokio::test]
+async fn descriptor_object_keys_list_each_objects_read_keys() {
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    // SoftDetector hints `det_counts`; TestMonitor has no hints.
+    let det: Arc<dyn ReadableObj> = SoftDetector::new("det");
+    let plain: Arc<dyn ReadableObj> = TestMonitor::new("mon");
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Create { stream_name: "primary".into() };
+        yield Msg::Read(det.clone());
+        yield Msg::Read(plain.clone());
+        yield Msg::Save;
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    re.run_async(plan).await.unwrap();
+
+    let docs = sink.snapshot().await;
+    let desc = docs
+        .iter()
+        .find_map(|d| match d {
+            Document::Descriptor(d) => Some(d),
+            _ => None,
+        })
+        .expect("primary descriptor");
+    let mut object_keys: Vec<_> = desc.object_keys.iter().collect();
+    object_keys.sort();
+    assert_eq!(
+        object_keys,
+        [
+            (&"det".to_string(), &vec!["det_counts".to_string()]),
+            (&"mon".to_string(), &vec!["mon".to_string()]),
+        ]
+    );
+    let hints = desc.hints.as_ref().expect("det contributes hints");
+    assert_eq!(
+        hints.get("det").and_then(|h| h.fields.clone()),
+        Some(vec!["det_counts".to_string()])
+    );
+    assert!(
+        !hints.contains_key("mon"),
+        "unhinted object has no hint entry"
+    );
+    assert_eq!(desc.data_keys["mon"].object_name.as_deref(), Some("mon"));
+    assert_eq!(
+        desc.data_keys["det_counts"].object_name.as_deref(),
+        Some("det")
+    );
+}
+
+// `Msg::DeclareStream` carries bare data keys; the descriptor's `object_keys`
+// come from their `object_name` annotations, keys without one join only
+// `data_keys`.
+#[tokio::test]
+async fn declare_stream_groups_object_keys_by_object_name() {
+    use bsrs::event_model::{DataKey, Dtype};
+    fn key(object: Option<&str>) -> DataKey {
+        DataKey {
+            source: "test://k".into(),
+            dtype: Dtype::Number,
+            shape: vec![],
+            dtype_numpy: None,
+            external: None,
+            units: None,
+            precision: None,
+            object_name: object.map(str::to_string),
+            dims: None,
+            limits: None,
+            choices: None,
+        }
+    }
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let data_keys = std::collections::HashMap::from([
+        ("enc_theta".to_string(), key(Some("flyer"))),
+        ("enc_time".to_string(), key(Some("flyer"))),
+        ("loose".to_string(), key(None)),
+    ]);
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::DeclareStream { stream_name: "fly".into(), data_keys };
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    re.run_async(plan).await.unwrap();
+
+    let docs = sink.snapshot().await;
+    let desc = docs
+        .iter()
+        .find_map(|d| match d {
+            Document::Descriptor(d) if d.name.as_deref() == Some("fly") => Some(d),
+            _ => None,
+        })
+        .expect("fly descriptor");
+    assert_eq!(
+        desc.object_keys,
+        std::collections::HashMap::from([(
+            "flyer".to_string(),
+            vec!["enc_theta".to_string(), "enc_time".to_string()]
+        )])
+    );
+    assert_eq!(desc.data_keys.len(), 3);
+    assert!(desc.hints.is_none());
 }
 
 // The monitor pump keys each Event by the object's single described data

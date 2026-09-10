@@ -2541,6 +2541,51 @@ impl bsrs::core::msg::CollectableObj for FlyCollector {
     }
 }
 
+// A collect stream's descriptor lists the collector's keys under its name
+// and stamps each key with it — bluesky's collect path runs `_prepare_stream`
+// over `{obj: describe_collect()[stream]}`. Before F4 `declare_stream` passed
+// an empty `object_keys`.
+#[tokio::test]
+async fn collect_stream_descriptor_lists_the_collectors_keys() {
+    use bsrs::core::Msg;
+    use std::sync::atomic::AtomicUsize;
+
+    let flyer = Arc::new(FlyCollector {
+        collects: Arc::new(AtomicUsize::new(0)),
+    });
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let fly: Arc<dyn bsrs::core::msg::FlyableObj> = flyer.clone();
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Kickoff { obj: fly.clone(), group: Some("k".into()) };
+        yield Msg::Wait { group: "k".into(), error_on_timeout: true, timeout: None };
+        yield Msg::Complete { obj: fly.clone(), group: Some("c".into()) };
+        yield Msg::Wait { group: "c".into(), error_on_timeout: true, timeout: None };
+        yield Msg::Collect { obj: fly.clone().as_collectable().unwrap(), stream_name: None };
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    re.run_async(plan).await.unwrap();
+
+    let docs = sink.snapshot().await;
+    let desc = docs
+        .iter()
+        .find_map(|d| match d {
+            bsrs::core::Document::Descriptor(d) if d.name.as_deref() == Some("primary") => Some(d),
+            _ => None,
+        })
+        .expect("collect stream descriptor");
+    assert_eq!(
+        desc.object_keys,
+        std::collections::HashMap::from([("flycoll".to_string(), vec!["fly_val".to_string()])])
+    );
+    assert_eq!(
+        desc.data_keys["fly_val"].object_name.as_deref(),
+        Some("flycoll")
+    );
+    assert!(desc.configuration.contains_key("flycoll"));
+}
+
 #[tokio::test]
 async fn uncollected_flyer_is_backstop_collected_on_abort() {
     use bsrs::core::Msg;

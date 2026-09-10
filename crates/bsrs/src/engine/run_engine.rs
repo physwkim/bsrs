@@ -32,7 +32,7 @@ use serde_json::Value;
 use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
-use crate::engine::bundler::RunBundler;
+use crate::engine::bundler::{RunBundler, StreamObject};
 use crate::engine::sink::DocumentSink;
 use crate::engine::suspender::{Suspender, SuspenderHandle};
 
@@ -1440,8 +1440,13 @@ impl RunEngine {
             let mut out = Vec::new();
             for (name, dks) in &descs {
                 if bundler.descriptor_uid(name).is_none() {
-                    let configuration = HashMap::from([(obj.name().to_string(), config.clone())]);
-                    out.push(bundler.declare_stream(name.clone(), dks.clone(), configuration)?);
+                    let collected = StreamObject {
+                        object: Some(obj.name().to_string()),
+                        data_keys: dks.clone(),
+                        hint_fields: None,
+                        configuration: config.clone(),
+                    };
+                    out.push(bundler.declare_stream(name.clone(), vec![collected]));
                 }
             }
             out
@@ -2233,14 +2238,15 @@ impl RunEngine {
                 // `Msg::DeclareStream` carries raw data keys, not objects
                 // (deviation from bluesky, whose declare_stream takes the
                 // collect objects), so there is nothing to read configuration
-                // from — the descriptor's configuration stays empty here. The
-                // object-driven paths (Read/save, Collect, Monitor) fill it.
+                // or hints from; `object_keys` comes from the keys' own
+                // `object_name` annotations. The object-driven paths
+                // (Read/save, Collect, Monitor) fill everything.
                 let descriptor = {
                     let mut state = self.state.lock().await;
                     state
                         .bundler_mut(&run_key)
                         .ok_or_else(|| BsrsError::Plan("DeclareStream with no open run".into()))?
-                        .declare_stream(stream_name, data_keys, HashMap::new())?
+                        .declare_stream(stream_name, StreamObject::from_data_keys(data_keys))
                 };
                 self.broadcast(&Document::Descriptor(descriptor)).await?;
             }
@@ -2268,15 +2274,16 @@ impl RunEngine {
                     let config = self
                         .ensure_object_configuration(&run_key, obj.name(), obj.as_configurable())
                         .await?;
-                    let object_name = Some(obj.name().to_string());
-                    let hint_fields = obj.hint_fields();
+                    let read_obj = StreamObject {
+                        object: Some(obj.name().to_string()),
+                        data_keys,
+                        hint_fields: obj.hint_fields(),
+                        configuration: config,
+                    };
                     let tracks_assets = obj.writes_external_assets();
                     let mut state = self.state.lock().await;
                     if let Some(slot) = state.run_mut(&run_key) {
-                        slot.bundler
-                            .add_readings(readings, data_keys, object_name, hint_fields)?;
-                        slot.bundler
-                            .add_configuration(obj.name().to_string(), config)?;
+                        slot.bundler.add_read(read_obj, readings)?;
                         // Track asset-writing readables so the paired `Save`
                         // drains their `StreamResource`/`StreamDatum`, stamped
                         // with the bundle's descriptor (bluesky
@@ -2817,8 +2824,13 @@ impl RunEngine {
             let descriptor = if bundler.descriptor_uid(&stream).is_some() {
                 None
             } else {
-                let configuration = HashMap::from([(obj.name().to_string(), config)]);
-                Some(bundler.declare_stream(stream.clone(), data_keys.clone(), configuration)?)
+                let monitored = StreamObject {
+                    object: Some(obj.name().to_string()),
+                    data_keys: data_keys.clone(),
+                    hint_fields: obj.hint_fields(),
+                    configuration: config,
+                };
+                Some(bundler.declare_stream(stream.clone(), vec![monitored]))
             };
             (descriptor, bundler.bundle())
         };
@@ -3132,9 +3144,12 @@ impl RunEngine {
                         choices: None,
                     },
                 );
-                // No configuration: bluesky's interruptions descriptor is
-                // composed from a bare data key, no objects (bundlers.py).
-                Some(bundler.declare_stream("interruptions".into(), keys, HashMap::new())?)
+                // No object behind it: bluesky's interruptions descriptor is
+                // composed from a bare data key (run_engine.py:1880).
+                Some(
+                    bundler
+                        .declare_stream("interruptions".into(), StreamObject::from_data_keys(keys)),
+                )
             } else {
                 None
             };
