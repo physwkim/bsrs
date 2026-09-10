@@ -597,7 +597,8 @@ async fn suspend_bool_high_pauses_on_high_resumes_on_low() {
     use bsrs::engine::SuspendBoolHigh;
     let (tx, rx) = tokio::sync::watch::channel(false);
     let re = Arc::new(RunEngine::new(vec![]));
-    let _watcher = SuspendBoolHigh::new("shutter", rx).install(re.clone());
+    re.install_suspender(Arc::new(SuspendBoolHigh::new("shutter", rx)))
+        .await;
 
     let re2 = re.clone();
     let plan = plan_box(async_stream::stream! {
@@ -633,7 +634,8 @@ async fn suspend_bool_low_pauses_on_low_resumes_on_high() {
     use bsrs::engine::SuspendBoolLow;
     let (tx, rx) = tokio::sync::watch::channel(true);
     let re = Arc::new(RunEngine::new(vec![]));
-    let _watcher = SuspendBoolLow::new("beam", rx).install(re.clone());
+    re.install_suspender(Arc::new(SuspendBoolLow::new("beam", rx)))
+        .await;
 
     let re2 = re.clone();
     let plan = plan_box(async_stream::stream! {
@@ -662,8 +664,13 @@ async fn suspend_threshold_floor_pauses_when_below() {
     use bsrs::engine::{SuspendThreshold, ThresholdDirection};
     let (tx, rx) = tokio::sync::watch::channel(100.0_f64);
     let re = Arc::new(RunEngine::new(vec![]));
-    let _watcher = SuspendThreshold::new("beam_current", rx, 50.0, ThresholdDirection::BadIfBelow)
-        .install(re.clone());
+    re.install_suspender(Arc::new(SuspendThreshold::new(
+        "beam_current",
+        rx,
+        50.0,
+        ThresholdDirection::BadIfBelow,
+    )))
+    .await;
 
     let re2 = re.clone();
     let plan = plan_box(async_stream::stream! {
@@ -693,7 +700,13 @@ async fn suspend_outside_band_pauses_outside_resumes_inside() {
     use bsrs::engine::SuspendOutsideBand;
     let (tx, rx) = tokio::sync::watch::channel(25.0_f64); // inside (20, 30)
     let re = Arc::new(RunEngine::new(vec![]));
-    let _watcher = SuspendOutsideBand::new("temperature", rx, 20.0, 30.0).install(re.clone());
+    re.install_suspender(Arc::new(SuspendOutsideBand::new(
+        "temperature",
+        rx,
+        20.0,
+        30.0,
+    )))
+    .await;
 
     let re2 = re.clone();
     let plan = plan_box(async_stream::stream! {
@@ -730,9 +743,10 @@ async fn suspend_when_changed_allow_resume_pauses_then_resumes() {
     use bsrs::engine::SuspendWhenChanged;
     let (tx, rx) = tokio::sync::watch::channel("operate".to_string());
     let re = Arc::new(RunEngine::new(vec![]));
-    let _watcher = SuspendWhenChanged::new("facility_mode", rx, "operate".to_string())
-        .allow_resume()
-        .install(re.clone());
+    re.install_suspender(Arc::new(
+        SuspendWhenChanged::new("facility_mode", rx, "operate".to_string()).allow_resume(),
+    ))
+    .await;
 
     let re2 = re.clone();
     let plan = plan_box(async_stream::stream! {
@@ -766,11 +780,9 @@ async fn suspend_when_changed_no_resume_requires_manual_resume() {
     // `expected` does NOT auto-resume; only a manual RE.resume() lifts it.
     use bsrs::engine::SuspendWhenChanged;
     let (tx, rx) = tokio::sync::watch::channel(0_i64);
-    // Keep a receiver alive: the one-shot watcher drops its own on trip, and
-    // we still want `tx.send` to succeed afterwards to prove it does nothing.
-    let _rx_keep = rx.clone();
     let re = Arc::new(RunEngine::new(vec![]));
-    let _watcher = SuspendWhenChanged::new("interlock", rx, 0_i64).install(re.clone());
+    re.install_suspender(Arc::new(SuspendWhenChanged::new("interlock", rx, 0_i64)))
+        .await;
 
     let re2 = re.clone();
     let plan = plan_box(async_stream::stream! {
@@ -802,6 +814,281 @@ async fn suspend_when_changed_no_resume_requires_manual_resume() {
         .unwrap()
         .unwrap();
     assert_eq!(re.state(), EngineRunState::Idle);
+}
+
+// A plan that parks on `Sleep`s long enough for the test to trip and clear a
+// suspender while it runs; `OpenRun`/`CloseRun` so interruptions are recorded.
+fn sleepy_run(steps: usize) -> Plan {
+    plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        for _ in 0..steps {
+            yield Msg::Sleep(Duration::from_millis(50));
+        }
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    })
+}
+
+// An installed reference suspender runs its `pre_plan` when the suspension
+// takes hold and its `post_plan` on release, both through the engine's
+// handlers — bluesky's SuspendBoolHigh(pre_plan=close_shutter,
+// post_plan=open_shutter). Before F3 the reference impls had no plans at all.
+#[tokio::test]
+async fn installed_suspender_runs_pre_and_post_plans() {
+    use bsrs::core::msg::MovableObj;
+    use bsrs::engine::SuspendBoolHigh;
+
+    let log = Arc::new(StdMutex::new(Vec::<f64>::new()));
+    let motor: Arc<dyn MovableObj> = Arc::new(RecordingMotor {
+        name: "shutter".into(),
+        log: log.clone(),
+    });
+    let (pre_motor, post_motor) = (motor.clone(), motor.clone());
+    let pre: bsrs::engine::SuspendCallback = Arc::new(move || {
+        let m = pre_motor.clone();
+        plan_box(async_stream::stream! {
+            yield Msg::Set { obj: m.clone(), value: 10.0, group: None };
+        })
+    });
+    let post: bsrs::engine::SuspendCallback = Arc::new(move || {
+        let m = post_motor.clone();
+        plan_box(async_stream::stream! {
+            yield Msg::Set { obj: m.clone(), value: 20.0, group: None };
+        })
+    });
+
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let re = Arc::new(RunEngine::new(vec![]));
+    re.install_suspender(Arc::new(
+        SuspendBoolHigh::new("shutter", rx)
+            .with_pre_plan(pre)
+            .with_post_plan(post),
+    ))
+    .await;
+
+    let re2 = re.clone();
+    let join = tokio::spawn(async move { re2.run_async(sleepy_run(3)).await });
+    wait_for_state(&re, EngineRunState::Running).await;
+
+    tx.send(true).unwrap();
+    wait_for_state(&re, EngineRunState::Paused).await;
+    // pre_plan ran on the way into the suspension; post_plan not yet.
+    wait_until("pre_plan setpoint", || {
+        log.lock().unwrap().as_slice() == [10.0]
+    })
+    .await;
+
+    tx.send(false).unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("auto-resume in time")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        log.lock().unwrap().as_slice(),
+        [10.0, 20.0],
+        "post_plan must run once, on release"
+    );
+}
+
+// ENG-12 for a reference suspender: installed while already tripped, it gates
+// plan start until the condition clears (bluesky prepends a `wait_for` on every
+// tripped suspender in `RunEngine.__call__`). Before F3 the reference impls
+// were never registered, so the gate could not see them.
+#[tokio::test]
+async fn tripped_reference_suspender_gates_plan_start() {
+    use bsrs::engine::SuspendBoolHigh;
+    let (tx, rx) = tokio::sync::watch::channel(true);
+    let re = Arc::new(RunEngine::new(vec![]));
+    re.install_suspender(Arc::new(SuspendBoolHigh::new("shutter", rx)))
+        .await;
+
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let started_plan = started.clone();
+    let plan = plan_box(async_stream::stream! {
+        started_plan.store(true, Ordering::SeqCst);
+        yield Msg::OpenRun(Default::default());
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let re2 = re.clone();
+    let join = tokio::spawn(async move { re2.run_async(plan).await });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !started.load(Ordering::SeqCst),
+        "plan must not start while the shutter is closed"
+    );
+    assert_eq!(re.state(), EngineRunState::Running);
+
+    tx.send(false).unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("gate lifts once the signal clears")
+        .unwrap()
+        .unwrap();
+    assert!(started.load(Ordering::SeqCst));
+}
+
+// Two suspenders tripped at once hold the run until both clear — a beam dump
+// also closes the safety shutter, and releasing the first must not resume a
+// scan into a closed shutter.
+#[tokio::test]
+async fn overlapping_suspensions_resume_only_when_both_clear() {
+    use bsrs::engine::SuspendBoolHigh;
+    let (shutter_tx, shutter_rx) = tokio::sync::watch::channel(false);
+    let (beam_tx, beam_rx) = tokio::sync::watch::channel(false);
+    let re = Arc::new(RunEngine::new(vec![]));
+    re.install_suspender(Arc::new(SuspendBoolHigh::new("shutter", shutter_rx)))
+        .await;
+    re.install_suspender(Arc::new(SuspendBoolHigh::new("beam", beam_rx)))
+        .await;
+
+    let re2 = re.clone();
+    let join = tokio::spawn(async move { re2.run_async(sleepy_run(3)).await });
+    wait_for_state(&re, EngineRunState::Running).await;
+
+    shutter_tx.send(true).unwrap();
+    wait_for_state(&re, EngineRunState::Paused).await;
+    beam_tx.send(true).unwrap();
+    // Let the second trip register its hold before the first releases.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    shutter_tx.send(false).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        re.state(),
+        EngineRunState::Paused,
+        "the beam suspension must still hold the run"
+    );
+
+    beam_tx.send(false).unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("resume once both clear")
+        .unwrap()
+        .unwrap();
+    assert_eq!(re.state(), EngineRunState::Idle);
+}
+
+// A pause the user requested while the run is suspended outlives the
+// suspension's release: only `resume()` lifts it. Before F3 the installed
+// watcher lifted *any* pause when its condition cleared.
+#[tokio::test]
+async fn manual_pause_during_a_suspension_is_not_lifted_by_its_release() {
+    use bsrs::engine::SuspendBoolHigh;
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let re = Arc::new(RunEngine::new(vec![]));
+    re.install_suspender(Arc::new(SuspendBoolHigh::new("shutter", rx)))
+        .await;
+
+    let re2 = re.clone();
+    let join = tokio::spawn(async move { re2.run_async(sleepy_run(3)).await });
+    wait_for_state(&re, EngineRunState::Running).await;
+
+    tx.send(true).unwrap();
+    wait_for_state(&re, EngineRunState::Paused).await;
+    re.pause(false);
+
+    tx.send(false).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        re.state(),
+        EngineRunState::Paused,
+        "the user's pause must survive the suspension's release"
+    );
+
+    re.resume();
+    let _ = tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("resume lifts the pause")
+        .unwrap()
+        .unwrap();
+    assert_eq!(re.state(), EngineRunState::Idle);
+}
+
+// A suspension is recorded under the suspender's justification, once — bluesky
+// `_start_suspender` records `justification or "suspended"` where a pause
+// records "pause". Before F3 a suspension landed both.
+#[tokio::test]
+async fn suspension_records_its_justification_not_pause() {
+    use bsrs::engine::SuspendBoolHigh;
+    let sink = Arc::new(CapturingSink::new());
+    let re = Arc::new(RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]));
+    re.set_record_interruptions(true);
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    re.install_suspender(Arc::new(SuspendBoolHigh::new("shutter", rx)))
+        .await;
+
+    let re2 = re.clone();
+    let join = tokio::spawn(async move { re2.run_async(sleepy_run(3)).await });
+    wait_for_docs(&sink, "interruptions descriptor", |docs| {
+        docs.iter().any(
+            |d| matches!(d, Document::Descriptor(d) if d.name.as_deref() == Some("interruptions")),
+        )
+    })
+    .await;
+
+    tx.send(true).unwrap();
+    wait_for_state(&re, EngineRunState::Paused).await;
+    tx.send(false).unwrap();
+    let _ = join.await.unwrap().unwrap();
+
+    let labels: Vec<String> = sink
+        .snapshot()
+        .await
+        .iter()
+        .filter_map(|d| match d {
+            Document::Event(e) => e
+                .data
+                .get("interruption")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(labels, ["shutter: signal high", "resume"]);
+}
+
+// A suspender stays installed after the run ends (bluesky `RE._suspenders`
+// is only touched by `remove_suspender` / `clear_suspenders`), so the next
+// run is gated and suspended by it too. Before F3 the engine dropped every
+// suspender at run end.
+#[tokio::test]
+async fn installed_suspender_persists_across_runs() {
+    use bsrs::engine::SuspendBoolHigh;
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    // The removed suspender takes its receiver with it; keep one so the last
+    // `send` below still has somewhere to go.
+    let _rx_keep = rx.clone();
+    let re = Arc::new(RunEngine::new(vec![]));
+    let id = re
+        .install_suspender(Arc::new(SuspendBoolHigh::new("shutter", rx)))
+        .await;
+
+    let _ = re.run_async(sleepy_run(1)).await.unwrap();
+
+    let re2 = re.clone();
+    let join = tokio::spawn(async move { re2.run_async(sleepy_run(3)).await });
+    wait_for_state(&re, EngineRunState::Running).await;
+    tx.send(true).unwrap();
+    wait_for_state(&re, EngineRunState::Paused).await;
+    tx.send(false).unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("second run suspends and resumes")
+        .unwrap()
+        .unwrap();
+
+    // Removed, it no longer touches the run.
+    re.remove_suspender(id).await;
+    let re3 = re.clone();
+    let join = tokio::spawn(async move { re3.run_async(sleepy_run(3)).await });
+    wait_for_state(&re, EngineRunState::Running).await;
+    tx.send(true).unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("removed suspender must not suspend the run")
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]

@@ -16,7 +16,7 @@
 
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -200,42 +200,171 @@ struct WaitGroup {
     members: Vec<Status>,
 }
 
-/// Factory for a suspender `pre_plan` / `post_plan` — an injected plan run
-/// when the engine enters (`pre_plan`) or leaves (`post_plan`) a suspension.
-/// It is a factory (not a bare [`Plan`]) so a fresh message stream is produced
-/// each time a suspension fires, mirroring bluesky's `pre_plan` / `post_plan`
-/// (`run_engine.py:1199`), which are generator callables re-invoked per
-/// suspend. The produced plan's messages run through the *same* handlers as the
-/// main plan — so a `pre_plan` can e.g. close a shutter (real `Set`/`Wait`) and
-/// emit documents before the wait, and `post_plan` can re-open it on resume.
-pub type SuspendCallback = Arc<dyn Fn() -> Plan + Send + Sync>;
+pub use crate::core::suspender::SuspendCallback;
+
+/// The engine's control plane: the flags and wakeups a `pause`, `resume` or
+/// suspension request touches, behind one owner the engine shares (as an
+/// `Arc`) with the tasks that make such requests — an installed suspender's
+/// watcher, a suspension's release — so none of them needs the engine itself.
+/// Every `is_paused: false → true` transition goes through
+/// [`Self::mark_paused`], every `true → false` through [`Self::wake`].
+struct RunControl {
+    /// The engine has claimed a run: `run_async` is in progress, paused or not.
+    is_running: AtomicBool,
+    is_paused: AtomicBool,
+    /// Wakes the run loop parked in the pause gate (bluesky `_run_permit`).
+    permit: Notify,
+    /// Fired on every `is_paused: false → true` transition (immediate `pause`,
+    /// a suspension, or a deferred pause applied at a checkpoint) — the pause
+    /// edge, distinct from `permit` (which wakes the *plan* loop on resume).
+    pause_notify: Notify,
+    /// Per-run cancellation token. Renewed at every `run_async` entry so a
+    /// stale `abort` / `stop` from a previous run doesn't immediately tear
+    /// down the new one, and whenever the run loop acknowledges the pause or
+    /// interrupt request that cancelled it.
+    cancel: StdMutex<CancellationToken>,
+    /// Count of pause/suspend requests, the pause-side twin of the engine's
+    /// `interrupt_seq`: the run loop remembers the count as of the request it
+    /// last acted on, so a handler unparked by the request's token
+    /// cancellation is recognised as pausing rather than failing, and so a
+    /// `resume` that lands before the loop reaches the pause gate cannot make
+    /// the gate skip the request (the rewind on the way out is what replays
+    /// the interrupted message). Bumped only by `mark_paused`.
+    pause_seq: AtomicU64,
+    /// The suspension behind the pause request being made: stored before
+    /// `mark_paused` and taken by the pause gate as it enters, so its
+    /// justification is what the gate records and its plans are what the gate
+    /// runs. A second suspension requested while the run is already parked
+    /// replaces an untaken one — see `RunEngine::install_suspender`.
+    pending_suspend: StdMutex<Option<Suspension>>,
+    /// Suspensions requested and not yet released. A release wakes the engine
+    /// only when it is the last one — a beam dump closes the safety shutter
+    /// too, and the scan must wait for both — and never over a manual pause.
+    holds: AtomicUsize,
+    /// A pause the user asked for (`pause`, SIGINT, `Msg::Pause`) is lifted
+    /// only by `resume`, never by a suspension's release: in bluesky, Ctrl-C
+    /// during a suspension cancels its `wait_for` (run_engine.py:1710-1716)
+    /// and the suspender's event then resumes nothing.
+    manual_pause: AtomicBool,
+    /// Bumped by `reset_for_run`; a release carrying an older generation
+    /// belongs to a suspension of a previous run and is ignored.
+    run_gen: AtomicU64,
+}
+
+/// What a suspension runs around its wait and how it is recorded — bluesky
+/// `request_suspend`'s `pre_plan`, `post_plan` and `justification`.
+struct Suspension {
+    justification: String,
+    pre_plan: Option<SuspendCallback>,
+    post_plan: Option<SuspendCallback>,
+}
+
+impl RunControl {
+    fn new() -> Self {
+        Self {
+            is_running: AtomicBool::new(false),
+            is_paused: AtomicBool::new(false),
+            permit: Notify::new(),
+            pause_notify: Notify::new(),
+            cancel: StdMutex::new(CancellationToken::new()),
+            pause_seq: AtomicU64::new(0),
+            pending_suspend: StdMutex::new(None),
+            holds: AtomicUsize::new(0),
+            manual_pause: AtomicBool::new(false),
+            run_gen: AtomicU64::new(0),
+        }
+    }
+
+    /// Reset for a new run: nothing a previous run's pause, suspension or
+    /// interrupt left behind may reach this one.
+    fn reset_for_run(&self) {
+        self.run_gen.fetch_add(1, Ordering::SeqCst);
+        self.is_paused.store(false, Ordering::SeqCst);
+        self.manual_pause.store(false, Ordering::SeqCst);
+        self.holds.store(0, Ordering::SeqCst);
+        *self.pending_suspend.lock().unwrap() = None;
+        *self.cancel.lock().unwrap() = CancellationToken::new();
+    }
+
+    /// Single owner of the `is_paused: false → true` transition. Stores the
+    /// flag, counts the request under the token lock and cancels the run's
+    /// token so a handler parked in `Wait`/`Sleep`/`WaitFor` (or an inline
+    /// status await) returns at once — bluesky's `_request_pause_coro` and
+    /// `_request_suspend` both cancel the `_run` task (run_engine.py:856,
+    /// :1253), which is what lets `stop_on_pause` reach a motor while it is
+    /// still moving. Then signals `pause_notify` for whoever watches the pause
+    /// edge.
+    fn mark_paused(&self) {
+        self.is_paused.store(true, Ordering::SeqCst);
+        {
+            let token = self.cancel.lock().unwrap();
+            self.pause_seq.fetch_add(1, Ordering::SeqCst);
+            token.cancel();
+        }
+        self.pause_notify.notify_waiters();
+    }
+
+    /// A pause the user asked for: lifted only by [`Self::resume`].
+    fn pause(&self) {
+        self.manual_pause.store(true, Ordering::SeqCst);
+        self.mark_paused();
+    }
+
+    /// The user's resume: lifts the pause whatever requested it.
+    fn resume(&self) {
+        self.manual_pause.store(false, Ordering::SeqCst);
+        self.wake();
+    }
+
+    /// Single owner of the `is_paused: true → false` transition: clears the
+    /// flag and wakes the run loop parked in the pause gate.
+    fn wake(&self) {
+        self.is_paused.store(false, Ordering::SeqCst);
+        self.permit.notify_waiters();
+    }
+
+    /// Suspend the run until `fut` resolves (bluesky `request_suspend`). The
+    /// suspension is one hold on the engine; `fut` resolving releases it, and
+    /// the run wakes once no hold and no manual pause remains.
+    fn request_suspend(self: &Arc<Self>, fut: BoxFuture<'static, ()>, suspension: Suspension) {
+        // Store the suspension BEFORE `mark_paused` flips `is_paused`: the
+        // pause gate takes it the moment it observes the pause.
+        *self.pending_suspend.lock().unwrap() = Some(suspension);
+        self.holds.fetch_add(1, Ordering::SeqCst);
+        let gen = self.run_gen.load(Ordering::SeqCst);
+        self.mark_paused();
+        let me = Arc::downgrade(self);
+        tokio::spawn(async move {
+            fut.await;
+            if let Some(me) = me.upgrade() {
+                me.release(gen);
+            }
+        });
+    }
+
+    /// One suspension requested in run generation `gen` has lifted.
+    fn release(&self, gen: u64) {
+        if gen != self.run_gen.load(Ordering::SeqCst) {
+            return;
+        }
+        let before = self
+            .holds
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |h| {
+                Some(h.saturating_sub(1))
+            })
+            .unwrap_or(0);
+        if before <= 1 && !self.manual_pause.load(Ordering::SeqCst) {
+            self.wake();
+        }
+    }
+}
 
 /// The RunEngine.
 pub struct RunEngine {
     sinks: Vec<Arc<dyn DocumentSink>>,
-    /// Per-run cancellation token. Replaced at every `run_async` entry so
-    /// a stale `abort` / `stop` from a previous run doesn't immediately
-    /// tear down the new one. Borrowed via `cancel_token()`.
-    cancel: StdMutex<CancellationToken>,
-    permit: Arc<Notify>,
-    is_paused: Arc<AtomicBool>,
-    /// Fired on every `is_paused: false → true` transition (immediate
-    /// `pause`, `suspend_until_with`, or a deferred pause applied at a
-    /// checkpoint). Lets installed-`Suspender` watchers park until the
-    /// engine is actually paused instead of busy-looping a resume —
-    /// distinct from `permit` (which wakes the *plan* loop on resume).
-    pause_notify: Arc<Notify>,
-    /// Injected plan factories for the currently-requested suspension, set by
-    /// [`Self::suspend_until_with_plans`] *before* the pause takes effect. The
-    /// pause gate in `next_msg` takes `pending_pre_plan` right after
-    /// `on_pause_enter` (before the suspend wait) and `pending_post_plan` right
-    /// after `on_resume` (before the rewind replay), driving each produced plan
-    /// through the engine handlers. A plain `StdMutex` (not the async `state`
-    /// lock) so the synchronous `suspend_until_with_plans` can store them before
-    /// `mark_paused` without an await. Mirrors bluesky pre/post_plan injection.
-    pending_pre_plan: StdMutex<Option<SuspendCallback>>,
-    pending_post_plan: StdMutex<Option<SuspendCallback>>,
-    is_running: AtomicBool,
+    /// The control plane (`pause`/`resume`/suspend flags, wakeups, the run
+    /// token), shared with the tasks that pause the engine.
+    ctl: Arc<RunControl>,
     deferred_pause: AtomicBool,
     is_aborting: AtomicBool,
     is_halting: AtomicBool,
@@ -245,14 +374,6 @@ pub struct RunEngine {
     /// from the one already unwinding the plan — a second `abort` during
     /// cleanup is a second interrupt. Bumped only by `request_interrupt`.
     interrupt_seq: AtomicU64,
-    /// Count of pause/suspend requests, the pause-side twin of `interrupt_seq`:
-    /// the run loop remembers the count as of the request it last acted on, so
-    /// a handler unparked by the request's token cancellation is recognised as
-    /// pausing rather than failing, and so a `resume` that lands before the
-    /// loop reaches the pause gate cannot make the gate skip the request (the
-    /// rewind on the way out is what replays the interrupted message). Bumped
-    /// only by `mark_paused`.
-    pause_seq: AtomicU64,
     /// Caller-supplied reason for an interrupt (`abort`/`halt`), surfaced on
     /// the `RunStop` document of the closed run. Single owner of the interrupt
     /// reason: the interrupt entry points write it, `run_loop` reads it when
@@ -645,19 +766,12 @@ impl RunEngine {
     pub fn new(sinks: Vec<Arc<dyn DocumentSink>>) -> Self {
         Self {
             sinks,
-            cancel: StdMutex::new(CancellationToken::new()),
-            permit: Arc::new(Notify::new()),
-            is_paused: Arc::new(AtomicBool::new(false)),
-            pause_notify: Arc::new(Notify::new()),
-            pending_pre_plan: StdMutex::new(None),
-            pending_post_plan: StdMutex::new(None),
-            is_running: AtomicBool::new(false),
+            ctl: Arc::new(RunControl::new()),
             deferred_pause: AtomicBool::new(false),
             is_aborting: AtomicBool::new(false),
             is_halting: AtomicBool::new(false),
             is_stopping: AtomicBool::new(false),
             interrupt_seq: AtomicU64::new(0),
-            pause_seq: AtomicU64::new(0),
             interrupt_reason: StdMutex::new(String::new()),
             sigint_count: AtomicU8::new(0),
             suspender_count: AtomicU64::new(0),
@@ -744,6 +858,7 @@ impl RunEngine {
         // state reset are skipped, so a rejected caller leaves the in-flight
         // run untouched.
         if self
+            .ctl
             .is_running
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
@@ -770,8 +885,9 @@ impl RunEngine {
         // Clear any interrupt reason left by a previous run so it cannot leak
         // into this run's RunStop (bluesky run_engine.py:1497).
         self.interrupt_reason.lock().unwrap().clear();
-        self.is_paused.store(false, Ordering::SeqCst);
-        let pause_seen = self.pause_seq.load(Ordering::SeqCst);
+        // Pause, suspension and token state of a previous run stop here.
+        self.ctl.reset_for_run();
+        let pause_seen = self.ctl.pause_seq.load(Ordering::SeqCst);
         // A deferred pause that never reached a Checkpoint before its run
         // ended must not carry over and pause this run's first Checkpoint.
         self.deferred_pause.store(false, Ordering::SeqCst);
@@ -779,9 +895,6 @@ impl RunEngine {
         // not put a fresh run into the abort/halt path on the very
         // first ctrl-c.
         self.sigint_count.store(0, Ordering::SeqCst);
-        // Renew the cancel token so a previous abort/stop's cancel state
-        // doesn't immediately tear down this run.
-        *self.cancel.lock().unwrap() = CancellationToken::new();
         // Migrate any temp subs staged by `run_async_with` into the
         // engine state register so cleanup picks them up.
         let staged = std::mem::take(&mut *self.staged_temp_subs.lock().unwrap());
@@ -832,7 +945,7 @@ impl RunEngine {
                 match tokio::time::timeout(d, self.run_loop(plan, thrown_seq, pause_seen)).await {
                     Ok(r) => r,
                     Err(_) => {
-                        self.cancel.lock().unwrap().cancel();
+                        self.ctl.cancel.lock().unwrap().cancel();
                         Err(BsrsError::Timeout(d))
                     }
                 }
@@ -840,7 +953,7 @@ impl RunEngine {
             None => self.run_loop(plan, thrown_seq, pause_seen).await,
         };
         // Cleanup: stop touched movables / flyers, unstage anything
-        // still staged, drop suspenders. Mirrors bluesky's `_run`
+        // still staged. Mirrors bluesky's `_run`
         // exit chain (`_stop_movable_objects` then `unstage`).
         let mut state = self.state.lock().await;
         let staged = std::mem::take(&mut state.staged);
@@ -860,7 +973,8 @@ impl RunEngine {
         let _ = std::mem::take(&mut state.contingency_stack);
         let temp_subs = std::mem::take(&mut state.temp_subscribers);
         let _ = std::mem::take(&mut state.pausables);
-        let _ = std::mem::take(&mut state.suspenders); // Drop aborts watchers
+        // Suspenders stay installed across runs, as bluesky's `_suspenders`
+        // set does: only `remove_suspender` / `clear_suspenders` touch it.
         drop(state);
         // Bluesky `_temp_callback_ids` parity: subscribers added via
         // `Msg::Subscribe` or run_async_with's `subs` arg are removed
@@ -881,7 +995,7 @@ impl RunEngine {
         for s in staged {
             let _ = s.unstage_dyn().await;
         }
-        self.is_running.store(false, Ordering::SeqCst);
+        self.ctl.is_running.store(false, Ordering::SeqCst);
         // Clear per-call md so a subsequent `run_async` (without
         // `run_async_with`) sees an empty per-call register.
         self.per_call_md.lock().unwrap().clear();
@@ -916,10 +1030,10 @@ impl RunEngine {
         if self.is_aborting.load(Ordering::SeqCst) {
             return EngineRunState::Aborting;
         }
-        if self.is_paused.load(Ordering::SeqCst) {
+        if self.ctl.is_paused.load(Ordering::SeqCst) {
             return EngineRunState::Paused;
         }
-        if self.is_running.load(Ordering::SeqCst) {
+        if self.ctl.is_running.load(Ordering::SeqCst) {
             return EngineRunState::Running;
         }
         EngineRunState::Idle
@@ -1100,7 +1214,7 @@ impl RunEngine {
     /// the engine is already paused, this still installs the
     /// auto-resume task — the next resume will fire when `fut`
     /// resolves.
-    pub fn suspend_until(self: &Arc<Self>, fut: BoxFuture<'static, ()>) {
+    pub fn suspend_until(&self, fut: BoxFuture<'static, ()>) {
         self.suspend_until_with(fut, None);
     }
 
@@ -1108,11 +1222,7 @@ impl RunEngine {
     /// `"suspended"`) into the interruptions stream when recording
     /// is enabled. Mirrors bluesky's `request_suspend(fut, …,
     /// justification=…)`.
-    pub fn suspend_until_with(
-        self: &Arc<Self>,
-        fut: BoxFuture<'static, ()>,
-        justification: Option<String>,
-    ) {
+    pub fn suspend_until_with(&self, fut: BoxFuture<'static, ()>, justification: Option<String>) {
         self.suspend_until_with_plans(fut, justification, None, None);
     }
 
@@ -1125,31 +1235,20 @@ impl RunEngine {
     /// the main plan (real device motion + document emission), *not* as opaque
     /// side-effects. `None` for either leaves that phase unchanged.
     pub fn suspend_until_with_plans(
-        self: &Arc<Self>,
+        &self,
         fut: BoxFuture<'static, ()>,
         justification: Option<String>,
         pre_plan: Option<SuspendCallback>,
         post_plan: Option<SuspendCallback>,
     ) {
-        // Store the injected plans BEFORE `mark_paused` flips `is_paused`: the
-        // pause gate reads them the moment it observes the pause, so a store
-        // that raced after `mark_paused` could be missed on a fast pause entry.
-        *self.pending_pre_plan.lock().unwrap() = pre_plan;
-        *self.pending_post_plan.lock().unwrap() = post_plan;
-        self.mark_paused();
-        let me = Arc::downgrade(self);
-        let label = justification.unwrap_or_else(|| "suspended".into());
-        tokio::spawn(async move {
-            // Record the suspend at the start so it lands before any
-            // resume event from a fast-resolving future.
-            if let Some(me) = me.upgrade() {
-                me.record_interruption(&label).await;
-            }
-            fut.await;
-            if let Some(me) = me.upgrade() {
-                me.resume();
-            }
-        });
+        self.ctl.request_suspend(
+            fut,
+            Suspension {
+                justification: justification.unwrap_or_else(|| "suspended".into()),
+                pre_plan,
+                post_plan,
+            },
+        );
     }
 
     /// Synonym for [`Self::pause`]. Mirrors bluesky's `RE.request_pause`.
@@ -1173,25 +1272,6 @@ impl RunEngine {
         crate::core::runtime::block_on(self.run_async(plan))
     }
 
-    /// Single owner of the `is_paused: false → true` transition. Stores the
-    /// flag, counts the request under the token lock and cancels the run's
-    /// token so a handler parked in `Wait`/`Sleep`/`WaitFor` (or an inline
-    /// status await) returns at once — bluesky's `_request_pause_coro` and
-    /// `_request_suspend` both cancel the `_run` task (run_engine.py:856,
-    /// :1253), which is what lets `stop_on_pause` reach a motor while it is
-    /// still moving. Then signals `pause_notify` so installed-`Suspender`
-    /// watchers can re-arm on the pause edge. Every site that pauses the
-    /// engine routes through here so no watcher misses a suspension.
-    fn mark_paused(&self) {
-        self.is_paused.store(true, Ordering::SeqCst);
-        {
-            let token = self.cancel.lock().unwrap();
-            self.pause_seq.fetch_add(1, Ordering::SeqCst);
-            token.cancel();
-        }
-        self.pause_notify.notify_waiters();
-    }
-
     /// External: request a pause. If `defer = true`, the pause takes effect at
     /// the next `Checkpoint`; otherwise immediately, interrupting the message
     /// in flight. The interrupted message is not lost: the rewind on resume
@@ -1200,15 +1280,14 @@ impl RunEngine {
         if defer {
             self.deferred_pause.store(true, Ordering::SeqCst);
         } else {
-            self.mark_paused();
+            self.ctl.pause();
         }
     }
 
     /// External: resume a paused engine. Replays the rewind cache before
     /// pulling the next plan message.
     pub fn resume(&self) {
-        self.is_paused.store(false, Ordering::SeqCst);
-        self.permit.notify_waiters();
+        self.ctl.resume();
     }
 
     /// External: abort the run. Closes the open run with `exit_status="abort"`.
@@ -1247,13 +1326,12 @@ impl RunEngine {
     /// returns. The request is counted under the token lock, so the loop never
     /// observes the cancelled token without the count that explains it.
     fn request_interrupt(&self) {
-        self.is_paused.store(false, Ordering::SeqCst);
         {
-            let token = self.cancel.lock().unwrap();
+            let token = self.ctl.cancel.lock().unwrap();
             self.interrupt_seq.fetch_add(1, Ordering::SeqCst);
             token.cancel();
         }
-        self.permit.notify_waiters();
+        self.ctl.wake();
     }
 
     /// The caller-supplied interrupt reason as a `RunStop` `reason` field: an
@@ -1271,7 +1349,7 @@ impl RunEngine {
 
     /// Whether a pause is currently in effect.
     pub fn is_paused(&self) -> bool {
-        self.is_paused.load(Ordering::SeqCst)
+        self.ctl.is_paused.load(Ordering::SeqCst)
     }
 
     /// Install a SIGINT handler implementing bluesky's 3-tap pattern:
@@ -1673,7 +1751,7 @@ impl RunEngine {
     /// second interrupt — as bluesky throws a second `RequestAbort` into the
     /// `finally` block.
     fn take_interrupt(&self, thrown_seq: &mut u64) -> Option<InterruptRequest> {
-        let mut token = self.cancel.lock().unwrap();
+        let mut token = self.ctl.cancel.lock().unwrap();
         let seq = self.interrupt_seq.load(Ordering::SeqCst);
         if seq == *thrown_seq {
             return None;
@@ -1696,7 +1774,7 @@ impl RunEngine {
 
     /// Is a pause request outstanding that the pause gate has not acted on?
     fn pause_pending(&self, pause_seen: u64) -> bool {
-        self.pause_seq.load(Ordering::SeqCst) != pause_seen
+        self.ctl.pause_seq.load(Ordering::SeqCst) != pause_seen
     }
 
     /// Consume the pause requests outstanding since `pause_seen` and renew the
@@ -1705,8 +1783,8 @@ impl RunEngine {
     /// inherit the cancellation that unparked the interrupted handler. A pause
     /// requested after this cancels the new token and counts again.
     fn ack_pause(&self, pause_seen: &mut u64) {
-        let mut token = self.cancel.lock().unwrap();
-        let seq = self.pause_seq.load(Ordering::SeqCst);
+        let mut token = self.ctl.cancel.lock().unwrap();
+        let seq = self.ctl.pause_seq.load(Ordering::SeqCst);
         if seq != *pause_seen {
             *pause_seen = seq;
             *token = CancellationToken::new();
@@ -1754,7 +1832,7 @@ impl RunEngine {
             // would otherwise be lost and the engine would hang. `enable()`
             // registers the waiter up front; the `is_paused` re-check below
             // closes the tiny window between the loop condition and `enable()`.
-            let resumed = self.permit.notified();
+            let resumed = self.ctl.permit.notified();
             tokio::pin!(resumed);
             resumed.as_mut().enable();
 
@@ -1762,17 +1840,25 @@ impl RunEngine {
             // message is handled on its behalf (the stop walk's devices, the
             // pre_plan).
             self.ack_pause(pause_seen);
-            self.on_pause_enter().await;
+            // The suspension behind the request, if it was one: its
+            // justification is what the interruptions stream records — bluesky's
+            // `_start_suspender` records `justification or "suspended"`
+            // (run_engine.py:1263) where `_request_pause_coro` records "pause" —
+            // and its plans bracket the wait.
+            let suspension = self.ctl.pending_suspend.lock().unwrap().take();
+            let interruption = suspension
+                .as_ref()
+                .map_or("pause", |s| s.justification.as_str());
+            self.on_pause_enter(interruption).await;
             // pre_plan: run after the motor-stop / Pausable walk and before the
             // suspend wait, driven through the same handlers as the main plan.
-            let pre = self.pending_pre_plan.lock().unwrap().take();
-            if let Some(pre) = pre {
+            if let Some(pre) = suspension.as_ref().and_then(|s| s.pre_plan.clone()) {
                 self.run_injected_plan(pre()).await;
             }
             // Wait for resume — unless it already fired during pause-enter or
             // pre_plan (captured by the armed `resumed`, or observed here as a
             // cleared `is_paused` when the notify landed before `enable()`).
-            if self.is_paused.load(Ordering::SeqCst) {
+            if self.ctl.is_paused.load(Ordering::SeqCst) {
                 resumed.await;
             }
             // A pause requested while already parked is absorbed here rather
@@ -1786,8 +1872,7 @@ impl RunEngine {
             self.on_resume().await;
             // post_plan: run after Pausable resume + monitor restore and before
             // the rewind replay drains, mirroring bluesky's post_plan.
-            let post = self.pending_post_plan.lock().unwrap().take();
-            if let Some(post) = post {
+            if let Some(post) = suspension.as_ref().and_then(|s| s.post_plan.clone()) {
                 self.run_injected_plan(post()).await;
             }
         }
@@ -1851,7 +1936,7 @@ impl RunEngine {
         }
     }
 
-    async fn on_pause_enter(&self) {
+    async fn on_pause_enter(&self, interruption: &str) {
         // Snapshot touched objects under the lock, then drop the lock
         // before awaiting their stop / pause hooks so a slow backend
         // can't hold the engine state locked.
@@ -1896,9 +1981,10 @@ impl RunEngine {
                 tracing::warn!("pause_dyn failed for {}: {e}", p.name());
             }
         }
-        // Bluesky parity: record_interruption("pause") on every pause
-        // entry. No-op when recording is off or no run is open.
-        self.record_interruption("pause").await;
+        // Bluesky parity: every pause entry is recorded — "pause" for a
+        // pause, the justification for a suspension. No-op when recording is
+        // off or no run is open.
+        self.record_interruption(interruption).await;
     }
 
     async fn on_resume(&self) {
@@ -2406,7 +2492,7 @@ impl RunEngine {
                 *self.last_msg_result.lock().unwrap() = MsgResult::WaitComplete { done };
             }
             Msg::Sleep(d) => {
-                let token = self.cancel.lock().unwrap().clone();
+                let token = self.ctl.cancel.lock().unwrap().clone();
                 tokio::select! {
                     _ = tokio::time::sleep(d) => {}
                     _ = token.cancelled() => {
@@ -2454,7 +2540,7 @@ impl RunEngine {
                 }
                 // If a deferred_pause is queued, apply it now.
                 if self.deferred_pause.swap(false, Ordering::SeqCst) {
-                    self.mark_paused();
+                    self.ctl.pause();
                 }
             }
             Msg::ClearCheckpoint => {
@@ -2494,10 +2580,20 @@ impl RunEngine {
                 }
             }
             Msg::InstallSuspender { id, suspender } => {
-                self.install_suspender(id, suspender).await?;
+                // The plan-side Msg carries `Arc<dyn Any>` wrapping an
+                // `Arc<dyn Suspender>`.
+                let typed: Arc<dyn Suspender> = suspender
+                    .downcast::<Arc<dyn Suspender>>()
+                    .map(|a| (*a).clone())
+                    .map_err(|_| {
+                        BsrsError::Plan(
+                            "InstallSuspender payload was not Arc<dyn Suspender>".into(),
+                        )
+                    })?;
+                self.register_suspender(id, typed).await;
             }
             Msg::RemoveSuspender { id } => {
-                self.state.lock().await.suspenders.remove(&id);
+                self.remove_suspender(id).await;
             }
             Msg::RegisterPausable(obj) => {
                 self.state
@@ -2600,7 +2696,7 @@ impl RunEngine {
                 self.handle_status(status, group).await?;
             }
             Msg::WaitFor { factories, timeout } => {
-                let token = self.cancel.lock().unwrap().clone();
+                let token = self.ctl.cancel.lock().unwrap().clone();
                 // Start every awaitable up front so they make progress
                 // concurrently, mirroring bluesky's
                 // `[asyncio.ensure_future(f()) for f in futs]` followed by
@@ -2845,62 +2941,76 @@ impl RunEngine {
         }
     }
 
-    /// Install a `Suspender` at the engine level (outside any
-    /// active plan). The suspender's monitor task starts immediately
-    /// and is removed via [`Msg::RemoveSuspender`]. Use
-    /// [`Self::next_suspender_id`] to allocate `id`.
-    pub async fn install_suspender(&self, id: u64, susp: Arc<dyn Any + Send + Sync>) -> Result<()> {
-        // Recover the typed handle. The plan-side Msg carried `Arc<dyn Any>`
-        // wrapping an `Arc<dyn Suspender>`.
-        let typed: Arc<dyn Suspender> = susp
-            .downcast::<Arc<dyn Suspender>>()
-            .map(|a| (*a).clone())
-            .map_err(|_| {
-                BsrsError::Plan("InstallSuspender payload was not Arc<dyn Suspender>".into())
-            })?;
-
-        let permit = self.permit.clone();
-        let paused = self.is_paused.clone();
-        let pause_notify = self.pause_notify.clone();
-        let suspender_clone = typed.clone();
-        let handle = tokio::spawn(async move {
-            loop {
-                // Park until the engine is actually paused. The watcher exists
-                // to lift a *suspension*; it must never clear `is_paused` on a
-                // running engine (that would override an unrelated pause and
-                // make the engine un-pausable for as long as this suspender's
-                // condition stays clear). Arm the notification *before*
-                // re-checking the flag so a pause landing between check and
-                // await is never lost.
-                loop {
-                    let notified = pause_notify.notified();
-                    tokio::pin!(notified);
-                    notified.as_mut().enable();
-                    if paused.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    notified.await;
-                }
-                // Paused: wait for this suspender's condition to clear.
-                suspender_clone.watch().await;
-                // Resume — but only if the engine is still paused. If it was
-                // already resumed/aborted/halted, do nothing and re-arm; this
-                // never force-resumes a running engine.
-                if paused.swap(false, Ordering::SeqCst) {
-                    permit.notify_waiters();
-                }
-            }
-        });
-        let registration = SuspenderHandle::new(id, typed, handle);
-        self.state.lock().await.suspenders.insert(id, registration);
-        Ok(())
+    /// Install `susp` (bluesky `RE.install_suspender`). Registered, it gates
+    /// plan start while tripped (the ENG-12 gate in `run_async`), and its
+    /// watcher suspends the run each time [`Suspender::trip`] resolves until
+    /// [`Suspender::watch`] does, running the suspender's `pre_plan` after the
+    /// touched motors stop and its `post_plan` before the rewind replays. The
+    /// registration outlives the run, as bluesky's `_suspenders` set does; the
+    /// returned id is what [`Self::remove_suspender`] takes, and removing the
+    /// suspender releases a suspension it holds (bluesky's
+    /// `SuspenderBase.remove` sets its event, `suspenders.py:74-85`).
+    ///
+    /// A trip while no run is in progress requests nothing — the plan-start
+    /// gate covers a condition still bad when the next run starts — and one
+    /// bad episode requests one suspension: the watcher re-arms only once
+    /// `watch` has resolved, as bluesky requests only while no release event
+    /// exists (`suspenders.py:128-140`). A second suspender tripping while the
+    /// run is already suspended adds a hold the first release cannot lift, but
+    /// its plans do not run and its justification is not recorded: the gate
+    /// takes one suspension per pause.
+    pub async fn install_suspender(&self, susp: Arc<dyn Suspender>) -> u64 {
+        let id = self.next_suspender_id();
+        self.register_suspender(id, susp).await;
+        id
     }
 
-    /// Uninstall every engine-level suspender. Mirrors bluesky's
-    /// `RunEngine.clear_suspenders`: each suspender installed via
-    /// [`Msg::InstallSuspender`] is removed and its monitor task aborted
-    /// (dropping the [`SuspenderHandle`] aborts the watcher). A no-op when
-    /// none are installed. Per-id removal is [`Msg::RemoveSuspender`].
+    /// Registration shared by [`Self::install_suspender`] and the plan-side
+    /// `Msg::InstallSuspender`, whose issuer allocated `id` itself.
+    async fn register_suspender(&self, id: u64, susp: Arc<dyn Suspender>) {
+        let released = CancellationToken::new();
+        let watcher = {
+            let susp = susp.clone();
+            let ctl = self.ctl.clone();
+            let released = released.clone();
+            tokio::spawn(async move {
+                loop {
+                    susp.trip().await;
+                    if ctl.is_running.load(Ordering::SeqCst) {
+                        let clear = susp.watch();
+                        let released = released.clone();
+                        let fut: BoxFuture<'static, ()> = Box::pin(async move {
+                            tokio::select! {
+                                _ = clear => {}
+                                _ = released.cancelled() => {}
+                            }
+                        });
+                        ctl.request_suspend(
+                            fut,
+                            Suspension {
+                                justification: susp.justification(),
+                                pre_plan: susp.pre_plan(),
+                                post_plan: susp.post_plan(),
+                            },
+                        );
+                    }
+                    susp.watch().await;
+                }
+            })
+        };
+        let registration = SuspenderHandle::new(id, susp, watcher, released);
+        self.state.lock().await.suspenders.insert(id, registration);
+    }
+
+    /// Uninstall one suspender (bluesky `RE.remove_suspender`): its watcher is
+    /// aborted and a suspension it holds is released.
+    pub async fn remove_suspender(&self, id: u64) {
+        self.state.lock().await.suspenders.remove(&id);
+    }
+
+    /// Uninstall every suspender (bluesky `RE.clear_suspenders`): each watcher
+    /// is aborted and any suspension held is released. A no-op when none are
+    /// installed.
     pub async fn clear_suspenders(&self) {
         self.state.lock().await.suspenders.clear();
     }
@@ -3133,7 +3243,7 @@ impl RunEngine {
                 // The ungrouped form awaits inline, so it is parked exactly as
                 // `wait_group` is and must be unparked the same way: a
                 // pause/stop/abort cancels the token.
-                let token = self.cancel.lock().unwrap().clone();
+                let token = self.ctl.cancel.lock().unwrap().clone();
                 let outcome = tokio::select! {
                     r = status => r,
                     _ = token.cancelled() => return Err(BsrsError::Cancelled),
@@ -3179,7 +3289,7 @@ impl RunEngine {
         // it is still moving. The members are not restored on cancellation: as
         // in bluesky, where the popped futures are simply lost, the rewind on
         // resume re-issues the messages that created them.
-        let token = self.cancel.lock().unwrap().clone();
+        let token = self.ctl.cancel.lock().unwrap().clone();
         let fut = async move {
             // Await every member *concurrently*, returning as soon as the first
             // one fails — bluesky `_wait` runs the group through asyncio
@@ -3477,7 +3587,7 @@ mod tests {
                 },
             );
         }
-        let token = re.cancel.lock().unwrap().clone();
+        let token = re.ctl.cancel.lock().unwrap().clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
             token.cancel();

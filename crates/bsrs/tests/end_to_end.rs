@@ -1372,6 +1372,8 @@ async fn halt_emits_schema_valid_abort_in_stop_document() {
     }
 }
 
+// A suspender installed from inside the plan (`Msg::InstallSuspender`)
+// suspends the run when it trips and resumes it when it clears.
 #[tokio::test]
 async fn suspender_auto_resumes_engine() {
     use bsrs::engine::Suspender;
@@ -1380,30 +1382,43 @@ async fn suspender_auto_resumes_engine() {
     use std::sync::Arc as StdArc;
     use std::time::Duration;
 
+    // Tripped while `bad` is set; the test flips `bad` and pokes `notify`.
     struct ManualGate {
-        cleared: StdArc<AtomicBool>,
+        bad: StdArc<AtomicBool>,
         notify: StdArc<tokio::sync::Notify>,
+    }
+    impl ManualGate {
+        fn until(&self, want_bad: bool) -> BoxFuture<'static, ()> {
+            let bad = self.bad.clone();
+            let notify = self.notify.clone();
+            Box::pin(async move {
+                loop {
+                    let wait = notify.notified();
+                    if bad.load(AOrd::SeqCst) == want_bad {
+                        return;
+                    }
+                    wait.await;
+                }
+            })
+        }
     }
     #[async_trait::async_trait]
     impl Suspender for ManualGate {
         fn name(&self) -> &str {
             "manual_gate"
         }
+        fn trip(&self) -> BoxFuture<'static, ()> {
+            self.until(true)
+        }
         fn watch(&self) -> BoxFuture<'static, ()> {
-            let cleared = self.cleared.clone();
-            let notify = self.notify.clone();
-            Box::pin(async move {
-                while !cleared.load(AOrd::SeqCst) {
-                    notify.notified().await;
-                }
-            })
+            self.until(false)
         }
     }
 
-    let cleared = StdArc::new(AtomicBool::new(false));
+    let bad = StdArc::new(AtomicBool::new(false));
     let notify = StdArc::new(tokio::sync::Notify::new());
     let gate = StdArc::new(ManualGate {
-        cleared: cleared.clone(),
+        bad: bad.clone(),
         notify: notify.clone(),
     });
 
@@ -1417,8 +1432,9 @@ async fn suspender_auto_resumes_engine() {
     let plan = bsrs::core::plan::plan_box(async_stream::stream! {
         yield bsrs::core::Msg::InstallSuspender { id, suspender: payload };
         yield bsrs::core::Msg::OpenRun(Default::default());
-        yield bsrs::core::Msg::Pause { defer: false };
-        // After auto-resume:
+        yield bsrs::core::Msg::Sleep(Duration::from_millis(50));
+        yield bsrs::core::Msg::Sleep(Duration::from_millis(50));
+        yield bsrs::core::Msg::Sleep(Duration::from_millis(50));
         yield bsrs::core::Msg::CloseRun {
             exit_status: "success".into(),
             reason: None,
@@ -1429,14 +1445,25 @@ async fn suspender_auto_resumes_engine() {
     let re_run = re.clone();
     let join = tokio::spawn(async move { re_run.run_async(plan).await });
 
-    // Wait for pause, then clear the gate.
+    // Trip the gate once the run is going; the suspension pauses the engine.
+    for _ in 0..50 {
+        if re.state() == bsrs::engine::EngineRunState::Running {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    bad.store(true, AOrd::SeqCst);
+    notify.notify_waiters();
     for _ in 0..50 {
         if re.is_paused() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    cleared.store(true, AOrd::SeqCst);
+    assert!(re.is_paused(), "tripped suspender must suspend the run");
+
+    // Clear it; the suspension lifts and the plan runs on.
+    bad.store(false, AOrd::SeqCst);
     notify.notify_waiters();
 
     let result = tokio::time::timeout(Duration::from_secs(2), join)
@@ -1447,42 +1474,54 @@ async fn suspender_auto_resumes_engine() {
     assert_eq!(result.exit_status, "success");
 }
 
-// Contrast with `suspender_auto_resumes_engine`: once `clear_suspenders`
-// uninstalls the gate, clearing its condition must NOT auto-resume the engine
-// (the watcher was aborted with the dropped handle), so the run stays paused
-// until aborted. Verifies the bluesky `RunEngine.clear_suspenders` parity API.
+// `clear_suspenders` while a suspender holds the run releases its suspension
+// (bluesky `SuspenderBase.remove` sets the release event, `suspenders.py:74-85`)
+// and, uninstalled, its condition no longer touches the engine.
 #[tokio::test]
-async fn clear_suspenders_stops_auto_resume() {
+async fn clear_suspenders_releases_the_suspension() {
     use bsrs::engine::Suspender;
     use futures::future::BoxFuture;
     use std::sync::atomic::{AtomicBool, Ordering as AOrd};
     use std::sync::Arc as StdArc;
     use std::time::Duration;
 
+    // Tripped while `bad` is set; the test flips `bad` and pokes `notify`.
     struct ManualGate {
-        cleared: StdArc<AtomicBool>,
+        bad: StdArc<AtomicBool>,
         notify: StdArc<tokio::sync::Notify>,
+    }
+    impl ManualGate {
+        fn until(&self, want_bad: bool) -> BoxFuture<'static, ()> {
+            let bad = self.bad.clone();
+            let notify = self.notify.clone();
+            Box::pin(async move {
+                loop {
+                    let wait = notify.notified();
+                    if bad.load(AOrd::SeqCst) == want_bad {
+                        return;
+                    }
+                    wait.await;
+                }
+            })
+        }
     }
     #[async_trait::async_trait]
     impl Suspender for ManualGate {
         fn name(&self) -> &str {
             "manual_gate"
         }
+        fn trip(&self) -> BoxFuture<'static, ()> {
+            self.until(true)
+        }
         fn watch(&self) -> BoxFuture<'static, ()> {
-            let cleared = self.cleared.clone();
-            let notify = self.notify.clone();
-            Box::pin(async move {
-                while !cleared.load(AOrd::SeqCst) {
-                    notify.notified().await;
-                }
-            })
+            self.until(false)
         }
     }
 
-    let cleared = StdArc::new(AtomicBool::new(false));
+    let bad = StdArc::new(AtomicBool::new(false));
     let notify = StdArc::new(tokio::sync::Notify::new());
     let gate = StdArc::new(ManualGate {
-        cleared: cleared.clone(),
+        bad: bad.clone(),
         notify: notify.clone(),
     });
 
@@ -1496,9 +1535,9 @@ async fn clear_suspenders_stops_auto_resume() {
     let plan = bsrs::core::plan::plan_box(async_stream::stream! {
         yield bsrs::core::Msg::InstallSuspender { id, suspender: payload };
         yield bsrs::core::Msg::OpenRun(Default::default());
-        yield bsrs::core::Msg::Pause { defer: false };
-        // Reached only if something resumes the engine — which must NOT happen
-        // after clear_suspenders, so this run is expected to abort while paused.
+        yield bsrs::core::Msg::Sleep(Duration::from_millis(50));
+        yield bsrs::core::Msg::Sleep(Duration::from_millis(50));
+        yield bsrs::core::Msg::Sleep(Duration::from_millis(50));
         yield bsrs::core::Msg::CloseRun {
             exit_status: "success".into(),
             reason: None,
@@ -1508,36 +1547,54 @@ async fn clear_suspenders_stops_auto_resume() {
     let re_run = re.clone();
     let join = tokio::spawn(async move { re_run.run_async(plan).await });
 
-    // Wait for the suspender to pause the engine.
+    for _ in 0..50 {
+        if re.state() == bsrs::engine::EngineRunState::Running {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    bad.store(true, AOrd::SeqCst);
+    notify.notify_waiters();
     for _ in 0..50 {
         if re.is_paused() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(re.is_paused(), "engine should be paused by the suspender");
-
-    // Uninstall the suspender; its watcher is aborted with the dropped handle.
-    re.clear_suspenders().await;
-    // Give the abort time to propagate before satisfying the (now-ignored) gate.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    cleared.store(true, AOrd::SeqCst);
-    notify.notify_waiters();
-
-    // With no installed suspender, clearing the gate cannot resume the engine:
-    // it stays paused. The run only ends when we abort it.
-    tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
         re.is_paused(),
-        "cleared suspender must not auto-resume the engine"
+        "engine should be suspended by the suspender"
     );
-    re.abort("test");
+
+    // Uninstalling releases the hold with the condition still bad: the run
+    // completes without the gate ever clearing.
+    re.clear_suspenders().await;
     let result = tokio::time::timeout(Duration::from_secs(2), join)
         .await
-        .expect("engine did not exit after abort")
+        .expect("clear_suspenders must release the suspension")
         .unwrap()
         .unwrap();
-    assert_eq!(result.exit_status, "abort");
+    assert_eq!(result.exit_status, "success");
+
+    // Still bad at the next run start and tripped again during it: the
+    // uninstalled gate neither gates nor suspends.
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        yield bsrs::core::Msg::Sleep(Duration::from_millis(50));
+        yield bsrs::core::Msg::CloseRun {
+            exit_status: "success".into(),
+            reason: None,
+        };
+    });
+    bad.store(false, AOrd::SeqCst);
+    notify.notify_waiters();
+    bad.store(true, AOrd::SeqCst);
+    notify.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(2), re.run_async(plan))
+        .await
+        .expect("uninstalled suspender must not touch the run")
+        .unwrap();
+    assert_eq!(result.exit_status, "success");
 }
 
 // An installed `Suspender` exists to lift a *suspension*; its `watch()` must
@@ -1561,6 +1618,9 @@ async fn installed_suspender_not_watched_while_engine_runs() {
     impl Suspender for CountingClear {
         fn name(&self) -> &str {
             "counting_clear"
+        }
+        fn trip(&self) -> BoxFuture<'static, ()> {
+            Box::pin(std::future::pending())
         }
         fn watch(&self) -> BoxFuture<'static, ()> {
             let polls = self.polls.clone();
@@ -2762,6 +2822,12 @@ impl bsrs::engine::Suspender for GateSuspender {
     fn name(&self) -> &str {
         &self.name
     }
+    // Never trips at runtime: these tests exercise the plan-start gate, and a
+    // watcher parked on `clear` would compete with `tripped()` for the test's
+    // single `notify_one`.
+    fn trip(&self) -> futures::future::BoxFuture<'static, ()> {
+        Box::pin(std::future::pending())
+    }
     fn watch(&self) -> futures::future::BoxFuture<'static, ()> {
         let clear = self.clear.clone();
         Box::pin(async move { clear.notified().await })
@@ -2798,10 +2864,7 @@ async fn tripped_suspender_gates_plan_start_until_cleared() {
     let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let re = Arc::new(RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new()));
 
-    let id = re.next_suspender_id();
-    let gate_dyn: Arc<dyn bsrs::engine::Suspender> = gate;
-    let payload: Arc<dyn std::any::Any + Send + Sync> = Arc::new(gate_dyn);
-    re.install_suspender(id, payload).await.unwrap();
+    re.install_suspender(gate).await;
 
     let started_plan = started.clone();
     let plan = bsrs::core::plan::plan_box(async_stream::stream! {
@@ -2843,10 +2906,7 @@ async fn untripped_suspender_does_not_gate_plan_start() {
         clear: Arc::new(tokio::sync::Notify::new()),
     });
     let re = Arc::new(RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new()));
-    let id = re.next_suspender_id();
-    let gate_dyn: Arc<dyn bsrs::engine::Suspender> = gate;
-    let payload: Arc<dyn std::any::Any + Send + Sync> = Arc::new(gate_dyn);
-    re.install_suspender(id, payload).await.unwrap();
+    re.install_suspender(gate).await;
 
     let plan = bsrs::core::plan::plan_box(async_stream::stream! {
         yield bsrs::core::Msg::OpenRun(Default::default());
