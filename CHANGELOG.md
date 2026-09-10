@@ -7,8 +7,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 Monitorable devices: `Msg::Monitor` now works end to end over the built-in
-devices, from the Rust API and from Lua. Two public signatures change, so the
-next release must be 0.5.0.
+devices, from the Rust API and from Lua. Interrupts unwind through the plan
+so `finalize_wrapper` cleanup runs on abort, suspenders are engine-owned and
+persist across runs, and every descriptor is shaped from its objects. Public
+signatures change, so the next release must be 0.5.0.
 
 ### Changed
 
@@ -19,6 +21,25 @@ next release must be 0.5.0.
 - **Breaking**: `Registry::register_positioner` additionally requires
   `MonitorableObj` and registers the object under the monitorable facet.
 - `SoftDetector::tick` returns the reading it published.
+- **Breaking**: `ContingencySink` holds an `Option<Thrown>` (`Thrown::Error`
+  or `Thrown::Interrupt(kind, reason)`) instead of an error string, and
+  `contingency_wrapper`'s `except_plan` is an `ExceptPlan` built from the
+  `Thrown`, as bluesky's `except_plan(e)` receives the exception.
+  `run_wrapper` closes an interrupted run with the interrupt's exit status
+  (`abort`, `fail`) rather than dropping it open.
+- **Breaking**: `Suspender::trip` is required and the trait gains `watch`,
+  `tripped`, `justification`, `pre_plan` and `post_plan`; the reference
+  suspenders lose `install(self, re)`. Install through
+  `RunEngine::install_suspender(Arc<dyn Suspender>) -> u64` and remove with
+  `remove_suspender(id)` / `clear_suspenders()`; installed suspenders persist
+  across runs as bluesky's `RE._suspenders` do. `SuspendCallback` moved to
+  `bsrs::core`; `suspend_until*` take `&self`.
+- **Breaking**: `RunBundler::add_readings` / `add_configuration` are replaced
+  by `add_read(StreamObject, readings)`, and `declare_stream` takes
+  `Vec<StreamObject>` and returns the `EventDescriptor` it emitted.
+- `CaMotor::set_dyn`, `CaPositioner::set_dyn` and `CaDetector` return a
+  pending `Status` at once and complete it from a task, so a multi-axis `mv`
+  moves its axes together.
 
 ### Added
 
@@ -50,6 +71,21 @@ next release must be 0.5.0.
 - **Lua**: subscribers receive worker-thread documents (monitor Events) in
   emission order. The REPL thread replays a subscriber's buffer before each
   of its own deliveries instead of only after `RE:run` returns.
+- **Engine**: `stop` and `abort` are thrown into the plan at the message
+  they interrupt, so `finalize_wrapper`, `run_wrapper` and `stage_wrapper`
+  tails run before the run closes, as bluesky's `RequestStop` /
+  `RequestAbort` unwind a generator; `halt` still drops the plan. A pause
+  cancels an in-flight `Msg::Wait` instead of applying after the move
+  finished, so `stop_on_pause` reaches a motor that is still moving.
+- **Suspenders**: a tripped suspender gates the next run's start, records its
+  justification (not "pause") on the suspension, runs its pre/post plans, and
+  holds the engine until every tripped suspender has released; a manual
+  `pause` during a suspension is not lifted by the suspender's release.
+- **Descriptors**: `object_keys` lists every object's read keys (an unhinted
+  object had no entry) and `declare_stream` descriptors from `collect` and
+  `monitor` carry their objects, hints and configuration.
+- **CA devices**: `describe_dyn` reports the PV's units, precision and limits
+  from DBR_CTRL and sources the key as `ca://<pv>`.
 
 ## [0.4.2] - 2026-09-03
 
