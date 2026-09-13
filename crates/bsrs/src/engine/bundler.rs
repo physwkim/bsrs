@@ -5,7 +5,7 @@ use crate::core::error::{BsrsError, Result};
 use crate::core::reading::ReadingValue;
 use crate::event_model::compose::RunBundle;
 use crate::event_model::{Configuration, DataKey, Document, EventDescriptor, PerObjectHint};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 /// One object's contribution to a stream descriptor: bluesky
@@ -95,6 +95,12 @@ pub struct RunBundler {
     /// the resource emitted before it. bluesky
     /// `RunBundler._stream_resource_data_keys`.
     stream_resource_data_keys: HashMap<String, String>,
+    /// Streams pre-declared by `Msg::DeclareStream`, keyed by the set of
+    /// object names declared together. `collect` resolves its stream here:
+    /// a named collect must find its name, an unnamed one takes the single
+    /// declared stream (bluesky `RunBundler._declared_stream_names`,
+    /// bundlers.py:183, 356-357, 1113-1124).
+    declared_stream_names: HashMap<BTreeSet<String>, Vec<String>>,
 }
 
 impl RunBundler {
@@ -108,7 +114,25 @@ impl RunBundler {
             config_cache: HashMap::new(),
             seq_snapshot: None,
             stream_resource_data_keys: HashMap::new(),
+            declared_stream_names: HashMap::new(),
         }
+    }
+
+    /// Record that `Msg::DeclareStream` declared `stream_name` for `objs`.
+    pub fn record_declared_stream(&mut self, objs: BTreeSet<String>, stream_name: String) {
+        self.declared_stream_names
+            .entry(objs)
+            .or_default()
+            .push(stream_name);
+    }
+
+    /// The streams `Msg::DeclareStream` declared for exactly `objs`, in
+    /// declaration order; empty when none.
+    pub fn declared_stream_names(&self, objs: &BTreeSet<String>) -> &[String] {
+        self.declared_stream_names
+            .get(objs)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// The run's `StreamResource` uid → `data_key` registry, for the engine's

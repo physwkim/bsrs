@@ -2272,6 +2272,59 @@ async fn kickoff_without_open_run_is_rejected_before_flyer_starts() {
     );
 }
 
+struct DescribeCountingCollectable {
+    describes: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl bsrs::core::msg::NamedObj for DescribeCountingCollectable {
+    fn name(&self) -> &str {
+        "countcollect"
+    }
+}
+#[async_trait::async_trait]
+impl bsrs::core::msg::CollectableObj for DescribeCountingCollectable {
+    async fn describe_collect_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, bsrs::event_model::DataKey>,
+        >,
+        bsrs::core::error::BsrsError,
+    > {
+        self.describes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let key = bsrs::event_model::DataKey {
+            source: "soft://countcollect".into(),
+            dtype: bsrs::event_model::Dtype::Number,
+            shape: vec![],
+            dtype_numpy: None,
+            external: None,
+            units: None,
+            precision: None,
+            object_name: None,
+            dims: None,
+            limits: None,
+            choices: None,
+        };
+        Ok(std::collections::HashMap::from([(
+            "primary".to_string(),
+            std::collections::HashMap::from([("count_val".to_string(), key)]),
+        )]))
+    }
+    async fn collect_dyn(
+        &self,
+    ) -> Result<
+        Vec<(
+            String,
+            std::collections::HashMap<String, serde_json::Value>,
+            std::collections::HashMap<String, f64>,
+        )>,
+        bsrs::core::error::BsrsError,
+    > {
+        Ok(Vec::new())
+    }
+}
+
 #[tokio::test]
 async fn collect_without_open_run_does_not_describe_the_flyer() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2284,41 +2337,6 @@ async fn collect_without_open_run_does_not_describe_the_flyer() {
     // first. Sibling of kickoff_without_open_run_is_rejected_before_flyer_starts;
     // same describe-before-precondition family as
     // monitor_without_open_run_does_not_describe_the_device.
-    struct DescribeCountingCollectable {
-        describes: Arc<AtomicUsize>,
-    }
-    impl bsrs::core::msg::NamedObj for DescribeCountingCollectable {
-        fn name(&self) -> &str {
-            "countcollect"
-        }
-    }
-    #[async_trait::async_trait]
-    impl bsrs::core::msg::CollectableObj for DescribeCountingCollectable {
-        async fn describe_collect_dyn(
-            &self,
-        ) -> Result<
-            std::collections::HashMap<
-                String,
-                std::collections::HashMap<String, bsrs::event_model::DataKey>,
-            >,
-            bsrs::core::error::BsrsError,
-        > {
-            self.describes.fetch_add(1, Ordering::SeqCst);
-            Ok(std::collections::HashMap::new())
-        }
-        async fn collect_dyn(
-            &self,
-        ) -> Result<
-            Vec<(
-                String,
-                std::collections::HashMap<String, serde_json::Value>,
-                std::collections::HashMap<String, f64>,
-            )>,
-            bsrs::core::error::BsrsError,
-        > {
-            Ok(Vec::new())
-        }
-    }
 
     let describes = Arc::new(AtomicUsize::new(0));
     let coll = Arc::new(DescribeCountingCollectable {
@@ -2752,6 +2770,71 @@ async fn declare_stream_collect_requires_the_single_declared_stream() {
         extra.contains("expected two to collect into the single stream \"primary\", got [\"aux\"]"),
         "reason: {extra}"
     );
+}
+
+// bluesky `RunBundler.collect` resolves the stream through
+// `_declared_stream_names` (bundlers.py:1113-1124). Boundaries: a named
+// collect with no prior declare fails; a named collect after the declare
+// lands in that stream; an unnamed collect after the declare takes the
+// declared stream and does not re-describe the object.
+#[tokio::test]
+async fn collect_with_a_name_requires_a_prior_declare_stream() {
+    use bsrs::core::Msg;
+    use std::sync::atomic::AtomicUsize;
+
+    let re = RunEngine::new(vec![]);
+    let coll: Arc<dyn bsrs::core::msg::CollectableObj> = Arc::new(FlyCollector {
+        collects: Arc::new(AtomicUsize::new(0)),
+    });
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Collect { obj: coll.clone(), stream_name: Some("primary".into()) };
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let result = re.run_async(plan).await.unwrap();
+    assert_eq!(result.exit_status, "fail", "reason: {}", result.reason);
+    assert!(
+        result
+            .reason
+            .contains("declare_stream was not called for it first"),
+        "reason: {}",
+        result.reason
+    );
+}
+
+#[tokio::test]
+async fn collect_after_declare_stream_uses_the_declared_stream_without_redescribing() {
+    use bsrs::core::Msg;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let describes = Arc::new(AtomicUsize::new(0));
+    let obj = Arc::new(DescribeCountingCollectable {
+        describes: describes.clone(),
+    });
+    let coll: Arc<dyn bsrs::core::msg::CollectableObj> = obj;
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::DeclareStream { stream_name: "primary".into(), objs: vec![coll.clone()].into() };
+        // Named and unnamed: both resolve to the declared stream.
+        yield Msg::Collect { obj: coll.clone(), stream_name: Some("primary".into()) };
+        yield Msg::Collect { obj: coll.clone(), stream_name: None };
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let result = re.run_async(plan).await.unwrap();
+    assert_eq!(result.exit_status, "success", "reason: {}", result.reason);
+    assert_eq!(
+        describes.load(Ordering::SeqCst),
+        1,
+        "described once at declare_stream, never again at collect"
+    );
+    let docs = sink.snapshot().await;
+    let descriptors = docs
+        .iter()
+        .filter(|d| matches!(d, bsrs::core::Document::Descriptor(_)))
+        .count();
+    assert_eq!(descriptors, 1, "collect reuses the declared descriptor");
 }
 
 #[tokio::test]

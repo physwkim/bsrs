@@ -1424,50 +1424,92 @@ impl RunEngine {
                 ));
             }
         }
-        let descs = obj.describe_collect_dyn().await?;
-        // The collect object's configuration, for any descriptor
-        // declared below — bluesky's collect path runs
-        // `ensure_cached(obj)` + `_prepare_stream`, which folds the
-        // object's config into the descriptor (bundlers.py:814-819).
-        let config = self
-            .ensure_object_configuration(run_key, obj.name(), obj.as_configurable())
-            .await?;
-        let new_descriptors: Vec<crate::event_model::EventDescriptor> = {
-            let mut state = self.state.lock().await;
-            let bundler = state
-                .bundler_mut(run_key)
-                .ok_or_else(|| BsrsError::Plan("Collect with no open run".into()))?;
-            let mut out = Vec::new();
-            for (name, dks) in &descs {
-                if bundler.descriptor_uid(name).is_none() {
-                    let collected = StreamObject {
-                        object: Some(obj.name().to_string()),
-                        data_keys: dks.clone(),
-                        hint_fields: obj.hint_fields(),
-                        configuration: config.clone(),
-                    };
-                    out.push(bundler.declare_stream(name.clone(), vec![collected]));
+        // Resolve the stream against what `Msg::DeclareStream` declared for
+        // this object (bluesky bundlers.py:1113-1124): a named collect must
+        // have been declared first; an unnamed one takes the single declared
+        // stream; with nothing declared the object is described here and its
+        // nested stream(s) declared (the old-style doubly-nested path).
+        let declared_stream: Option<String> = {
+            let state = self.state.lock().await;
+            let bundler = state.bundler(run_key).ok_or_else(|| {
+                BsrsError::Plan("A 'collect' message was sent but no run is open".into())
+            })?;
+            let key = std::collections::BTreeSet::from([obj.name().to_string()]);
+            let declared = bundler.declared_stream_names(&key);
+            match stream_name {
+                Some(name) => {
+                    if !declared.contains(&name) {
+                        return Err(BsrsError::Plan(format!(
+                            "collect: stream {name:?} was given for {} but declare_stream \
+                             was not called for it first",
+                            obj.name()
+                        )));
+                    }
+                    Some(name)
+                }
+                None => {
+                    let distinct: std::collections::BTreeSet<&String> = declared.iter().collect();
+                    if distinct.len() > 1 {
+                        return Err(BsrsError::Plan(format!(
+                            "collect: {} has several declared streams {distinct:?}; \
+                             pass the stream name",
+                            obj.name()
+                        )));
+                    }
+                    declared.first().cloned()
                 }
             }
-            out
         };
-        for descriptor in new_descriptors {
-            self.broadcast(&Document::Descriptor(descriptor)).await?;
-        }
+        let collect_stream: Option<String> = if declared_stream.is_some() {
+            // Declared: the descriptor exists and the object was described at
+            // declaration; bluesky does not re-run describe_collect here.
+            declared_stream.clone()
+        } else {
+            let descs = obj.describe_collect_dyn().await?;
+            // The collect object's configuration, for any descriptor
+            // declared below — bluesky's collect path runs
+            // `ensure_cached(obj)` + `_prepare_stream`, which folds the
+            // object's config into the descriptor (bundlers.py:814-819).
+            let config = self
+                .ensure_object_configuration(run_key, obj.name(), obj.as_configurable())
+                .await?;
+            let new_descriptors: Vec<crate::event_model::EventDescriptor> = {
+                let mut state = self.state.lock().await;
+                let bundler = state
+                    .bundler_mut(run_key)
+                    .ok_or_else(|| BsrsError::Plan("Collect with no open run".into()))?;
+                let mut out = Vec::new();
+                for (name, dks) in &descs {
+                    if bundler.descriptor_uid(name).is_none() {
+                        let collected = StreamObject {
+                            object: Some(obj.name().to_string()),
+                            data_keys: dks.clone(),
+                            hint_fields: obj.hint_fields(),
+                            configuration: config.clone(),
+                        };
+                        out.push(bundler.declare_stream(name.clone(), vec![collected]));
+                    }
+                }
+                out
+            };
+            for descriptor in new_descriptors {
+                self.broadcast(&Document::Descriptor(descriptor)).await?;
+            }
+            // StandardDetector collects into a single stream; pass that
+            // stream's descriptor to the asset drain below.
+            descs.keys().next().cloned()
+        };
         // Emit the writer's StreamResource/StreamDatum, stamped with the
-        // collect stream's just-composed EventDescriptor UID, so stream
-        // data links back to its descriptor (CBEM-13). StandardDetector
-        // collects into a single stream; pass that stream's descriptor.
-        let (collect_stream, collect_descriptor) = {
+        // collect stream's EventDescriptor UID, so stream data links back to
+        // its descriptor (CBEM-13).
+        let collect_descriptor = {
             let state = self.state.lock().await;
             let bundler = state.bundler(run_key).ok_or_else(|| {
                 BsrsError::Plan("Collect lost open run before stream docs".into())
             })?;
-            let stream = descs.keys().next().cloned();
-            (
-                stream.clone(),
-                stream.and_then(|s| bundler.descriptor_uid(&s)),
-            )
+            collect_stream
+                .as_deref()
+                .and_then(|s| bundler.descriptor_uid(s))
         };
         if let Some(descriptor_uid) = collect_descriptor {
             let mut asset_docs = obj.collect_stream_docs_dyn(&descriptor_uid).await?;
@@ -1515,7 +1557,7 @@ impl RunEngine {
         }
         let events = obj.collect_dyn().await?;
         for (name, data, timestamps) in events {
-            let stream = stream_name.clone().unwrap_or(name);
+            let stream = declared_stream.clone().unwrap_or(name);
             let ev = {
                 let state = self.state.lock().await;
                 let bundler = state.bundler(run_key).ok_or_else(|| {
@@ -2247,12 +2289,17 @@ impl RunEngine {
                 let stream_objs = self
                     .describe_stream_objs(&run_key, &stream_name, objs)
                     .await?;
+                let declared_for: std::collections::BTreeSet<String> = stream_objs
+                    .iter()
+                    .filter_map(|o| o.object.clone())
+                    .collect();
                 let descriptor = {
                     let mut state = self.state.lock().await;
-                    state
+                    let bundler = state
                         .bundler_mut(&run_key)
-                        .ok_or_else(|| BsrsError::Plan("DeclareStream with no open run".into()))?
-                        .declare_stream(stream_name, stream_objs)
+                        .ok_or_else(|| BsrsError::Plan("DeclareStream with no open run".into()))?;
+                    bundler.record_declared_stream(declared_for, stream_name.clone());
+                    bundler.declare_stream(stream_name, stream_objs)
                 };
                 self.broadcast(&Document::Descriptor(descriptor)).await?;
             }
