@@ -1765,9 +1765,9 @@ checksum = "869b0adbda23651a9c5c0c3d270aac9fcb52e8622a8f2b17e57802d7791962f2"
 
 [[package]]
 name = "epics-base-rs"
-version = "0.28.2"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d54304ef621fd088f1b87f0cc1795e232e57538e14e306a3639957b02b6d282"
+checksum = "fb82fb50b8abd3acbbc1132f889331dbde8f235667bb342f7752eaef3b008dd8"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1791,9 +1791,9 @@ dependencies = [
 
 [[package]]
 name = "epics-ca-rs"
-version = "0.28.2"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33a1db432dc63994e76edf60641eb4cba6a2c954ee695b82c7d90d3379158f0f"
+checksum = "0826432a9453ce4a0d204f311b80f5a0d1e8fc80ee8a444d5dbee19264897e86"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1816,9 +1816,9 @@ dependencies = [
 
 [[package]]
 name = "epics-libcom-rs"
-version = "0.28.2"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f65590994e56ac2038decb4edbbab3b91253053a6a86d97144d573aecc54c3bf"
+checksum = "b4c33c29f693adfb06609a031fc8c18e5448a09fad80e7ddebf906b0cca4ee1a"
 dependencies = [
  "chrono",
  "epics-rtems-boot",
@@ -1833,9 +1833,9 @@ dependencies = [
 
 [[package]]
 name = "epics-macros-rs"
-version = "0.28.2"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6bacc66e0ca5b61dafe2c59ec8859590b3cb96f8abd6e7f2abe64146587712c"
+checksum = "c8325475ef8deef91fda1423268b2b5d9c89a7a2af8aa7ee3019f22b976cdb48"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1845,9 +1845,9 @@ dependencies = [
 
 [[package]]
 name = "epics-pva-rs"
-version = "0.28.2"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e52a7e38b328c93a9f0a244186e868e4b70f6bfa2b25eb970bc09c8c2f949b0"
+checksum = "1d001f82b3ad7e8b1c683eb44925495c434abf2991c1e585568f82098cdb8360"
 dependencies = [
  "bytes",
  "chrono",
@@ -1884,9 +1884,9 @@ dependencies = [
 
 [[package]]
 name = "epics-rtems-boot"
-version = "0.28.2"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9e21b1e99fe89652e3449bf032fd0508985288374f2f5c69e734cb74278922b"
+checksum = "665a5ecb2c6a090dcf303f8ec96c764eb32d976a3200a0c158b52d89135d0107"
 dependencies = [
  "cc",
  "libc",
