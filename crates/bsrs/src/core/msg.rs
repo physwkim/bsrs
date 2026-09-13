@@ -908,6 +908,14 @@ pub trait CollectableObj: NamedObj {
     ) -> Result<Vec<crate::event_model::Document>, crate::core::error::BsrsError> {
         Ok(Vec::new())
     }
+    /// Hint contributions for this object's collect stream(s) — the
+    /// collect-path twin of [`ReadableObj::hint_fields`]. bluesky reads one
+    /// `obj.hints` whichever path declares the stream (`maybe_update_hints`,
+    /// utils/__init__.py:2003), so an object that is both readable and
+    /// collectable returns the same fields here.
+    fn hint_fields(&self) -> Option<Vec<String>> {
+        None
+    }
     /// This object's configuration view, if it has one — the collect-path
     /// twin of [`ReadableObj::as_configurable`], read when the engine
     /// declares this object's collect stream(s) (bluesky `describe_collect`

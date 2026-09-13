@@ -1443,7 +1443,7 @@ impl RunEngine {
                     let collected = StreamObject {
                         object: Some(obj.name().to_string()),
                         data_keys: dks.clone(),
-                        hint_fields: None,
+                        hint_fields: obj.hint_fields(),
                         configuration: config.clone(),
                     };
                     out.push(bundler.declare_stream(name.clone(), vec![collected]));
@@ -2826,7 +2826,7 @@ impl RunEngine {
                     out.push(StreamObject {
                         object: Some(obj.name().to_string()),
                         data_keys,
-                        hint_fields: None,
+                        hint_fields: obj.hint_fields(),
                         configuration,
                     });
                 }

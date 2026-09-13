@@ -2539,6 +2539,9 @@ impl bsrs::core::msg::CollectableObj for FlyCollector {
             std::collections::HashMap::from([("fly_val".to_string(), 1.0)]),
         )])
     }
+    fn hint_fields(&self) -> Option<Vec<String>> {
+        Some(vec!["fly_val".to_string()])
+    }
 }
 
 // A collect stream's descriptor lists the collector's keys under its name
@@ -2584,6 +2587,13 @@ async fn collect_stream_descriptor_lists_the_collectors_keys() {
         Some("flycoll")
     );
     assert!(desc.configuration.contains_key("flycoll"));
+    assert_eq!(
+        desc.hints
+            .as_ref()
+            .and_then(|h| h["flycoll"].fields.clone()),
+        Some(vec!["fly_val".to_string()]),
+        "collect descriptor carries the collectable's hint fields"
+    );
 }
 
 // bluesky `declare_stream(*objs, name=, collect=True)`: the stream is
@@ -2627,6 +2637,13 @@ async fn declare_stream_collect_describes_the_collect_stream_once() {
         std::collections::HashMap::from([("flycoll".to_string(), vec!["fly_val".to_string()])])
     );
     assert!(descs[0].configuration.contains_key("flycoll"));
+    assert_eq!(
+        descs[0]
+            .hints
+            .as_ref()
+            .and_then(|h| h["flycoll"].fields.clone()),
+        Some(vec!["fly_val".to_string()])
+    );
     let events = docs
         .iter()
         .filter(|d| matches!(d, bsrs::core::Document::Event(e) if e.descriptor == descs[0].uid))

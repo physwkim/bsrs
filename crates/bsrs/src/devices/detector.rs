@@ -367,6 +367,9 @@ where
     ) -> Result<Vec<crate::event_model::Document>> {
         self.drain_asset_documents(descriptor).await
     }
+    fn hint_fields(&self) -> Option<Vec<String>> {
+        ReadableObj::hint_fields(self)
+    }
     fn as_configurable(&self) -> Option<&dyn ConfigurableObj> {
         Some(self)
     }
