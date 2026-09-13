@@ -2637,31 +2637,103 @@ async fn declare_stream_collect_describes_the_collect_stream_once() {
     );
 }
 
-// `collect=True` over an object that does not collect into the named stream
-// is a plan error (bluesky raises from `declare_stream`).
+// A collectable whose `describe_collect` names two streams.
+struct TwoStreamCollector;
+impl bsrs::core::msg::NamedObj for TwoStreamCollector {
+    fn name(&self) -> &str {
+        "two"
+    }
+}
+#[async_trait::async_trait]
+impl bsrs::core::msg::CollectableObj for TwoStreamCollector {
+    async fn describe_collect_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, bsrs::event_model::DataKey>,
+        >,
+        bsrs::core::error::BsrsError,
+    > {
+        let key = bsrs::event_model::DataKey {
+            source: "soft://two".into(),
+            dtype: bsrs::event_model::Dtype::Number,
+            shape: vec![],
+            dtype_numpy: None,
+            external: None,
+            units: None,
+            precision: None,
+            object_name: None,
+            dims: None,
+            limits: None,
+            choices: None,
+        };
+        Ok(std::collections::HashMap::from([
+            (
+                "primary".to_string(),
+                std::collections::HashMap::from([("a".to_string(), key.clone())]),
+            ),
+            (
+                "aux".to_string(),
+                std::collections::HashMap::from([("b".to_string(), key)]),
+            ),
+        ]))
+    }
+    async fn collect_dyn(
+        &self,
+    ) -> Result<
+        Vec<(
+            String,
+            std::collections::HashMap<String, serde_json::Value>,
+            std::collections::HashMap<String, f64>,
+        )>,
+        bsrs::core::error::BsrsError,
+    > {
+        Ok(vec![])
+    }
+}
+
+// `collect=True` accepts a nested `describe_collect` only when its single
+// stream is the declared one (bluesky `_format_datakeys_with_stream_name`,
+// bundlers.py:754-759): a stream the object does not collect into and an
+// object collecting into more streams than the declared one both fail the
+// run. Boundaries: absent stream; declared stream present among others.
 #[tokio::test]
-async fn declare_stream_collect_rejects_a_stream_the_object_does_not_collect() {
+async fn declare_stream_collect_requires_the_single_declared_stream() {
     use bsrs::core::Msg;
     use std::sync::atomic::AtomicUsize;
 
-    let flyer = Arc::new(FlyCollector {
-        collects: Arc::new(AtomicUsize::new(0)),
-    });
-    let re = RunEngine::new(vec![]);
-    let coll: Arc<dyn bsrs::core::msg::CollectableObj> = flyer;
-    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
-        yield Msg::OpenRun(Default::default());
-        yield Msg::DeclareStream { stream_name: "other".into(), objs: vec![coll].into() };
-        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
-    });
-    let result = re.run_async(plan).await.unwrap();
-    assert_eq!(result.exit_status, "fail");
-    assert!(
-        result
-            .reason
-            .contains("does not collect into stream \"other\""),
-        "reason: {}",
+    async fn declare(coll: Arc<dyn bsrs::core::msg::CollectableObj>, stream: &str) -> String {
+        let re = RunEngine::new(vec![]);
+        let stream = stream.to_string();
+        let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+            yield Msg::OpenRun(Default::default());
+            yield Msg::DeclareStream { stream_name: stream, objs: vec![coll].into() };
+            yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+        });
+        let result = re.run_async(plan).await.unwrap();
+        assert_eq!(result.exit_status, "fail", "reason: {}", result.reason);
         result.reason
+    }
+
+    let absent = declare(
+        Arc::new(FlyCollector {
+            collects: Arc::new(AtomicUsize::new(0)),
+        }),
+        "other",
+    )
+    .await;
+    assert!(
+        absent.contains(
+            "expected flycoll to collect into the single stream \"other\", got [\"primary\"]"
+        ),
+        "reason: {absent}"
+    );
+
+    let extra = declare(Arc::new(TwoStreamCollector), "primary").await;
+    assert!(
+        extra.contains("expected two to collect into the single stream \"primary\", got [\"aux\"]"),
+        "reason: {extra}"
     );
 }
 

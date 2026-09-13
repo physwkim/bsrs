@@ -2804,13 +2804,22 @@ impl RunEngine {
             }
             StreamObjs::Collectable(objs) => {
                 for obj in objs {
+                    // bluesky `_format_datakeys_with_stream_name`: a nested
+                    // describe_collect is accepted only when its single
+                    // stream is the declared one (bundlers.py:754-759).
                     let mut descs = obj.describe_collect_dyn().await?;
-                    let data_keys = descs.remove(stream_name).ok_or_else(|| {
-                        BsrsError::Plan(format!(
-                            "declare_stream: {} does not collect into stream {stream_name:?}",
-                            obj.name()
-                        ))
-                    })?;
+                    let data_keys = match descs.remove(stream_name) {
+                        Some(dks) if descs.is_empty() => dks,
+                        _ => {
+                            let mut got: Vec<&String> = descs.keys().collect();
+                            got.sort();
+                            return Err(BsrsError::Plan(format!(
+                                "declare_stream: expected {} to collect into the single stream \
+                                 {stream_name:?}, got {got:?}",
+                                obj.name()
+                            )));
+                        }
+                    };
                     let configuration = self
                         .ensure_object_configuration(run_key, obj.name(), obj.as_configurable())
                         .await?;
