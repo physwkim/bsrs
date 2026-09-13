@@ -41,8 +41,9 @@ caput mini:KohzuModeBO Auto
 | 07 | [`07_tiled_sink.lua`](./07_tiled_sink.lua) | bsrs → tiled-rs HTTP catalog (`TiledSink` registers RunStart, PATCHes RunStop). Read-side via `tiled.from_uri` confirms the run lands. |
 | 08 | [`08_suspender.lua`](./08_suspender.lua) | CA-PV-backed `SuspendThreshold` armed but not tripped — verifies arming + run + dispose introduces no overhead |
 | 08b | [`08b_suspender_trip.lua`](./08b_suspender_trip.lua) | Same `SuspendThreshold` but threshold is set inside the natural beam-current oscillation (475–525) so the engine actually pauses & auto-resumes mid-plan |
-| 09 | (none — see below) | `bsrs repl --doc-jsonl <PATH>` writes every Document as a JSONL line. Smoke: run any Lua scan with `--doc-jsonl /tmp/run.jsonl` and tail the file. |
+| 09 | [`09_monitor_during.lua`](./09_monitor_during.lua) | `bpp.monitor_during` over a `ca_motor`, a `ca_detector` and a `pva_detector`: each gets a `<name>_monitor` descriptor keyed by its data key and streams Events alongside the 5 primary events |
 | 10 | (none — see below) | bsrs-qs daemon E2E: register CA devices via `bsrs qs-manager --ca-motor name=val,rbv` / `--ca-detector name=pv`, then attach `bsrs qs --address ... repl` and drive `RE:run(scan({ph_det}, ph_mtr, ...))`. |
+| 11 | (none — see below) | `bsrs repl --doc-jsonl <PATH>` writes every Document as a JSONL line. Smoke: run any Lua scan with `--doc-jsonl /tmp/run.jsonl` and tail the file. |
 
 Run any one with:
 
@@ -95,6 +96,17 @@ Last good run on 2026-05-11 (m3 macOS, mini_ioc release build):
 qs-manager + ca devices — `bsrs qs-manager --ca-motor / --ca-detector` registers
                           mini-beamline PVs; `bsrs qs ... repl` attaches and runs
                           scan({ph_det}, ph_mtr, -2, 2, 5); 5 frames seen
+```
+
+Run on 2026-09-14 (linux, epics-rs 0.29.0 mini_ioc release build):
+
+```
+09_monitor_during.lua   — 5 primary events, exit_status=success; monitor streams
+                          ph_det_monitor 80 / ph_mtr_monitor 49 / beam_monitor 42
+                          events, each descriptor keyed by the device data key
+qs-manager + ca devices — same scan wrapped in bpp.monitor_during through
+                          `bsrs qs ... repl`: primary 3, ph_mtr_monitor 25,
+                          ph_det_monitor 41
 ```
 
 ## tiled-rs setup (one-shot for #07)
