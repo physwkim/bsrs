@@ -589,6 +589,12 @@ mod tests {
         let engine_slot = Arc::new(TMutex::new(Some(Arc::new(RunEngine::new(vec![])))));
         let state = ManagerLuaState::new(engine_slot, Arc::new(reg));
 
+        let r = state.eval("tostring(dev)").await;
+        assert_eq!(
+            r.return_value.as_deref(),
+            Some("Device(dev, [preparable,configurable,pausable])"),
+            "{r:?}"
+        );
         for src in [
             "msg.prepare(dev, 1); return 'ok'",
             "msg.configure(dev, {a = 1}); return 'ok'",

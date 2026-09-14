@@ -200,6 +200,18 @@ impl UserData for LuaDevice {
             if dev.flyable.is_some() {
                 roles.push("flyable");
             }
+            if dev.preparable.is_some() {
+                roles.push("preparable");
+            }
+            if dev.configurable.is_some() {
+                roles.push("configurable");
+            }
+            if dev.collectable.is_some() {
+                roles.push("collectable");
+            }
+            if dev.pausable.is_some() {
+                roles.push("pausable");
+            }
             Ok(format!("Device({}, [{}])", dev.name, roles.join(",")))
         });
 
