@@ -4,22 +4,39 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0] - 2026-09-14
 
 Monitorable devices: `Msg::Monitor` now works end to end over the built-in
 devices, from the Rust API and from Lua. Interrupts unwind through the plan
 so `finalize_wrapper` cleanup runs on abort, suspenders are engine-owned and
-persist across runs, and every descriptor is shaped from its objects. Public
-signatures change, so the next release must be 0.5.0.
+persist across runs, every descriptor is shaped from its objects, and
+`declare_stream` / `collect` resolve streams the way bluesky's bundler does.
+Public signatures change, hence the minor version.
 
 ### Changed
 
+- Based the EPICS CA/PVA backends on `epics-rs` 0.29.1 (from 0.28.1). No
+  bsrs source change was needed for 0.28.2, 0.29.0 or 0.29.1.
+- **Breaking**: `Msg::DeclareStream` carries the stream's objects
+  (`StreamObjs::Readable` or `StreamObjs::Collectable`) instead of raw data
+  keys, so its descriptor gets their hints and configuration as bluesky's
+  `declare_stream(*objs, name=, collect=)` does; `plans::declare_stream(name,
+  objs)` and the Lua `msg.declare_stream(name, {devices}, [collect])` follow.
+  A collectable must collect into exactly the declared stream.
+  `StreamObject::from_data_keys` is replaced by `StreamObject::objectless`,
+  used only for the interruptions stream.
+- `collect` resolves its stream through what `declare_stream` declared for
+  the object, as bluesky's `_declared_stream_names`: a named `collect`
+  requires that name to have been declared for the object, an unnamed one
+  takes the single declared stream and skips `describe_collect`, and an
+  undeclared object still describes and declares its nested streams.
 - **Breaking**: `Subscription::new` takes a third argument, the data key of
   the readings it streams, exposed as `Subscription::key`. The engine keys
   every monitor Event by it and fails the run when `describe_dyn` does not
   declare that key.
 - **Breaking**: `Registry::register_positioner` additionally requires
-  `MonitorableObj` and registers the object under the monitorable facet.
+  `MonitorableObj` and `StoppableObj` and registers the object under both
+  facets.
 - `SoftDetector::tick` returns the reading it published.
 - **Breaking**: `ContingencySink` holds an `Option<Thrown>` (`Thrown::Error`
   or `Thrown::Interrupt(kind, reason)`) instead of an error string, and
@@ -50,6 +67,18 @@ signatures change, so the next release must be 0.5.0.
   binary, the qs Lua manager and `mini_beamline_qs` register soft detectors
   under the facet, and every Lua device factory reports the `monitorable`
   role.
+- `Registry` tracks the stoppable, preparable, configurable and pausable
+  facets (`register_stoppable` / `register_preparable` /
+  `register_configurable` / `register_pausable` and the matching lookups),
+  and the daemon Lua state publishes them, so `stop()`, `msg.prepare`,
+  `msg.configure` and `RE:register_pausable` work on registry devices; a
+  `--ca-motor` in `bsrs qs-manager` had no `stop()`.
+- `CollectableObj::hint_fields` (default `None`); `StandardDetector` forwards
+  its readable hint fields, so collect descriptors carry hints as bluesky's
+  `maybe_update_hints` gives them.
+- `examples/mini_beamline/09_monitor_during.lua`: `bpp.monitor_during` over
+  a `ca_motor`, a `ca_detector` and a `pva_detector` against the mini-beamline
+  IOC.
 
 ### Fixed
 
@@ -86,6 +115,9 @@ signatures change, so the next release must be 0.5.0.
   `monitor` carry their objects, hints and configuration.
 - **CA devices**: `describe_dyn` reports the PV's units, precision and limits
   from DBR_CTRL and sources the key as `ca://<pv>`.
+- **Lua**: `LuaDevice` `__tostring` lists the preparable, configurable,
+  collectable and pausable roles, and `inspect()` resolves through the
+  preparable and configurable facets instead of answering `type = "Unknown"`.
 
 ## [0.4.2] - 2026-09-03
 
@@ -394,6 +426,7 @@ wire- and behaviour-parity with the upstream Python projects.
 
 - `doc/gap-analysis/`: bluesky/ophyd/ophyd-async parity gap inventory.
 
+[0.5.0]: https://github.com/physwkim/bsrs/releases/tag/v0.5.0
 [0.4.2]: https://github.com/physwkim/bsrs/releases/tag/v0.4.2
 [0.4.1]: https://github.com/physwkim/bsrs/releases/tag/v0.4.1
 [0.4.0]: https://github.com/physwkim/bsrs/releases/tag/v0.4.0
