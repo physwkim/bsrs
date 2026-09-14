@@ -539,6 +539,9 @@ mod tests {
             fn name(&self) -> &str {
                 "dev"
             }
+            fn inspect_dyn(&self) -> serde_json::Value {
+                serde_json::json!({"name": "dev", "type": "TestDev"})
+            }
         }
         #[async_trait::async_trait]
         impl crate::core::msg::PreparableObj for Dev {
@@ -595,6 +598,10 @@ mod tests {
             Some("Device(dev, [preparable,configurable,pausable])"),
             "{r:?}"
         );
+        // inspect() resolves through the preparable facet instead of
+        // falling through to the `type = "Unknown"` placeholder.
+        let r = state.eval("return dev:inspect().type").await;
+        assert_eq!(r.return_value.as_deref(), Some("TestDev"), "{r:?}");
         for src in [
             "msg.prepare(dev, 1); return 'ok'",
             "msg.configure(dev, {a = 1}); return 'ok'",

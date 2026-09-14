@@ -167,6 +167,10 @@ impl UserData for LuaDevice {
                 f.inspect_dyn()
             } else if let Some(c) = &dev.collectable {
                 c.inspect_dyn()
+            } else if let Some(p) = &dev.preparable {
+                p.inspect_dyn()
+            } else if let Some(c) = &dev.configurable {
+                c.inspect_dyn()
             } else if let Some(p) = &dev.pausable {
                 p.inspect_dyn()
             } else {
