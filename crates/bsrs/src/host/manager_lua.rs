@@ -90,9 +90,7 @@ pub fn build_shared_lua(re: Arc<RunEngine>, registry: &Registry) -> mlua::Result
     // Publish each registered device as a Lua global with its
     // declared name. Walk the role tables; a device that appears
     // under multiple roles (motor: readable + movable) carries
-    // both. Roles the registry doesn't currently track
-    // (preparable, configurable, pausable) are left None — those
-    // calls error from Lua.
+    // both.
     // Union of every #[lua_methods] name in this state. LuaDevice's
     // shared `__index` fallback consults it so only real lua-exposed
     // method names produce a dispatch wrapper (anything else stays
@@ -110,10 +108,10 @@ pub fn build_shared_lua(re: Arc<RunEngine>, registry: &Registry) -> mlua::Result
             stageable: registry.stageable(&name).cloned(),
             monitorable: registry.monitorable(&name).cloned(),
             flyable: registry.flyable(&name).cloned(),
-            preparable: None,
-            configurable: None,
+            preparable: registry.preparable(&name).cloned(),
+            configurable: registry.configurable(&name).cloned(),
             collectable: registry.collectable(&name).cloned(),
-            pausable: None,
+            pausable: registry.pausable(&name).cloned(),
             // #[lua_methods] resolve via LuaDevice's __index fallback,
             // so the device stays a plain userdata and works directly
             // as a scan()/mv()/... argument.
@@ -529,6 +527,77 @@ mod tests {
             .eval("m1:stop(); m1:stop_emergency(); return 'ok'")
             .await;
         assert!(r.error.is_none(), "{r:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registry_preparable_configurable_pausable_facets_reach_lua() {
+        // Every Lua entry point that projects one of the three facets
+        // resolves on a registry device (before the registry tracked
+        // them, each failed with "is not preparable/configurable/pausable").
+        struct Dev;
+        impl crate::core::msg::NamedObj for Dev {
+            fn name(&self) -> &str {
+                "dev"
+            }
+        }
+        #[async_trait::async_trait]
+        impl crate::core::msg::PreparableObj for Dev {
+            async fn prepare_dyn(&self, _value: serde_json::Value) -> crate::core::status::Status {
+                crate::core::status::Status::done()
+            }
+        }
+        #[async_trait::async_trait]
+        impl crate::core::msg::ConfigurableObj for Dev {
+            async fn read_configuration_dyn(
+                &self,
+            ) -> crate::core::error::Result<
+                std::collections::HashMap<String, crate::core::reading::ReadingValue>,
+            > {
+                Ok(Default::default())
+            }
+            async fn describe_configuration_dyn(
+                &self,
+            ) -> crate::core::error::Result<
+                std::collections::HashMap<String, crate::event_model::DataKey>,
+            > {
+                Ok(Default::default())
+            }
+            async fn configure_dyn(
+                &self,
+                _args: crate::core::msg::ConfigureArgs,
+            ) -> crate::core::error::Result<()> {
+                Ok(())
+            }
+        }
+        #[async_trait::async_trait]
+        impl crate::core::msg::PausableObj for Dev {
+            async fn pause_dyn(&self) -> crate::core::error::Result<()> {
+                Ok(())
+            }
+            async fn resume_dyn(&self) -> crate::core::error::Result<()> {
+                Ok(())
+            }
+        }
+
+        let dev = Arc::new(Dev);
+        let mut reg = Registry::new();
+        reg.register_preparable("dev", dev.clone());
+        reg.register_configurable("dev", dev.clone());
+        reg.register_pausable("dev", dev);
+        assert_eq!(reg.device_names(), vec!["dev".to_string()]);
+
+        let engine_slot = Arc::new(TMutex::new(Some(Arc::new(RunEngine::new(vec![])))));
+        let state = ManagerLuaState::new(engine_slot, Arc::new(reg));
+
+        for src in [
+            "msg.prepare(dev, 1); return 'ok'",
+            "msg.configure(dev, {a = 1}); return 'ok'",
+            "msg.register_pausable(dev); return 'ok'",
+            "RE:register_pausable(dev); RE:unregister_pausable(dev); return 'ok'",
+        ] {
+            let r = state.eval(src).await;
+            assert!(r.error.is_none(), "{src}: {r:?}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
