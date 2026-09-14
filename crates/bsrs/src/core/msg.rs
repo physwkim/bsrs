@@ -3,6 +3,7 @@
 //! See `bluesky/src/bluesky/run_engine.py:_command_registry` for the reference
 //! command set.
 
+use crate::core::error::Interrupt;
 use futures::future::BoxFuture;
 use serde_json::Value;
 use std::any::Any;
@@ -41,14 +42,38 @@ pub struct ConfigureArgs {
 pub type AwaitableFactory =
     Arc<dyn Fn() -> BoxFuture<'static, crate::core::error::Result<()>> + Send + Sync>;
 
-/// Error sink for a [`Msg::PushContingency`] region. While a run has one of
-/// these on its contingency stack, the engine routes a message error into the
-/// innermost sink (as its `Display` string) and keeps running, instead of
-/// failing the run — letting the plan-level `contingency_wrapper` observe the
-/// error, run its `except`/`finally` recovery, and choose whether to re-raise
-/// (via [`Msg::Fail`]). Mirrors how bluesky's generator plans catch an engine
-/// error at the `yield` point.
-pub type ContingencySink = Arc<std::sync::Mutex<Option<String>>>;
+/// What the engine threw into the plan at a `yield`: the value a
+/// `contingency_wrapper` finds in its [`ContingencySink`] right after the
+/// message it forwarded, and re-raises with [`Msg::Raise`] once its
+/// `except`/`finally` plans have run — bluesky's exception object,
+/// propagating frame by frame up the plan stack.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Thrown {
+    /// A message handler failed; the text is the error's `Display`.
+    Error(String),
+    /// A `stop`/`abort` request (`RequestStop`/`RequestAbort`), with the
+    /// caller's reason — `abort(reason)`; `stop` carries none.
+    Interrupt(Interrupt, Option<String>),
+}
+
+impl From<Thrown> for crate::core::error::BsrsError {
+    /// The error a [`Msg::Raise`] hands the run loop: an error re-raised as a
+    /// plan error carrying its text, an interrupt as `Interrupted`.
+    fn from(thrown: Thrown) -> Self {
+        match thrown {
+            Thrown::Error(text) => Self::Plan(text),
+            Thrown::Interrupt(kind, _) => Self::Interrupted(kind),
+        }
+    }
+}
+
+/// Sink of a [`Msg::PushContingency`] region. While a run has one on its
+/// contingency stack, a message error or a `stop`/`abort` request is thrown
+/// into the innermost sink and the run keeps going, instead of ending at once
+/// — so the `contingency_wrapper` that owns the sink can run its
+/// `except`/`finally` plans and re-raise with [`Msg::Raise`]. Mirrors how a
+/// bluesky generator plan catches an exception at its `yield`.
+pub type ContingencySink = Arc<std::sync::Mutex<Option<Thrown>>>;
 
 /// The complete set of commands that plans can issue. Closed enum + `Custom`.
 #[non_exhaustive]
@@ -92,12 +117,15 @@ pub enum Msg {
     Save,
     /// Discard the open bundle.
     Drop,
-    /// Pre-declare a stream (for fly scans without `Read`+`Save`).
+    /// Pre-declare a stream from the objects behind it (bluesky
+    /// `declare_stream(*objs, name=, collect=)`): the engine describes each
+    /// object and emits the descriptor with its hints and configuration, as
+    /// the first `Save` of a `Read` stream would.
     DeclareStream {
         /// Stream name.
         stream_name: String,
-        /// Pre-declared data keys.
-        data_keys: HashMap<String, crate::event_model::DataKey>,
+        /// The objects the stream is described from.
+        objs: StreamObjs,
     },
 
     /// Read all signals on `obj` into the open bundle.
@@ -275,6 +303,12 @@ pub enum Msg {
     /// panicking the async task.
     Fail(String),
 
+    /// Re-raise what a contingency region caught, once its `except`/`finally`
+    /// plans have run: the engine throws it into the next enclosing region, or
+    /// ends the run with it — `fail` for an error, the interrupt's exit status
+    /// for a `stop`/`abort`. Emitted only by `contingency_wrapper`.
+    Raise(Thrown),
+
     /// Resume after a deferred pause / suspend.
     Resume,
 
@@ -389,6 +423,7 @@ impl Msg {
                 | Msg::Subscribe { .. }
                 | Msg::Unsubscribe(_)
                 | Msg::Fail(_)
+                | Msg::Raise(_)
                 | Msg::PushContingency(_)
                 | Msg::PopContingency
                 | Msg::Null
@@ -442,12 +477,9 @@ impl Clone for Msg {
             },
             Msg::Save => Msg::Save,
             Msg::Drop => Msg::Drop,
-            Msg::DeclareStream {
-                stream_name,
-                data_keys,
-            } => Msg::DeclareStream {
+            Msg::DeclareStream { stream_name, objs } => Msg::DeclareStream {
                 stream_name: stream_name.clone(),
-                data_keys: data_keys.clone(),
+                objs: objs.clone(),
             },
             Msg::Read(o) => Msg::Read(o.clone()),
             Msg::Set { obj, value, group } => Msg::Set {
@@ -520,6 +552,7 @@ impl Clone for Msg {
             },
             Msg::Unsubscribe(id) => Msg::Unsubscribe(*id),
             Msg::Fail(reason) => Msg::Fail(reason.clone()),
+            Msg::Raise(thrown) => Msg::Raise(thrown.clone()),
             Msg::Resume => Msg::Resume,
             Msg::InstallSuspender { id, suspender } => Msg::InstallSuspender {
                 id: *id,
@@ -578,6 +611,7 @@ impl std::fmt::Debug for Msg {
             Msg::Subscribe { filter, .. } => write!(f, "Subscribe(<cb>, {filter:?})"),
             Msg::Unsubscribe(id) => write!(f, "Unsubscribe({id})"),
             Msg::Fail(reason) => write!(f, "Fail({reason:?})"),
+            Msg::Raise(thrown) => write!(f, "Raise({thrown:?})"),
             Msg::Resume => write!(f, "Resume"),
             Msg::InstallSuspender { id, .. } => write!(f, "InstallSuspender({id})"),
             Msg::RemoveSuspender { id } => write!(f, "RemoveSuspender({id})"),
@@ -613,6 +647,32 @@ fn document_label(d: &crate::event_model::Document) -> &'static str {
 // These are intentionally object-safe and live here in bsrs-core so that the
 // `Msg` enum does not depend on the protocols crate. The concrete protocol
 // traits (`AsyncReadable`, `AsyncMovable`, ...) all extend these.
+
+/// The objects a [`Msg::DeclareStream`] is described from — bluesky's
+/// `declare_stream(*objs, name=, collect=False)` flag as a type. `Readable`
+/// describes each object with `describe_dyn` (the `Read`/`Save` stream shape);
+/// `Collectable` (bluesky `collect=True`) takes each object's
+/// `describe_collect_dyn()[stream_name]` and errors when an object does not
+/// collect into that stream.
+#[derive(Clone)]
+pub enum StreamObjs {
+    /// Describe with `describe_dyn`.
+    Readable(Vec<Arc<dyn ReadableObj>>),
+    /// Describe with `describe_collect_dyn` (fly-scan streams).
+    Collectable(Vec<Arc<dyn CollectableObj>>),
+}
+
+impl From<Vec<Arc<dyn ReadableObj>>> for StreamObjs {
+    fn from(objs: Vec<Arc<dyn ReadableObj>>) -> Self {
+        Self::Readable(objs)
+    }
+}
+
+impl From<Vec<Arc<dyn CollectableObj>>> for StreamObjs {
+    fn from(objs: Vec<Arc<dyn CollectableObj>>) -> Self {
+        Self::Collectable(objs)
+    }
+}
 
 /// Anything with a name.
 pub trait NamedObj: Send + Sync {
@@ -848,6 +908,14 @@ pub trait CollectableObj: NamedObj {
     ) -> Result<Vec<crate::event_model::Document>, crate::core::error::BsrsError> {
         Ok(Vec::new())
     }
+    /// Hint contributions for this object's collect stream(s) — the
+    /// collect-path twin of [`ReadableObj::hint_fields`]. bluesky reads one
+    /// `obj.hints` whichever path declares the stream (`maybe_update_hints`,
+    /// utils/__init__.py:2003), so an object that is both readable and
+    /// collectable returns the same fields here.
+    fn hint_fields(&self) -> Option<Vec<String>> {
+        None
+    }
     /// This object's configuration view, if it has one — the collect-path
     /// twin of [`ReadableObj::as_configurable`], read when the engine
     /// declares this object's collect stream(s) (bluesky `describe_collect`
@@ -858,12 +926,15 @@ pub trait CollectableObj: NamedObj {
 }
 
 /// Anything that can be subscribed to (monitor stream). A monitorable
-/// object is also `Readable`: the engine uses `describe_dyn` / `read_dyn`
-/// to get the data keys for the monitor stream's `EventDescriptor`, and
-/// to seed the first Event before any rx-side updates arrive.
+/// object is also `Readable`: the engine uses `describe_dyn` for the monitor
+/// stream's `EventDescriptor`. A subscription made while the object holds a
+/// reading starts with it pending, so the first Event carries the current
+/// value (ophyd `subscribe(run=True)`, ophyd-async `_SignalCache.subscribe`);
+/// the engine seeds nothing itself.
 #[async_trait::async_trait]
 pub trait MonitorableObj: ReadableObj {
-    /// Subscribe — engine receives a `Subscription` (rx + RAII token).
+    /// Subscribe. The `Subscription`'s key must be one of the data keys
+    /// `describe_dyn` returns: the engine keys every monitor Event by it.
     async fn subscribe_dyn(
         &self,
     ) -> Result<crate::core::subscription::Subscription, crate::core::error::BsrsError>;

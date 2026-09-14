@@ -1,9 +1,10 @@
-//! Soft detector — fake counts on every trigger; soft writer emits in-memory frames.
+//! Soft detector — fake counts on every read; soft writer emits in-memory frames.
 
 use crate::core::error::{BsrsError, Result};
-use crate::core::msg::{NamedObj, ReadableObj};
+use crate::core::msg::{MonitorableObj, NamedObj, ReadableObj};
 use crate::core::reading::ReadingValue;
-use crate::core::status::Status;
+use crate::core::status::{Status, SubToken};
+use crate::core::subscription::Subscription;
 use crate::devices::StandardDetector;
 use crate::event_model::{DataKey, Dtype};
 use crate::protocols_async::{
@@ -25,23 +26,59 @@ fn now_ts() -> f64 {
 }
 
 /// Fake-counts detector implementing `AsyncReadable` directly (step scans).
+///
+/// Every `read` is one acquisition: it advances the count and returns it.
+/// `count` / `scan` read without triggering (`stubs::read_shot`), so the
+/// read is the only step of their path a fake detector can count on.
+///
+/// Also a [`MonitorableObj`]: every acquisition (`read` or
+/// [`SoftDetector::tick`]) publishes the new reading, so `monitor_during`
+/// over a soft detector emits one Event per scan point.
 pub struct SoftDetector {
     name: String,
     counts: AtomicU64,
+    /// Monitor fan-out; `read` / `tick` store the fresh reading.
+    monitor: watch::Sender<ReadingValue>,
 }
 
 impl SoftDetector {
     /// Build with an initial counter.
     pub fn new(name: impl Into<String>) -> Arc<Self> {
+        let name = name.into();
+        let (monitor, _rx) = watch::channel(ReadingValue {
+            value: serde_json::Value::Number(0.into()),
+            timestamp: now_ts(),
+            alarm_severity: None,
+            message: None,
+        });
         Arc::new(Self {
-            name: name.into(),
+            name,
             counts: AtomicU64::new(0),
+            monitor,
         })
     }
 
-    /// Bump the counter.
-    pub fn tick(&self) {
+    /// One acquisition: bump the counter and publish the new reading.
+    pub fn tick(&self) -> ReadingValue {
         self.counts.fetch_add(1, Ordering::SeqCst);
+        self.publish()
+    }
+
+    /// Sample the counter and store it in the monitor channel. `send_replace`
+    /// (not `send`) so the value is kept even with no live subscriber.
+    fn publish(&self) -> ReadingValue {
+        let r = self.reading();
+        self.monitor.send_replace(r.clone());
+        r
+    }
+
+    fn reading(&self) -> ReadingValue {
+        ReadingValue {
+            value: serde_json::Value::Number(self.counts.load(Ordering::SeqCst).into()),
+            timestamp: now_ts(),
+            alarm_severity: None,
+            message: None,
+        }
     }
 }
 
@@ -67,17 +104,8 @@ impl AsyncReadable for SoftDetector {
         &self.name
     }
     async fn read(&self) -> Result<HashMap<String, ReadingValue>> {
-        let v = self.counts.load(Ordering::SeqCst);
         let mut out = HashMap::new();
-        out.insert(
-            format!("{}_counts", self.name),
-            ReadingValue {
-                value: serde_json::Value::Number(v.into()),
-                timestamp: now_ts(),
-                alarm_severity: None,
-                message: None,
-            },
-        );
+        out.insert(format!("{}_counts", self.name), self.tick());
         Ok(out)
     }
     async fn describe(&self) -> Result<HashMap<String, DataKey>> {
@@ -112,6 +140,22 @@ impl ReadableObj for SoftDetector {
     }
     fn hint_fields(&self) -> Option<Vec<String>> {
         Some(vec![format!("{}_counts", self.name)])
+    }
+}
+
+#[async_trait]
+impl MonitorableObj for SoftDetector {
+    async fn subscribe_dyn(&self) -> Result<Subscription> {
+        // The watch sender lives as long as the detector; nothing to release.
+        // The stored count is pending so the first `changed()` yields it
+        // (ophyd `subscribe(run=True)`).
+        let mut rx = self.monitor.subscribe();
+        rx.mark_changed();
+        Ok(Subscription::new(
+            rx,
+            SubToken::noop(),
+            format!("{}_counts", self.name),
+        ))
     }
 }
 
@@ -175,7 +219,9 @@ impl DetectorControl for SoftDetectorControl {
     }
     async fn arm(&self) -> Status {
         let new = self.arm_count.fetch_add(1, Ordering::SeqCst) + 1;
-        let _ = self.index_tx.send(new);
+        // `send_replace`: no receiver exists until `subscribe_index`, and
+        // `send` would drop the count armed before it.
+        self.index_tx.send_replace(new);
         Status::done()
     }
     async fn wait_for_idle(&self) -> Result<()> {
@@ -340,6 +386,47 @@ mod tests {
         };
         DetectorControl::prepare(&control, info).await.unwrap();
         assert_eq!(control.target().load(Ordering::SeqCst), 7);
+    }
+
+    // Each read is an acquisition: the count advances and the monitor
+    // channel carries the value the read returned.
+    #[tokio::test]
+    async fn soft_detector_counts_every_read() {
+        let det = SoftDetector::new("det");
+        let key = "det_counts";
+        let first = AsyncReadable::read(&*det).await.unwrap();
+        let second = AsyncReadable::read(&*det).await.unwrap();
+        assert_eq!(first[key].value, serde_json::json!(1));
+        assert_eq!(second[key].value, serde_json::json!(2));
+        let sub = MonitorableObj::subscribe_dyn(&*det).await.unwrap();
+        assert_eq!(sub.rx().borrow().value, serde_json::json!(2));
+    }
+
+    // A subscription starts with the current count pending: monitor start
+    // emits the value read so far, not only the next change.
+    #[tokio::test]
+    async fn soft_detector_subscription_starts_with_the_current_count() {
+        let det = SoftDetector::new("det");
+        det.tick();
+        let mut sub = MonitorableObj::subscribe_dyn(&*det).await.unwrap();
+        assert!(sub.rx_mut().has_changed().unwrap());
+        assert_eq!(sub.rx_mut().borrow_and_update().value, serde_json::json!(1));
+        assert!(!sub.rx_mut().has_changed().unwrap(), "consumed once");
+    }
+
+    // Boundary: `arm` before any `subscribe_index`. The channel has no
+    // receiver yet, so a plain `send` discarded the count and a later
+    // subscriber started from 0.
+    #[tokio::test]
+    async fn soft_arm_before_subscribe_is_seen_by_a_later_subscriber() {
+        let control = SoftDetectorControl::new(Duration::from_micros(0));
+        DetectorControl::arm(&control).await;
+        let rx = control.subscribe_index();
+        assert_eq!(
+            *rx.borrow(),
+            1,
+            "armed count must survive without a receiver"
+        );
     }
 
     #[tokio::test]

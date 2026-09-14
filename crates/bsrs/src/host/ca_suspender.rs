@@ -1,12 +1,12 @@
 //! CA-backed `SuspendBoolHigh` / `SuspendBoolLow` /
 //! `SuspendThreshold` factories for the daemon Lua surface.
 //!
-//! The user-facing Suspender impls in `bsrs-engine` are
-//! `install(self, re)`-shape helpers that spawn a watcher task
-//! tied to the supplied engine. To wire a live EPICS PV in we
-//! subscribe via bsrs's CA backend and pump every monitor
-//! update into a `tokio::sync::watch::Sender`; the watcher task
-//! observes the receiver and asks the engine to pause / resume.
+//! The user-facing Suspender impls in `bsrs-engine` watch a
+//! `tokio::sync::watch::Receiver`. To wire a live EPICS PV in we
+//! subscribe via bsrs's CA backend and pump every monitor update
+//! into the matching `watch::Sender`, then hand the suspender to
+//! `RunEngine::install_suspender`, whose watcher asks the engine to
+//! pause / resume.
 //!
 //! Lua surface exposed by `build_lua` when the `ca` feature is on:
 //!
@@ -17,8 +17,7 @@
 //! ```
 //!
 //! Each factory installs the suspender on the in-process `RE`
-//! captured at REPL build time. Removal is best-effort via daemon
-//! shutdown; finer-grained control is future work.
+//! captured at REPL build time; `RE:clear_suspenders` removes them.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -89,24 +88,23 @@ pub async fn install_suspend_threshold(
         }
     };
     let rx = ca_watch_f64(pv).await?;
-    let s = SuspendThreshold::new(name, rx, threshold, dir);
-    let join = s.install(re);
-    Box::leak(Box::new(join));
+    re.install_suspender(Arc::new(SuspendThreshold::new(name, rx, threshold, dir)))
+        .await;
     Ok(())
 }
 
 /// `SuspendBoolHigh` against a PV.
 pub async fn install_suspend_bool_high(name: &str, pv: &str, re: Arc<RunEngine>) -> Result<()> {
     let rx = ca_watch_bool(pv).await?;
-    let s = SuspendBoolHigh::new(name, rx);
-    Box::leak(Box::new(s.install(re)));
+    re.install_suspender(Arc::new(SuspendBoolHigh::new(name, rx)))
+        .await;
     Ok(())
 }
 
 /// `SuspendBoolLow` against a PV.
 pub async fn install_suspend_bool_low(name: &str, pv: &str, re: Arc<RunEngine>) -> Result<()> {
     let rx = ca_watch_bool(pv).await?;
-    let s = SuspendBoolLow::new(name, rx);
-    Box::leak(Box::new(s.install(re)));
+    re.install_suspender(Arc::new(SuspendBoolLow::new(name, rx)))
+        .await;
     Ok(())
 }

@@ -131,7 +131,7 @@ mod tests {
     #[tokio::test]
     async fn wait_for_value_matches_current_immediately() {
         let (tx, rx) = watch::channel(reading(5.0));
-        let mut sub = Subscription::new(rx, SubToken::noop());
+        let mut sub = Subscription::new(rx, SubToken::noop(), "x");
         let got = wait_for_value(&mut sub, |r| r.value == json!(5.0), None)
             .await
             .unwrap();
@@ -142,7 +142,7 @@ mod tests {
     #[tokio::test]
     async fn wait_for_value_waits_for_a_matching_change() {
         let (tx, rx) = watch::channel(reading(0.0));
-        let mut sub = Subscription::new(rx, SubToken::noop());
+        let mut sub = Subscription::new(rx, SubToken::noop(), "x");
         let h = tokio::spawn(async move {
             wait_for_value(
                 &mut sub,
@@ -161,7 +161,7 @@ mod tests {
     #[tokio::test]
     async fn wait_for_value_times_out() {
         let (tx, rx) = watch::channel(reading(0.0));
-        let mut sub = Subscription::new(rx, SubToken::noop());
+        let mut sub = Subscription::new(rx, SubToken::noop(), "x");
         let r = wait_for_value(
             &mut sub,
             |r| r.value == json!(9.0),
@@ -177,7 +177,7 @@ mod tests {
     async fn observe_value_yields_current_then_changes() {
         use futures::StreamExt;
         let (tx, rx) = watch::channel(reading(1.0));
-        let sub = Subscription::new(rx, SubToken::noop());
+        let sub = Subscription::new(rx, SubToken::noop(), "x");
         let mut s = Box::pin(observe_value(sub));
         assert_eq!(s.next().await.unwrap().value, json!(1.0));
         tx.send(reading(2.0)).unwrap();
@@ -190,8 +190,8 @@ mod tests {
         use std::collections::HashMap;
         let (tx0, rx0) = watch::channel(reading(1.0));
         let (tx1, rx1) = watch::channel(reading(2.0));
-        let s0 = Subscription::new(rx0, SubToken::noop());
-        let s1 = Subscription::new(rx1, SubToken::noop());
+        let s0 = Subscription::new(rx0, SubToken::noop(), "s0");
+        let s1 = Subscription::new(rx1, SubToken::noop(), "s1");
         let mut merged = Box::pin(observe_signals_value(vec![s0, s1]));
 
         // Both current values arrive first, each tagged with its input index.
@@ -221,8 +221,8 @@ mod tests {
         use futures::StreamExt;
         let (tx0, rx0) = watch::channel(reading(1.0));
         let (tx1, rx1) = watch::channel(reading(2.0));
-        let s0 = Subscription::new(rx0, SubToken::noop());
-        let s1 = Subscription::new(rx1, SubToken::noop());
+        let s0 = Subscription::new(rx0, SubToken::noop(), "s0");
+        let s1 = Subscription::new(rx1, SubToken::noop(), "s1");
         let mut merged = Box::pin(observe_signals_value(vec![s0, s1]));
         // Drain the two initial values.
         merged.next().await.unwrap();

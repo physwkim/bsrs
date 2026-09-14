@@ -13,11 +13,12 @@
 //! `RE:subscribe` and `msg.subscribe` solve this with thread-aware
 //! routing in [`make_lua_subscriber_cb`]: same-thread callbacks fire
 //! synchronously (reentrant lock OK); other-thread callbacks push
-//! into a per-subscriber buffer and are replayed on the REPL thread
-//! after `RE:run`'s `block_on` returns (see
-//! [`drain_lua_subscriber_buffers`]). This means worker-emitted docs
-//! are still delivered to Lua subscribers, just batched to run end —
-//! sufficient for the prototype/debug workflow.
+//! into a per-subscriber buffer that is replayed on the REPL thread
+//! at the next opportunity: before the subscriber's next same-thread
+//! delivery, and after `RE:run`'s `block_on` returns (see
+//! [`drain_lua_subscriber_buffers`]). A subscriber therefore sees its
+//! documents in emission order; worker-emitted docs are only delayed
+//! until the REPL thread next emits or the run ends.
 //!
 //! The other Lua callbacks (`RE:set_input_handler`,
 //! `RE:set_md_validator`, `RE:set_md_normalizer`,
@@ -166,6 +167,10 @@ impl UserData for LuaDevice {
                 f.inspect_dyn()
             } else if let Some(c) = &dev.collectable {
                 c.inspect_dyn()
+            } else if let Some(p) = &dev.preparable {
+                p.inspect_dyn()
+            } else if let Some(c) = &dev.configurable {
+                c.inspect_dyn()
             } else if let Some(p) = &dev.pausable {
                 p.inspect_dyn()
             } else {
@@ -198,6 +203,18 @@ impl UserData for LuaDevice {
             }
             if dev.flyable.is_some() {
                 roles.push("flyable");
+            }
+            if dev.preparable.is_some() {
+                roles.push("preparable");
+            }
+            if dev.configurable.is_some() {
+                roles.push("configurable");
+            }
+            if dev.collectable.is_some() {
+                roles.push("collectable");
+            }
+            if dev.pausable.is_some() {
+                roles.push("pausable");
             }
             Ok(format!("Device({}, [{}])", dev.name, roles.join(",")))
         });
@@ -683,19 +700,13 @@ impl UserData for LuaRunEngine {
         });
         // `RE:install_suspender` is intentionally not exposed: the
         // `Suspender` trait is `Send + Sync + 'static` Rust-only and
-        // cannot be implemented from Lua. CA-PV-backed suspenders
-        // self-install via the `ca_suspend_*` factories below — they
-        // capture `re` and call `Suspend{BoolHigh,BoolLow,Threshold}::install`
-        // directly. Pure-Lua tests that exercise the engine's
-        // pause/resume path use `RE:request_suspend` /
-        // `RE:suspend_until_seconds` instead.
-        methods.add_method("remove_suspender", |_, this, _id: u64| {
-            // Top-level remove is not currently exposed on
-            // `RunEngine`; the engine consumes
-            // `Msg::RemoveSuspender` from inside a plan. Document:
-            // remove via `coroutine.yield(msg.remove_suspender(id))`
-            // or just let the daemon shutdown reap.
-            let _ = this;
+        // cannot be implemented from Lua. CA-PV-backed suspenders are
+        // installed by the `ca_suspend_*` factories below, which capture
+        // `re` and call `RunEngine::install_suspender`. Pure-Lua tests
+        // that exercise the engine's pause/resume path use
+        // `RE:request_suspend` / `RE:suspend_until_seconds` instead.
+        methods.add_method("remove_suspender", |_, this, id: u64| {
+            crate::core::runtime::bsrs_runtime().block_on(this.re.remove_suspender(id));
             Ok(())
         });
         methods.add_method("clear_preprocessors", |_, this, ()| {
@@ -1061,15 +1072,30 @@ const BRIDGE_ERROR_CMD: &str = "_bsrs_lua_bridge_error";
 static REPL_THREAD_ID: std::sync::OnceLock<std::thread::ThreadId> = std::sync::OnceLock::new();
 
 /// Per-subscriber state: the Lua callback, an optional document-name
-/// filter, and a worker-thread buffer drained after `RE:run` returns.
+/// filter, and a worker-thread buffer drained on the REPL thread.
 struct LuaSubscriberInner {
     lua_fn: mlua::Function,
     /// Document-name filter. `None` or `"all"` matches all docs;
     /// otherwise only docs whose name equals this string fire.
     filter: Option<String>,
     /// Buffer for (name, body_json) pairs pushed by worker threads.
-    /// Drained after `RE:run` returns.
+    /// Drained by [`LuaSubscriberInner::flush`], only on the REPL thread.
     buffer: std::sync::Mutex<Vec<(&'static str, String)>>,
+}
+
+impl LuaSubscriberInner {
+    /// Deliver every buffered worker-thread entry, in push order. Must
+    /// run on the REPL thread: it calls into Lua. Errors are warned, not
+    /// propagated; a subscriber must not fail the run.
+    fn flush(&self) {
+        let entries: Vec<(&'static str, String)> =
+            std::mem::take(&mut *self.buffer.lock().unwrap());
+        for (name, body) in entries {
+            if let Err(e) = self.lua_fn.call::<()>((name, body)) {
+                tracing::warn!("Lua subscriber drain callback error: {e}");
+            }
+        }
+    }
 }
 
 /// Global registry of Lua subscribers needing post-`RE:run` drain.
@@ -1085,10 +1111,11 @@ static SUBSCRIBER_BUFFERS: std::sync::LazyLock<std::sync::Mutex<Vec<Arc<LuaSubsc
 /// - same as REPL: call the Lua fn synchronously (no deadlock — same
 ///   thread re-enters mlua's reentrant mutex)
 /// - different thread (worker — monitor pumps, suspend tasks): push
-///   `(name, body_json)` into the per-subscriber buffer; the next
-///   `drain_lua_subscriber_buffers()` (run after `RE:run`'s
-///   `block_on` returns) replays the buffered entries on the REPL
-///   thread.
+///   `(name, body_json)` into the per-subscriber buffer; the REPL
+///   thread replays it before this subscriber's next synchronous
+///   delivery, or in `drain_lua_subscriber_buffers()` after `RE:run`'s
+///   `block_on` returns. Either way the subscriber sees its documents
+///   in emission order.
 ///
 /// The user callback receives the body as a Lua *table* (bluesky
 /// passes dicts). Internally the buffer carries the body as a JSON
@@ -1126,8 +1153,11 @@ fn make_lua_subscriber_cb(
             .unwrap_or(false);
         if on_repl {
             // Same thread as REPL — mlua reentrant lock allows the
-            // call. Errors are warned (not propagated; subscribers
+            // call. Worker-thread entries buffered since the last
+            // delivery were emitted before this document, so they go
+            // first. Errors are warned (not propagated; subscribers
             // shouldn't fail the run).
+            inner.flush();
             if let Err(e) = inner.lua_fn.call::<()>((name, body.to_string())) {
                 tracing::warn!("Lua subscriber callback error: {e}");
             }
@@ -1143,13 +1173,7 @@ fn make_lua_subscriber_cb(
 fn drain_lua_subscriber_buffers() {
     let snapshot: Vec<_> = SUBSCRIBER_BUFFERS.lock().unwrap().iter().cloned().collect();
     for inner in snapshot {
-        let entries: Vec<(&'static str, String)> =
-            std::mem::take(&mut *inner.buffer.lock().unwrap());
-        for (name, body) in entries {
-            if let Err(e) = inner.lua_fn.call::<()>((name, body)) {
-                tracing::warn!("Lua subscriber drain callback error: {e}");
-            }
-        }
+        inner.flush();
     }
     // Reap entries the engine has unsubscribed (Arc strong = 1, only
     // the registry holds it).
@@ -1188,13 +1212,13 @@ pub fn build_lua(re: Arc<RunEngine>) -> mlua::Result<Lua> {
         let det = SoftDetector::new(&name);
         Ok(LuaDevice {
             name,
-            readable: Some(det as Arc<dyn ReadableObj>),
+            readable: Some(det.clone() as Arc<dyn ReadableObj>),
             movable: None,
             locatable: None,
             stoppable: None,
             triggerable: None,
             stageable: None,
-            monitorable: None,
+            monitorable: Some(det as Arc<dyn MonitorableObj>),
             flyable: None,
             preparable: None,
             configurable: None,
@@ -1215,7 +1239,7 @@ pub fn build_lua(re: Arc<RunEngine>) -> mlua::Result<Lua> {
             stoppable: Some(motor.clone() as Arc<dyn StoppableObj>),
             triggerable: None,
             stageable: None,
-            monitorable: None,
+            monitorable: Some(motor as Arc<dyn MonitorableObj>),
             flyable: None,
             preparable: None,
             configurable: None,
@@ -1239,10 +1263,10 @@ pub fn build_lua(re: Arc<RunEngine>) -> mlua::Result<Lua> {
                 readable: Some(m.clone() as Arc<dyn ReadableObj>),
                 movable: Some(m.clone() as Arc<dyn MovableObj>),
                 locatable: Some(m.clone() as Arc<dyn LocatableObj>),
-                stoppable: Some(m as Arc<dyn StoppableObj>),
+                stoppable: Some(m.clone() as Arc<dyn StoppableObj>),
                 triggerable: None,
                 stageable: None,
-                monitorable: None,
+                monitorable: Some(m as Arc<dyn MonitorableObj>),
                 flyable: None,
                 preparable: None,
                 configurable: None,
@@ -1279,10 +1303,10 @@ pub fn build_lua(re: Arc<RunEngine>) -> mlua::Result<Lua> {
                         readable: Some(p.clone() as Arc<dyn ReadableObj>),
                         movable: Some(p.clone() as Arc<dyn MovableObj>),
                         locatable: Some(p.clone() as Arc<dyn LocatableObj>),
-                        stoppable: Some(p as Arc<dyn StoppableObj>),
+                        stoppable: Some(p.clone() as Arc<dyn StoppableObj>),
                         triggerable: None,
                         stageable: None,
-                        monitorable: None,
+                        monitorable: Some(p as Arc<dyn MonitorableObj>),
                         flyable: None,
                         preparable: None,
                         configurable: None,
@@ -1299,13 +1323,13 @@ pub fn build_lua(re: Arc<RunEngine>) -> mlua::Result<Lua> {
                 .map_err(|e| mlua::Error::RuntimeError(format!("ca_detector: connect: {e}")))?;
             Ok(LuaDevice {
                 name,
-                readable: Some(d as Arc<dyn ReadableObj>),
+                readable: Some(d.clone() as Arc<dyn ReadableObj>),
                 movable: None,
                 locatable: None,
                 stoppable: None,
                 triggerable: None,
                 stageable: None,
-                monitorable: None,
+                monitorable: Some(d as Arc<dyn MonitorableObj>),
                 flyable: None,
                 preparable: None,
                 configurable: None,
@@ -1316,12 +1340,11 @@ pub fn build_lua(re: Arc<RunEngine>) -> mlua::Result<Lua> {
         })?;
         lua.globals().set("ca_detector", f)?;
 
-        // CA-backed Suspender factories. Each subscribes to a PV
-        // and self-installs onto the captured `RE` — the spawned
-        // watcher task issues `re.suspend_until_with(...)` whenever
-        // the monitored signal enters the BAD region and auto-resumes
-        // when it leaves. The factories return `nil` (no Lua handle);
-        // the watcher's lifetime is tied to the `RunEngine` Arc.
+        // CA-backed Suspender factories. Each subscribes to a PV and
+        // installs a suspender over it on the captured `RE`, which
+        // suspends the run whenever the monitored signal enters the BAD
+        // region and resumes when it leaves. The factories return `nil`
+        // (no Lua handle); `RE:clear_suspenders` removes them.
         use crate::host::ca_suspender::{
             install_suspend_bool_high, install_suspend_bool_low, install_suspend_threshold,
         };
@@ -1379,10 +1402,10 @@ pub fn build_lua(re: Arc<RunEngine>) -> mlua::Result<Lua> {
                 readable: Some(m.clone() as Arc<dyn ReadableObj>),
                 movable: Some(m.clone() as Arc<dyn MovableObj>),
                 locatable: Some(m.clone() as Arc<dyn LocatableObj>),
-                stoppable: Some(m as Arc<dyn StoppableObj>),
+                stoppable: Some(m.clone() as Arc<dyn StoppableObj>),
                 triggerable: None,
                 stageable: None,
-                monitorable: None,
+                monitorable: Some(m as Arc<dyn MonitorableObj>),
                 flyable: None,
                 preparable: None,
                 configurable: None,
@@ -1398,13 +1421,13 @@ pub fn build_lua(re: Arc<RunEngine>) -> mlua::Result<Lua> {
                 .map_err(|e| mlua::Error::RuntimeError(format!("pva_detector: connect: {e}")))?;
             Ok(LuaDevice {
                 name,
-                readable: Some(d as Arc<dyn ReadableObj>),
+                readable: Some(d.clone() as Arc<dyn ReadableObj>),
                 movable: None,
                 locatable: None,
                 stoppable: None,
                 triggerable: None,
                 stageable: None,
-                monitorable: None,
+                monitorable: Some(d as Arc<dyn MonitorableObj>),
                 flyable: None,
                 preparable: None,
                 configurable: None,
@@ -1794,48 +1817,6 @@ pub(crate) fn lua_table_to_json_map(
         out.insert(k, lua_value_to_json(&v)?);
     }
     Ok(out)
-}
-
-/// Build a minimal `DataKey` from a Lua table:
-/// `{source = "...", dtype = "number"|"string"|"boolean"|"integer"|"array",
-///   shape = {1, 2, 3}, units = "...", precision = 3}`.
-fn lua_table_to_data_key(t: &mlua::Table) -> mlua::Result<crate::event_model::DataKey> {
-    let source: String = t.get("source").unwrap_or_else(|_| "lua".into());
-    let dtype_str: String = t.get("dtype").unwrap_or_else(|_| "number".into());
-    let dtype = match dtype_str.as_str() {
-        "number" => crate::event_model::Dtype::Number,
-        "string" => crate::event_model::Dtype::String,
-        "boolean" => crate::event_model::Dtype::Boolean,
-        "integer" => crate::event_model::Dtype::Integer,
-        "array" => crate::event_model::Dtype::Array,
-        other => {
-            return Err(mlua::Error::RuntimeError(format!(
-                "unknown dtype {other:?} (expected number/string/boolean/integer/array)"
-            )))
-        }
-    };
-    let shape: Vec<Option<u64>> = if let Ok(s) = t.get::<mlua::Table>("shape") {
-        let mut v = Vec::new();
-        for x in s.sequence_values::<i64>().flatten() {
-            v.push(if x < 0 { None } else { Some(x as u64) });
-        }
-        v
-    } else {
-        Vec::new()
-    };
-    Ok(crate::event_model::DataKey {
-        source,
-        dtype,
-        shape,
-        dtype_numpy: t.get::<String>("dtype_numpy").ok().map(Into::into),
-        external: None,
-        units: t.get::<String>("units").ok(),
-        precision: t.get::<i64>("precision").ok(),
-        object_name: t.get::<String>("object_name").ok(),
-        dims: None,
-        limits: None,
-        choices: None,
-    })
 }
 
 /// Required-field hints for each publishable Document kind. Used to
@@ -2352,26 +2333,21 @@ fn register_msg_namespace(lua: &Lua) -> mlua::Result<()> {
             }))
         })?,
     )?;
-    // declare_stream(name, data_keys_table) — data_keys is
-    // {field = {source=, dtype="number"|"string"|..., shape={...}}, ...}
+    // declare_stream(name, {devices}, [collect]) — bluesky
+    // `declare_stream(*objs, name=, collect=False)`: the devices are
+    // described (their collect stream `name` when `collect` is true).
     msg.set(
         "declare_stream",
-        lua.create_function(|_, (stream_name, keys_t): (String, mlua::Table)| {
-            let mut data_keys = std::collections::HashMap::new();
-            for (name, spec) in lua_table_string_keyed(&keys_t)? {
-                let LuaValue::Table(spec) = spec else {
-                    return Err(mlua::Error::RuntimeError(format!(
-                        "declare_stream: data key {name:?} must be a table, got {}",
-                        spec.type_name()
-                    )));
+        lua.create_function(
+            |_, (stream_name, devs_t, collect): (String, mlua::Table, Option<bool>)| {
+                let objs = if collect.unwrap_or(false) {
+                    crate::core::msg::StreamObjs::Collectable(collectables_of(&devs_t)?)
+                } else {
+                    crate::core::msg::StreamObjs::Readable(dets(&devs_t)?)
                 };
-                data_keys.insert(name, lua_table_to_data_key(&spec)?);
-            }
-            Ok(LuaMsg(Msg::DeclareStream {
-                stream_name,
-                data_keys,
-            }))
-        })?,
+                Ok(LuaMsg(Msg::DeclareStream { stream_name, objs }))
+            },
+        )?,
     )?;
     // collect(device, [stream_name])
     msg.set(
@@ -2672,6 +2648,20 @@ fn monitors_of(t: &mlua::Table) -> mlua::Result<Vec<Arc<dyn MonitorableObj>>> {
             .clone()
             .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not monitorable", d.name)))?;
         out.push(m);
+    }
+    Ok(out)
+}
+
+fn collectables_of(t: &mlua::Table) -> mlua::Result<Vec<Arc<dyn CollectableObj>>> {
+    let mut out = Vec::new();
+    for v in t.clone().sequence_values::<mlua::AnyUserData>() {
+        let ud = v?;
+        let d = ud.borrow::<LuaDevice>()?;
+        let c = d
+            .collectable
+            .clone()
+            .ok_or_else(|| mlua::Error::RuntimeError(format!("{} is not collectable", d.name)))?;
+        out.push(c);
     }
     Ok(out)
 }

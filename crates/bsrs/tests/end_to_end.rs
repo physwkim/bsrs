@@ -1372,6 +1372,8 @@ async fn halt_emits_schema_valid_abort_in_stop_document() {
     }
 }
 
+// A suspender installed from inside the plan (`Msg::InstallSuspender`)
+// suspends the run when it trips and resumes it when it clears.
 #[tokio::test]
 async fn suspender_auto_resumes_engine() {
     use bsrs::engine::Suspender;
@@ -1380,30 +1382,43 @@ async fn suspender_auto_resumes_engine() {
     use std::sync::Arc as StdArc;
     use std::time::Duration;
 
+    // Tripped while `bad` is set; the test flips `bad` and pokes `notify`.
     struct ManualGate {
-        cleared: StdArc<AtomicBool>,
+        bad: StdArc<AtomicBool>,
         notify: StdArc<tokio::sync::Notify>,
+    }
+    impl ManualGate {
+        fn until(&self, want_bad: bool) -> BoxFuture<'static, ()> {
+            let bad = self.bad.clone();
+            let notify = self.notify.clone();
+            Box::pin(async move {
+                loop {
+                    let wait = notify.notified();
+                    if bad.load(AOrd::SeqCst) == want_bad {
+                        return;
+                    }
+                    wait.await;
+                }
+            })
+        }
     }
     #[async_trait::async_trait]
     impl Suspender for ManualGate {
         fn name(&self) -> &str {
             "manual_gate"
         }
+        fn trip(&self) -> BoxFuture<'static, ()> {
+            self.until(true)
+        }
         fn watch(&self) -> BoxFuture<'static, ()> {
-            let cleared = self.cleared.clone();
-            let notify = self.notify.clone();
-            Box::pin(async move {
-                while !cleared.load(AOrd::SeqCst) {
-                    notify.notified().await;
-                }
-            })
+            self.until(false)
         }
     }
 
-    let cleared = StdArc::new(AtomicBool::new(false));
+    let bad = StdArc::new(AtomicBool::new(false));
     let notify = StdArc::new(tokio::sync::Notify::new());
     let gate = StdArc::new(ManualGate {
-        cleared: cleared.clone(),
+        bad: bad.clone(),
         notify: notify.clone(),
     });
 
@@ -1417,8 +1432,9 @@ async fn suspender_auto_resumes_engine() {
     let plan = bsrs::core::plan::plan_box(async_stream::stream! {
         yield bsrs::core::Msg::InstallSuspender { id, suspender: payload };
         yield bsrs::core::Msg::OpenRun(Default::default());
-        yield bsrs::core::Msg::Pause { defer: false };
-        // After auto-resume:
+        yield bsrs::core::Msg::Sleep(Duration::from_millis(50));
+        yield bsrs::core::Msg::Sleep(Duration::from_millis(50));
+        yield bsrs::core::Msg::Sleep(Duration::from_millis(50));
         yield bsrs::core::Msg::CloseRun {
             exit_status: "success".into(),
             reason: None,
@@ -1429,14 +1445,25 @@ async fn suspender_auto_resumes_engine() {
     let re_run = re.clone();
     let join = tokio::spawn(async move { re_run.run_async(plan).await });
 
-    // Wait for pause, then clear the gate.
+    // Trip the gate once the run is going; the suspension pauses the engine.
+    for _ in 0..50 {
+        if re.state() == bsrs::engine::EngineRunState::Running {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    bad.store(true, AOrd::SeqCst);
+    notify.notify_waiters();
     for _ in 0..50 {
         if re.is_paused() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    cleared.store(true, AOrd::SeqCst);
+    assert!(re.is_paused(), "tripped suspender must suspend the run");
+
+    // Clear it; the suspension lifts and the plan runs on.
+    bad.store(false, AOrd::SeqCst);
     notify.notify_waiters();
 
     let result = tokio::time::timeout(Duration::from_secs(2), join)
@@ -1447,42 +1474,54 @@ async fn suspender_auto_resumes_engine() {
     assert_eq!(result.exit_status, "success");
 }
 
-// Contrast with `suspender_auto_resumes_engine`: once `clear_suspenders`
-// uninstalls the gate, clearing its condition must NOT auto-resume the engine
-// (the watcher was aborted with the dropped handle), so the run stays paused
-// until aborted. Verifies the bluesky `RunEngine.clear_suspenders` parity API.
+// `clear_suspenders` while a suspender holds the run releases its suspension
+// (bluesky `SuspenderBase.remove` sets the release event, `suspenders.py:74-85`)
+// and, uninstalled, its condition no longer touches the engine.
 #[tokio::test]
-async fn clear_suspenders_stops_auto_resume() {
+async fn clear_suspenders_releases_the_suspension() {
     use bsrs::engine::Suspender;
     use futures::future::BoxFuture;
     use std::sync::atomic::{AtomicBool, Ordering as AOrd};
     use std::sync::Arc as StdArc;
     use std::time::Duration;
 
+    // Tripped while `bad` is set; the test flips `bad` and pokes `notify`.
     struct ManualGate {
-        cleared: StdArc<AtomicBool>,
+        bad: StdArc<AtomicBool>,
         notify: StdArc<tokio::sync::Notify>,
+    }
+    impl ManualGate {
+        fn until(&self, want_bad: bool) -> BoxFuture<'static, ()> {
+            let bad = self.bad.clone();
+            let notify = self.notify.clone();
+            Box::pin(async move {
+                loop {
+                    let wait = notify.notified();
+                    if bad.load(AOrd::SeqCst) == want_bad {
+                        return;
+                    }
+                    wait.await;
+                }
+            })
+        }
     }
     #[async_trait::async_trait]
     impl Suspender for ManualGate {
         fn name(&self) -> &str {
             "manual_gate"
         }
+        fn trip(&self) -> BoxFuture<'static, ()> {
+            self.until(true)
+        }
         fn watch(&self) -> BoxFuture<'static, ()> {
-            let cleared = self.cleared.clone();
-            let notify = self.notify.clone();
-            Box::pin(async move {
-                while !cleared.load(AOrd::SeqCst) {
-                    notify.notified().await;
-                }
-            })
+            self.until(false)
         }
     }
 
-    let cleared = StdArc::new(AtomicBool::new(false));
+    let bad = StdArc::new(AtomicBool::new(false));
     let notify = StdArc::new(tokio::sync::Notify::new());
     let gate = StdArc::new(ManualGate {
-        cleared: cleared.clone(),
+        bad: bad.clone(),
         notify: notify.clone(),
     });
 
@@ -1496,9 +1535,9 @@ async fn clear_suspenders_stops_auto_resume() {
     let plan = bsrs::core::plan::plan_box(async_stream::stream! {
         yield bsrs::core::Msg::InstallSuspender { id, suspender: payload };
         yield bsrs::core::Msg::OpenRun(Default::default());
-        yield bsrs::core::Msg::Pause { defer: false };
-        // Reached only if something resumes the engine — which must NOT happen
-        // after clear_suspenders, so this run is expected to abort while paused.
+        yield bsrs::core::Msg::Sleep(Duration::from_millis(50));
+        yield bsrs::core::Msg::Sleep(Duration::from_millis(50));
+        yield bsrs::core::Msg::Sleep(Duration::from_millis(50));
         yield bsrs::core::Msg::CloseRun {
             exit_status: "success".into(),
             reason: None,
@@ -1508,36 +1547,54 @@ async fn clear_suspenders_stops_auto_resume() {
     let re_run = re.clone();
     let join = tokio::spawn(async move { re_run.run_async(plan).await });
 
-    // Wait for the suspender to pause the engine.
+    for _ in 0..50 {
+        if re.state() == bsrs::engine::EngineRunState::Running {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    bad.store(true, AOrd::SeqCst);
+    notify.notify_waiters();
     for _ in 0..50 {
         if re.is_paused() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(re.is_paused(), "engine should be paused by the suspender");
-
-    // Uninstall the suspender; its watcher is aborted with the dropped handle.
-    re.clear_suspenders().await;
-    // Give the abort time to propagate before satisfying the (now-ignored) gate.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    cleared.store(true, AOrd::SeqCst);
-    notify.notify_waiters();
-
-    // With no installed suspender, clearing the gate cannot resume the engine:
-    // it stays paused. The run only ends when we abort it.
-    tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
         re.is_paused(),
-        "cleared suspender must not auto-resume the engine"
+        "engine should be suspended by the suspender"
     );
-    re.abort("test");
+
+    // Uninstalling releases the hold with the condition still bad: the run
+    // completes without the gate ever clearing.
+    re.clear_suspenders().await;
     let result = tokio::time::timeout(Duration::from_secs(2), join)
         .await
-        .expect("engine did not exit after abort")
+        .expect("clear_suspenders must release the suspension")
         .unwrap()
         .unwrap();
-    assert_eq!(result.exit_status, "abort");
+    assert_eq!(result.exit_status, "success");
+
+    // Still bad at the next run start and tripped again during it: the
+    // uninstalled gate neither gates nor suspends.
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield bsrs::core::Msg::OpenRun(Default::default());
+        yield bsrs::core::Msg::Sleep(Duration::from_millis(50));
+        yield bsrs::core::Msg::CloseRun {
+            exit_status: "success".into(),
+            reason: None,
+        };
+    });
+    bad.store(false, AOrd::SeqCst);
+    notify.notify_waiters();
+    bad.store(true, AOrd::SeqCst);
+    notify.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(2), re.run_async(plan))
+        .await
+        .expect("uninstalled suspender must not touch the run")
+        .unwrap();
+    assert_eq!(result.exit_status, "success");
 }
 
 // An installed `Suspender` exists to lift a *suspension*; its `watch()` must
@@ -1561,6 +1618,9 @@ async fn installed_suspender_not_watched_while_engine_runs() {
     impl Suspender for CountingClear {
         fn name(&self) -> &str {
             "counting_clear"
+        }
+        fn trip(&self) -> BoxFuture<'static, ()> {
+            Box::pin(std::future::pending())
         }
         fn watch(&self) -> BoxFuture<'static, ()> {
             let polls = self.polls.clone();
@@ -2212,6 +2272,59 @@ async fn kickoff_without_open_run_is_rejected_before_flyer_starts() {
     );
 }
 
+struct DescribeCountingCollectable {
+    describes: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl bsrs::core::msg::NamedObj for DescribeCountingCollectable {
+    fn name(&self) -> &str {
+        "countcollect"
+    }
+}
+#[async_trait::async_trait]
+impl bsrs::core::msg::CollectableObj for DescribeCountingCollectable {
+    async fn describe_collect_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, bsrs::event_model::DataKey>,
+        >,
+        bsrs::core::error::BsrsError,
+    > {
+        self.describes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let key = bsrs::event_model::DataKey {
+            source: "soft://countcollect".into(),
+            dtype: bsrs::event_model::Dtype::Number,
+            shape: vec![],
+            dtype_numpy: None,
+            external: None,
+            units: None,
+            precision: None,
+            object_name: None,
+            dims: None,
+            limits: None,
+            choices: None,
+        };
+        Ok(std::collections::HashMap::from([(
+            "primary".to_string(),
+            std::collections::HashMap::from([("count_val".to_string(), key)]),
+        )]))
+    }
+    async fn collect_dyn(
+        &self,
+    ) -> Result<
+        Vec<(
+            String,
+            std::collections::HashMap<String, serde_json::Value>,
+            std::collections::HashMap<String, f64>,
+        )>,
+        bsrs::core::error::BsrsError,
+    > {
+        Ok(Vec::new())
+    }
+}
+
 #[tokio::test]
 async fn collect_without_open_run_does_not_describe_the_flyer() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2224,41 +2337,6 @@ async fn collect_without_open_run_does_not_describe_the_flyer() {
     // first. Sibling of kickoff_without_open_run_is_rejected_before_flyer_starts;
     // same describe-before-precondition family as
     // monitor_without_open_run_does_not_describe_the_device.
-    struct DescribeCountingCollectable {
-        describes: Arc<AtomicUsize>,
-    }
-    impl bsrs::core::msg::NamedObj for DescribeCountingCollectable {
-        fn name(&self) -> &str {
-            "countcollect"
-        }
-    }
-    #[async_trait::async_trait]
-    impl bsrs::core::msg::CollectableObj for DescribeCountingCollectable {
-        async fn describe_collect_dyn(
-            &self,
-        ) -> Result<
-            std::collections::HashMap<
-                String,
-                std::collections::HashMap<String, bsrs::event_model::DataKey>,
-            >,
-            bsrs::core::error::BsrsError,
-        > {
-            self.describes.fetch_add(1, Ordering::SeqCst);
-            Ok(std::collections::HashMap::new())
-        }
-        async fn collect_dyn(
-            &self,
-        ) -> Result<
-            Vec<(
-                String,
-                std::collections::HashMap<String, serde_json::Value>,
-                std::collections::HashMap<String, f64>,
-            )>,
-            bsrs::core::error::BsrsError,
-        > {
-            Ok(Vec::new())
-        }
-    }
 
     let describes = Arc::new(AtomicUsize::new(0));
     let coll = Arc::new(DescribeCountingCollectable {
@@ -2479,6 +2557,284 @@ impl bsrs::core::msg::CollectableObj for FlyCollector {
             std::collections::HashMap::from([("fly_val".to_string(), 1.0)]),
         )])
     }
+    fn hint_fields(&self) -> Option<Vec<String>> {
+        Some(vec!["fly_val".to_string()])
+    }
+}
+
+// A collect stream's descriptor lists the collector's keys under its name
+// and stamps each key with it — bluesky's collect path runs `_prepare_stream`
+// over `{obj: describe_collect()[stream]}`. Before F4 `declare_stream` passed
+// an empty `object_keys`.
+#[tokio::test]
+async fn collect_stream_descriptor_lists_the_collectors_keys() {
+    use bsrs::core::Msg;
+    use std::sync::atomic::AtomicUsize;
+
+    let flyer = Arc::new(FlyCollector {
+        collects: Arc::new(AtomicUsize::new(0)),
+    });
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let fly: Arc<dyn bsrs::core::msg::FlyableObj> = flyer.clone();
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Kickoff { obj: fly.clone(), group: Some("k".into()) };
+        yield Msg::Wait { group: "k".into(), error_on_timeout: true, timeout: None };
+        yield Msg::Complete { obj: fly.clone(), group: Some("c".into()) };
+        yield Msg::Wait { group: "c".into(), error_on_timeout: true, timeout: None };
+        yield Msg::Collect { obj: fly.clone().as_collectable().unwrap(), stream_name: None };
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    re.run_async(plan).await.unwrap();
+
+    let docs = sink.snapshot().await;
+    let desc = docs
+        .iter()
+        .find_map(|d| match d {
+            bsrs::core::Document::Descriptor(d) if d.name.as_deref() == Some("primary") => Some(d),
+            _ => None,
+        })
+        .expect("collect stream descriptor");
+    assert_eq!(
+        desc.object_keys,
+        std::collections::HashMap::from([("flycoll".to_string(), vec!["fly_val".to_string()])])
+    );
+    assert_eq!(
+        desc.data_keys["fly_val"].object_name.as_deref(),
+        Some("flycoll")
+    );
+    assert!(desc.configuration.contains_key("flycoll"));
+    assert_eq!(
+        desc.hints
+            .as_ref()
+            .and_then(|h| h["flycoll"].fields.clone()),
+        Some(vec!["fly_val".to_string()]),
+        "collect descriptor carries the collectable's hint fields"
+    );
+}
+
+// bluesky `declare_stream(*objs, name=, collect=True)`: the stream is
+// described from each object's `describe_collect()[name]` slice, and the
+// later `Collect` reuses that descriptor instead of declaring a second one.
+#[tokio::test]
+async fn declare_stream_collect_describes_the_collect_stream_once() {
+    use bsrs::core::Msg;
+    use std::sync::atomic::AtomicUsize;
+
+    let flyer = Arc::new(FlyCollector {
+        collects: Arc::new(AtomicUsize::new(0)),
+    });
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let fly: Arc<dyn bsrs::core::msg::FlyableObj> = flyer.clone();
+    let coll: Arc<dyn bsrs::core::msg::CollectableObj> = flyer.clone();
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::DeclareStream { stream_name: "primary".into(), objs: vec![coll.clone()].into() };
+        yield Msg::Kickoff { obj: fly.clone(), group: Some("k".into()) };
+        yield Msg::Wait { group: "k".into(), error_on_timeout: true, timeout: None };
+        yield Msg::Complete { obj: fly.clone(), group: Some("c".into()) };
+        yield Msg::Wait { group: "c".into(), error_on_timeout: true, timeout: None };
+        yield Msg::Collect { obj: coll.clone(), stream_name: None };
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    re.run_async(plan).await.unwrap();
+
+    let docs = sink.snapshot().await;
+    let descs: Vec<_> = docs
+        .iter()
+        .filter_map(|d| match d {
+            bsrs::core::Document::Descriptor(d) if d.name.as_deref() == Some("primary") => Some(d),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(descs.len(), 1, "collect reuses the pre-declared descriptor");
+    assert_eq!(
+        descs[0].object_keys,
+        std::collections::HashMap::from([("flycoll".to_string(), vec!["fly_val".to_string()])])
+    );
+    assert!(descs[0].configuration.contains_key("flycoll"));
+    assert_eq!(
+        descs[0]
+            .hints
+            .as_ref()
+            .and_then(|h| h["flycoll"].fields.clone()),
+        Some(vec!["fly_val".to_string()])
+    );
+    let events = docs
+        .iter()
+        .filter(|d| matches!(d, bsrs::core::Document::Event(e) if e.descriptor == descs[0].uid))
+        .count();
+    assert!(
+        events >= 1,
+        "collect events stamped with the declared descriptor"
+    );
+}
+
+// A collectable whose `describe_collect` names two streams.
+struct TwoStreamCollector;
+impl bsrs::core::msg::NamedObj for TwoStreamCollector {
+    fn name(&self) -> &str {
+        "two"
+    }
+}
+#[async_trait::async_trait]
+impl bsrs::core::msg::CollectableObj for TwoStreamCollector {
+    async fn describe_collect_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, bsrs::event_model::DataKey>,
+        >,
+        bsrs::core::error::BsrsError,
+    > {
+        let key = bsrs::event_model::DataKey {
+            source: "soft://two".into(),
+            dtype: bsrs::event_model::Dtype::Number,
+            shape: vec![],
+            dtype_numpy: None,
+            external: None,
+            units: None,
+            precision: None,
+            object_name: None,
+            dims: None,
+            limits: None,
+            choices: None,
+        };
+        Ok(std::collections::HashMap::from([
+            (
+                "primary".to_string(),
+                std::collections::HashMap::from([("a".to_string(), key.clone())]),
+            ),
+            (
+                "aux".to_string(),
+                std::collections::HashMap::from([("b".to_string(), key)]),
+            ),
+        ]))
+    }
+    async fn collect_dyn(
+        &self,
+    ) -> Result<
+        Vec<(
+            String,
+            std::collections::HashMap<String, serde_json::Value>,
+            std::collections::HashMap<String, f64>,
+        )>,
+        bsrs::core::error::BsrsError,
+    > {
+        Ok(vec![])
+    }
+}
+
+// `collect=True` accepts a nested `describe_collect` only when its single
+// stream is the declared one (bluesky `_format_datakeys_with_stream_name`,
+// bundlers.py:754-759): a stream the object does not collect into and an
+// object collecting into more streams than the declared one both fail the
+// run. Boundaries: absent stream; declared stream present among others.
+#[tokio::test]
+async fn declare_stream_collect_requires_the_single_declared_stream() {
+    use bsrs::core::Msg;
+    use std::sync::atomic::AtomicUsize;
+
+    async fn declare(coll: Arc<dyn bsrs::core::msg::CollectableObj>, stream: &str) -> String {
+        let re = RunEngine::new(vec![]);
+        let stream = stream.to_string();
+        let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+            yield Msg::OpenRun(Default::default());
+            yield Msg::DeclareStream { stream_name: stream, objs: vec![coll].into() };
+            yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+        });
+        let result = re.run_async(plan).await.unwrap();
+        assert_eq!(result.exit_status, "fail", "reason: {}", result.reason);
+        result.reason
+    }
+
+    let absent = declare(
+        Arc::new(FlyCollector {
+            collects: Arc::new(AtomicUsize::new(0)),
+        }),
+        "other",
+    )
+    .await;
+    assert!(
+        absent.contains(
+            "expected flycoll to collect into the single stream \"other\", got [\"primary\"]"
+        ),
+        "reason: {absent}"
+    );
+
+    let extra = declare(Arc::new(TwoStreamCollector), "primary").await;
+    assert!(
+        extra.contains("expected two to collect into the single stream \"primary\", got [\"aux\"]"),
+        "reason: {extra}"
+    );
+}
+
+// bluesky `RunBundler.collect` resolves the stream through
+// `_declared_stream_names` (bundlers.py:1113-1124). Boundaries: a named
+// collect with no prior declare fails; a named collect after the declare
+// lands in that stream; an unnamed collect after the declare takes the
+// declared stream and does not re-describe the object.
+#[tokio::test]
+async fn collect_with_a_name_requires_a_prior_declare_stream() {
+    use bsrs::core::Msg;
+    use std::sync::atomic::AtomicUsize;
+
+    let re = RunEngine::new(vec![]);
+    let coll: Arc<dyn bsrs::core::msg::CollectableObj> = Arc::new(FlyCollector {
+        collects: Arc::new(AtomicUsize::new(0)),
+    });
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Collect { obj: coll.clone(), stream_name: Some("primary".into()) };
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let result = re.run_async(plan).await.unwrap();
+    assert_eq!(result.exit_status, "fail", "reason: {}", result.reason);
+    assert!(
+        result
+            .reason
+            .contains("declare_stream was not called for it first"),
+        "reason: {}",
+        result.reason
+    );
+}
+
+#[tokio::test]
+async fn collect_after_declare_stream_uses_the_declared_stream_without_redescribing() {
+    use bsrs::core::Msg;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let describes = Arc::new(AtomicUsize::new(0));
+    let obj = Arc::new(DescribeCountingCollectable {
+        describes: describes.clone(),
+    });
+    let coll: Arc<dyn bsrs::core::msg::CollectableObj> = obj;
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::DeclareStream { stream_name: "primary".into(), objs: vec![coll.clone()].into() };
+        // Named and unnamed: both resolve to the declared stream.
+        yield Msg::Collect { obj: coll.clone(), stream_name: Some("primary".into()) };
+        yield Msg::Collect { obj: coll.clone(), stream_name: None };
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let result = re.run_async(plan).await.unwrap();
+    assert_eq!(result.exit_status, "success", "reason: {}", result.reason);
+    assert_eq!(
+        describes.load(Ordering::SeqCst),
+        1,
+        "described once at declare_stream, never again at collect"
+    );
+    let docs = sink.snapshot().await;
+    let descriptors = docs
+        .iter()
+        .filter(|d| matches!(d, bsrs::core::Document::Descriptor(_)))
+        .count();
+    assert_eq!(descriptors, 1, "collect reuses the declared descriptor");
 }
 
 #[tokio::test]
@@ -2714,7 +3070,7 @@ async fn trigger_and_read_read_error_is_catchable_by_outer_contingency() {
     );
     let caught = bsrs::plans::preprocessors::contingency_wrapper(
         inner,
-        Some(bsrs::plans::stubs::null()),
+        Some(Box::new(|_| bsrs::plans::stubs::null())),
         None,
         None,
         false, // swallow the read fault
@@ -2762,6 +3118,12 @@ impl bsrs::engine::Suspender for GateSuspender {
     fn name(&self) -> &str {
         &self.name
     }
+    // Never trips at runtime: these tests exercise the plan-start gate, and a
+    // watcher parked on `clear` would compete with `tripped()` for the test's
+    // single `notify_one`.
+    fn trip(&self) -> futures::future::BoxFuture<'static, ()> {
+        Box::pin(std::future::pending())
+    }
     fn watch(&self) -> futures::future::BoxFuture<'static, ()> {
         let clear = self.clear.clone();
         Box::pin(async move { clear.notified().await })
@@ -2798,10 +3160,7 @@ async fn tripped_suspender_gates_plan_start_until_cleared() {
     let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let re = Arc::new(RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new()));
 
-    let id = re.next_suspender_id();
-    let gate_dyn: Arc<dyn bsrs::engine::Suspender> = gate;
-    let payload: Arc<dyn std::any::Any + Send + Sync> = Arc::new(gate_dyn);
-    re.install_suspender(id, payload).await.unwrap();
+    re.install_suspender(gate).await;
 
     let started_plan = started.clone();
     let plan = bsrs::core::plan::plan_box(async_stream::stream! {
@@ -2843,10 +3202,7 @@ async fn untripped_suspender_does_not_gate_plan_start() {
         clear: Arc::new(tokio::sync::Notify::new()),
     });
     let re = Arc::new(RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new()));
-    let id = re.next_suspender_id();
-    let gate_dyn: Arc<dyn bsrs::engine::Suspender> = gate;
-    let payload: Arc<dyn std::any::Any + Send + Sync> = Arc::new(gate_dyn);
-    re.install_suspender(id, payload).await.unwrap();
+    re.install_suspender(gate).await;
 
     let plan = bsrs::core::plan::plan_box(async_stream::stream! {
         yield bsrs::core::Msg::OpenRun(Default::default());

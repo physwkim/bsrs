@@ -85,7 +85,10 @@ where
         let fanout = self.fanout.clone();
         Box::new(move |v: &T, ts: f64, alarm_severity: Option<i32>| {
             if let Ok(json) = serde_json::to_value(v) {
-                let _ = fanout.tx.send(ReadingValue {
+                // `send_replace`, not `send`: a staged cache with no listener
+                // has no receiver, and `send` would drop the value while
+                // `cached_reading` keeps serving the initial null.
+                fanout.tx.send_replace(ReadingValue {
                     value: json,
                     timestamp: ts,
                     alarm_severity,
@@ -128,11 +131,18 @@ where
     /// Register a listener. Returns a `watch::Receiver` over the shared fan-out
     /// and a `SubToken` that decrements the listener count (and tears the
     /// monitor down if it was the last and the cache is not staged) on drop.
+    ///
+    /// When a reading is already cached the receiver starts with it pending,
+    /// so the listener's first `changed()` yields the current value: ophyd-async
+    /// `_SignalCache.subscribe` notifies a new listener at once when valid.
     pub fn add_listener(&self) -> (watch::Receiver<ReadingValue>, SubToken) {
         let mut st = self.state.lock().unwrap();
         st.listeners += 1;
         self.ensure_token(&mut st);
-        let rx = self.fanout.tx.subscribe();
+        let mut rx = self.fanout.tx.subscribe();
+        if self.fanout.has_value.load(Ordering::SeqCst) {
+            rx.mark_changed();
+        }
         drop(st);
 
         // Capture only the state + fanout handles (no backend / `B`) so the
@@ -248,6 +258,42 @@ mod tests {
         );
     }
 
+    // Boundary: a listener added before any reading is cached waits for the
+    // first update; one added after starts with the cached reading pending
+    // (ophyd-async `_SignalCache.subscribe` notifies at once when valid).
+    #[tokio::test]
+    async fn a_listener_added_after_a_reading_starts_with_it_pending() {
+        let be = backend(0.0);
+        let cache = SignalCache::new(be.clone());
+        let (early, _t0) = cache.add_listener();
+        assert!(!early.has_changed().unwrap(), "nothing cached yet");
+
+        be.write_now(3.0);
+        let (mut late, _t1) = cache.add_listener();
+        assert!(late.has_changed().unwrap(), "cached reading is pending");
+        assert_eq!(late.borrow_and_update().value, serde_json::json!(3.0));
+        assert!(early.has_changed().unwrap(), "the update reached it too");
+    }
+
+    // INVARIANT boundary: listeners == 0 while staged. The fan-out watch has
+    // no receiver then, and `watch::Sender::send` drops the value in that
+    // case, so a staged-only cache served the initial null reading with
+    // `has_value` already true.
+    #[tokio::test]
+    async fn staged_cache_without_listeners_caches_the_update() {
+        let be = backend(0.0);
+        let cache = SignalCache::new(be.clone());
+        cache.set_staged(true);
+        assert_eq!(cache.listener_count(), 0);
+
+        be.write_now(4.5);
+        assert_eq!(
+            cache.cached_reading().expect("value cached").value,
+            serde_json::json!(4.5),
+            "staged-only cache must hold the latest backend value"
+        );
+    }
+
     // The backend-facing callback must thread `alarm_severity` through to the
     // cached reading. CA/PVA monitors now deliver `Some(severity)` on each
     // update; the cache previously hardcoded `None` and dropped it. The soft
@@ -256,10 +302,8 @@ mod tests {
     #[tokio::test]
     async fn callback_threads_alarm_severity_into_cache() {
         let cache = SignalCache::new(backend(0.0));
-        // Keep a live fan-out receiver so the watch retains sent values, but
-        // skip `add_listener` (it installs the backend monitor, which would
+        // Skip `add_listener` (it installs the backend monitor, which would
         // race its own None-severity updates into the channel).
-        let _rx = cache.fanout.tx.subscribe();
         let cb = cache.make_callback();
         cb(&7.5_f64, 12.0, Some(2)); // MAJOR
         let r = cache.cached_reading().expect("value cached after callback");

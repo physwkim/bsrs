@@ -30,18 +30,24 @@ use std::time::Duration;
 use crate::backends::epics_pva::EpicsPvaBackend;
 use crate::core::error::Result;
 use crate::core::msg::{
-    DynLocation, LocatableObj, MovableObj, NamedObj, ReadableObj, StoppableObj,
+    DynLocation, LocatableObj, MonitorableObj, MovableObj, NamedObj, ReadableObj, StoppableObj,
 };
 use crate::core::reading::ReadingValue;
 use crate::core::status::Status;
+use crate::core::subscription::Subscription;
+use crate::devices::SignalCache;
 use crate::event_model::{DataKey, Dtype};
 use crate::protocols_async::SignalBackend;
 
 /// PVA-backed motor: setpoint + readback Signal pair.
+///
+/// Also a [`MonitorableObj`] over the readback: every PVA update becomes
+/// an Event, through one shared [`SignalCache`] (CP-08 / K2).
 pub struct PvaMotor {
     name: String,
     setpoint: Arc<EpicsPvaBackend<f64>>,
     readback: Arc<EpicsPvaBackend<f64>>,
+    cache: Arc<SignalCache<f64, EpicsPvaBackend<f64>>>,
 }
 
 impl PvaMotor {
@@ -58,6 +64,7 @@ impl PvaMotor {
         Ok(Arc::new(Self {
             name: name.to_string(),
             setpoint: sp,
+            cache: SignalCache::new(rb.clone()),
             readback: rb,
         }))
     }
@@ -138,10 +145,22 @@ impl StoppableObj for PvaMotor {
     }
 }
 
+#[async_trait::async_trait]
+impl MonitorableObj for PvaMotor {
+    async fn subscribe_dyn(&self) -> Result<Subscription> {
+        let (rx, token) = self.cache.add_listener();
+        Ok(Subscription::new(rx, token, self.name.clone()))
+    }
+}
+
 /// PVA-backed scalar detector: one Signal on a `_RBV` PV.
+///
+/// Also a [`MonitorableObj`]: every PVA update of the PV becomes an Event,
+/// through one shared [`SignalCache`] (CP-08 / K2).
 pub struct PvaDetector {
     name: String,
     value: Arc<EpicsPvaBackend<f64>>,
+    cache: Arc<SignalCache<f64, EpicsPvaBackend<f64>>>,
     seen: AtomicI64,
 }
 
@@ -154,6 +173,7 @@ impl PvaDetector {
             .block_on(async move { v_for_async.connect(Duration::from_secs(5)).await })?;
         Ok(Arc::new(Self {
             name: name.to_string(),
+            cache: SignalCache::new(v.clone()),
             value: v,
             seen: AtomicI64::new(0),
         }))
@@ -201,5 +221,13 @@ impl ReadableObj for PvaDetector {
             },
         );
         Ok(out)
+    }
+}
+
+#[async_trait::async_trait]
+impl MonitorableObj for PvaDetector {
+    async fn subscribe_dyn(&self) -> Result<Subscription> {
+        let (rx, token) = self.cache.add_listener();
+        Ok(Subscription::new(rx, token, self.name.clone()))
     }
 }

@@ -149,18 +149,44 @@ its own cleanup chain.
 
 ```rust
 #[async_trait]
-pub trait Suspender: Send + Sync {
-    fn install(&self, re: &SuspenderHandle);
-    fn remove (&self, re: &SuspenderHandle);
-    /// Returns a future that resolves when the RE should resume.
+pub trait Suspender: Send + Sync + 'static {
+    fn name(&self) -> &str;
+    /// Resolves once the condition is active (at once if it already is).
+    fn trip(&self) -> BoxFuture<'static, ()>;
+    /// Resolves once the condition has cleared, resume delay included.
     fn watch(&self) -> BoxFuture<'static, ()>;
+    /// `Some(clear-future)` while tripped: gates plan start (ENG-12).
+    fn tripped(&self) -> Option<BoxFuture<'static, ()>> { None }
+    fn justification(&self) -> String;
+    fn pre_plan(&self) -> Option<SuspendCallback> { None }
+    fn post_plan(&self) -> Option<SuspendCallback> { None }
 }
 ```
 
-Two reference impls:
+`RunEngine::install_suspender(Arc<dyn Suspender>) -> u64` registers one
+(bluesky `RE.install_suspender`); `remove_suspender(id)` and
+`clear_suspenders()` uninstall. The registration persists across runs, as
+bluesky's `RE._suspenders` does. The engine's watcher loop is
+`trip → request_suspend(watch) → watch → trip …`: a trip while a run is in
+progress suspends it under the suspender's justification (recorded to the
+`interruptions` stream), runs `pre_plan` after the touched motors are
+stopped and `post_plan` before the rewind replays, and releases when
+`watch` resolves. Tripped at plan start, the suspender gates the run until
+it clears. Overlapping suspensions each hold the run; it resumes when the
+last releases. A pause the user requested during a suspension is lifted only
+by `resume()`. Uninstalling a suspender releases a suspension it holds.
+`resume()` also lifts a suspension (there is no Ctrl-C-cancels-`wait_for`
+equivalent); a second suspender tripping while the run is already suspended
+adds a hold but its plans do not run and its justification is not recorded.
 
-- `SuspendBoolHigh` / `SuspendBoolLow` — watch a `Subscribable<bool>` (e.g. shutter PV).
-- `SuspendThreshold` — watch a `Subscribable<f64>` against a threshold.
+Reference impls over a `tokio::sync::watch::Receiver`, each with
+`with_resume_delay` / `with_pre_plan` / `with_post_plan`:
+
+- `SuspendBoolHigh` / `SuspendBoolLow` — a `bool` signal (e.g. shutter PV).
+- `SuspendThreshold` (`ThresholdDirection::{BadIfBelow, BadIfAbove}`) and
+  `SuspendOutsideBand` — an `f64` signal.
+- `SuspendWhenChanged<T>` — any value leaving `expected`; one-shot unless
+  `allow_resume()`.
 
 ## Differences from `bluesky/run_engine.py`
 

@@ -250,14 +250,18 @@ pub mod stubs {
         })
     }
 
-    /// `declare_stream(name, data_keys)` — pre-declare a stream descriptor.
+    /// `declare_stream(*objs, name=)` — pre-declare a stream descriptor from
+    /// the objects behind it. Pass `Vec<Arc<dyn ReadableObj>>` for a
+    /// read stream or `Vec<Arc<dyn CollectableObj>>` (bluesky `collect=True`)
+    /// for a fly-scan stream.
     pub fn declare_stream(
         stream_name: impl Into<String>,
-        data_keys: std::collections::HashMap<String, crate::event_model::DataKey>,
+        objs: impl Into<crate::core::msg::StreamObjs>,
     ) -> Plan {
         let stream_name = stream_name.into();
+        let objs = objs.into();
         plan_box(async_stream::stream! {
-            yield Msg::DeclareStream { stream_name, data_keys };
+            yield Msg::DeclareStream { stream_name, objs };
         })
     }
 
@@ -726,7 +730,7 @@ pub mod stubs {
             };
             let guarded = preprocessors::contingency_wrapper(
                 read_plan,
-                Some(drop_bundle()),
+                Some(Box::new(|_| drop_bundle())),
                 Some(save()),
                 None,
                 true,
@@ -2861,11 +2865,17 @@ mod tests {
         }
     }
 
+    /// The plan's messages, without the contingency bookkeeping a
+    /// `finalize_wrapper`/`contingency_wrapper` emits (`PushContingency`/
+    /// `PopContingency`): it never reaches a device, and the sequences
+    /// asserted on are the device-facing ones.
     async fn drain(mut plan: Plan) -> Vec<Msg> {
         let mut out = Vec::new();
         while let Some(item) = plan.next().await {
             let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
-            out.push(m);
+            if !matches!(m, Msg::PushContingency(_) | Msg::PopContingency) {
+                out.push(m);
+            }
         }
         out
     }
@@ -2940,6 +2950,7 @@ mod tests {
         let mut out = Vec::new();
         while let Some(item) = plan.next().await {
             match item {
+                PlanItem::Bare(Msg::PushContingency(_) | Msg::PopContingency) => {}
                 PlanItem::Bare(m) => out.push(m),
                 PlanItem::Respond(m, tx) => {
                     out.push(m);

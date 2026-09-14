@@ -109,9 +109,7 @@ async fn run(args: Args) -> i32 {
             return 2;
         }
     };
-    reg.register_readable("ph_mtr", ph_mtr.clone() as Arc<dyn ReadableObj>);
-    reg.register_movable("ph_mtr", ph_mtr.clone() as Arc<dyn MovableObj>);
-    reg.register_locatable("ph_mtr", ph_mtr as Arc<dyn LocatableObj>);
+    reg.register_positioner("ph_mtr", ph_mtr);
     tracing::info!(target: "mini-beamline-qs", "registered ph_mtr");
 
     let ph_det =
@@ -124,7 +122,8 @@ async fn run(args: Args) -> i32 {
                 return 2;
             }
         };
-    reg.register_readable("ph_det", ph_det as Arc<dyn ReadableObj>);
+    reg.register_readable("ph_det", ph_det.clone() as Arc<dyn ReadableObj>);
+    reg.register_monitorable("ph_det", ph_det);
     tracing::info!(target: "mini-beamline-qs", "registered ph_det");
 
     // ---- composite Dcm: energy + theta_rbv ----

@@ -91,7 +91,8 @@ pub async fn run(args: ManagerArgs) -> i32 {
     for i in 1..=args.soft_detectors {
         let name = format!("det{i}");
         let det = SoftDetector::new(&name);
-        reg.register_readable(&name, det as Arc<dyn ReadableObj>);
+        reg.register_readable(&name, det.clone() as Arc<dyn ReadableObj>);
+        reg.register_monitorable(&name, det);
     }
     for i in 1..=args.soft_motors {
         let name = format!("m{i}");
@@ -154,7 +155,8 @@ pub async fn run(args: ManagerArgs) -> i32 {
                     return 2;
                 }
             };
-            reg.register_readable(name, d as Arc<dyn ReadableObj>);
+            reg.register_readable(name, d.clone() as Arc<dyn ReadableObj>);
+            reg.register_monitorable(name, d);
             tracing::info!(target: "bsrs-qs", "registered ca_detector {name} → {pv}");
         }
     }

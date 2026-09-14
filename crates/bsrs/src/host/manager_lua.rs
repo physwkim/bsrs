@@ -90,9 +90,7 @@ pub fn build_shared_lua(re: Arc<RunEngine>, registry: &Registry) -> mlua::Result
     // Publish each registered device as a Lua global with its
     // declared name. Walk the role tables; a device that appears
     // under multiple roles (motor: readable + movable) carries
-    // both. Roles the registry doesn't currently track
-    // (locatable, stoppable, monitorable, ...) are left None —
-    // those calls error from Lua.
+    // both.
     // Union of every #[lua_methods] name in this state. LuaDevice's
     // shared `__index` fallback consults it so only real lua-exposed
     // method names produce a dispatch wrapper (anything else stays
@@ -105,15 +103,15 @@ pub fn build_shared_lua(re: Arc<RunEngine>, registry: &Registry) -> mlua::Result
             readable: registry.readable(&name).cloned(),
             movable: registry.movable(&name).cloned(),
             locatable: registry.locatable(&name).cloned(),
-            stoppable: None,
+            stoppable: registry.stoppable(&name).cloned(),
             triggerable: registry.triggerable(&name).cloned(),
             stageable: registry.stageable(&name).cloned(),
-            monitorable: None,
+            monitorable: registry.monitorable(&name).cloned(),
             flyable: registry.flyable(&name).cloned(),
-            preparable: None,
-            configurable: None,
+            preparable: registry.preparable(&name).cloned(),
+            configurable: registry.configurable(&name).cloned(),
             collectable: registry.collectable(&name).cloned(),
-            pausable: None,
+            pausable: registry.pausable(&name).cloned(),
             // #[lua_methods] resolve via LuaDevice's __index fallback,
             // so the device stays a plain userdata and works directly
             // as a scan()/mv()/... argument.
@@ -500,5 +498,186 @@ mod tests {
         let r = state.eval("dx:set_orientation(1.0)").await;
         assert!(r.error.is_some());
         assert!(r.error.as_deref().unwrap().contains("expected 3 args"));
+    }
+
+    // A device registered under the monitorable facet reaches the daemon Lua
+    // state with that role, so `msg.monitor` / `bpp.monitor_during` accept it
+    // (before the facet existed every registry device was published with
+    // `monitorable: None` and those calls failed with "is not monitorable").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registry_positioner_is_stoppable_from_lua() {
+        // `register_positioner` carries the stoppable facet, so the
+        // daemon's Lua global exposes `stop()` / `stop_emergency()`
+        // like the repl's `soft_motor` / `ca_motor` factories do.
+        let mut reg = Registry::new();
+        reg.register_positioner(
+            "m1",
+            Arc::new(crate::backends::soft::SoftMotor::new("m1", Some(0.0))),
+        );
+        let engine_slot = Arc::new(TMutex::new(Some(Arc::new(RunEngine::new(vec![])))));
+        let state = ManagerLuaState::new(engine_slot, Arc::new(reg));
+
+        let r = state.eval("tostring(m1)").await;
+        assert_eq!(
+            r.return_value.as_deref(),
+            Some("Device(m1, [readable,movable,locatable,stoppable,monitorable])"),
+            "{r:?}"
+        );
+        let r = state
+            .eval("m1:stop(); m1:stop_emergency(); return 'ok'")
+            .await;
+        assert!(r.error.is_none(), "{r:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registry_preparable_configurable_pausable_facets_reach_lua() {
+        // Every Lua entry point that projects one of the three facets
+        // resolves on a registry device (before the registry tracked
+        // them, each failed with "is not preparable/configurable/pausable").
+        struct Dev;
+        impl crate::core::msg::NamedObj for Dev {
+            fn name(&self) -> &str {
+                "dev"
+            }
+            fn inspect_dyn(&self) -> serde_json::Value {
+                serde_json::json!({"name": "dev", "type": "TestDev"})
+            }
+        }
+        #[async_trait::async_trait]
+        impl crate::core::msg::PreparableObj for Dev {
+            async fn prepare_dyn(&self, _value: serde_json::Value) -> crate::core::status::Status {
+                crate::core::status::Status::done()
+            }
+        }
+        #[async_trait::async_trait]
+        impl crate::core::msg::ConfigurableObj for Dev {
+            async fn read_configuration_dyn(
+                &self,
+            ) -> crate::core::error::Result<
+                std::collections::HashMap<String, crate::core::reading::ReadingValue>,
+            > {
+                Ok(Default::default())
+            }
+            async fn describe_configuration_dyn(
+                &self,
+            ) -> crate::core::error::Result<
+                std::collections::HashMap<String, crate::event_model::DataKey>,
+            > {
+                Ok(Default::default())
+            }
+            async fn configure_dyn(
+                &self,
+                _args: crate::core::msg::ConfigureArgs,
+            ) -> crate::core::error::Result<()> {
+                Ok(())
+            }
+        }
+        #[async_trait::async_trait]
+        impl crate::core::msg::PausableObj for Dev {
+            async fn pause_dyn(&self) -> crate::core::error::Result<()> {
+                Ok(())
+            }
+            async fn resume_dyn(&self) -> crate::core::error::Result<()> {
+                Ok(())
+            }
+        }
+
+        let dev = Arc::new(Dev);
+        let mut reg = Registry::new();
+        reg.register_preparable("dev", dev.clone());
+        reg.register_configurable("dev", dev.clone());
+        reg.register_pausable("dev", dev);
+        assert_eq!(reg.device_names(), vec!["dev".to_string()]);
+
+        let engine_slot = Arc::new(TMutex::new(Some(Arc::new(RunEngine::new(vec![])))));
+        let state = ManagerLuaState::new(engine_slot, Arc::new(reg));
+
+        let r = state.eval("tostring(dev)").await;
+        assert_eq!(
+            r.return_value.as_deref(),
+            Some("Device(dev, [preparable,configurable,pausable])"),
+            "{r:?}"
+        );
+        // inspect() resolves through the preparable facet instead of
+        // falling through to the `type = "Unknown"` placeholder.
+        let r = state.eval("return dev:inspect().type").await;
+        assert_eq!(r.return_value.as_deref(), Some("TestDev"), "{r:?}");
+        for src in [
+            "msg.prepare(dev, 1); return 'ok'",
+            "msg.configure(dev, {a = 1}); return 'ok'",
+            "msg.register_pausable(dev); return 'ok'",
+            "RE:register_pausable(dev); RE:unregister_pausable(dev); return 'ok'",
+        ] {
+            let r = state.eval(src).await;
+            assert!(r.error.is_none(), "{src}: {r:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registry_monitorable_facet_is_published_to_lua() {
+        struct Mon;
+        impl crate::core::msg::NamedObj for Mon {
+            fn name(&self) -> &str {
+                "mon"
+            }
+        }
+        #[async_trait::async_trait]
+        impl crate::core::msg::ReadableObj for Mon {
+            async fn read_dyn(
+                &self,
+            ) -> crate::core::error::Result<
+                std::collections::HashMap<String, crate::core::reading::ReadingValue>,
+            > {
+                Ok(std::collections::HashMap::new())
+            }
+            async fn describe_dyn(
+                &self,
+            ) -> crate::core::error::Result<
+                std::collections::HashMap<String, crate::event_model::DataKey>,
+            > {
+                Ok(std::collections::HashMap::new())
+            }
+        }
+        #[async_trait::async_trait]
+        impl crate::core::msg::MonitorableObj for Mon {
+            async fn subscribe_dyn(
+                &self,
+            ) -> crate::core::error::Result<crate::core::subscription::Subscription> {
+                let (_tx, rx) = tokio::sync::watch::channel(crate::core::reading::ReadingValue {
+                    value: serde_json::Value::Null,
+                    timestamp: 0.0,
+                    alarm_severity: None,
+                    message: None,
+                });
+                Ok(crate::core::subscription::Subscription::new(
+                    rx,
+                    crate::core::status::SubToken::noop(),
+                    "mon",
+                ))
+            }
+        }
+
+        let mon = Arc::new(Mon);
+        let mut reg = Registry::new();
+        reg.register_readable("mon", mon.clone());
+        reg.register_monitorable("mon", mon);
+        assert_eq!(reg.device_names(), vec!["mon".to_string()]);
+
+        let engine_slot = Arc::new(TMutex::new(Some(Arc::new(RunEngine::new(vec![])))));
+        let state = ManagerLuaState::new(engine_slot, Arc::new(reg));
+
+        let r = state.eval("tostring(mon)").await;
+        assert_eq!(
+            r.return_value.as_deref(),
+            Some("Device(mon, [readable,monitorable])"),
+            "{r:?}"
+        );
+        // Both Lua entry points that project the monitorable facet resolve.
+        let r = state.eval("msg.monitor(mon); return 'ok'").await;
+        assert!(r.error.is_none(), "{r:?}");
+        let r = state
+            .eval("bpp.monitor_during(count({mon}, 1), {mon}); return 'ok'")
+            .await;
+        assert!(r.error.is_none(), "{r:?}");
     }
 }

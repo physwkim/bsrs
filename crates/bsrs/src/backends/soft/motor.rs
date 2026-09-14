@@ -2,11 +2,13 @@
 
 use crate::core::error::Result;
 use crate::core::msg::{
-    DynLocation, LocatableObj, MovableObj, NamedObj, ReadableObj, StoppableObj,
+    DynLocation, LocatableObj, MonitorableObj, MovableObj, NamedObj, ReadableObj, StoppableObj,
 };
 use crate::core::reading::ReadingValue;
 use crate::core::status::{Status, StatusError};
+use crate::core::subscription::Subscription;
 use crate::core::Kind;
+use crate::devices::SignalCache;
 use crate::event_model::{DataKey, Dtype};
 use crate::protocols_async::{AsyncMovable, AsyncReadable, Locatable, Location, SignalBackend};
 use async_trait::async_trait;
@@ -16,9 +18,13 @@ use std::sync::Arc;
 use crate::backends::soft::signal::SoftSignalBackend;
 
 /// Single-signal motor backed by a `SoftSignalBackend<f64>`.
+///
+/// Also a [`MonitorableObj`]: every `set` publishes the new position to
+/// monitor subscribers through one shared [`SignalCache`] (CP-08 / K2).
 pub struct SoftMotor {
     name: String,
     backend: Arc<SoftSignalBackend<f64>>,
+    cache: Arc<SignalCache<f64, SoftSignalBackend<f64>>>,
     units: Option<String>,
     kind: Kind,
 }
@@ -26,13 +32,15 @@ pub struct SoftMotor {
 impl SoftMotor {
     /// Build a soft motor with `initial_pos` at `0.0` if `None`.
     pub fn new(name: impl Into<String>, initial_pos: Option<f64>) -> Self {
+        let backend = Arc::new(
+            SoftSignalBackend::new(initial_pos.unwrap_or(0.0), Dtype::Number)
+                .with_dtype_numpy("<f8")
+                .with_units("mm"),
+        );
         Self {
             name: name.into(),
-            backend: Arc::new(
-                SoftSignalBackend::new(initial_pos.unwrap_or(0.0), Dtype::Number)
-                    .with_dtype_numpy("<f8")
-                    .with_units("mm"),
-            ),
+            cache: SignalCache::new(backend.clone()),
+            backend,
             units: Some("mm".into()),
             kind: Kind::Hinted,
         }
@@ -150,6 +158,14 @@ impl LocatableObj for SoftMotor {
         let setpoint = SignalBackend::get_setpoint(self.backend.as_ref()).await?;
         let readback = SignalBackend::get_value(self.backend.as_ref()).await?;
         Ok(DynLocation { setpoint, readback })
+    }
+}
+
+#[async_trait]
+impl MonitorableObj for SoftMotor {
+    async fn subscribe_dyn(&self) -> Result<Subscription> {
+        let (rx, token) = self.cache.add_listener();
+        Ok(Subscription::new(rx, token, self.name.clone()))
     }
 }
 

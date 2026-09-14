@@ -2,7 +2,8 @@
 
 use crate::core::lua_exposable::LuaMethodEntry;
 use crate::core::msg::{
-    CollectableObj, FlyableObj, LocatableObj, MovableObj, ReadableObj, StageableObj, TriggerableObj,
+    CollectableObj, ConfigurableObj, FlyableObj, LocatableObj, MonitorableObj, MovableObj,
+    PausableObj, PreparableObj, ReadableObj, StageableObj, StoppableObj, TriggerableObj,
 };
 use crate::core::plan::Plan;
 use serde_json::Value;
@@ -174,10 +175,15 @@ pub struct Registry {
     readables: HashMap<String, Arc<dyn ReadableObj>>,
     movables: HashMap<String, Arc<dyn MovableObj>>,
     locatables: HashMap<String, Arc<dyn LocatableObj>>,
+    stoppables: HashMap<String, Arc<dyn StoppableObj>>,
     triggerables: HashMap<String, Arc<dyn TriggerableObj>>,
     stageables: HashMap<String, Arc<dyn StageableObj>>,
     flyables: HashMap<String, Arc<dyn FlyableObj>>,
     collectables: HashMap<String, Arc<dyn CollectableObj>>,
+    monitorables: HashMap<String, Arc<dyn MonitorableObj>>,
+    preparables: HashMap<String, Arc<dyn PreparableObj>>,
+    configurables: HashMap<String, Arc<dyn ConfigurableObj>>,
+    pausables: HashMap<String, Arc<dyn PausableObj>>,
     /// Devices with `#[lua_methods]`-derived `LuaExposable` impls.
     /// Surfaced through the daemon's Lua state as device-specific
     /// methods on the device global. See `host/manager_lua.rs`.
@@ -217,7 +223,7 @@ impl Registry {
     }
 
     /// Register a positioner under every facet it implements — readable,
-    /// movable *and* locatable.
+    /// movable, locatable, stoppable *and* monitorable.
     ///
     /// Prefer this over calling the per-facet `register_*` methods for a
     /// motor. Registering a positioner facet-by-facet is how a device
@@ -227,12 +233,14 @@ impl Registry {
     /// forget one.
     pub fn register_positioner<T>(&mut self, name: impl Into<String>, obj: Arc<T>)
     where
-        T: ReadableObj + MovableObj + LocatableObj + 'static,
+        T: ReadableObj + MovableObj + LocatableObj + StoppableObj + MonitorableObj + 'static,
     {
         let name = name.into();
         self.readables.insert(name.clone(), obj.clone());
         self.movables.insert(name.clone(), obj.clone());
-        self.locatables.insert(name, obj);
+        self.locatables.insert(name.clone(), obj.clone());
+        self.stoppables.insert(name.clone(), obj.clone());
+        self.monitorables.insert(name, obj);
     }
 
     /// Register a `ReadableObj` device under a name.
@@ -249,6 +257,11 @@ impl Registry {
     /// register both for full motor surface (set + locate).
     pub fn register_locatable(&mut self, name: impl Into<String>, obj: Arc<dyn LocatableObj>) {
         self.locatables.insert(name.into(), obj);
+    }
+
+    /// Register a `StoppableObj` device under a name.
+    pub fn register_stoppable(&mut self, name: impl Into<String>, obj: Arc<dyn StoppableObj>) {
+        self.stoppables.insert(name.into(), obj);
     }
 
     /// Register a `TriggerableObj` device.
@@ -269,6 +282,33 @@ impl Registry {
     /// Register a `CollectableObj` device.
     pub fn register_collectable(&mut self, name: impl Into<String>, obj: Arc<dyn CollectableObj>) {
         self.collectables.insert(name.into(), obj);
+    }
+
+    /// Register a `MonitorableObj` device — the daemon Lua state exposes
+    /// it to `monitor` / `monitor_during`.
+    pub fn register_monitorable(&mut self, name: impl Into<String>, obj: Arc<dyn MonitorableObj>) {
+        self.monitorables.insert(name.into(), obj);
+    }
+
+    /// Register a `PreparableObj` device under a name.
+    pub fn register_preparable(&mut self, name: impl Into<String>, obj: Arc<dyn PreparableObj>) {
+        self.preparables.insert(name.into(), obj);
+    }
+
+    /// Register a `ConfigurableObj` device under a name.
+    pub fn register_configurable(
+        &mut self,
+        name: impl Into<String>,
+        obj: Arc<dyn ConfigurableObj>,
+    ) {
+        self.configurables.insert(name.into(), obj);
+    }
+
+    /// Register a `PausableObj` device under a name. The daemon Lua
+    /// state exposes it to `RE:register_pausable`; the registry itself
+    /// does not attach it to the engine.
+    pub fn register_pausable(&mut self, name: impl Into<String>, obj: Arc<dyn PausableObj>) {
+        self.pausables.insert(name.into(), obj);
     }
 
     /// Register the device's `#[lua_methods]` table for daemon-Lua
@@ -312,6 +352,11 @@ impl Registry {
         self.locatables.get(name)
     }
 
+    /// Look up a `StoppableObj` by name.
+    pub fn stoppable(&self, name: &str) -> Option<&Arc<dyn StoppableObj>> {
+        self.stoppables.get(name)
+    }
+
     /// Look up a `TriggerableObj` by name.
     pub fn triggerable(&self, name: &str) -> Option<&Arc<dyn TriggerableObj>> {
         self.triggerables.get(name)
@@ -330,6 +375,26 @@ impl Registry {
     /// Look up a `CollectableObj` by name.
     pub fn collectable(&self, name: &str) -> Option<&Arc<dyn CollectableObj>> {
         self.collectables.get(name)
+    }
+
+    /// Look up a `MonitorableObj` by name.
+    pub fn monitorable(&self, name: &str) -> Option<&Arc<dyn MonitorableObj>> {
+        self.monitorables.get(name)
+    }
+
+    /// Look up a `PreparableObj` by name.
+    pub fn preparable(&self, name: &str) -> Option<&Arc<dyn PreparableObj>> {
+        self.preparables.get(name)
+    }
+
+    /// Look up a `ConfigurableObj` by name.
+    pub fn configurable(&self, name: &str) -> Option<&Arc<dyn ConfigurableObj>> {
+        self.configurables.get(name)
+    }
+
+    /// Look up a `PausableObj` by name.
+    pub fn pausable(&self, name: &str) -> Option<&Arc<dyn PausableObj>> {
+        self.pausables.get(name)
     }
 
     /// Look up a registered plan factory by name.
@@ -402,6 +467,9 @@ impl Registry {
         if let Some(o) = self.movables.get(name) {
             return Some(o.inspect_dyn());
         }
+        if let Some(o) = self.stoppables.get(name) {
+            return Some(o.inspect_dyn());
+        }
         if let Some(o) = self.triggerables.get(name) {
             return Some(o.inspect_dyn());
         }
@@ -412,6 +480,18 @@ impl Registry {
             return Some(o.inspect_dyn());
         }
         if let Some(o) = self.collectables.get(name) {
+            return Some(o.inspect_dyn());
+        }
+        if let Some(o) = self.monitorables.get(name) {
+            return Some(o.inspect_dyn());
+        }
+        if let Some(o) = self.preparables.get(name) {
+            return Some(o.inspect_dyn());
+        }
+        if let Some(o) = self.configurables.get(name) {
+            return Some(o.inspect_dyn());
+        }
+        if let Some(o) = self.pausables.get(name) {
             return Some(o.inspect_dyn());
         }
         None
@@ -432,6 +512,9 @@ impl Registry {
         for k in self.locatables.keys() {
             s.insert(k.clone());
         }
+        for k in self.stoppables.keys() {
+            s.insert(k.clone());
+        }
         for k in self.triggerables.keys() {
             s.insert(k.clone());
         }
@@ -442,6 +525,18 @@ impl Registry {
             s.insert(k.clone());
         }
         for k in self.collectables.keys() {
+            s.insert(k.clone());
+        }
+        for k in self.monitorables.keys() {
+            s.insert(k.clone());
+        }
+        for k in self.preparables.keys() {
+            s.insert(k.clone());
+        }
+        for k in self.configurables.keys() {
+            s.insert(k.clone());
+        }
+        for k in self.pausables.keys() {
             s.insert(k.clone());
         }
         for k in self.lua_exposed.keys() {

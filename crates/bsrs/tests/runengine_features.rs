@@ -597,7 +597,8 @@ async fn suspend_bool_high_pauses_on_high_resumes_on_low() {
     use bsrs::engine::SuspendBoolHigh;
     let (tx, rx) = tokio::sync::watch::channel(false);
     let re = Arc::new(RunEngine::new(vec![]));
-    let _watcher = SuspendBoolHigh::new("shutter", rx).install(re.clone());
+    re.install_suspender(Arc::new(SuspendBoolHigh::new("shutter", rx)))
+        .await;
 
     let re2 = re.clone();
     let plan = plan_box(async_stream::stream! {
@@ -633,7 +634,8 @@ async fn suspend_bool_low_pauses_on_low_resumes_on_high() {
     use bsrs::engine::SuspendBoolLow;
     let (tx, rx) = tokio::sync::watch::channel(true);
     let re = Arc::new(RunEngine::new(vec![]));
-    let _watcher = SuspendBoolLow::new("beam", rx).install(re.clone());
+    re.install_suspender(Arc::new(SuspendBoolLow::new("beam", rx)))
+        .await;
 
     let re2 = re.clone();
     let plan = plan_box(async_stream::stream! {
@@ -662,8 +664,13 @@ async fn suspend_threshold_floor_pauses_when_below() {
     use bsrs::engine::{SuspendThreshold, ThresholdDirection};
     let (tx, rx) = tokio::sync::watch::channel(100.0_f64);
     let re = Arc::new(RunEngine::new(vec![]));
-    let _watcher = SuspendThreshold::new("beam_current", rx, 50.0, ThresholdDirection::BadIfBelow)
-        .install(re.clone());
+    re.install_suspender(Arc::new(SuspendThreshold::new(
+        "beam_current",
+        rx,
+        50.0,
+        ThresholdDirection::BadIfBelow,
+    )))
+    .await;
 
     let re2 = re.clone();
     let plan = plan_box(async_stream::stream! {
@@ -693,7 +700,13 @@ async fn suspend_outside_band_pauses_outside_resumes_inside() {
     use bsrs::engine::SuspendOutsideBand;
     let (tx, rx) = tokio::sync::watch::channel(25.0_f64); // inside (20, 30)
     let re = Arc::new(RunEngine::new(vec![]));
-    let _watcher = SuspendOutsideBand::new("temperature", rx, 20.0, 30.0).install(re.clone());
+    re.install_suspender(Arc::new(SuspendOutsideBand::new(
+        "temperature",
+        rx,
+        20.0,
+        30.0,
+    )))
+    .await;
 
     let re2 = re.clone();
     let plan = plan_box(async_stream::stream! {
@@ -730,9 +743,10 @@ async fn suspend_when_changed_allow_resume_pauses_then_resumes() {
     use bsrs::engine::SuspendWhenChanged;
     let (tx, rx) = tokio::sync::watch::channel("operate".to_string());
     let re = Arc::new(RunEngine::new(vec![]));
-    let _watcher = SuspendWhenChanged::new("facility_mode", rx, "operate".to_string())
-        .allow_resume()
-        .install(re.clone());
+    re.install_suspender(Arc::new(
+        SuspendWhenChanged::new("facility_mode", rx, "operate".to_string()).allow_resume(),
+    ))
+    .await;
 
     let re2 = re.clone();
     let plan = plan_box(async_stream::stream! {
@@ -766,11 +780,9 @@ async fn suspend_when_changed_no_resume_requires_manual_resume() {
     // `expected` does NOT auto-resume; only a manual RE.resume() lifts it.
     use bsrs::engine::SuspendWhenChanged;
     let (tx, rx) = tokio::sync::watch::channel(0_i64);
-    // Keep a receiver alive: the one-shot watcher drops its own on trip, and
-    // we still want `tx.send` to succeed afterwards to prove it does nothing.
-    let _rx_keep = rx.clone();
     let re = Arc::new(RunEngine::new(vec![]));
-    let _watcher = SuspendWhenChanged::new("interlock", rx, 0_i64).install(re.clone());
+    re.install_suspender(Arc::new(SuspendWhenChanged::new("interlock", rx, 0_i64)))
+        .await;
 
     let re2 = re.clone();
     let plan = plan_box(async_stream::stream! {
@@ -802,6 +814,281 @@ async fn suspend_when_changed_no_resume_requires_manual_resume() {
         .unwrap()
         .unwrap();
     assert_eq!(re.state(), EngineRunState::Idle);
+}
+
+// A plan that parks on `Sleep`s long enough for the test to trip and clear a
+// suspender while it runs; `OpenRun`/`CloseRun` so interruptions are recorded.
+fn sleepy_run(steps: usize) -> Plan {
+    plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        for _ in 0..steps {
+            yield Msg::Sleep(Duration::from_millis(50));
+        }
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    })
+}
+
+// An installed reference suspender runs its `pre_plan` when the suspension
+// takes hold and its `post_plan` on release, both through the engine's
+// handlers — bluesky's SuspendBoolHigh(pre_plan=close_shutter,
+// post_plan=open_shutter). Before F3 the reference impls had no plans at all.
+#[tokio::test]
+async fn installed_suspender_runs_pre_and_post_plans() {
+    use bsrs::core::msg::MovableObj;
+    use bsrs::engine::SuspendBoolHigh;
+
+    let log = Arc::new(StdMutex::new(Vec::<f64>::new()));
+    let motor: Arc<dyn MovableObj> = Arc::new(RecordingMotor {
+        name: "shutter".into(),
+        log: log.clone(),
+    });
+    let (pre_motor, post_motor) = (motor.clone(), motor.clone());
+    let pre: bsrs::engine::SuspendCallback = Arc::new(move || {
+        let m = pre_motor.clone();
+        plan_box(async_stream::stream! {
+            yield Msg::Set { obj: m.clone(), value: 10.0, group: None };
+        })
+    });
+    let post: bsrs::engine::SuspendCallback = Arc::new(move || {
+        let m = post_motor.clone();
+        plan_box(async_stream::stream! {
+            yield Msg::Set { obj: m.clone(), value: 20.0, group: None };
+        })
+    });
+
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let re = Arc::new(RunEngine::new(vec![]));
+    re.install_suspender(Arc::new(
+        SuspendBoolHigh::new("shutter", rx)
+            .with_pre_plan(pre)
+            .with_post_plan(post),
+    ))
+    .await;
+
+    let re2 = re.clone();
+    let join = tokio::spawn(async move { re2.run_async(sleepy_run(3)).await });
+    wait_for_state(&re, EngineRunState::Running).await;
+
+    tx.send(true).unwrap();
+    wait_for_state(&re, EngineRunState::Paused).await;
+    // pre_plan ran on the way into the suspension; post_plan not yet.
+    wait_until("pre_plan setpoint", || {
+        log.lock().unwrap().as_slice() == [10.0]
+    })
+    .await;
+
+    tx.send(false).unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("auto-resume in time")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        log.lock().unwrap().as_slice(),
+        [10.0, 20.0],
+        "post_plan must run once, on release"
+    );
+}
+
+// ENG-12 for a reference suspender: installed while already tripped, it gates
+// plan start until the condition clears (bluesky prepends a `wait_for` on every
+// tripped suspender in `RunEngine.__call__`). Before F3 the reference impls
+// were never registered, so the gate could not see them.
+#[tokio::test]
+async fn tripped_reference_suspender_gates_plan_start() {
+    use bsrs::engine::SuspendBoolHigh;
+    let (tx, rx) = tokio::sync::watch::channel(true);
+    let re = Arc::new(RunEngine::new(vec![]));
+    re.install_suspender(Arc::new(SuspendBoolHigh::new("shutter", rx)))
+        .await;
+
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let started_plan = started.clone();
+    let plan = plan_box(async_stream::stream! {
+        started_plan.store(true, Ordering::SeqCst);
+        yield Msg::OpenRun(Default::default());
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let re2 = re.clone();
+    let join = tokio::spawn(async move { re2.run_async(plan).await });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !started.load(Ordering::SeqCst),
+        "plan must not start while the shutter is closed"
+    );
+    assert_eq!(re.state(), EngineRunState::Running);
+
+    tx.send(false).unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("gate lifts once the signal clears")
+        .unwrap()
+        .unwrap();
+    assert!(started.load(Ordering::SeqCst));
+}
+
+// Two suspenders tripped at once hold the run until both clear — a beam dump
+// also closes the safety shutter, and releasing the first must not resume a
+// scan into a closed shutter.
+#[tokio::test]
+async fn overlapping_suspensions_resume_only_when_both_clear() {
+    use bsrs::engine::SuspendBoolHigh;
+    let (shutter_tx, shutter_rx) = tokio::sync::watch::channel(false);
+    let (beam_tx, beam_rx) = tokio::sync::watch::channel(false);
+    let re = Arc::new(RunEngine::new(vec![]));
+    re.install_suspender(Arc::new(SuspendBoolHigh::new("shutter", shutter_rx)))
+        .await;
+    re.install_suspender(Arc::new(SuspendBoolHigh::new("beam", beam_rx)))
+        .await;
+
+    let re2 = re.clone();
+    let join = tokio::spawn(async move { re2.run_async(sleepy_run(3)).await });
+    wait_for_state(&re, EngineRunState::Running).await;
+
+    shutter_tx.send(true).unwrap();
+    wait_for_state(&re, EngineRunState::Paused).await;
+    beam_tx.send(true).unwrap();
+    // Let the second trip register its hold before the first releases.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    shutter_tx.send(false).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        re.state(),
+        EngineRunState::Paused,
+        "the beam suspension must still hold the run"
+    );
+
+    beam_tx.send(false).unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("resume once both clear")
+        .unwrap()
+        .unwrap();
+    assert_eq!(re.state(), EngineRunState::Idle);
+}
+
+// A pause the user requested while the run is suspended outlives the
+// suspension's release: only `resume()` lifts it. Before F3 the installed
+// watcher lifted *any* pause when its condition cleared.
+#[tokio::test]
+async fn manual_pause_during_a_suspension_is_not_lifted_by_its_release() {
+    use bsrs::engine::SuspendBoolHigh;
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let re = Arc::new(RunEngine::new(vec![]));
+    re.install_suspender(Arc::new(SuspendBoolHigh::new("shutter", rx)))
+        .await;
+
+    let re2 = re.clone();
+    let join = tokio::spawn(async move { re2.run_async(sleepy_run(3)).await });
+    wait_for_state(&re, EngineRunState::Running).await;
+
+    tx.send(true).unwrap();
+    wait_for_state(&re, EngineRunState::Paused).await;
+    re.pause(false);
+
+    tx.send(false).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        re.state(),
+        EngineRunState::Paused,
+        "the user's pause must survive the suspension's release"
+    );
+
+    re.resume();
+    let _ = tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("resume lifts the pause")
+        .unwrap()
+        .unwrap();
+    assert_eq!(re.state(), EngineRunState::Idle);
+}
+
+// A suspension is recorded under the suspender's justification, once — bluesky
+// `_start_suspender` records `justification or "suspended"` where a pause
+// records "pause". Before F3 a suspension landed both.
+#[tokio::test]
+async fn suspension_records_its_justification_not_pause() {
+    use bsrs::engine::SuspendBoolHigh;
+    let sink = Arc::new(CapturingSink::new());
+    let re = Arc::new(RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]));
+    re.set_record_interruptions(true);
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    re.install_suspender(Arc::new(SuspendBoolHigh::new("shutter", rx)))
+        .await;
+
+    let re2 = re.clone();
+    let join = tokio::spawn(async move { re2.run_async(sleepy_run(3)).await });
+    wait_for_docs(&sink, "interruptions descriptor", |docs| {
+        docs.iter().any(
+            |d| matches!(d, Document::Descriptor(d) if d.name.as_deref() == Some("interruptions")),
+        )
+    })
+    .await;
+
+    tx.send(true).unwrap();
+    wait_for_state(&re, EngineRunState::Paused).await;
+    tx.send(false).unwrap();
+    let _ = join.await.unwrap().unwrap();
+
+    let labels: Vec<String> = sink
+        .snapshot()
+        .await
+        .iter()
+        .filter_map(|d| match d {
+            Document::Event(e) => e
+                .data
+                .get("interruption")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(labels, ["shutter: signal high", "resume"]);
+}
+
+// A suspender stays installed after the run ends (bluesky `RE._suspenders`
+// is only touched by `remove_suspender` / `clear_suspenders`), so the next
+// run is gated and suspended by it too. Before F3 the engine dropped every
+// suspender at run end.
+#[tokio::test]
+async fn installed_suspender_persists_across_runs() {
+    use bsrs::engine::SuspendBoolHigh;
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    // The removed suspender takes its receiver with it; keep one so the last
+    // `send` below still has somewhere to go.
+    let _rx_keep = rx.clone();
+    let re = Arc::new(RunEngine::new(vec![]));
+    let id = re
+        .install_suspender(Arc::new(SuspendBoolHigh::new("shutter", rx)))
+        .await;
+
+    let _ = re.run_async(sleepy_run(1)).await.unwrap();
+
+    let re2 = re.clone();
+    let join = tokio::spawn(async move { re2.run_async(sleepy_run(3)).await });
+    wait_for_state(&re, EngineRunState::Running).await;
+    tx.send(true).unwrap();
+    wait_for_state(&re, EngineRunState::Paused).await;
+    tx.send(false).unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("second run suspends and resumes")
+        .unwrap()
+        .unwrap();
+
+    // Removed, it no longer touches the run.
+    re.remove_suspender(id).await;
+    let re3 = re.clone();
+    let join = tokio::spawn(async move { re3.run_async(sleepy_run(3)).await });
+    wait_for_state(&re, EngineRunState::Running).await;
+    tx.send(true).unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("removed suspender must not suspend the run")
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]
@@ -846,11 +1133,21 @@ async fn msg_fail_marks_run_failed_with_reason() {
 
 struct TestMonitor {
     name: String,
+    /// Data key used by `read_dyn` / `describe_dyn` (defaults to `name`).
+    key: String,
+    /// Data key the subscription claims (defaults to `key`).
+    sub_key: String,
     tx: tokio::sync::watch::Sender<bsrs::core::reading::ReadingValue>,
 }
 
 impl TestMonitor {
     fn new(name: &str) -> Arc<Self> {
+        Self::with_key(name, name)
+    }
+    fn with_key(name: &str, key: &str) -> Arc<Self> {
+        Self::with_keys(name, key, key)
+    }
+    fn with_keys(name: &str, key: &str, sub_key: &str) -> Arc<Self> {
         let (tx, _rx) = tokio::sync::watch::channel(bsrs::core::reading::ReadingValue {
             value: Value::from(0.0),
             timestamp: 0.0,
@@ -859,6 +1156,8 @@ impl TestMonitor {
         });
         Arc::new(Self {
             name: name.into(),
+            key: key.into(),
+            sub_key: sub_key.into(),
             tx,
         })
     }
@@ -891,7 +1190,7 @@ impl bsrs::core::msg::ReadableObj for TestMonitor {
     > {
         let v = self.tx.borrow().clone();
         let mut out = std::collections::HashMap::new();
-        out.insert(self.name.clone(), v);
+        out.insert(self.key.clone(), v);
         Ok(out)
     }
     async fn describe_dyn(
@@ -902,7 +1201,7 @@ impl bsrs::core::msg::ReadableObj for TestMonitor {
     > {
         let mut out = std::collections::HashMap::new();
         out.insert(
-            self.name.clone(),
+            self.key.clone(),
             bsrs::event_model::DataKey {
                 source: format!("test://{}", self.name),
                 dtype: bsrs::event_model::Dtype::Number,
@@ -930,6 +1229,7 @@ impl bsrs::core::msg::MonitorableObj for TestMonitor {
         Ok(bsrs::core::subscription::Subscription::new(
             rx,
             bsrs::core::status::SubToken::noop(),
+            self.sub_key.clone(),
         ))
     }
 }
@@ -979,9 +1279,360 @@ async fn monitor_emits_descriptor_then_events() {
         "monitor descriptor has the object's configuration entry; got keys {:?}",
         descriptors[0].configuration.keys().collect::<Vec<_>>()
     );
+    // ... and lists the object's keys, like any `_prepare_stream` descriptor.
+    assert_eq!(
+        descriptors[0].object_keys.get("mon1"),
+        Some(&vec!["mon1".to_string()]),
+        "monitor descriptor object_keys: {:?}",
+        descriptors[0].object_keys
+    );
     assert!(
         events >= 1,
         "expected at least one Event from the monitor pump"
+    );
+}
+
+// A descriptor's `object_keys[obj]` is the object's read keys — bluesky
+// `_prepare_stream`: `object_keys[obj.name] = list(dks)` — for every object
+// read, hinted or not; `hints[obj].fields` is the separate hint. Every key
+// carries its object's name. Before F4 `object_keys` was filled from the
+// hint fields, so an unhinted object had no entry at all.
+#[tokio::test]
+async fn descriptor_object_keys_list_each_objects_read_keys() {
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    // SoftDetector hints `det_counts`; TestMonitor has no hints.
+    let det: Arc<dyn ReadableObj> = SoftDetector::new("det");
+    let plain: Arc<dyn ReadableObj> = TestMonitor::new("mon");
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Create { stream_name: "primary".into() };
+        yield Msg::Read(det.clone());
+        yield Msg::Read(plain.clone());
+        yield Msg::Save;
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    re.run_async(plan).await.unwrap();
+
+    let docs = sink.snapshot().await;
+    let desc = docs
+        .iter()
+        .find_map(|d| match d {
+            Document::Descriptor(d) => Some(d),
+            _ => None,
+        })
+        .expect("primary descriptor");
+    let mut object_keys: Vec<_> = desc.object_keys.iter().collect();
+    object_keys.sort();
+    assert_eq!(
+        object_keys,
+        [
+            (&"det".to_string(), &vec!["det_counts".to_string()]),
+            (&"mon".to_string(), &vec!["mon".to_string()]),
+        ]
+    );
+    let hints = desc.hints.as_ref().expect("det contributes hints");
+    assert_eq!(
+        hints.get("det").and_then(|h| h.fields.clone()),
+        Some(vec!["det_counts".to_string()])
+    );
+    assert!(
+        !hints.contains_key("mon"),
+        "unhinted object has no hint entry"
+    );
+    assert_eq!(desc.data_keys["mon"].object_name.as_deref(), Some("mon"));
+    assert_eq!(
+        desc.data_keys["det_counts"].object_name.as_deref(),
+        Some("det")
+    );
+}
+
+// A hinted, configurable readable for the `DeclareStream` tests below.
+struct HintedDet {
+    name: String,
+}
+
+impl bsrs::core::msg::NamedObj for HintedDet {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[async_trait::async_trait]
+impl bsrs::core::msg::ReadableObj for HintedDet {
+    async fn read_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, bsrs::core::reading::ReadingValue>,
+        bsrs::core::error::BsrsError,
+    > {
+        Ok(std::collections::HashMap::from([(
+            format!("{}_counts", self.name),
+            bsrs::core::reading::ReadingValue {
+                value: Value::from(1.0),
+                timestamp: 0.0,
+                alarm_severity: None,
+                message: None,
+            },
+        )]))
+    }
+    async fn describe_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, bsrs::event_model::DataKey>,
+        bsrs::core::error::BsrsError,
+    > {
+        Ok(std::collections::HashMap::from([(
+            format!("{}_counts", self.name),
+            bsrs::event_model::DataKey {
+                source: format!("test://{}", self.name),
+                dtype: bsrs::event_model::Dtype::Number,
+                shape: vec![],
+                dtype_numpy: None,
+                external: None,
+                units: None,
+                precision: None,
+                object_name: None,
+                dims: None,
+                limits: None,
+                choices: None,
+            },
+        )]))
+    }
+    fn hint_fields(&self) -> Option<Vec<String>> {
+        Some(vec![format!("{}_counts", self.name)])
+    }
+    fn as_configurable(&self) -> Option<&dyn bsrs::core::msg::ConfigurableObj> {
+        Some(self)
+    }
+}
+
+#[async_trait::async_trait]
+impl bsrs::core::msg::ConfigurableObj for HintedDet {
+    async fn read_configuration_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, bsrs::core::reading::ReadingValue>,
+        bsrs::core::error::BsrsError,
+    > {
+        Ok(std::collections::HashMap::from([(
+            format!("{}_gain", self.name),
+            bsrs::core::reading::ReadingValue {
+                value: Value::from(2.5),
+                timestamp: 0.0,
+                alarm_severity: None,
+                message: None,
+            },
+        )]))
+    }
+    async fn describe_configuration_dyn(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, bsrs::event_model::DataKey>,
+        bsrs::core::error::BsrsError,
+    > {
+        Ok(std::collections::HashMap::from([(
+            format!("{}_gain", self.name),
+            bsrs::event_model::DataKey {
+                source: format!("test://{}.gain", self.name),
+                dtype: bsrs::event_model::Dtype::Number,
+                shape: vec![],
+                dtype_numpy: None,
+                external: None,
+                units: None,
+                precision: None,
+                object_name: None,
+                dims: None,
+                limits: None,
+                choices: None,
+            },
+        )]))
+    }
+    async fn configure_dyn(
+        &self,
+        _args: bsrs::core::msg::ConfigureArgs,
+    ) -> Result<(), bsrs::core::error::BsrsError> {
+        Ok(())
+    }
+}
+
+// `Msg::DeclareStream` carries the objects behind the stream (bluesky
+// `declare_stream(*objs, name=)`), so its descriptor lists each object's
+// keys, hints and configuration exactly as the first `Save` of a `Read`
+// stream would. The raw-data-key form it replaces could carry neither
+// hints nor configuration.
+#[tokio::test]
+async fn declare_stream_describes_its_objects_with_hints_and_configuration() {
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let det_a: Arc<dyn bsrs::core::msg::ReadableObj> = Arc::new(HintedDet { name: "a".into() });
+    let det_b: Arc<dyn bsrs::core::msg::ReadableObj> = Arc::new(HintedDet { name: "b".into() });
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::DeclareStream {
+            stream_name: "fly".into(),
+            objs: vec![det_a.clone(), det_b.clone()].into(),
+        };
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    re.run_async(plan).await.unwrap();
+
+    let docs = sink.snapshot().await;
+    let desc = docs
+        .iter()
+        .find_map(|d| match d {
+            Document::Descriptor(d) if d.name.as_deref() == Some("fly") => Some(d),
+            _ => None,
+        })
+        .expect("fly descriptor");
+    assert_eq!(
+        desc.object_keys,
+        std::collections::HashMap::from([
+            ("a".to_string(), vec!["a_counts".to_string()]),
+            ("b".to_string(), vec!["b_counts".to_string()]),
+        ])
+    );
+    assert_eq!(desc.data_keys["a_counts"].object_name.as_deref(), Some("a"));
+    let hints = desc.hints.as_ref().expect("hints from the objects");
+    assert_eq!(
+        hints["a"].fields.as_deref(),
+        Some(&["a_counts".to_string()][..])
+    );
+    assert_eq!(
+        hints["b"].fields.as_deref(),
+        Some(&["b_counts".to_string()][..])
+    );
+    assert_eq!(
+        desc.configuration["a"].data["a_gain"],
+        Value::from(2.5),
+        "configuration read from the object"
+    );
+    assert!(desc.configuration.contains_key("b"));
+}
+
+#[tokio::test]
+async fn declare_stream_without_open_run_is_rejected() {
+    let re = RunEngine::new(vec![]);
+    let det: Arc<dyn bsrs::core::msg::ReadableObj> = Arc::new(HintedDet { name: "a".into() });
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::DeclareStream { stream_name: "fly".into(), objs: vec![det].into() };
+    });
+    let result = re.run_async(plan).await.unwrap();
+    assert_eq!(
+        result.exit_status, "fail",
+        "DeclareStream with no open run must be rejected"
+    );
+}
+
+// The monitor pump keys each Event by the object's single described data
+// key, not by its name — a detector whose `describe` key is `<name>_counts`
+// (e.g. `SoftDetector`) must produce Events that match its own descriptor.
+#[tokio::test]
+async fn monitor_event_is_keyed_by_the_described_data_key() {
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let mon = TestMonitor::with_key("det", "det_counts");
+    let mon_for_plan: Arc<dyn bsrs::core::msg::MonitorableObj> = mon.clone();
+
+    let mon_for_drive = mon.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Monitor { obj: mon_for_plan.clone(), name: None };
+        yield Msg::Sleep(Duration::from_millis(50));
+        mon_for_drive.push(3.0, 1.0);
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::Unmonitor(mon_for_plan);
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    re.run_async(plan).await.unwrap();
+
+    let docs = sink.snapshot().await;
+    let descriptor = docs
+        .iter()
+        .find_map(|d| match d {
+            Document::Descriptor(d) => Some(d),
+            _ => None,
+        })
+        .expect("monitor descriptor");
+    assert!(descriptor.data_keys.contains_key("det_counts"));
+    let events: Vec<_> = docs
+        .iter()
+        .filter_map(|d| match d {
+            Document::Event(e) => Some(e),
+            _ => None,
+        })
+        .collect();
+    assert!(!events.is_empty(), "expected a monitor Event");
+    for ev in events {
+        assert_eq!(
+            ev.data.keys().collect::<Vec<_>>(),
+            vec!["det_counts"],
+            "Event keyed by the described data key, not the object name"
+        );
+        assert!(ev.timestamps.contains_key("det_counts"));
+    }
+}
+
+// A device that already holds a reading yields it as the first monitor Event
+// with no update in between: ophyd's subscribe(run=True) and ophyd-async's
+// _SignalCache.subscribe both notify a new subscriber at once. The engine
+// seeds nothing; the Subscription arrives with the reading pending.
+#[tokio::test]
+async fn monitor_emits_the_current_reading_first() {
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let det = bsrs::backends::soft::SoftDetector::new("det");
+    det.tick();
+    det.tick();
+    let mon: Arc<dyn bsrs::core::msg::MonitorableObj> = det.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Monitor { obj: mon.clone(), name: None };
+        yield Msg::Sleep(Duration::from_millis(50));
+        yield Msg::Unmonitor(mon);
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    re.run_async(plan).await.unwrap();
+
+    let values: Vec<_> = sink
+        .snapshot()
+        .await
+        .iter()
+        .filter_map(|d| match d {
+            Document::Event(e) => e.data.get("det_counts").cloned(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        values,
+        vec![Value::from(2)],
+        "the current count, exactly once"
+    );
+}
+
+// A subscription whose key is not among the object's described data keys is
+// rejected when the monitor starts: its Events could not match the stream's
+// descriptor. The key comes from the device, so this is the only check the
+// engine needs.
+#[tokio::test]
+async fn monitor_rejects_a_subscription_key_the_device_does_not_describe() {
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let mon = TestMonitor::with_keys("det", "det_counts", "det");
+    let mon_for_plan: Arc<dyn bsrs::core::msg::MonitorableObj> = mon.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Monitor { obj: mon_for_plan.clone(), name: None };
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    // Handler errors surface as a failed run, as for an unmonitored Unmonitor.
+    let result = re.run_async(plan).await.unwrap();
+    assert_eq!(result.exit_status, "fail", "{result:?}");
+    assert!(result.reason.contains("does not declare"), "{result:?}");
+    let docs = sink.snapshot().await;
+    assert!(
+        !docs.iter().any(|d| matches!(d, Document::Event(_))),
+        "no Event was emitted for the rejected monitor"
     );
 }
 
@@ -1071,6 +1722,7 @@ impl bsrs::core::msg::MonitorableObj for ConfigurableMonitor {
         Ok(bsrs::core::subscription::Subscription::new(
             self.tx.subscribe(),
             bsrs::core::status::SubToken::noop(),
+            self.name.clone(),
         ))
     }
 }
@@ -1419,6 +2071,7 @@ impl bsrs::core::msg::MonitorableObj for DescribeCountingMonitor {
         Ok(bsrs::core::subscription::Subscription::new(
             self.tx.subscribe(),
             bsrs::core::status::SubToken::noop(),
+            self.name.clone(),
         ))
     }
 }
@@ -1450,6 +2103,45 @@ async fn monitor_without_open_run_does_not_describe_the_device() {
         0,
         "no device describe may happen when a monitor is rejected for no open run"
     );
+}
+
+// An update that lands in the subscription while the object is monitored is
+// emitted even when `Unmonitor` follows it with no yield in between: the pump
+// drains its pending value before it stops instead of being aborted. Without
+// the drain a starved pump lost every update of a short scan (0 monitor
+// Events for a 3-point `monitor_during` scan under CPU load).
+#[tokio::test]
+async fn unmonitor_drains_the_update_pending_in_the_subscription() {
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let mon = TestMonitor::new("mon1");
+    let mon_for_plan: Arc<dyn bsrs::core::msg::MonitorableObj> = mon.clone();
+    let mon_for_drive = mon.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Monitor { obj: mon_for_plan.clone(), name: None };
+        // No sleep: the push and the Unmonitor reach the engine back to back.
+        mon_for_drive.push(7.0, 1.0);
+        yield Msg::Unmonitor(mon_for_plan);
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    re.run_async(plan).await.unwrap();
+
+    let docs = sink.snapshot().await;
+    let values: Vec<_> = docs
+        .iter()
+        .filter_map(|d| match d {
+            Document::Event(e) => e.data.get("mon1").cloned(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        values,
+        vec![Value::from(7.0)],
+        "the update pending at Unmonitor is emitted exactly once"
+    );
+    // The Unmonitor completed with the pump gone: the RunStop follows it.
+    assert!(matches!(docs.last(), Some(Document::Stop(_))));
 }
 
 #[tokio::test]
@@ -2628,6 +3320,11 @@ fn bump_plan(counter: Arc<AtomicUsize>) -> Plan {
     })
 }
 
+/// `bump_plan` as a `contingency_wrapper` except-plan (ignores what was thrown).
+fn bump_except(counter: Arc<AtomicUsize>) -> bsrs::plans::preprocessors::ExceptPlan {
+    Box::new(move |_| bump_plan(counter))
+}
+
 /// A plan that always errors when the engine runs it.
 fn boom_plan() -> Plan {
     plan_box(async_stream::stream! {
@@ -2656,7 +3353,7 @@ async fn contingency_wrapper_runs_except_and_finally_then_reraises_on_error() {
 
     let guarded = bsrs::plans::preprocessors::contingency_wrapper(
         boom_plan(),
-        Some(bump_plan(except_ran.clone())),
+        Some(bump_except(except_ran.clone())),
         Some(bump_plan(else_ran.clone())),
         Some(bump_plan(final_ran.clone())),
         true,
@@ -2684,7 +3381,7 @@ async fn contingency_wrapper_runs_else_and_finally_on_success() {
     let inner = plan_box(async_stream::stream! { yield Msg::Null; });
     let guarded = bsrs::plans::preprocessors::contingency_wrapper(
         inner,
-        Some(bump_plan(except_ran.clone())),
+        Some(bump_except(except_ran.clone())),
         Some(bump_plan(else_ran.clone())),
         Some(bump_plan(final_ran.clone())),
         true,
@@ -2708,7 +3405,7 @@ async fn contingency_wrapper_auto_raise_false_swallows_error() {
 
     let guarded = bsrs::plans::preprocessors::contingency_wrapper(
         boom_plan(),
-        Some(bump_plan(except_ran.clone())),
+        Some(bump_except(except_ran.clone())),
         None,
         None,
         false, // swallow: do not re-raise after except
@@ -3078,4 +3775,492 @@ async fn abort_during_sleep_exits_abort() {
 async fn halt_during_sleep_exits_halt() {
     let r = interrupt_during_sleep(|re| re.halt("user halt")).await;
     assert_eq!(r.exit_status, "halt");
+}
+
+// ---------------------------------------------------------------------------
+// `stop`/`abort` are thrown into the plan (bluesky `RequestStop`/`RequestAbort`
+// thrown at the generator's `yield`), so `finalize_wrapper`/`contingency_wrapper`
+// cleanup runs and the run closes with the interrupt's status once it
+// propagates out; `halt` drops the plan (`PlanHalt`, no cleanup yields).
+// ---------------------------------------------------------------------------
+
+/// A one-message plan that appends `step` to `log` when the engine processes it.
+fn note_plan(log: Arc<StdMutex<Vec<&'static str>>>, step: &'static str) -> Plan {
+    plan_box(async_stream::stream! {
+        let log = log.clone();
+        let factory: bsrs::core::msg::AwaitableFactory = Arc::new(move || {
+            let log = log.clone();
+            Box::pin(async move {
+                log.lock().unwrap().push(step);
+                Ok(())
+            })
+        });
+        yield Msg::WaitFor { factories: vec![factory], timeout: None };
+    })
+}
+
+/// A run whose body parks in a 30 s `Sleep`: `OpenRun`, `Sleep`, `CloseRun`.
+fn sleeping_run() -> Plan {
+    plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Sleep(Duration::from_secs(30));
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    })
+}
+
+/// Run `plan`, fire `interrupt` once the engine is parked inside a handler,
+/// and return the result.
+async fn interrupt_running(
+    plan: Plan,
+    interrupt: impl FnOnce(&RunEngine) + Send + 'static,
+) -> bsrs::engine::RunResult {
+    let re = Arc::new(RunEngine::new(vec![]));
+    let re2 = re.clone();
+    let run = tokio::spawn(async move { re2.run_async(plan).await });
+    while re.state() != EngineRunState::Running {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    interrupt(&re);
+    tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("run hung after interrupt")
+        .expect("join failed")
+        .expect("run errored")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abort_runs_finalize_cleanup_then_exits_abort() {
+    let log = Arc::new(StdMutex::new(Vec::new()));
+    let plan = bsrs::plans::preprocessors::finalize_wrapper(
+        sleeping_run(),
+        note_plan(log.clone(), "cleanup"),
+    );
+    let r = interrupt_running(plan, |re| re.abort("user abort")).await;
+    assert_eq!(r.exit_status, "abort");
+    assert_eq!(r.reason, "user abort");
+    assert!(r.interrupted);
+    assert_eq!(*log.lock().unwrap(), vec!["cleanup"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_runs_finalize_cleanup_then_exits_success() {
+    let log = Arc::new(StdMutex::new(Vec::new()));
+    let plan = bsrs::plans::preprocessors::finalize_wrapper(
+        sleeping_run(),
+        note_plan(log.clone(), "cleanup"),
+    );
+    let r = interrupt_running(plan, |re| re.stop()).await;
+    assert_eq!(r.exit_status, "success", "bluesky RE.stop closes clean");
+    assert!(r.interrupted);
+    assert_eq!(*log.lock().unwrap(), vec!["cleanup"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn halt_skips_finalize_cleanup() {
+    let log = Arc::new(StdMutex::new(Vec::new()));
+    let plan = bsrs::plans::preprocessors::finalize_wrapper(
+        sleeping_run(),
+        note_plan(log.clone(), "cleanup"),
+    );
+    let r = interrupt_running(plan, |re| re.halt("user halt")).await;
+    assert_eq!(r.exit_status, "halt");
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "PlanHalt lets no cleanup run"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abort_unwinds_nested_finalize_wrappers_innermost_first() {
+    let log = Arc::new(StdMutex::new(Vec::new()));
+    let inner = bsrs::plans::preprocessors::finalize_wrapper(
+        sleeping_run(),
+        note_plan(log.clone(), "inner"),
+    );
+    let plan = bsrs::plans::preprocessors::finalize_wrapper(inner, note_plan(log.clone(), "outer"));
+    let r = interrupt_running(plan, |re| re.abort("user abort")).await;
+    assert_eq!(r.exit_status, "abort");
+    assert_eq!(*log.lock().unwrap(), vec!["inner", "outer"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn error_in_abort_cleanup_exits_fail() {
+    // bluesky: an exception raised from the `finally` block replaces the
+    // `RequestAbort` propagating through it, and `_run` exits "fail".
+    let plan = bsrs::plans::preprocessors::finalize_wrapper(sleeping_run(), boom_plan());
+    let r = interrupt_running(plan, |re| re.abort("user abort")).await;
+    assert_eq!(r.exit_status, "fail");
+    assert!(r.reason.contains("boom"), "reason: {}", r.reason);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn second_abort_during_cleanup_interrupts_the_cleanup() {
+    // The cleanup itself parks in a Sleep; a second abort must reach it (the
+    // token renewed at the first throw is cancelled again) and end the run.
+    let log = Arc::new(StdMutex::new(Vec::new()));
+    let cleanup = plan_box(async_stream::stream! {
+        yield Msg::Sleep(Duration::from_secs(30));
+    });
+    let cleanup = bsrs::plans::preprocessors::pchain(vec![
+        note_plan(log.clone(), "cleanup-start"),
+        cleanup,
+        note_plan(log.clone(), "cleanup-end"),
+    ]);
+    let plan = bsrs::plans::preprocessors::finalize_wrapper(sleeping_run(), cleanup);
+    let re = Arc::new(RunEngine::new(vec![]));
+    let re2 = re.clone();
+    let run = tokio::spawn(async move { re2.run_async(plan).await });
+    while re.state() != EngineRunState::Running {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    re.abort("first");
+    while log.lock().unwrap().is_empty() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    re.abort("second");
+    let r = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("run hung: second abort did not reach the cleanup Sleep")
+        .unwrap()
+        .unwrap();
+    assert_eq!(r.exit_status, "abort");
+    assert_eq!(*log.lock().unwrap(), vec!["cleanup-start"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abort_while_paused_runs_cleanup_without_rewind() {
+    let log = Arc::new(StdMutex::new(Vec::new()));
+    let body = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Checkpoint;
+    });
+    let body = bsrs::plans::preprocessors::pchain(vec![
+        body,
+        note_plan(log.clone(), "point"),
+        plan_box(async_stream::stream! {
+            yield Msg::Pause { defer: false };
+        }),
+        note_plan(log.clone(), "after-pause"),
+        plan_box(async_stream::stream! {
+            yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+        }),
+    ]);
+    let plan =
+        bsrs::plans::preprocessors::finalize_wrapper(body, note_plan(log.clone(), "cleanup"));
+    let re = Arc::new(RunEngine::new(vec![]));
+    let re2 = re.clone();
+    let run = tokio::spawn(async move { re2.run_async(plan).await });
+    while !re.is_paused() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    re.abort("while paused");
+    let r = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("run hung after abort while paused")
+        .unwrap()
+        .unwrap();
+    assert_eq!(r.exit_status, "abort");
+    // "point" is not replayed (no rewind on abort) and the plan does not
+    // continue past the pause; only the cleanup runs.
+    assert_eq!(*log.lock().unwrap(), vec!["point", "cleanup"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_wrapper_closes_run_with_abort_status_before_outer_cleanup() {
+    // bluesky's run_wrapper closes the run from its except-plan with the
+    // interrupt's exit status, so the RunStop precedes an enclosing finalize's
+    // cleanup messages.
+    let sink = Arc::new(CapturingSink::new());
+    let stops_at_cleanup = Arc::new(AtomicU64::new(u64::MAX));
+    let cleanup = {
+        let sink = sink.clone();
+        let seen = stops_at_cleanup.clone();
+        plan_box(async_stream::stream! {
+            let factory: bsrs::core::msg::AwaitableFactory = Arc::new(move || {
+                let sink = sink.clone();
+                let seen = seen.clone();
+                Box::pin(async move {
+                    let stops = sink
+                        .snapshot()
+                        .await
+                        .iter()
+                        .filter(|d| matches!(d, Document::Stop(_)))
+                        .count();
+                    seen.store(stops as u64, Ordering::SeqCst);
+                    Ok(())
+                })
+            });
+            yield Msg::WaitFor { factories: vec![factory], timeout: None };
+        })
+    };
+    let body = plan_box(async_stream::stream! {
+        yield Msg::Sleep(Duration::from_secs(30));
+    });
+    let plan = bsrs::plans::preprocessors::finalize_wrapper(
+        bsrs::plans::preprocessors::run_wrapper(body, Default::default()),
+        cleanup,
+    );
+    let re = Arc::new(RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]));
+    let re2 = re.clone();
+    let run = tokio::spawn(async move { re2.run_async(plan).await });
+    while re.state() != EngineRunState::Running {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    re.abort("user abort");
+    let r = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("run hung after abort")
+        .unwrap()
+        .unwrap();
+    assert_eq!(r.exit_status, "abort");
+    assert_eq!(
+        stops_at_cleanup.load(Ordering::SeqCst),
+        1,
+        "the RunStop must be emitted before the outer cleanup runs"
+    );
+    let docs = sink.snapshot().await;
+    let stop = docs
+        .iter()
+        .find_map(|d| match d {
+            Document::Stop(s) => Some(s.clone()),
+            _ => None,
+        })
+        .expect("a RunStop was emitted");
+    assert_eq!(stop.exit_status, bsrs::event_model::ExitStatus::Abort);
+    assert_eq!(stop.reason.as_deref(), Some("user abort"));
+}
+
+#[tokio::test]
+async fn contingency_wrapper_except_plan_receives_what_was_thrown() {
+    let got: Arc<StdMutex<Option<bsrs::core::Thrown>>> = Arc::new(StdMutex::new(None));
+    let except: bsrs::plans::preprocessors::ExceptPlan = {
+        let got = got.clone();
+        Box::new(move |thrown| {
+            *got.lock().unwrap() = Some(thrown);
+            plan_box(async_stream::stream! {
+                yield Msg::Null;
+            })
+        })
+    };
+    let guarded = bsrs::plans::preprocessors::contingency_wrapper(
+        boom_plan(),
+        Some(except),
+        None,
+        None,
+        false,
+    );
+    let re = RunEngine::new(vec![]);
+    let result = re.run_async(drain_into(guarded)).await.unwrap();
+    assert_eq!(result.exit_status, "success");
+    let thrown = got.lock().unwrap().take();
+    match thrown {
+        Some(bsrs::core::Thrown::Error(text)) => assert!(text.contains("boom"), "{text}"),
+        other => panic!("except_plan got {other:?}"),
+    }
+}
+
+/// A stageable whose `unstage_dyn` appends "unstage" to a log.
+struct LogStage(Arc<StdMutex<Vec<&'static str>>>);
+impl bsrs::core::msg::NamedObj for LogStage {
+    fn name(&self) -> &str {
+        "log_stage"
+    }
+}
+#[async_trait::async_trait]
+impl bsrs::core::msg::StageableObj for LogStage {
+    async fn stage_dyn(&self) -> Result<(), bsrs::core::error::BsrsError> {
+        Ok(())
+    }
+    async fn unstage_dyn(&self) -> Result<(), bsrs::core::error::BsrsError> {
+        self.0.lock().unwrap().push("unstage");
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stage_wrapper_unstages_from_the_plan_on_abort() {
+    // bluesky's stage_wrapper unstages from a finalize_wrapper, so on abort the
+    // Unstage runs from inside the plan — before an enclosing finalize's
+    // cleanup — not from the engine's run-end teardown (which would run after).
+    let log = Arc::new(StdMutex::new(Vec::new()));
+    let dev: Arc<dyn bsrs::core::msg::StageableObj> = Arc::new(LogStage(log.clone()));
+    let staged = bsrs::plans::preprocessors::stage_wrapper(sleeping_run(), vec![dev]);
+    let plan =
+        bsrs::plans::preprocessors::finalize_wrapper(staged, note_plan(log.clone(), "cleanup"));
+    let r = interrupt_running(plan, |re| re.abort("user abort")).await;
+    assert_eq!(r.exit_status, "abort");
+    assert_eq!(*log.lock().unwrap(), vec!["unstage", "cleanup"]);
+}
+
+// -- Pause interrupts the message in flight -----------------------------------
+//
+// bluesky's `_request_pause_coro` cancels the `_run` task (run_engine.py:856),
+// so a pause requested while the engine is parked in `wait` reaches
+// `stop_on_pause` while the motor is still moving; the rewind on resume then
+// re-issues the interrupted messages from the last checkpoint.
+
+/// A movable whose moves never complete on their own: every `set_dyn` hands
+/// back a pending status and keeps its setter for the test to resolve.
+struct PendingMovable {
+    name: String,
+    sets: AtomicU64,
+    stops: AtomicU64,
+    setters: StdMutex<Vec<bsrs::core::status::StatusSetter>>,
+}
+
+impl PendingMovable {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.into(),
+            sets: AtomicU64::new(0),
+            stops: AtomicU64::new(0),
+            setters: StdMutex::new(Vec::new()),
+        }
+    }
+    fn sets(&self) -> u64 {
+        self.sets.load(Ordering::SeqCst)
+    }
+    fn stops(&self) -> u64 {
+        self.stops.load(Ordering::SeqCst)
+    }
+    /// Moves issued and still pending.
+    fn pending(&self) -> usize {
+        self.setters.lock().unwrap().len()
+    }
+    fn complete_all(&self) {
+        for setter in self.setters.lock().unwrap().drain(..) {
+            setter.success();
+        }
+    }
+}
+
+impl bsrs::core::msg::NamedObj for PendingMovable {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[async_trait::async_trait]
+impl bsrs::core::msg::MovableObj for PendingMovable {
+    async fn set_dyn(&self, _value: f64) -> bsrs::core::status::Status {
+        let (status, setter) = bsrs::core::status::Status::new();
+        self.setters.lock().unwrap().push(setter);
+        self.sets.fetch_add(1, Ordering::SeqCst);
+        status
+    }
+    async fn stop_on_pause(&self, _success: bool) -> Result<(), bsrs::core::error::BsrsError> {
+        self.stops.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// `Checkpoint`, then a grouped `Set` + `Wait` on `dev` inside a run.
+fn set_and_wait(dev: &Arc<PendingMovable>) -> Plan {
+    let mover: Arc<dyn bsrs::core::msg::MovableObj> = dev.clone();
+    plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Checkpoint;
+        yield Msg::Set { obj: mover.clone(), value: 1.0, group: Some("g".into()) };
+        yield Msg::Wait { group: "g".into(), error_on_timeout: true, timeout: None };
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    })
+}
+
+#[tokio::test]
+async fn pause_interrupts_an_in_flight_wait() {
+    let dev = Arc::new(PendingMovable::new("m1"));
+    let re = Arc::new(RunEngine::new(vec![]));
+    let re2 = re.clone();
+    let plan = set_and_wait(&dev);
+    let join = tokio::spawn(async move { re2.run_async(plan).await });
+    {
+        let dev = dev.clone();
+        wait_until("first Set issued", move || dev.sets() == 1).await;
+    }
+    // The engine is now parked in `Wait` on a move that never completes.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    re.pause(false);
+    {
+        let dev = dev.clone();
+        wait_until("stop_on_pause fired", move || dev.stops() >= 1).await;
+    }
+    assert_eq!(
+        dev.pending(),
+        1,
+        "stop_on_pause must reach the motor while its move is still pending"
+    );
+    assert_eq!(re.state(), EngineRunState::Paused);
+    re.resume();
+    // The rewind re-issues the Set from the checkpoint; the replayed Wait then
+    // completes once the test resolves the moves.
+    {
+        let dev = dev.clone();
+        wait_until("Set replayed after resume", move || dev.sets() == 2).await;
+    }
+    dev.complete_all();
+    let result = tokio::time::timeout(Duration::from_secs(5), join)
+        .await
+        .expect("run did not finish after resume")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.exit_status, "success");
+    // One stop from the pause, one from the run-end stop walk (bluesky's
+    // `_stop_movable_objects` in `_run`'s `finally`); the replayed Set added
+    // none.
+    assert_eq!(dev.stops(), 2);
+}
+
+/// A `resume` that lands before the run loop reaches the pause gate must not
+/// make the gate skip the request: the pause cancelled the in-flight `Wait`,
+/// and only the rewind on the way out of the gate replays it.
+#[tokio::test]
+async fn resume_racing_the_pause_still_stops_and_rewinds() {
+    let dev = Arc::new(PendingMovable::new("m1"));
+    let re = Arc::new(RunEngine::new(vec![]));
+    let re2 = re.clone();
+    let plan = set_and_wait(&dev);
+    let join = tokio::spawn(async move { re2.run_async(plan).await });
+    {
+        let dev = dev.clone();
+        wait_until("first Set issued", move || dev.sets() == 1).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    re.pause(false);
+    re.resume();
+    {
+        let dev = dev.clone();
+        wait_until("Set replayed after resume", move || dev.sets() == 2).await;
+    }
+    assert_eq!(dev.stops(), 1, "the pause still stopped the motor");
+    dev.complete_all();
+    let result = tokio::time::timeout(Duration::from_secs(5), join)
+        .await
+        .expect("run did not finish after resume")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.exit_status, "success");
+}
+
+/// The ungrouped `Set` awaits its status inline; an abort must unpark it the
+/// way it unparks `Wait`.
+#[tokio::test]
+async fn abort_interrupts_an_inline_set_await() {
+    let dev = Arc::new(PendingMovable::new("m1"));
+    let mover: Arc<dyn bsrs::core::msg::MovableObj> = dev.clone();
+    let plan = plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Set { obj: mover.clone(), value: 1.0, group: None };
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let r = interrupt_running(plan, |re| re.abort("user abort")).await;
+    assert_eq!(r.exit_status, "abort");
+    assert_eq!(
+        dev.pending(),
+        1,
+        "the move was still pending when the abort landed"
+    );
 }

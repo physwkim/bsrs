@@ -1225,6 +1225,108 @@ print("total2=" .. total)
 }
 
 #[test]
+fn lua_monitor_during_soft_motor_emits_monitor_stream_events() {
+    // End-to-end Lua path of the monitorable facet: `soft_motor` and
+    // `soft_detector` are monitorable, `bpp.monitor_during` declares an
+    // `m1_monitor` / `det1_monitor` stream for each, and every `set` /
+    // `read` during the scan is published as an Event of that stream
+    // (worker-thread emit, delivered through the buffered drain).
+    let (out, err, code) = run_script(
+        r#"
+local desc, events = {}, { m1_monitor = 0, det1_monitor = 0 }
+RE:subscribe(function(name, body)
+    if name == "descriptor" and events[body.name] ~= nil then
+        desc[body.uid] = body.name
+    elseif name == "event" and desc[body.descriptor] ~= nil then
+        local stream = desc[body.descriptor]
+        events[stream] = events[stream] + 1
+        -- the Event carries the object's described data key
+        if stream == "det1_monitor" then
+            assert(body.data.det1_counts ~= nil, "det1_monitor event keyed by det1_counts")
+        end
+    end
+end, "all")
+local det1 = soft_detector("det1")
+local m1 = soft_motor("m1")
+print(tostring(m1))
+print(tostring(det1))
+RE:run(bpp.monitor_during(scan({det1}, m1, 0, 2, 3), {m1, det1}))
+print("m1_events=" .. events.m1_monitor)
+print("det1_events=" .. events.det1_monitor)
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("Device(m1, [readable,movable,locatable,stoppable,monitorable])"),
+        "out = {out}"
+    );
+    assert!(
+        out.contains("Device(det1, [readable,monitorable])"),
+        "out = {out}"
+    );
+    let count = |prefix: &str| -> i32 {
+        out.lines()
+            .find_map(|l| l.strip_prefix(prefix))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(-1)
+    };
+    // The watch channel coalesces updates the pump has not consumed yet, so
+    // fewer than 3 is legal; zero means the monitor never fired.
+    let m1 = count("m1_events=");
+    let det1 = count("det1_events=");
+    assert!(m1 >= 1, "m1_events = {m1}, out = {out}");
+    assert!(det1 >= 1, "det1_events = {det1}, out = {out}");
+}
+
+#[test]
+fn lua_subscriber_sees_worker_docs_before_the_next_repl_thread_doc() {
+    // The monitor's initial Event is emitted by the pump task (worker
+    // thread) during the sleep and buffered; the primary Event that
+    // follows is emitted on the REPL thread. The buffered entry must be
+    // delivered first, so the subscriber sees the run in emission order
+    // rather than every worker doc after every REPL-thread doc. The
+    // second monitor Event (the read's new count) races the Save that
+    // emits the primary Event, so only the first position is asserted.
+    let (out, err, code) = run_script(
+        r#"
+local desc, log = {}, {}
+RE:subscribe(function(name, body)
+    if name == "descriptor" then
+        desc[body.uid] = body.name
+    elseif name == "event" then
+        local s = desc[body.descriptor]
+        if s == "det1_monitor" then log[#log + 1] = "mon"
+        elseif s == "primary" then log[#log + 1] = "pri" end
+    end
+end, "all")
+local det1 = soft_detector("det1")
+local function p()
+    coroutine.yield(msg.open_run())
+    coroutine.yield(msg.monitor(det1, "det1_monitor"))
+    coroutine.yield(msg.sleep(0.2))
+    coroutine.yield(msg.create("primary"))
+    coroutine.yield(msg.read(det1))
+    coroutine.yield(msg.save())
+    coroutine.yield(msg.unmonitor(det1))
+    coroutine.yield(msg.close_run("success"))
+end
+print(RE:run(plan(p)))
+print("order=" .. table.concat(log, " "))
+"#,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    let order = out
+        .lines()
+        .find_map(|l| l.strip_prefix("order="))
+        .unwrap_or("");
+    let tokens: Vec<&str> = order.split_whitespace().collect();
+    assert!(
+        tokens.first() == Some(&"mon") && tokens.contains(&"pri"),
+        "the monitor Event emitted before the primary Event must reach the subscriber first: order = {order:?}, out = {out}"
+    );
+}
+
+#[test]
 fn run_async_with_rejects_non_table_md() {
     // Regression for R5-2: opts.md must be a table or nil; other
     // types must surface a clear error rather than being silently
@@ -1585,23 +1687,33 @@ print("msg=" .. tostring(e))
 }
 
 #[test]
-fn declare_stream_rejects_a_non_table_data_key_spec() {
-    // Same family on the `pairs::<String, mlua::Table>` variant: a
-    // value of the wrong type used to end the iteration too, so both
-    // `bad` *and* `good` disappeared from the descriptor.
+fn declare_stream_takes_devices_and_describes_them() {
+    // `msg.declare_stream(name, {devices})` mirrors bluesky
+    // `declare_stream(*objs, name=)`: the descriptor lists the device's keys
+    // under its name and carries its hints, the same as a read stream.
     let (out, err, code) = run_script(
         r#"
-local ok, e = pcall(function()
-    return msg.declare_stream("primary", { good = { source = "s" }, bad = 42 })
-end)
+local seen
+RE:subscribe(function(name, body)
+    if name == "descriptor" and body.name == "fly" then seen = body end
+end, "all")
+local det1 = soft_detector("det1")
+RE:run(plan(function()
+    coroutine.yield(msg.open_run({}))
+    coroutine.yield(msg.declare_stream("fly", {det1}))
+    coroutine.yield(msg.close_run("success"))
+end))
+print("keys=" .. table.concat(seen.object_keys.det1, ","))
+print("hints=" .. table.concat(seen.hints.det1.fields, ","))
+local ok, e = pcall(function() return msg.declare_stream("fly", {42}) end)
 print("ok=" .. tostring(ok))
-print("msg=" .. tostring(e))
 "#,
     );
     assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("keys=det1_counts"), "out = {out}");
+    assert!(out.contains("hints=det1_counts"), "out = {out}");
     assert!(
         out.contains("ok=false"),
-        "must not report success; out = {out}"
+        "a non-device entry is rejected; out = {out}"
     );
-    assert!(out.contains("must be a table"), "out = {out}");
 }
