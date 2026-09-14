@@ -3,7 +3,7 @@
 use crate::core::lua_exposable::LuaMethodEntry;
 use crate::core::msg::{
     CollectableObj, FlyableObj, LocatableObj, MonitorableObj, MovableObj, ReadableObj,
-    StageableObj, TriggerableObj,
+    StageableObj, StoppableObj, TriggerableObj,
 };
 use crate::core::plan::Plan;
 use serde_json::Value;
@@ -175,6 +175,7 @@ pub struct Registry {
     readables: HashMap<String, Arc<dyn ReadableObj>>,
     movables: HashMap<String, Arc<dyn MovableObj>>,
     locatables: HashMap<String, Arc<dyn LocatableObj>>,
+    stoppables: HashMap<String, Arc<dyn StoppableObj>>,
     triggerables: HashMap<String, Arc<dyn TriggerableObj>>,
     stageables: HashMap<String, Arc<dyn StageableObj>>,
     flyables: HashMap<String, Arc<dyn FlyableObj>>,
@@ -219,7 +220,7 @@ impl Registry {
     }
 
     /// Register a positioner under every facet it implements — readable,
-    /// movable, locatable *and* monitorable.
+    /// movable, locatable, stoppable *and* monitorable.
     ///
     /// Prefer this over calling the per-facet `register_*` methods for a
     /// motor. Registering a positioner facet-by-facet is how a device
@@ -229,12 +230,13 @@ impl Registry {
     /// forget one.
     pub fn register_positioner<T>(&mut self, name: impl Into<String>, obj: Arc<T>)
     where
-        T: ReadableObj + MovableObj + LocatableObj + MonitorableObj + 'static,
+        T: ReadableObj + MovableObj + LocatableObj + StoppableObj + MonitorableObj + 'static,
     {
         let name = name.into();
         self.readables.insert(name.clone(), obj.clone());
         self.movables.insert(name.clone(), obj.clone());
         self.locatables.insert(name.clone(), obj.clone());
+        self.stoppables.insert(name.clone(), obj.clone());
         self.monitorables.insert(name, obj);
     }
 
@@ -252,6 +254,11 @@ impl Registry {
     /// register both for full motor surface (set + locate).
     pub fn register_locatable(&mut self, name: impl Into<String>, obj: Arc<dyn LocatableObj>) {
         self.locatables.insert(name.into(), obj);
+    }
+
+    /// Register a `StoppableObj` device under a name.
+    pub fn register_stoppable(&mut self, name: impl Into<String>, obj: Arc<dyn StoppableObj>) {
+        self.stoppables.insert(name.into(), obj);
     }
 
     /// Register a `TriggerableObj` device.
@@ -319,6 +326,11 @@ impl Registry {
     /// Look up a `LocatableObj` by name.
     pub fn locatable(&self, name: &str) -> Option<&Arc<dyn LocatableObj>> {
         self.locatables.get(name)
+    }
+
+    /// Look up a `StoppableObj` by name.
+    pub fn stoppable(&self, name: &str) -> Option<&Arc<dyn StoppableObj>> {
+        self.stoppables.get(name)
     }
 
     /// Look up a `TriggerableObj` by name.
@@ -416,6 +428,9 @@ impl Registry {
         if let Some(o) = self.movables.get(name) {
             return Some(o.inspect_dyn());
         }
+        if let Some(o) = self.stoppables.get(name) {
+            return Some(o.inspect_dyn());
+        }
         if let Some(o) = self.triggerables.get(name) {
             return Some(o.inspect_dyn());
         }
@@ -447,6 +462,9 @@ impl Registry {
             s.insert(k.clone());
         }
         for k in self.locatables.keys() {
+            s.insert(k.clone());
+        }
+        for k in self.stoppables.keys() {
             s.insert(k.clone());
         }
         for k in self.triggerables.keys() {

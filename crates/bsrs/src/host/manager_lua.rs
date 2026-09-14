@@ -91,8 +91,8 @@ pub fn build_shared_lua(re: Arc<RunEngine>, registry: &Registry) -> mlua::Result
     // declared name. Walk the role tables; a device that appears
     // under multiple roles (motor: readable + movable) carries
     // both. Roles the registry doesn't currently track
-    // (stoppable, preparable, configurable, pausable) are left None —
-    // those calls error from Lua.
+    // (preparable, configurable, pausable) are left None — those
+    // calls error from Lua.
     // Union of every #[lua_methods] name in this state. LuaDevice's
     // shared `__index` fallback consults it so only real lua-exposed
     // method names produce a dispatch wrapper (anything else stays
@@ -105,7 +105,7 @@ pub fn build_shared_lua(re: Arc<RunEngine>, registry: &Registry) -> mlua::Result
             readable: registry.readable(&name).cloned(),
             movable: registry.movable(&name).cloned(),
             locatable: registry.locatable(&name).cloned(),
-            stoppable: None,
+            stoppable: registry.stoppable(&name).cloned(),
             triggerable: registry.triggerable(&name).cloned(),
             stageable: registry.stageable(&name).cloned(),
             monitorable: registry.monitorable(&name).cloned(),
@@ -506,6 +506,31 @@ mod tests {
     // state with that role, so `msg.monitor` / `bpp.monitor_during` accept it
     // (before the facet existed every registry device was published with
     // `monitorable: None` and those calls failed with "is not monitorable").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registry_positioner_is_stoppable_from_lua() {
+        // `register_positioner` carries the stoppable facet, so the
+        // daemon's Lua global exposes `stop()` / `stop_emergency()`
+        // like the repl's `soft_motor` / `ca_motor` factories do.
+        let mut reg = Registry::new();
+        reg.register_positioner(
+            "m1",
+            Arc::new(crate::backends::soft::SoftMotor::new("m1", Some(0.0))),
+        );
+        let engine_slot = Arc::new(TMutex::new(Some(Arc::new(RunEngine::new(vec![])))));
+        let state = ManagerLuaState::new(engine_slot, Arc::new(reg));
+
+        let r = state.eval("tostring(m1)").await;
+        assert_eq!(
+            r.return_value.as_deref(),
+            Some("Device(m1, [readable,movable,locatable,stoppable,monitorable])"),
+            "{r:?}"
+        );
+        let r = state
+            .eval("m1:stop(); m1:stop_emergency(); return 'ok'")
+            .await;
+        assert!(r.error.is_none(), "{r:?}");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn registry_monitorable_facet_is_published_to_lua() {
         struct Mon;
