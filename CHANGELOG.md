@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-09-15
+
+A dependency-refresh release. No bsrs code, API, or behaviour changes.
+
+### Changed
+
+- Based the EPICS CA/PVA backends on `epics-rs` 0.29.2 (from 0.29.1). The
+  release moves the SNL program start gate into `epics-base-rs`
+  (`spawn_program` awaits `wait_for_pini` at the one spawn site), which is
+  what makes the mini-beamline `kohzuCtl` boot with the right d-spacing; no
+  bsrs source change was needed.
+- **MSRV is now 1.94** (from a declared 1.80). The old floor had been
+  unachievable since 0.24.3: `epics-base-rs` is edition 2024, so no toolchain
+  below 1.85 can build the CA/PVA backends at all. 1.94.0 is the channel
+  `epics-rs` pins for itself, and the workspace is verified to build and test
+  on exactly that toolchain.
+
+### Fixed
+
+- The 0.4.2 section's date: the tag and publish landed on 2026-09-04 (KST),
+  a day after the date the changelog carried.
+
 ## [0.5.0] - 2026-09-14
 
 Monitorable devices: `Msg::Monitor` now works end to end over the built-in
@@ -119,7 +141,7 @@ Public signatures change, hence the minor version.
   collectable and pausable roles, and `inspect()` resolves through the
   preparable and configurable facets instead of answering `type = "Unknown"`.
 
-## [0.4.2] - 2026-09-03
+## [0.4.2] - 2026-09-04
 
 A dependency-refresh release. No bsrs code, API, or behaviour changes.
 
@@ -426,6 +448,7 @@ wire- and behaviour-parity with the upstream Python projects.
 
 - `doc/gap-analysis/`: bluesky/ophyd/ophyd-async parity gap inventory.
 
+[0.5.1]: https://github.com/physwkim/bsrs/releases/tag/v0.5.1
 [0.5.0]: https://github.com/physwkim/bsrs/releases/tag/v0.5.0
 [0.4.2]: https://github.com/physwkim/bsrs/releases/tag/v0.4.2
 [0.4.1]: https://github.com/physwkim/bsrs/releases/tag/v0.4.1
