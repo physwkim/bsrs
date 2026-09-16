@@ -550,9 +550,13 @@ async fn run_plan_item(
         subs: Vec::new(),
     };
     let run_result = re.run_async_with(plan, opts).await;
-    let exit_status = match &run_result {
-        Ok(r) => r.exit_status.clone(),
-        Err(_) => "fail".to_string(),
+    // The reason travels with the status: an item that could not start
+    // archives one (the unknown-plan and build-failure arms above), so an
+    // item that ran and failed must too, or the only record of why is the
+    // daemon's log and `history_get` tells a client `fail` and nothing else.
+    let (exit_status, reason) = match &run_result {
+        Ok(r) => (r.exit_status.clone(), r.reason.clone()),
+        Err(e) => ("fail".to_string(), e.to_string()),
     };
     #[cfg(feature = "metrics")]
     crate::qs::metrics::run_finished(&exit_status);
@@ -587,6 +591,7 @@ async fn run_plan_item(
     let archived = item.clone().with_result(serde_json::json!({
         "exit_status": exit_status,
         "run_uid": run_uid,
+        "reason": reason,
     }));
     queue.lock().unwrap().push_history(archived);
     exit_status
