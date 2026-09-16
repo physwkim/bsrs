@@ -2418,6 +2418,8 @@ async fn queue_item_execute_runs_in_background_with_bookkeeping() {
     let r = rpc(&req, "history_get", json!({}));
     assert_eq!(r["items"][0]["name"], "pausable_loop", "{r}");
     assert_eq!(r["items"][0]["result"]["exit_status"], "success", "{r}");
+    // The reason is on every archived result, empty for a clean run.
+    assert_eq!(r["items"][0]["result"]["reason"], "", "{r}");
 
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2449,6 +2451,10 @@ async fn queue_item_execute_failure_is_archived() {
 
     let r = rpc(&req, "history_get", json!({}));
     assert_eq!(r["items"][0]["result"]["exit_status"], "fail", "{r}");
+    // Why it failed has to survive into the history, or a client that only
+    // speaks the protocol has no way to learn it.
+    let reason = r["items"][0]["result"]["reason"].as_str().unwrap_or("");
+    assert!(reason.contains("intentional test failure"), "{r}");
 
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
