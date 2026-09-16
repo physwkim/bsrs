@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] - 2026-09-16
+
+A dependency-refresh release. No bsrs code, API, or behaviour changes.
+
+### Changed
+
+- Based the EPICS CA/PVA backends on `epics-rs` 0.29.3 (from 0.29.2). The
+  release makes a record's monitor state advance on every value-class post
+  whether or not the field has a subscriber, so a move that finished with no
+  `.DMOV` monitor no longer swallows the next subscriber's 1→0 transition,
+  which is the done-PV wait every `ca_motor` put relies on. No bsrs source
+  change was needed.
+- `Cargo.lock` moves `chacha20`, `der` and `spin` off their yanked versions
+  (0.10.1, 0.8.0, 0.9.8) to the compatible successors; none is a direct
+  dependency and no advisory names the old versions.
+
 ## [0.5.1] - 2026-09-15
 
 A dependency-refresh release. No bsrs code, API, or behaviour changes.
@@ -448,6 +464,7 @@ wire- and behaviour-parity with the upstream Python projects.
 
 - `doc/gap-analysis/`: bluesky/ophyd/ophyd-async parity gap inventory.
 
+[0.5.2]: https://github.com/physwkim/bsrs/releases/tag/v0.5.2
 [0.5.1]: https://github.com/physwkim/bsrs/releases/tag/v0.5.1
 [0.5.0]: https://github.com/physwkim/bsrs/releases/tag/v0.5.0
 [0.4.2]: https://github.com/physwkim/bsrs/releases/tag/v0.4.2
