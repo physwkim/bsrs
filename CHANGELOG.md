@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.4] - 2026-09-17
+
+### Fixed
+
+- The queue continues past an item that opened no run. A queued plan whose
+  whole job is a side effect (a bare `mv`, a `sleep`) archives exit_status
+  `no-run`, which `execute_queue_loop` read as failure and halted on, so a
+  batch could not put its sample moves in the queue. `item_completed()` now
+  treats `no-run` as finished in both the queue loop and
+  `execute_single_item`; `plans_failed` already excluded it.
+
 ## [0.5.3] - 2026-09-16
 
 ### Fixed
@@ -474,6 +485,7 @@ wire- and behaviour-parity with the upstream Python projects.
 
 - `doc/gap-analysis/`: bluesky/ophyd/ophyd-async parity gap inventory.
 
+[0.5.4]: https://github.com/physwkim/bsrs/releases/tag/v0.5.4
 [0.5.3]: https://github.com/physwkim/bsrs/releases/tag/v0.5.3
 [0.5.2]: https://github.com/physwkim/bsrs/releases/tag/v0.5.2
 [0.5.1]: https://github.com/physwkim/bsrs/releases/tag/v0.5.1
