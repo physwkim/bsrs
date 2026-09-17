@@ -417,6 +417,16 @@ fn idle_out(state: &Arc<StdMutex<EngineState>>, disable_autostart: bool) {
     }
 }
 
+/// Did the item run to its end?
+///
+/// The queue halts on an interrupted plan, as bluesky's `queue_start` does
+/// on an error. A plan that opened no run reports "no-run" -- a bare `mv`,
+/// a `sleep`, anything whose whole job is a side effect -- and that is a
+/// finished item, not a failed one, so the items behind it must still run.
+fn item_completed(exit_status: &str) -> bool {
+    matches!(exit_status, "success" | "no-run")
+}
+
 pub(crate) async fn execute_queue_loop(
     re: Arc<RunEngine>,
     registry: Arc<Registry>,
@@ -508,9 +518,9 @@ pub(crate) async fn execute_queue_loop(
         {
             queue.lock().unwrap().push_back(item);
         }
-        // On non-success, idle out (matches bluesky behaviour: queue_start
-        // halts on error) and deactivate autostart.
-        if exit_status != "success" {
+        // On an item that did not finish, idle out (matches bluesky
+        // behaviour: queue_start halts on error) and deactivate autostart.
+        if !item_completed(&exit_status) {
             idle_out(&state, true);
             return;
         }
@@ -615,7 +625,7 @@ pub(crate) async fn execute_single_item(
     // A failed/interrupted item deactivates autostart, same as a queued
     // plan (ref: manager.py:852 — the plan-state path is shared between
     // queued and immediate execution).
-    idle_out(&state, exit_status != "success");
+    idle_out(&state, !item_completed(&exit_status));
 }
 
 #[cfg(test)]
