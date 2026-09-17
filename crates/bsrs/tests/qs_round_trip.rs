@@ -2257,6 +2257,63 @@ fn register_failing_plan(reg: &mut Registry, name: &str) {
     reg.register_plan(name, factory);
 }
 
+/// Register a plan that opens no run (`Msg::Sleep` only → exit_status
+/// "no-run"), the shape of a side-effect-only item such as a bare `mv`.
+fn register_no_run_plan(reg: &mut Registry, name: &str) {
+    use bsrs::core::msg::Msg;
+    use bsrs::core::plan::plan_box;
+    let factory: bsrs::qs::PlanFactory = Arc::new(move |_reg, _args| {
+        Ok(plan_box(async_stream::stream! {
+            yield Msg::Sleep(Duration::from_millis(10));
+        }))
+    });
+    reg.register_plan(name, factory);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_continues_past_an_item_that_opened_no_run() {
+    let det = SoftDetector::new("det1");
+    let mut reg = Registry::new();
+    reg.register_readable("det1", det as Arc<dyn ReadableObj>);
+    reg.register_plan_count("count");
+    register_no_run_plan(&mut reg, "no_run_plan");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    rpc(&req, "environment_open", json!({}));
+    // A batch is a side-effect item (move the sample in) followed by the
+    // scans on it; the mover opens no run and must not end the batch.
+    for item in [
+        json!({"name": "no_run_plan", "args": []}),
+        json!({"name": "count", "args": ["det1", 1]}),
+    ] {
+        let r = rpc(&req, "queue_item_add", json!({ "item": item }));
+        assert_eq!(r["success"], true, "{r}");
+    }
+    rpc(&req, "queue_start", json!({}));
+
+    let r = poll_status(&req, |s| {
+        s["manager_state"] == "idle" && s["items_in_history"] == 2
+    })
+    .await;
+    assert_eq!(r["items_in_queue"], 0, "queue did not drain: {r}");
+    assert_eq!(r["items_in_history"], 2, "{r}");
+
+    let hist = rpc(&req, "history_get", json!({}));
+    assert_eq!(
+        hist["items"][0]["result"]["exit_status"], "no-run",
+        "{hist}"
+    );
+    assert_eq!(
+        hist["items"][1]["result"]["exit_status"], "success",
+        "{hist}"
+    );
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn queue_stops_when_item_fails_to_build() {
     let det = SoftDetector::new("det1");
