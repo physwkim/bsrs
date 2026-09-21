@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.5] - 2026-09-21
+
+### Changed
+
+- EPICS backends move to epics-rs 0.30.0 (`epics-ca-rs`, `epics-base-rs`,
+  `epics-pva-rs`). No bsrs source change was needed; the mini-beamline
+  scan, DCM energy and `monitor_during` scripts pass against a mini_ioc
+  built from that release.
+
 ## [0.5.4] - 2026-09-17
 
 ### Fixed
@@ -485,6 +494,7 @@ wire- and behaviour-parity with the upstream Python projects.
 
 - `doc/gap-analysis/`: bluesky/ophyd/ophyd-async parity gap inventory.
 
+[0.5.5]: https://github.com/physwkim/bsrs/releases/tag/v0.5.5
 [0.5.4]: https://github.com/physwkim/bsrs/releases/tag/v0.5.4
 [0.5.3]: https://github.com/physwkim/bsrs/releases/tag/v0.5.3
 [0.5.2]: https://github.com/physwkim/bsrs/releases/tag/v0.5.2
