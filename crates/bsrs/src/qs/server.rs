@@ -491,7 +491,7 @@ pub(crate) async fn execute_queue_loop(
                 return;
             }
         };
-        let plan = match factory(&registry, &item.args) {
+        let plan = match factory(&registry, &item.plan_args()) {
             Ok(p) => p,
             Err(e) => {
                 // Same rule as the unknown-plan arm above.

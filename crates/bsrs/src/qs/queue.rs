@@ -3,11 +3,17 @@
 //! of completed items.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::VecDeque;
 use uuid::Uuid;
 
-/// One queued plan item — name + JSON args, with an item UID.
+/// One queued plan item: the submitted item's own keys, plus the ones the
+/// server owns (`item_uid`, `user`, `user_group`, `result`).
+///
+/// `args` and `kwargs` are kept apart, as submitted, and not as one nested
+/// value: this struct is what `queue_get`, its `running_item` and
+/// `history_get` all serialize, so a client reads a queued, a running and a
+/// finished item by the same keys it submitted the item with.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct QueuedItem {
     /// Stable item identifier (UUID v4).
@@ -16,8 +22,10 @@ pub struct QueuedItem {
     pub item_type: String,
     /// Plan / function name.
     pub name: String,
-    /// Positional or keyword arguments — typically `{"args": [...], "kwargs": {...}}`.
+    /// Positional arguments, as submitted.
     pub args: Value,
+    /// Keyword arguments, as submitted.
+    pub kwargs: Value,
     /// Free-form metadata attached by the submitter.
     #[serde(default)]
     pub meta: Value,
@@ -33,13 +41,17 @@ pub struct QueuedItem {
 }
 
 impl QueuedItem {
-    /// Build a plan item, allocating a fresh UID.
-    pub fn plan(name: impl Into<String>, args: Value) -> Self {
+    /// Build a plan item from the submitted item, allocating a fresh UID.
+    ///
+    /// Takes the whole submitted item and lifts `args` / `kwargs` out of it,
+    /// so the one place that reads a request's argument shape is here.
+    pub fn plan(name: impl Into<String>, item: Value) -> Self {
         Self {
             item_uid: Uuid::new_v4().to_string(),
             item_type: "plan".into(),
             name: name.into(),
-            args,
+            args: item.get("args").cloned().unwrap_or_else(|| json!([])),
+            kwargs: item.get("kwargs").cloned().unwrap_or_else(|| json!({})),
             meta: Value::Null,
             user: None,
             user_group: None,
@@ -54,11 +66,18 @@ impl QueuedItem {
             item_type: "instruction".into(),
             name: name.into(),
             args: Value::Null,
+            kwargs: Value::Null,
             meta: Value::Null,
             user: None,
             user_group: None,
             result: None,
         }
+    }
+
+    /// The arguments in the shape a `PlanFactory` takes
+    /// (`{"args": [...], "kwargs": {...}}`).
+    pub fn plan_args(&self) -> Value {
+        json!({ "args": self.args, "kwargs": self.kwargs })
     }
 
     /// Attach a result (used when archiving into history).
