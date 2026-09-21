@@ -411,7 +411,7 @@ fn idle_out(state: &Arc<StdMutex<EngineState>>, disable_autostart: bool) {
     let mut s = state.lock().unwrap();
     s.state = Some(EState::Idle);
     s.pause_pending = false;
-    s.current_plan_name = None;
+    s.current_item = None;
     if disable_autostart {
         s.queue_autostart_enabled = false;
     }
@@ -491,7 +491,7 @@ pub(crate) async fn execute_queue_loop(
                 return;
             }
         };
-        let plan = match factory(&registry, &item.args) {
+        let plan = match factory(&registry, &item.plan_args()) {
             Ok(p) => p,
             Err(e) => {
                 // Same rule as the unknown-plan arm above.
@@ -543,7 +543,7 @@ async fn run_plan_item(
     {
         let mut s = state.lock().unwrap();
         s.state = Some(EState::ExecutingQueue);
-        s.current_plan_name = Some(item.name.clone());
+        s.current_item = Some(item.clone());
     }
     // Forward the queue item's submitter metadata into the run as per-call
     // md (bluesky's `_metadata_per_call`, the highest-precedence merge
@@ -579,7 +579,7 @@ async fn run_plan_item(
         let mut s = state.lock().unwrap();
         s.plans_run += 1;
         s.current_run_uid = run_uid.clone();
-        s.current_plan_name = None;
+        s.current_item = None;
         if let Some(uid) = &run_uid {
             // Mark any prior entry for this uid as closed (shouldn't happen, but safe).
             for entry in s.re_runs.iter_mut() {

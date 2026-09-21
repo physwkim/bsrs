@@ -695,8 +695,8 @@ fn status_response(
         "msg_recv": "",
         "items_in_queue": q.len(),
         "items_in_history": q.history_size(),
-        "running_item_uid": st.current_run_uid,
-        "running_item_name": st.current_plan_name,
+        "running_item_uid": st.current_item.as_ref().map(|i| &i.item_uid),
+        "running_item_name": st.current_item.as_ref().map(|i| &i.name),
         "plans_run": st.plans_run,
         "plans_failed": st.plans_failed,
         "re_state": re_state,
@@ -803,13 +803,12 @@ fn env_destroy(
 fn queue_get(queue: &Arc<StdMutex<PlanQueue>>, state: &Arc<StdMutex<EngineState>>) -> Value {
     let q = queue.lock().unwrap();
     let st = state.lock().unwrap();
-    let running = if let Some(name) = &st.current_plan_name {
-        json!({
-            "name": name,
-            "item_uid": st.current_run_uid.clone().unwrap_or_default(),
-        })
-    } else {
-        Value::Null
+    // The running item verbatim, not a name rebuilt into a stub: the queue
+    // view renders it in the same table as the pending items, and anything
+    // dropped here is a blank cell on the only row that is running.
+    let running = match &st.current_item {
+        Some(item) => serde_json::to_value(item).unwrap_or(Value::Null),
+        None => Value::Null,
     };
     json!({
         "success": true,
