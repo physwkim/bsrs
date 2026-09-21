@@ -2152,6 +2152,53 @@ async fn a_queued_item_carries_the_arguments_it_was_submitted_with() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_running_item_is_reported_as_the_item_that_was_queued() {
+    let mut reg = Registry::new();
+    register_pausable_loop(&mut reg, "pausable_loop");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+    rpc(&req, "environment_open", json!({}));
+
+    let added = rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"item_type": "plan", "name": "pausable_loop",
+                        "args": ["det1"],
+                        "kwargs": {"md": {"sample": "Cu foil"}}}}),
+    );
+    let uid = added["item"]["item_uid"].as_str().unwrap().to_string();
+    let q = rpc(&req, "queue_get", json!({}));
+    assert_eq!(q["running_item"], Value::Null, "nothing runs yet: {q}");
+
+    // While it runs it is still that item and not a name rebuilt into a
+    // stub: the keys it was queued with are all on it, and it is addressed
+    // by its own item_uid rather than by the uid of the run it opened.
+    rpc(&req, "queue_start", json!({}));
+    let s = poll_status(&req, |s| s["manager_state"] == "executing_queue").await;
+    assert_eq!(s["running_item_name"], "pausable_loop", "{s}");
+    assert_eq!(s["running_item_uid"], uid.as_str(), "{s}");
+    let q = rpc(&req, "queue_get", json!({}));
+    assert_eq!(q["running_item"]["item_uid"], uid.as_str(), "{q}");
+    assert_eq!(q["running_item"]["name"], "pausable_loop", "{q}");
+    assert_eq!(q["running_item"]["args"], json!(["det1"]), "{q}");
+    assert_eq!(
+        q["running_item"]["kwargs"]["md"]["sample"], "Cu foil",
+        "{q}"
+    );
+
+    // And nothing is left standing in it once the engine is idle again.
+    rpc(&req, "re_stop", json!({}));
+    let s = poll_status(&req, |s| s["manager_state"] == "idle").await;
+    assert_eq!(s["running_item_uid"], Value::Null, "{s}");
+    let q = rpc(&req, "queue_get", json!({}));
+    assert_eq!(q["running_item"], Value::Null, "{q}");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn status_reports_paused_while_engine_paused() {
     let mut reg = Registry::new();
     register_pausable_loop(&mut reg, "pausable_loop");

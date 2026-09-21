@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::qs::queue::QueuedItem;
+
 /// Public engine state — values match `bluesky_queueserver.manager.MState`
 /// so qserver CLI displays them naturally.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,8 +166,13 @@ pub struct EngineState {
     pub state: Option<EState>,
     /// UID of the current run, if any.
     pub current_run_uid: Option<String>,
-    /// Plan name currently running.
-    pub current_plan_name: Option<String>,
+    /// The item currently running, as it was queued.
+    ///
+    /// The item itself and not its name: `queue_get` reports the running
+    /// item beside the pending ones, and a name is not an item -- a client
+    /// rendering the queue would have every column but the plan blank on
+    /// the one row that is actually running.
+    pub current_item: Option<QueuedItem>,
     /// Pending queue length.
     pub queue_len: usize,
     /// History length.
@@ -198,7 +205,7 @@ impl Default for EngineState {
         Self {
             state: None,
             current_run_uid: None,
-            current_plan_name: None,
+            current_item: None,
             queue_len: 0,
             history_len: 0,
             plans_run: 0,
