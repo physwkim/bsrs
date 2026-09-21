@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.6] - 2026-09-21
+
+### Fixed
+
+- A queued item keeps the arguments it was submitted with. `QueuedItem::plan`
+  put the whole submitted body into `args`, so a client reading the queue back
+  found the plan's metadata nested one level down and rendered the columns it
+  fills -- sample, edge energy, point count -- as blank. `args` and `kwargs`
+  are now separate fields and `plan_args()` recombines them for `PlanFactory`.
+- The running item is reported as the item that was queued. `current_item`
+  replaces `current_plan_name` in the server state, so `queue_get` hands back
+  the running item beside the pending ones instead of a name; a name is not an
+  item, and a client rendering the queue as one table had every column but the
+  plan empty on the one row that was actually running.
+
 ## [0.5.5] - 2026-09-21
 
 ### Changed
