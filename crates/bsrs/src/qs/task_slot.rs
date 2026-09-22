@@ -9,6 +9,7 @@
 //! never clear a successor's claim, and a handle registered after a forced
 //! [`QueueTaskSlot::take`] is aborted instead of leaking an untracked task.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
@@ -19,6 +20,11 @@ use tokio::task::AbortHandle;
 /// (a `JoinHandle` does not exist until `tokio::spawn` returns).
 pub(crate) struct QueueTaskSlot {
     inner: StdMutex<SlotInner>,
+    /// Set when a live claim released the slot, cleared by whoever acts on
+    /// it. The worker that just finished cannot start the queue behind it
+    /// — its own claim is live until it returns — so the release has to be
+    /// announced to someone else.
+    worker_finished: AtomicBool,
 }
 
 struct SlotInner {
@@ -38,6 +44,7 @@ impl QueueTaskSlot {
                 next_gen: 0,
                 entry: None,
             }),
+            worker_finished: AtomicBool::new(false),
         }
     }
 
@@ -95,7 +102,19 @@ impl QueueTaskSlot {
         let mut inner = self.inner.lock().unwrap();
         if matches!(&inner.entry, Some(e) if e.generation == generation) {
             inner.entry = None;
+            // After the slot is free, so whoever reads this can claim it.
+            self.worker_finished.store(true, Ordering::SeqCst);
         }
+    }
+
+    /// Has a worker released the slot since this was last asked?
+    ///
+    /// Read by the rep thread, which is the one that may act on it: the
+    /// queue behind a finished worker can be armed and non-empty, and
+    /// starting it goes through `queue_start`, which blocks on the engine
+    /// lock and therefore cannot run inside the runtime.
+    pub(crate) fn take_worker_finished(&self) -> bool {
+        self.worker_finished.swap(false, Ordering::SeqCst)
     }
 }
 

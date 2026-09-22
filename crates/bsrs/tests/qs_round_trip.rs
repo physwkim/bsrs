@@ -2891,3 +2891,131 @@ async fn environment_hook_failure_leaves_environment_closed() {
     shutdown.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
+
+/// A plan that only waits: it opens no run, so it archives as "no-run" —
+/// a finished item, the shape of a side-effect-only `mv`.
+fn register_sleeper(reg: &mut Registry, name: &str, ms: u64) {
+    use bsrs::core::msg::Msg;
+    use bsrs::core::plan::plan_box;
+    let factory: bsrs::qs::PlanFactory = Arc::new(move |_reg, _args| {
+        Ok(plan_box(async_stream::stream! {
+            yield Msg::Sleep(Duration::from_millis(ms));
+        }))
+    });
+    reg.register_plan(name, factory);
+}
+
+/// A plan that waits and then fails, so a client has time to act while an
+/// item that will NOT complete is running.
+fn register_slow_failing_plan(reg: &mut Registry, name: &str, ms: u64) {
+    use bsrs::core::msg::Msg;
+    use bsrs::core::plan::plan_box;
+    let factory: bsrs::qs::PlanFactory = Arc::new(move |_reg, _args| {
+        Ok(plan_box(async_stream::stream! {
+            yield Msg::OpenRun(Default::default());
+            yield Msg::Sleep(Duration::from_millis(ms));
+            yield Msg::Fail("intentional test failure".into());
+        }))
+    });
+    reg.register_plan(name, factory);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_armed_queue_starts_when_the_running_item_frees_the_worker() {
+    let det = SoftDetector::new("det1");
+    let mut reg = Registry::new();
+    register_sleeper(&mut reg, "slow", 1_000);
+    reg.register_readable("det1", det as Arc<dyn ReadableObj>);
+    reg.register_plan_count("count");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    rpc(&req, "environment_open", json!({}));
+    let r = rpc(&req, "queue_autostart", json!({"enable": true}));
+    assert_eq!(r["success"], true, "{r}");
+
+    // An item run outside the queue (the GUI's Run): it holds the worker
+    // and does not touch the queue.
+    let r = rpc(
+        &req,
+        "queue_item_execute",
+        json!({"item": {"name": "slow", "args": []}}),
+    );
+    assert_eq!(r["success"], true, "{r}");
+    let r = poll_status(&req, |s| s["manager_state"] == "executing_queue").await;
+    assert_eq!(r["manager_state"], "executing_queue", "{r}");
+
+    // Two items added while it runs. Each add attempts a start and is
+    // refused -- the manager is not idle -- so they wait.
+    for _ in 0..2 {
+        let r = rpc(
+            &req,
+            "queue_item_add",
+            json!({"item": {"name": "count", "args": ["det1", 1]}}),
+        );
+        assert_eq!(r["success"], true, "{r}");
+    }
+    let r = rpc(&req, "status", json!({}));
+    assert_eq!(r["items_in_queue"], 2, "an add must not start here: {r}");
+    assert_eq!(r["queue_autostart_enabled"], true, "{r}");
+
+    // The running item finishing is what frees the worker, and it is the
+    // only event left: nothing else will be requested. The queue must run.
+    let r = poll_status(&req, |s| {
+        s["manager_state"] == "idle" && s["items_in_queue"] == 0
+    })
+    .await;
+    assert_eq!(
+        r["items_in_queue"], 0,
+        "the armed queue did not start when the worker came free: {r}"
+    );
+    assert_eq!(r["plans_run"], 3, "{r}");
+    assert_eq!(r["queue_autostart_enabled"], true, "{r}");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_item_leaves_the_queue_standing_when_the_worker_frees() {
+    let det = SoftDetector::new("det1");
+    let mut reg = Registry::new();
+    register_slow_failing_plan(&mut reg, "slow_boom", 700);
+    reg.register_readable("det1", det as Arc<dyn ReadableObj>);
+    reg.register_plan_count("count");
+    let shutdown = spawn_server(reg);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    rpc(&req, "environment_open", json!({}));
+    rpc(&req, "queue_autostart", json!({"enable": true}));
+    rpc(
+        &req,
+        "queue_item_execute",
+        json!({"item": {"name": "slow_boom", "args": []}}),
+    );
+    poll_status(&req, |s| s["manager_state"] == "executing_queue").await;
+    let r = rpc(
+        &req,
+        "queue_item_add",
+        json!({"item": {"name": "count", "args": ["det1", 1]}}),
+    );
+    assert_eq!(r["success"], true, "{r}");
+
+    // The item failed, which disarms autostart; freeing the worker must
+    // not start the queue anyway -- the operator is meant to look first.
+    let r = poll_status(&req, |s| s["manager_state"] == "idle").await;
+    assert_eq!(r["queue_autostart_enabled"], false, "{r}");
+    assert_eq!(r["items_in_queue"], 1, "the queue must still wait: {r}");
+    assert_eq!(r["plans_failed"], 1, "{r}");
+
+    // And it stays that way: no later trigger picks it up on its own.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let r = rpc(&req, "status", json!({}));
+    assert_eq!(r["items_in_queue"], 1, "{r}");
+    assert_eq!(r["manager_state"], "idle", "{r}");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}

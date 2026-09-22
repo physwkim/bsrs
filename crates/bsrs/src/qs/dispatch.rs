@@ -1473,11 +1473,18 @@ fn queue_start(
 
 /// Event-driven autostart (ref: manager.py:1253-1306 `_autostart_task` /
 /// `_autostart_push`): every event that can make the queue runnable —
-/// item added, environment opened, autostart enabled — attempts a start.
-/// `queue_start` stays the single owner of the start transition and
-/// re-checks manager state and environment, so a losing race is just a
-/// rejected call, never a second worker.
-fn maybe_autostart(
+/// item added, environment opened, autostart enabled, a worker finished
+/// and freed the slot — attempts a start. `queue_start` stays the single
+/// owner of the start transition and re-checks manager state and
+/// environment, so a losing race is just a rejected call, never a second
+/// worker.
+///
+/// The worker-finished event is the one no caller can raise: an item
+/// added while a plan is running is refused at that moment (the manager
+/// is not idle), and without a retry when the plan ends an armed queue
+/// would sit still with the engine free. It reaches here from the rep
+/// thread, which polls `QueueTaskSlot::take_worker_finished`.
+pub(crate) fn maybe_autostart(
     registry: &Arc<Registry>,
     queue: &Arc<StdMutex<PlanQueue>>,
     state: &Arc<StdMutex<EngineState>>,

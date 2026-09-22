@@ -390,6 +390,21 @@ fn rep_loop(
 ) -> Result<()> {
     let stop_requested = Arc::new(AtomicBool::new(false));
     while !socket.is_shutdown() {
+        // A worker that finished released the slot; the queue behind it can
+        // be armed and non-empty, and it could not start that queue itself
+        // while its own claim was live. Checked on every turn of this loop,
+        // the recv timeout included, so the wait is bounded by that timeout
+        // and not by the next request to arrive.
+        if queue_task.take_worker_finished() {
+            crate::qs::dispatch::maybe_autostart(
+                &registry,
+                &queue,
+                &state,
+                &engine,
+                &rt,
+                &queue_task,
+            );
+        }
         let (req, encoding) = match socket.try_recv() {
             Ok(Some(r)) => r,
             Ok(None) => continue, // recv timeout, poll shutdown again
