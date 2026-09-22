@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.8] - 2026-09-22
+
+### Fixed
+
+- An armed queue is retried when a worker frees the queue slot. Autostart was
+  attempted only on the events a client raises -- item added, environment
+  opened, autostart enabled -- so items added while a plan was running were
+  refused for not being idle and then waited forever with the engine free:
+  nothing asked again. The releasing worker cannot ask either, its own
+  `SlotClaim` being live until it returns, so `QueueTaskSlot` announces the
+  release and the rep thread performs the attempt. A failed or stopped item
+  still disarms autostart, so the retry starts nothing after one.
+
 ## [0.5.7] - 2026-09-22
 
 ### Added
