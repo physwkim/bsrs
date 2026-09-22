@@ -87,6 +87,7 @@
 
 mod curve;
 mod dispatch;
+mod env_hook;
 mod lua_eval;
 mod methods;
 #[cfg(feature = "metrics")]
@@ -101,6 +102,7 @@ mod tasks;
 mod transport;
 
 pub use curve::{curve_supported, generate_zmq_keys};
+pub use env_hook::EnvironmentHook;
 pub use lua_eval::LuaEvaluator;
 pub use methods::QsRequest;
 pub use permissions::{MethodClass, Permissions};

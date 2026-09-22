@@ -11,6 +11,7 @@ use tokio::sync::Mutex;
 
 use crate::engine::CheckpointHook;
 use crate::qs::dispatch::dispatch;
+use crate::qs::env_hook::EnvironmentHook;
 use crate::qs::lua_eval::LuaEvaluator;
 use crate::qs::permissions::Permissions;
 use crate::qs::queue::PlanQueue;
@@ -48,6 +49,12 @@ pub struct ServerBuilder {
     /// is born — a fast plan can run to completion before the
     /// watcher catches up.
     checkpoint_hook: Option<CheckpointHook>,
+    /// Optional [`EnvironmentHook`] run on the engine `environment_open`
+    /// creates, before it becomes the environment. Where a daemon puts
+    /// what every open environment must have — the beamline's
+    /// suspenders, say — since the engine is new on every open and a
+    /// client is not told the open happened.
+    environment_hook: Option<Arc<dyn EnvironmentHook>>,
     /// Explicit CURVE private key (Z85, 40 chars). Takes precedence over
     /// the `QSERVER_ZMQ_PRIVATE_KEY` env var. If neither is set, CURVE
     /// is disabled (plaintext). Mirrors the reference's config mechanism
@@ -66,6 +73,7 @@ impl Default for ServerBuilder {
             lua_evaluator: None,
             engine_slot: None,
             checkpoint_hook: None,
+            environment_hook: None,
             curve_private_key: None,
         }
     }
@@ -134,6 +142,16 @@ impl ServerBuilder {
     /// Used by the daemon's crash-recovery JSONL store.
     pub fn checkpoint_hook(mut self, hook: CheckpointHook) -> Self {
         self.checkpoint_hook = Some(hook);
+        self
+    }
+    /// Run `hook` on the engine `environment_open` creates, before that
+    /// engine becomes the open environment; an `Err` from the hook fails
+    /// the open. Fires for every open, including one a console or
+    /// another client asks for. It does not fire for an engine the
+    /// caller seeds into [`ServerBuilder::engine_slot`] itself — that
+    /// engine's creator is the caller, which prepares it directly.
+    pub fn environment_hook(mut self, hook: Arc<dyn EnvironmentHook>) -> Self {
+        self.environment_hook = Some(hook);
         self
     }
     /// Enable ZMQ CURVE encryption using the given Z85-encoded private key
@@ -216,6 +234,7 @@ impl ServerBuilder {
             lua_evaluator: self.lua_evaluator,
             task_tracker: Arc::new(TaskTracker::new()),
             checkpoint_hook: self.checkpoint_hook,
+            environment_hook: self.environment_hook,
         })
     }
 }
@@ -237,6 +256,7 @@ pub struct Server {
     lua_evaluator: Option<Arc<dyn LuaEvaluator>>,
     task_tracker: Arc<TaskTracker>,
     checkpoint_hook: Option<CheckpointHook>,
+    environment_hook: Option<Arc<dyn EnvironmentHook>>,
 }
 
 impl Server {
@@ -264,6 +284,7 @@ impl Server {
         let lua_evaluator = self.lua_evaluator.clone();
         let task_tracker = self.task_tracker.clone();
         let checkpoint_hook = self.checkpoint_hook.clone();
+        let environment_hook = self.environment_hook.clone();
         let rt = tokio::runtime::Handle::current();
 
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
@@ -283,6 +304,7 @@ impl Server {
                     lua_evaluator,
                     task_tracker,
                     checkpoint_hook,
+                    environment_hook,
                 );
                 let _ = done_tx.send(result);
             })
@@ -364,6 +386,7 @@ fn rep_loop(
     lua_evaluator: Option<Arc<dyn LuaEvaluator>>,
     task_tracker: Arc<TaskTracker>,
     checkpoint_hook: Option<CheckpointHook>,
+    environment_hook: Option<Arc<dyn EnvironmentHook>>,
 ) -> Result<()> {
     let stop_requested = Arc::new(AtomicBool::new(false));
     while !socket.is_shutdown() {
@@ -385,6 +408,7 @@ fn rep_loop(
             lua_evaluator.clone(),
             task_tracker.clone(),
             checkpoint_hook.clone(),
+            environment_hook.clone(),
             stop_requested.clone(),
         );
         if let Err(e) = socket.send(&resp, encoding) {
