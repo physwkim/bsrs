@@ -2769,3 +2769,125 @@ async fn leaked_server_does_not_hang_test_shutdown() {
     // Intentionally NO shutdown.shutdown(): the test passes iff the
     // runtime drop after this body returns instead of hanging.
 }
+
+// -- environment_hook -------------------------------------------------------
+
+/// Marks every engine it is handed with the number of the open that
+/// created it, so `re_metadata` shows whether the engine the hook got is
+/// the one that became the environment.
+struct MarkingHook {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl bsrs::qs::EnvironmentHook for MarkingHook {
+    async fn environment_opened(
+        &self,
+        re: &Arc<bsrs::engine::RunEngine>,
+    ) -> bsrs::core::Result<()> {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        re.md_replace(
+            [("opened_by_hook".to_string(), json!(n))]
+                .into_iter()
+                .collect(),
+        );
+        Ok(())
+    }
+}
+
+/// Fails the first open and succeeds after it.
+struct FailFirstHook {
+    failed: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl bsrs::qs::EnvironmentHook for FailFirstHook {
+    async fn environment_opened(
+        &self,
+        _re: &Arc<bsrs::engine::RunEngine>,
+    ) -> bsrs::core::Result<()> {
+        if self.failed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err(bsrs::core::BsrsError::State("synthetic".into()))
+        }
+    }
+}
+
+fn spawn_server_with_env_hook(
+    reg: Registry,
+    hook: Arc<dyn bsrs::qs::EnvironmentHook>,
+) -> ServerShutdown {
+    let server = Server::builder()
+        .control_address("tcp://127.0.0.1:*")
+        .document_address("tcp://127.0.0.1:*")
+        .registry(reg)
+        .environment_hook(hook)
+        .build()
+        .expect("server build");
+    let shutdown = server.shutdown_handle();
+    tokio::spawn(async move {
+        let _ = server.run_async().await;
+    });
+    shutdown
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn environment_hook_runs_on_every_open() {
+    let shutdown = spawn_server_with_env_hook(
+        Registry::new(),
+        Arc::new(MarkingHook {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }),
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    let r = rpc(&req, "environment_open", json!({}));
+    assert!(r["success"].as_bool().unwrap_or(false), "{r}");
+    let md = rpc(&req, "re_metadata", json!({}));
+    assert_eq!(md["re_metadata"]["opened_by_hook"], 1, "{md}");
+
+    // The second open gets a new engine, and the hook must run on that
+    // one too -- what it installs on the first engine died with it.
+    assert!(rpc(&req, "environment_close", json!({}))["success"]
+        .as_bool()
+        .unwrap_or(false));
+    let r = rpc(&req, "environment_open", json!({}));
+    assert!(r["success"].as_bool().unwrap_or(false), "{r}");
+    let md = rpc(&req, "re_metadata", json!({}));
+    assert_eq!(md["re_metadata"]["opened_by_hook"], 2, "{md}");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn environment_hook_failure_leaves_environment_closed() {
+    let shutdown = spawn_server_with_env_hook(
+        Registry::new(),
+        Arc::new(FailFirstHook {
+            failed: std::sync::atomic::AtomicBool::new(false),
+        }),
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let req = req_socket(shutdown.control_endpoint());
+
+    let r = rpc(&req, "environment_open", json!({}));
+    assert_eq!(r["success"], false, "{r}");
+    assert!(
+        r["msg"].as_str().unwrap_or("").contains("synthetic"),
+        "the hook's reason reaches the client: {r}"
+    );
+    let s = rpc(&req, "status", json!({}));
+    assert_eq!(s["worker_environment_exists"], false, "{s}");
+    assert_eq!(s["manager_state"], "environment_closed", "{s}");
+
+    // The failed open left the slot empty, not poisoned: the next one
+    // opens rather than reporting "environment already open".
+    let r = rpc(&req, "environment_open", json!({}));
+    assert!(r["success"].as_bool().unwrap_or(false), "{r}");
+
+    shutdown.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}

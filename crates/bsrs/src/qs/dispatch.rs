@@ -16,6 +16,7 @@ use crate::engine::{CheckpointHook, DocumentSink, RunEngine};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
+use crate::qs::env_hook::EnvironmentHook;
 use crate::qs::lua_eval::LuaEvaluator;
 use crate::qs::methods::{err, QsRequest};
 use crate::qs::permissions::Permissions;
@@ -42,6 +43,7 @@ pub(crate) fn dispatch(
     lua_evaluator: Option<Arc<dyn LuaEvaluator>>,
     task_tracker: Arc<TaskTracker>,
     checkpoint_hook: Option<CheckpointHook>,
+    environment_hook: Option<Arc<dyn EnvironmentHook>>,
     stop_requested: Arc<AtomicBool>,
 ) -> Value {
     let m = req.method.as_str();
@@ -143,7 +145,14 @@ pub(crate) fn dispatch(
 
         // -- environment --------------------------------------------------
         "environment_open" => {
-            let r = env_open(document_sink, &state, &engine, rt, checkpoint_hook.as_ref());
+            let r = env_open(
+                document_sink,
+                &state,
+                &engine,
+                rt,
+                checkpoint_hook.as_ref(),
+                environment_hook.as_ref(),
+            );
             // Opening the env can make an armed queue runnable (ref: manager.py:563).
             if r["success"] == true {
                 maybe_autostart(&registry, &queue, &state, &engine, rt, &queue_task);
@@ -730,6 +739,7 @@ fn env_open(
     engine: &Arc<Mutex<Option<Arc<RunEngine>>>>,
     rt: &tokio::runtime::Handle,
     checkpoint_hook: Option<&CheckpointHook>,
+    environment_hook: Option<&Arc<dyn EnvironmentHook>>,
 ) -> Value {
     let mut e = rt.block_on(engine.lock());
     if e.is_some() {
@@ -741,6 +751,16 @@ fn env_open(
     let re = Arc::new(RunEngine::new(sinks));
     if let Some(hook) = checkpoint_hook {
         re.set_checkpoint_hook(hook.clone());
+    }
+    // Prepared before it becomes the environment, so a hook that fails
+    // leaves nothing half-open: the slot is still empty and the state
+    // goes back where it came from. The engine goes as an argument —
+    // this thread holds the slot's lock.
+    if let Some(hook) = environment_hook {
+        if let Err(e) = rt.block_on(hook.environment_opened(&re)) {
+            state.lock().unwrap().state = Some(EState::EnvironmentClosed);
+            return err(format!("environment hook failed: {e}"));
+        }
     }
     *e = Some(re);
     state.lock().unwrap().state = Some(EState::Idle);
