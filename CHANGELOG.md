@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.7] - 2026-09-22
+
+### Added
+
+- `ServerBuilder::environment_hook` — an `EnvironmentHook` the server runs on
+  the engine `environment_open` has just created, before that engine becomes
+  the environment. The engine is new on every open, so anything a client
+  installed on the last one (the beamline's suspenders, say) is gone, and the
+  client is not told the open happened; the hook puts the daemon that owns the
+  beamline in charge of preparing each engine. An `Err` from the hook fails
+  the open and leaves the environment closed.
+
 ## [0.5.6] - 2026-09-21
 
 ### Fixed
