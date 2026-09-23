@@ -106,3 +106,33 @@ def test_serve_over_tcp():
         client.close()
         stop.set()
         thread.join(5)
+
+
+def test_ax_backend_optimizes_a_quadratic():
+    pytest.importorskip("ax")
+    server = Server(BACKENDS["ax"])
+    spec = {
+        "parameters": [
+            {"kind": "range", "name": "x1", "bounds": [-5.0, 5.0], "parameter_type": "float"},
+            {"kind": "range", "name": "x2", "bounds": [-5.0, 5.0], "parameter_type": "float"},
+        ],
+        "objective": "-loss",
+        "parameter_constraints": [],
+        "outcome_constraints": [],
+    }
+    configured = call(server, "configure", spec=spec, backend={})
+    assert configured["name"] == "AxOptimizer"
+    assert configured["capabilities"] == {"register_suggestions": True, "stopping_criteria": True, "checkpoint": True}
+    for _ in range(6):
+        suggestions = call(server, "suggest", n=2)
+        assert 1 <= len(suggestions) <= 2  # Ax may generate fewer than asked
+        call(
+            server,
+            "ingest",
+            points=[{"_id": s["_id"], "loss": (s["x1"] - 1) ** 2 + (s["x2"] + 2) ** 2} for s in suggestions],
+        )
+    (best,) = call(server, "best_points")
+    assert set(best["params"]) == {"x1", "x2"}
+    mean, _sem = best["outcomes"]["loss"]
+    assert mean < 25.0
+    assert call(server, "should_stop") == [False, None]

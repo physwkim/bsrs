@@ -63,7 +63,10 @@ in-process optimizer. One request is one JSON frame,
 `{"method": …, "params": …}`, answered by `{"result": …}` or
 `{"error": …}`; the methods and their shapes are documented in
 `python/bsrs_blop_bridge/server.py`. Values are JSON, so a NaN outcome
-crosses as `null`.
+crosses as `null`, and a `best_points` outcome is whatever the optimizer
+reports: Ax reports `[mean, sem]` pairs. Ax may also generate fewer
+trials than `n_points` asks for; the plans pad such a step as they do
+for any short suggestion list.
 
 The `Optimizer` trait is synchronous and the plans call it from inside a
 stream, so a bridge call blocks for up to `BridgeOptions::timeout`
@@ -77,7 +80,9 @@ is dropped.
 `crates/bsrs/tests/blop_bridge.rs` drives the client against a scripted
 REP server in a thread; set `BSRS_BLOP_PYTHON=/path/to/python` (an
 interpreter with pyzmq) to also run it against the real server's `random`
-backend. `python/tests/` covers the server with pytest.
+backend, and against the `ax` backend when `blop[ax]` is installed there.
+`python/tests/` covers the server with pytest; its Ax case skips without
+Ax.
 
 ## Design differences
 

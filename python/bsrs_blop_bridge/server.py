@@ -25,7 +25,9 @@ Methods, with ``params`` and ``result``:
 ``ingest``
     ``{"points": [{"_id": id, <outcome>: value, ...}, ...]}`` → ``null``
 ``best_points``
-    ``{}`` → ``[{"_id": id, "params": {...}, "outcomes": {...}}, ...]``
+    ``{}`` → ``[{"_id": id, "params": {...}, "outcomes": {...}}, ...]``.
+    An outcome value is whatever the optimizer reports; Ax reports
+    ``[mean, sem]`` pairs.
 ``register_suggestions``
     ``{"suggestions": [{<param>: value, ...}, ...]}`` → suggestions with ids
 ``register_failures``

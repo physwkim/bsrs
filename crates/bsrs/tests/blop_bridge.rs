@@ -434,7 +434,7 @@ fn mock_acquisition() -> AcquisitionPlan<String> {
     })
 }
 
-async fn optimize_over(endpoint: &str) -> (Vec<String>, usize) {
+async fn optimize_over(endpoint: &str, options: BridgeOptions) -> (Vec<String>, usize) {
     let sink = Arc::new(CapturingSink::new());
     let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
     let agent = Agent::builder(
@@ -444,7 +444,7 @@ async fn optimize_over(endpoint: &str) -> (Vec<String>, usize) {
     )
     .sensors([SoftDetector::new("det") as Sensor])
     .acquisition_plan(mock_acquisition())
-    .build(BridgeOptimizer::factory(endpoint, options(5000)))
+    .build(BridgeOptimizer::factory(endpoint, options))
     .unwrap();
 
     let result = re.run_async(agent.optimize(Some(3), 2)).await.unwrap();
@@ -462,7 +462,7 @@ async fn optimize_over(endpoint: &str) -> (Vec<String>, usize) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_optimizes_over_the_bridge_on_a_multi_thread_runtime() {
     let server = FakeServer::start(all_capabilities());
-    let (best, events) = optimize_over(&server.endpoint).await;
+    let (best, events) = optimize_over(&server.endpoint, options(5000)).await;
     assert_eq!(events, 3);
     assert_eq!(best, ["0", "1", "2", "3", "4", "5"]);
     let methods = server.methods();
@@ -474,7 +474,7 @@ async fn agent_optimizes_over_the_bridge_on_a_multi_thread_runtime() {
 #[tokio::test]
 async fn agent_optimizes_over_the_bridge_on_a_current_thread_runtime() {
     let server = FakeServer::start(all_capabilities());
-    let (best, events) = optimize_over(&server.endpoint).await;
+    let (best, events) = optimize_over(&server.endpoint, options(5000)).await;
     assert_eq!(events, 3);
     assert_eq!(best.len(), 6);
 }
@@ -484,13 +484,13 @@ async fn agent_optimizes_over_the_bridge_on_a_current_thread_runtime() {
 // ---------------------------------------------------------------------------
 
 /// `BSRS_BLOP_PYTHON=/path/to/python cargo nextest run --features blop-bridge`
-/// runs `python -m bsrs_blop_bridge --backend random` from `python/` and
-/// optimizes through it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn python_random_backend_end_to_end() {
+/// runs `python -m bsrs_blop_bridge --backend <backend>` from `python/`
+/// and returns the child and its resolved endpoint; `None` when the
+/// variable is unset.
+fn spawn_python_server(backend: &str) -> Option<(PythonServer, String)> {
     let Ok(python) = std::env::var("BSRS_BLOP_PYTHON") else {
         eprintln!("BSRS_BLOP_PYTHON unset; skipping the Python end-to-end test");
-        return;
+        return None;
     };
     let python_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python");
     let mut child = Command::new(python)
@@ -500,7 +500,7 @@ async fn python_random_backend_end_to_end() {
             "--endpoint",
             "tcp://127.0.0.1:*",
             "--backend",
-            "random",
+            backend,
         ])
         .current_dir(&python_dir)
         .stdout(Stdio::piped())
@@ -516,11 +516,58 @@ async fn python_random_backend_end_to_end() {
         .unwrap_or_else(|| panic!("unexpected first line {line:?}"))
         .trim()
         .to_owned();
+    Some((PythonServer(child), endpoint))
+}
 
-    let (best, events) = optimize_over(&endpoint).await;
-    let _ = child.kill();
-    let _ = child.wait();
+/// Kills the server on every exit path, so a failed assertion leaves no
+/// interpreter behind.
+struct PythonServer(std::process::Child);
+
+impl Drop for PythonServer {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn python_random_backend_end_to_end() {
+    let Some((_server, endpoint)) = spawn_python_server("random") else {
+        return;
+    };
+    let (best, events) = optimize_over(&endpoint, options(5000)).await;
     assert_eq!(events, 3);
     // The random backend keeps one best point: the largest x1 seen.
+    assert_eq!(best.len(), 1);
+}
+
+/// Needs `blop[ax]` in the interpreter; skipped (with a note) when the
+/// server fails to configure, as that is the `ImportError` of a missing Ax.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn python_ax_backend_end_to_end() {
+    let Some((_server, endpoint)) = spawn_python_server("ax") else {
+        return;
+    };
+    // Ax takes `backend` as `configure_experiment` keywords, so no seed.
+    let ax_options = || BridgeOptions {
+        backend: json!({}),
+        timeout: Duration::from_secs(120),
+    };
+    let probe = BridgeOptimizer::connect(&endpoint, &spec(), ax_options());
+    if let Err(e) = &probe {
+        if e.to_string().contains("ImportError") {
+            eprintln!("ax not installed in BSRS_BLOP_PYTHON; skipping: {e}");
+            return;
+        }
+    }
+    let probe = probe.unwrap();
+    assert_eq!(probe.name(), "AxOptimizer");
+    assert!(probe.supports_register_suggestions());
+    assert!(probe.supports_stopping_criteria());
+    assert!(probe.supports_checkpoint());
+    drop(probe);
+
+    let (best, events) = optimize_over(&endpoint, ax_options()).await;
+    assert_eq!(events, 3);
     assert_eq!(best.len(), 1);
 }
