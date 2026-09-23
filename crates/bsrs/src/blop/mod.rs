@@ -6,8 +6,14 @@
 //! actuators, sensors and an evaluation function, and the plans that drive
 //! it (`optimize`, `optimize_in_run`, `optimize_step`, `sample_suggestions`,
 //! `acquire_baseline`, `default_acquire`, `list_scan_in_run`,
-//! `navigate_to_best`). Optimizer backends are not part of this module;
-//! any type implementing [`Optimizer`](crate::blop::protocol::Optimizer) plugs in.
+//! `navigate_to_best`), and the search-space layer blop's `ax` package
+//! defines around them: [`Dof`](crate::blop::dof::Dof),
+//! [`Objective`](crate::blop::objective::Objective), the two constraint
+//! kinds, and the [`Agent`](crate::blop::agent::Agent) that binds them to
+//! an optimizer. Optimizer backends are not part of this module; any type
+//! implementing [`Optimizer`](crate::blop::protocol::Optimizer) plugs in,
+//! and the agent hands it the backend-neutral
+//! [`ExperimentSpec`](crate::blop::agent::ExperimentSpec).
 //!
 //! Differences from blop that a user porting a workflow will meet:
 //!
@@ -24,18 +30,40 @@
 //! - Routing uses deterministic nearest-neighbour plus 2-opt instead of
 //!   networkx's simulated annealing (see [`routing`](crate::blop::routing)).
 //! - `read_step` pads a short step with `null`, not NaN.
+//! - A DOF's binding is an enum ([`DofBinding`](crate::blop::dof::DofBinding))
+//!   rather than blop's optional `name` plus optional `actuator`, so the
+//!   rejected combinations cannot be written. Constraint and scalarized
+//!   objective templates are validated by whole word, where blop tests for
+//!   a substring.
+//! - The agent takes an optimizer factory over the `ExperimentSpec` instead
+//!   of constructing Ax's client; the Ax-specific surface (`fixed_dofs`,
+//!   `reconfigure_search_space`, `from_checkpoint`, `plot_objective`) and
+//!   the per-agent callback list are not ported.
 //! - Each blop run key is a bsrs run: bluesky's `set_run_key_wrapper` sets
 //!   `msg.run`, bsrs's only records `run_key` in the start document, so
 //!   [`in_run_wrapper`](crate::blop::stubs::in_run_wrapper) routes each run's messages
 //!   through [`Msg::InRun`](crate::core::Msg::InRun). That is what lets a
 //!   `default_acquire` scan open its own run inside an `optimize` run.
 
+pub mod agent;
+pub mod dof;
+mod expr;
+pub mod objective;
 pub mod plans;
 pub mod protocol;
 pub mod routing;
 pub mod stubs;
 pub mod tracking;
 
+pub use agent::{Agent, AgentBuilder, ExperimentSpec};
+pub use dof::{
+    ChoiceDof, Dof, DofBinding, DofConstraint, ParameterConfig, ParameterType, RangeDof, RangeType,
+    Scaling,
+};
+pub use objective::{
+    objective_expression, Objective, Objectives, OutcomeConstraint, OutcomeName,
+    ScalarizedObjective,
+};
 pub use plans::{
     acquire_baseline, default_acquire, optimize, optimize_in_run, optimize_step, sample_candidates,
     sample_suggestions, StepOptions, StepResult, DEFAULT_ACQUIRE_RUN_KEY, OPTIMIZE_IN_RUN_KEY,

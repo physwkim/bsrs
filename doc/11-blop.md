@@ -19,9 +19,16 @@ utils.py}`; the tests in `crates/bsrs/tests/blop_plans.rs` are ported from
 | `default_acquire`, `list_scan_in_run`, `navigate_to_best`, `read_step`, `seq_read` | same names in `blop::stubs` |
 | `InferredReadable`, `Source` | `blop::tracking::{TrackingReadable, Source}` |
 | `route_suggestions` | `blop::routing::route_suggestions` |
+| `ax.dof.{RangeDOF, ChoiceDOF, DOFConstraint}` | `blop::dof::{RangeDof, ChoiceDof, DofConstraint}` with the binding as `DofBinding` |
+| `ax.objective.{Objective, ScalarizedObjective, OutcomeConstraint, to_ax_objective_str}` | `blop::objective::{Objective, ScalarizedObjective, OutcomeConstraint, objective_expression}` |
+| `ax.agent.Agent` | `blop::agent::Agent`, built over an optimizer factory taking an `ExperimentSpec` |
 
 Optimizer backends (Ax, BoTorch) are not ported. Any type implementing
-`Optimizer` plugs into the plans (decision D22).
+`Optimizer` plugs into the plans (decision D22). The agent renders its
+DOFs, objectives and constraints into an `ExperimentSpec` — the arguments of
+Ax's `configure_experiment` / `configure_optimization`, serializable as JSON
+— and calls a factory with it, so an in-process optimizer or a bridge to an
+out-of-process one is configured the same way.
 
 ## Design differences
 
@@ -51,10 +58,27 @@ Optimizer backends (Ax, BoTorch) are not ported. Any type implementing
 - **Routing.** Deterministic nearest-neighbour plus 2-opt over the numeric
   parameters, seeded from the actuators' current position, in place of
   networkx's simulated-annealing TSP. Integer parameters are routed too.
+- **DOF binding.** blop's `DOF` has optional `name` and `actuator` fields
+  and rejects the combinations that make no sense at construction. bsrs
+  makes each legal combination a `DofBinding` variant: `Actuator` (a device
+  the RunEngine moves), `External` (a name something else sets), `Remote`
+  (a queueserver variable name, with the device name when it differs). The
+  agent refuses `Remote`, as blop's does a string actuator.
+- **Template validation.** A constraint or scalarized objective names its
+  inputs by template variables. blop checks each variable with a substring
+  test and substitutes with `\b…\b`; bsrs uses one word tokenizer for both,
+  so a variable that validates is the one substituted.
+- **Agent surface.** The Ax-only methods (`fixed_dofs`,
+  `reconfigure_search_space`, `from_checkpoint`, `plot_objective`) and the
+  per-agent callback list are not ported; document sinks subscribe on the
+  RunEngine.
 - **Padding.** `read_step` pads a short step (fewer points than
   `n_points`) with `null`, not NaN, since the event data is JSON.
 
 ## Tests not ported
 
 Cases whose precondition cannot exist in the typed port: sensors that are
-not `Readable`, unhashable ids, and suggestions without an `_id`.
+not `Readable`, unhashable ids, suggestions without an `_id`, and a DOF with
+both an actuator and a name or with neither. Cases that exercise Ax itself
+(`test_ax_api_consistency_*`, the Ax-client assertions of `test_agent.py`)
+are replaced by assertions on the rendered `ExperimentSpec`.

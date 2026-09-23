@@ -16,6 +16,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   outcomes are typed, plans that produce a value return a `PlanWithResult`,
   and routing is deterministic nearest-neighbour plus 2-opt. Optimizer
   backends are not included. See `doc/11-blop.md`.
+- `bsrs::blop::{dof, objective, agent}` — the search-space layer of blop's
+  `ax` package: `RangeDof`/`ChoiceDof` with a `DofBinding`, `DofConstraint`,
+  `Objective`/`ScalarizedObjective`/`OutcomeConstraint`, and an `Agent` that
+  renders them into a backend-neutral, JSON-serializable `ExperimentSpec`
+  and builds its optimizer through a factory over it.
 
 ### Fixed
 
