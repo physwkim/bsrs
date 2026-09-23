@@ -25,6 +25,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `Optimizer` served by another process over ZMQ REQ/REP as JSON, with the
   `bsrs_blop_bridge` Python server in `python/` (`random` and `ax`
   backends). This is how Ax is driven from bsrs.
+- `bsrs::blop::callbacks` — `OptimizationRouter` (forward the `primary`
+  stream of optimization runs to a shared, editable sink list) and
+  `OptimizationLogger` (plain-text progress tables and running statistics),
+  ports of blop's `callbacks` package as `DocumentSink`s.
 
 ### Fixed
 

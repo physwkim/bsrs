@@ -22,6 +22,7 @@ utils.py}`; the tests in `crates/bsrs/tests/blop_plans.rs` are ported from
 | `ax.dof.{RangeDOF, ChoiceDOF, DOFConstraint}` | `blop::dof::{RangeDof, ChoiceDof, DofConstraint}` with the binding as `DofBinding` |
 | `ax.objective.{Objective, ScalarizedObjective, OutcomeConstraint, to_ax_objective_str}` | `blop::objective::{Objective, ScalarizedObjective, OutcomeConstraint, objective_expression}` |
 | `ax.agent.Agent` | `blop::agent::Agent`, built over an optimizer factory taking an `ExperimentSpec` |
+| `callbacks.{OptimizationCallbackRouter, OptimizationLogger, RunningStats}` | `blop::callbacks::{OptimizationRouter, OptimizationLogger, RunningStats}` as `DocumentSink`s |
 
 Optimizer backends (Ax, BoTorch) are not ported; Ax is reached through
 the bridge below. Any type implementing `Optimizer` plugs into the plans
@@ -83,6 +84,24 @@ interpreter with pyzmq) to also run it against the real server's `random`
 backend, and against the `ax` backend when `blop[ax]` is installed there.
 `python/tests/` covers the server with pytest; its Ax case skips without
 Ax.
+
+## Callbacks
+
+`blop::callbacks::OptimizationRouter` is the sink to hand the RunEngine:
+it forwards the documents of `optimize` and `sample_suggestions` runs —
+and only their `primary` stream, so a `baseline` from `SupplementalData`
+is dropped — to a shared list of sinks read at each matching start, so a
+sink added between runs takes part in the next one.
+`OptimizationLogger` is such a sink: a header per start, a table of each
+iteration's parameters and outcomes with running min/max/mean of the
+outcomes, and a summary table at stop, as plain text on any `Write`
+(blop uses `rich`). Iteration counts and statistics accumulate across
+runs, as blop's do. `RunningStats` is the Welford accumulator behind it.
+
+```rust
+let router = OptimizationRouter::with_sinks([Arc::new(OptimizationLogger::stderr()) as Arc<dyn DocumentSink>]);
+let re = RunEngine::new(vec![Arc::new(router) as Arc<dyn DocumentSink>]);
+```
 
 ## Design differences
 

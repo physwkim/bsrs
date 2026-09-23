@@ -41,7 +41,9 @@
 //! - The agent takes an optimizer factory over the `ExperimentSpec` instead
 //!   of constructing Ax's client; the Ax-specific surface (`fixed_dofs`,
 //!   `reconfigure_search_space`, `from_checkpoint`, `plot_objective`) and
-//!   the per-agent callback list are not ported.
+//!   the per-agent callback list are not ported; blop's callbacks are
+//!   [`DocumentSink`](crate::engine::sink::DocumentSink)s in
+//!   [`callbacks`](crate::blop::callbacks), subscribed on the RunEngine.
 //! - Each blop run key is a bsrs run: bluesky's `set_run_key_wrapper` sets
 //!   `msg.run`, bsrs's only records `run_key` in the start document, so
 //!   [`in_run_wrapper`](crate::blop::stubs::in_run_wrapper) routes each run's messages
@@ -51,6 +53,7 @@
 pub mod agent;
 #[cfg(feature = "blop-bridge")]
 pub mod bridge;
+pub mod callbacks;
 pub mod dof;
 mod expr;
 pub mod objective;
@@ -61,6 +64,7 @@ pub mod stubs;
 pub mod tracking;
 
 pub use agent::{Agent, AgentBuilder, ExperimentSpec};
+pub use callbacks::{OptimizationLogger, OptimizationRouter, RunningStats, SinkList};
 pub use dof::{
     ChoiceDof, Dof, DofBinding, DofConstraint, ParameterConfig, ParameterType, RangeDof, RangeType,
     Scaling,

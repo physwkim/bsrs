@@ -20,7 +20,7 @@ use crate::event_model::{DataKey, Dtype, DtypeNumpy};
 
 /// Where a tracked key's data comes from; recorded as the data key's
 /// `source` so downstream callbacks can tell parameters from outcomes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Source {
     /// An objective or constraint value produced by the evaluation function.
     Outcome,
@@ -43,6 +43,18 @@ impl Source {
             Source::SuggestionId => "optimization-suggestion-id",
             Source::AcquisitionUid => "optimization-acquisition-uid",
             Source::Other => "optimization-other",
+        }
+    }
+
+    /// The variant a data key's `source` names; anything else, blop's
+    /// `Source.OTHER` included, is [`Source::Other`].
+    pub fn from_data_key_source(source: &str) -> Source {
+        match source {
+            "optimization-outcome" => Source::Outcome,
+            "optimization-parameter" => Source::Parameter,
+            "optimization-suggestion-id" => Source::SuggestionId,
+            "optimization-acquisition-uid" => Source::AcquisitionUid,
+            _ => Source::Other,
         }
     }
 }
