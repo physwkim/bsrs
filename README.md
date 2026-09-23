@@ -180,6 +180,7 @@ Design notes (numbered for read-in-order):
 9. [`doc/08-decisions.md`](doc/08-decisions.md)
 10. [`doc/09-references.md`](doc/09-references.md)
 11. [`doc/10-roadmap.md`](doc/10-roadmap.md) — tracked open items
+12. [`doc/11-blop.md`](doc/11-blop.md) — beamline optimization (blop port)
 
 ## License
 

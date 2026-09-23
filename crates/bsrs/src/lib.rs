@@ -38,6 +38,10 @@ pub mod qs;
 #[cfg(feature = "host")]
 pub mod host;
 
+/// Beamline optimization plans — the blop port (feature `blop`).
+#[cfg(feature = "blop")]
+pub mod blop;
+
 // Re-export the derive macros from the companion proc-macro crate so users
 // only need to depend on `bsrs`.
 pub use bsrs_derive::{lua_methods, Device};
