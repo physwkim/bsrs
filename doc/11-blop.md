@@ -23,12 +23,61 @@ utils.py}`; the tests in `crates/bsrs/tests/blop_plans.rs` are ported from
 | `ax.objective.{Objective, ScalarizedObjective, OutcomeConstraint, to_ax_objective_str}` | `blop::objective::{Objective, ScalarizedObjective, OutcomeConstraint, objective_expression}` |
 | `ax.agent.Agent` | `blop::agent::Agent`, built over an optimizer factory taking an `ExperimentSpec` |
 
-Optimizer backends (Ax, BoTorch) are not ported. Any type implementing
-`Optimizer` plugs into the plans (decision D22). The agent renders its
+Optimizer backends (Ax, BoTorch) are not ported; Ax is reached through
+the bridge below. Any type implementing `Optimizer` plugs into the plans
+(decision D22). The agent renders its
 DOFs, objectives and constraints into an `ExperimentSpec` — the arguments of
 Ax's `configure_experiment` / `configure_optimization`, serializable as JSON
 — and calls a factory with it, so an in-process optimizer or a bridge to an
 out-of-process one is configured the same way.
+
+## Optimizer bridge (`blop-bridge`)
+
+The `blop-bridge` feature adds `blop::bridge::BridgeOptimizer`, an
+`Optimizer` whose calls go to another process over a ZMQ REQ/REP socket
+as JSON. The server is the `bsrs_blop_bridge` Python package in
+[`python/`](../python/); it serves any object with blop's `Optimizer`
+surface, and ships two backends:
+
+- `random` — uniform random search over the spec, no dependencies beyond
+  pyzmq; the reference for tests and a random-search baseline.
+- `ax` — `blop.ax.optimizer.AxOptimizer` configured from the spec
+  (`pip install blop[ax]`).
+
+```sh
+cd python && pip install -e '.[ax]'
+python -m bsrs_blop_bridge --endpoint tcp://127.0.0.1:5590 --backend ax
+```
+
+```rust
+let agent = Agent::builder(dofs, Objective::maximize("intensity"), eval)
+    .build(BridgeOptimizer::factory("tcp://127.0.0.1:5590", BridgeOptions::default()))?;
+re.run_async(agent.optimize(Some(20), 1)).await?;
+```
+
+`connect` sends the agent's `ExperimentSpec` as `configure` and learns the
+optimizer's name and which optional protocols it implements
+(`register_suggestions`, `stopping_criteria`, `checkpoint`); those answer
+the `supports_*` methods, so the plans branch exactly as they do for an
+in-process optimizer. One request is one JSON frame,
+`{"method": …, "params": …}`, answered by `{"result": …}` or
+`{"error": …}`; the methods and their shapes are documented in
+`python/bsrs_blop_bridge/server.py`. Values are JSON, so a NaN outcome
+crosses as `null`.
+
+The `Optimizer` trait is synchronous and the plans call it from inside a
+stream, so a bridge call blocks for up to `BridgeOptions::timeout`
+(default five minutes: Ax refits its model before each `suggest`). On a
+multi-thread tokio runtime the call runs under `block_in_place`; on a
+current-thread runtime it blocks the thread. A call that times out fails
+that step and leaves the socket usable: the REQ socket runs relaxed and
+correlated, so the next request goes out and a late reply to the old one
+is dropped.
+
+`crates/bsrs/tests/blop_bridge.rs` drives the client against a scripted
+REP server in a thread; set `BSRS_BLOP_PYTHON=/path/to/python` (an
+interpreter with pyzmq) to also run it against the real server's `random`
+backend. `python/tests/` covers the server with pytest.
 
 ## Design differences
 

@@ -21,6 +21,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `Objective`/`ScalarizedObjective`/`OutcomeConstraint`, and an `Agent` that
   renders them into a backend-neutral, JSON-serializable `ExperimentSpec`
   and builds its optimizer through a factory over it.
+- `bsrs::blop::bridge` (feature `blop-bridge`) — `BridgeOptimizer`, an
+  `Optimizer` served by another process over ZMQ REQ/REP as JSON, with the
+  `bsrs_blop_bridge` Python server in `python/` (`random` and `ax`
+  backends). This is how Ax is driven from bsrs.
 
 ### Fixed
 

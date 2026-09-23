@@ -13,7 +13,10 @@
 //! an optimizer. Optimizer backends are not part of this module; any type
 //! implementing [`Optimizer`](crate::blop::protocol::Optimizer) plugs in,
 //! and the agent hands it the backend-neutral
-//! [`ExperimentSpec`](crate::blop::agent::ExperimentSpec).
+//! [`ExperimentSpec`](crate::blop::agent::ExperimentSpec). Feature
+//! `blop-bridge` adds [`bridge::BridgeOptimizer`](crate::blop::bridge::BridgeOptimizer),
+//! which serves that spec to an out-of-process optimizer (Ax, through the
+//! `bsrs_blop_bridge` Python package) over ZMQ.
 //!
 //! Differences from blop that a user porting a workflow will meet:
 //!
@@ -46,6 +49,8 @@
 //!   `default_acquire` scan open its own run inside an `optimize` run.
 
 pub mod agent;
+#[cfg(feature = "blop-bridge")]
+pub mod bridge;
 pub mod dof;
 mod expr;
 pub mod objective;
