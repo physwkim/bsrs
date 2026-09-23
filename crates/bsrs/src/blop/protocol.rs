@@ -215,6 +215,64 @@ pub trait Optimizer: Send + Sync {
     fn checkpoint(&mut self) -> Result<()> {
         Ok(())
     }
+
+    /// Where [`checkpoint`](Self::checkpoint) writes, if the optimizer
+    /// checkpoints to a file (Ax's `checkpoint_path`).
+    fn checkpoint_path(&self) -> Result<Option<String>> {
+        Err(unsupported(&self.name(), "checkpoint_path"))
+    }
+
+    /// Set where [`checkpoint`](Self::checkpoint) writes.
+    fn set_checkpoint_path(&mut self, path: Option<String>) -> Result<()> {
+        let _ = path;
+        Err(unsupported(&self.name(), "checkpoint_path"))
+    }
+
+    /// Parameters held at a value for future suggestions, `None` when all
+    /// are free (Ax's `fixed_parameters`).
+    fn fixed_parameters(&self) -> Result<Option<Params>> {
+        Err(unsupported(&self.name(), "fixed_parameters"))
+    }
+
+    /// Hold `fixed` at their values for future suggestions; `None` frees
+    /// them all. A name outside the search space is an error.
+    fn set_fixed_parameters(&mut self, fixed: Option<Params>) -> Result<()> {
+        let _ = fixed;
+        Err(unsupported(&self.name(), "fixed_parameters"))
+    }
+
+    /// Narrow or widen the search space of existing parameters for future
+    /// suggestions. All or nothing: a rejected update leaves every
+    /// parameter as it was.
+    fn reconfigure_search_space(&mut self, updates: BTreeMap<String, SearchSpace>) -> Result<()> {
+        let _ = updates;
+        Err(unsupported(&self.name(), "reconfigure_search_space"))
+    }
+}
+
+fn unsupported(optimizer: &str, what: &str) -> BsrsError {
+    BsrsError::Plan(format!("optimizer {optimizer} does not support {what}"))
+}
+
+/// A parameter's new search space for
+/// [`Optimizer::reconfigure_search_space`]: bounds for a range parameter,
+/// the allowed values for a choice parameter.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SearchSpace {
+    /// `(lower, upper)` for a range parameter.
+    Bounds(f64, f64),
+    /// The values of a choice parameter.
+    Values(Vec<Value>),
+}
+
+impl SearchSpace {
+    /// The wire form: `{"bounds": [lo, hi]}` or `{"values": [...]}`.
+    pub fn to_value(&self) -> Value {
+        match self {
+            SearchSpace::Bounds(lo, hi) => serde_json::json!({ "bounds": [lo, hi] }),
+            SearchSpace::Values(values) => serde_json::json!({ "values": values }),
+        }
+    }
 }
 
 /// An optimizer shared between the plan that drives it and the caller that

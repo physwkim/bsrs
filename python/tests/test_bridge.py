@@ -32,7 +32,14 @@ def test_configure_reports_name_and_capabilities():
     result = call(server, "configure", spec=SPEC, backend={"seed": 1})
     assert result == {
         "name": "RandomOptimizer",
-        "capabilities": {"register_suggestions": True, "stopping_criteria": False, "checkpoint": False},
+        "capabilities": {
+            "register_suggestions": True,
+            "stopping_criteria": False,
+            "checkpoint": False,
+            "checkpoint_path": False,
+            "fixed_parameters": True,
+            "reconfigure_search_space": True,
+        },
     }
 
 
@@ -122,7 +129,14 @@ def test_ax_backend_optimizes_a_quadratic():
     }
     configured = call(server, "configure", spec=spec, backend={})
     assert configured["name"] == "AxOptimizer"
-    assert configured["capabilities"] == {"register_suggestions": True, "stopping_criteria": True, "checkpoint": True}
+    assert configured["capabilities"] == {
+        "register_suggestions": True,
+        "stopping_criteria": True,
+        "checkpoint": True,
+        "checkpoint_path": True,
+        "fixed_parameters": True,
+        "reconfigure_search_space": True,
+    }
     for _ in range(6):
         suggestions = call(server, "suggest", n=2)
         assert 1 <= len(suggestions) <= 2  # Ax may generate fewer than asked
@@ -136,3 +150,75 @@ def test_ax_backend_optimizes_a_quadratic():
     mean, _sem = best["outcomes"]["loss"]
     assert mean < 25.0
     assert call(server, "should_stop") == [False, None]
+
+
+def test_fixed_parameters_and_search_space_over_the_random_backend():
+    server = Server(BACKENDS["random"])
+    call(server, "configure", spec=SPEC, backend={"seed": 3})
+    assert call(server, "fixed_parameters") is None
+    call(server, "set_fixed_parameters", fixed={"n": 2, "filter": "Al"})
+    assert call(server, "fixed_parameters") == {"n": 2, "filter": "Al"}
+    for s in call(server, "suggest", n=5):
+        assert (s["n"], s["filter"]) == (2, "Al")
+    call(server, "set_fixed_parameters", fixed=None)
+    assert call(server, "fixed_parameters") is None
+
+    call(server, "reconfigure_search_space", updates={"x": {"bounds": [3.0, 6.0]}, "filter": {"values": ["Al"]}})
+    for s in call(server, "suggest", n=20):
+        assert 3.0 <= s["x"] <= 6.0
+        assert s["filter"] == "Al"
+
+    reply = json.loads(server.handle(json.dumps({"method": "set_fixed_parameters", "params": {"fixed": {"zz": 1}}}).encode()))
+    assert "Unknown parameter" in reply["error"]
+    reply = json.loads(server.handle(json.dumps({"method": "reconfigure_search_space", "params": {"updates": {"x": {"nope": 1}}}}).encode()))
+    assert "needs 'bounds' or 'values'" in reply["error"]
+    reply = json.loads(server.handle(json.dumps({"method": "restore", "params": {"checkpoint_path": "x.json"}}).encode()))
+    assert "cannot restore" in reply["error"]
+    reply = json.loads(server.handle(json.dumps({"method": "checkpoint_path"}).encode()))
+    assert "AttributeError" in reply["error"]
+
+
+def test_ax_checkpoint_restore_fixed_and_search_space(tmp_path):
+    pytest.importorskip("ax")
+    path = str(tmp_path / "checkpoint.json")
+    spec = {
+        "parameters": [
+            {"kind": "range", "name": "x1", "bounds": [0.0, 10.0], "parameter_type": "float"},
+            {"kind": "range", "name": "x2", "bounds": [0.0, 10.0], "parameter_type": "float"},
+            {"kind": "choice", "name": "x3", "values": ["A", "B", "C", "D", "E"], "parameter_type": "str"},
+        ],
+        "objective": "obj",
+        "parameter_constraints": [],
+        "outcome_constraints": [],
+    }
+    server = Server(BACKENDS["ax"])
+    call(server, "configure", spec=spec, backend={})
+    assert call(server, "checkpoint_path") is None
+    call(server, "set_checkpoint_path", path=path)
+    assert call(server, "checkpoint_path") == path
+
+    call(server, "set_fixed_parameters", fixed={"x2": 4, "x3": "B"})
+    suggestions = call(server, "suggest", n=3)
+    for s in suggestions[1:]:  # the first trial is the centre of the search space
+        assert (s["x2"], s["x3"]) == (4, "B")
+    call(server, "set_fixed_parameters", fixed=None)
+    # Ax's Sobol node wants data before it generates more. The centre trial
+    # gets the top value: it is the one point sure to stay inside the
+    # narrowed space below, and Ax's best point is filtered to that space.
+    call(server, "ingest", points=[{"_id": s["_id"], "obj": float(-i)} for i, s in enumerate(suggestions)])
+
+    call(server, "reconfigure_search_space", updates={"x1": {"bounds": [3.0, 6.0]}, "x3": {"values": ["B", "C"]}})
+    for s in call(server, "suggest", n=3):
+        assert 3.0 <= s["x1"] <= 6.0
+        assert s["x3"] in {"B", "C"}
+
+    call(server, "checkpoint")
+    assert (tmp_path / "checkpoint.json").exists()
+    (best,) = call(server, "best_points")
+    assert best["_id"] == suggestions[0]["_id"]
+
+    restored = Server(BACKENDS["ax"])
+    result = call(restored, "restore", checkpoint_path=path, backend={})
+    assert result["name"] == "AxOptimizer"
+    assert call(restored, "checkpoint_path") == path
+    assert call(restored, "best_points") == [best]

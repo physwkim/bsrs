@@ -60,7 +60,23 @@ re.run_async(agent.optimize(Some(20), 1)).await?;
 optimizer's name and which optional protocols it implements
 (`register_suggestions`, `stopping_criteria`, `checkpoint`); those answer
 the `supports_*` methods, so the plans branch exactly as they do for an
-in-process optimizer. One request is one JSON frame,
+in-process optimizer. The same reply says whether the optimizer has Ax's
+extras, `checkpoint_path`, `fixed_parameters` and
+`reconfigure_search_space`; the agent's `set_fixed_dofs`,
+`reconfigure_search_space` and `set_checkpoint_path` go over the wire when
+it does and fail with "does not support" when it does not. A checkpoint
+restores through `BridgeOptimizer::from_checkpoint`, which sends `restore`
+in place of `configure`, and an agent is built around the restored
+optimizer with `Agent::from_optimizer`:
+
+```rust
+let optimizer = BridgeOptimizer::from_checkpoint(endpoint, "run.json", options)?;
+let agent = Agent::from_optimizer(shared(optimizer), actuators, sensors, eval, None);
+```
+
+Such an agent has no `ExperimentSpec` (`agent.spec()` is `None`) and no
+DOFs; its search space is whatever the checkpoint holds. One request is
+one JSON frame,
 `{"method": …, "params": …}`, answered by `{"result": …}` or
 `{"error": …}`; the methods and their shapes are documented in
 `python/bsrs_blop_bridge/server.py`. Values are JSON, so a NaN outcome
@@ -141,10 +157,14 @@ let re = RunEngine::new(vec![Arc::new(router) as Arc<dyn DocumentSink>]);
   inputs by template variables. blop checks each variable with a substring
   test and substitutes with `\b…\b`; bsrs uses one word tokenizer for both,
   so a variable that validates is the one substituted.
-- **Agent surface.** The Ax-only methods (`fixed_dofs`,
-  `reconfigure_search_space`, `from_checkpoint`, `plot_objective`) and the
-  per-agent callback list are not ported; document sinks subscribe on the
-  RunEngine.
+- **Agent surface.** blop's `Agent` reaches into its `AxOptimizer` for
+  `fixed_dofs`, `reconfigure_search_space`, `checkpoint_path` and
+  `from_checkpoint`. bsrs makes the first three optional `Optimizer`
+  methods (defaulting to "does not support") that the agent forwards, so
+  they work over the bridge and on any backend that has them, and
+  `from_checkpoint` belongs to the optimizer, with `Agent::from_optimizer`
+  wrapping the result. `plot_objective` and the per-agent callback list
+  are not ported; document sinks subscribe on the RunEngine.
 - **Padding.** `read_step` pads a short step (fewer points than
   `n_points`) with `null`, not NaN, since the event data is JSON.
 

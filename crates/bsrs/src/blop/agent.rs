@@ -10,6 +10,7 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::core::error::{BsrsError, Result};
 use crate::core::plan::Plan;
@@ -22,7 +23,7 @@ use super::plans::{
 };
 use super::protocol::{
     AcquireArgs, AcquisitionPlan, AcquisitionUid, Actuator, BestPoint, Candidate,
-    EvaluationFunction, OptimizationProblem, Outcome, Params, PlanWithResult, Sensor,
+    EvaluationFunction, OptimizationProblem, Outcome, Params, PlanWithResult, SearchSpace, Sensor,
     SharedOptimizer, Suggestion,
 };
 use super::stubs::navigate_to_best;
@@ -160,7 +161,7 @@ impl<U: AcquisitionUid> AgentBuilder<U> {
             evaluation_function: self.evaluation_function,
             acquisition_plan: self.acquisition_plan,
             optimizer,
-            spec,
+            spec: Some(spec),
             readable_cache: readable_cache(),
         })
     }
@@ -178,7 +179,9 @@ pub struct Agent<U: AcquisitionUid> {
     evaluation_function: EvaluationFunction<U>,
     acquisition_plan: Option<AcquisitionPlan<U>>,
     optimizer: SharedOptimizer,
-    spec: ExperimentSpec,
+    /// `None` for an agent restored around an existing optimizer, whose
+    /// configuration lives in the optimizer alone.
+    spec: Option<ExperimentSpec>,
     readable_cache: ReadableCache,
 }
 
@@ -220,9 +223,83 @@ impl<U: AcquisitionUid> Agent<U> {
         }
     }
 
-    /// The configuration the optimizer was built from.
-    pub fn spec(&self) -> &ExperimentSpec {
-        &self.spec
+    /// Bind an already configured optimizer — blop's `Agent.from_checkpoint`
+    /// shape, with the restoring left to the optimizer (for the bridge,
+    /// `BridgeOptimizer::from_checkpoint`). Only the optimizer state was
+    /// saved, so the agent has no DOFs and no [`spec`](Self::spec); the
+    /// actuators must cover the names the optimizer suggests.
+    pub fn from_optimizer(
+        optimizer: SharedOptimizer,
+        actuators: impl IntoIterator<Item = Actuator>,
+        sensors: impl IntoIterator<Item = Sensor>,
+        evaluation_function: EvaluationFunction<U>,
+        acquisition_plan: Option<AcquisitionPlan<U>>,
+    ) -> Self {
+        Self {
+            dofs: Vec::new(),
+            actuators: actuators.into_iter().collect(),
+            sensors: sensors.into_iter().collect(),
+            evaluation_function,
+            acquisition_plan,
+            optimizer,
+            spec: None,
+            readable_cache: readable_cache(),
+        }
+    }
+
+    /// The configuration the optimizer was built from; `None` for an agent
+    /// from [`from_optimizer`](Self::from_optimizer).
+    pub fn spec(&self) -> Option<&ExperimentSpec> {
+        self.spec.as_ref()
+    }
+
+    /// Where the optimizer checkpoints, if it checkpoints to a file.
+    pub fn checkpoint_path(&self) -> Result<Option<String>> {
+        self.optimizer.lock().unwrap().checkpoint_path()
+    }
+
+    /// Set where the optimizer checkpoints.
+    pub fn set_checkpoint_path(&self, path: impl Into<String>) -> Result<()> {
+        self.optimizer
+            .lock()
+            .unwrap()
+            .set_checkpoint_path(Some(path.into()))
+    }
+
+    /// The DOFs held fixed, by parameter name, or `None` when all are free.
+    pub fn fixed_dofs(&self) -> Result<Option<Params>> {
+        self.optimizer.lock().unwrap().fixed_parameters()
+    }
+
+    /// Fix DOFs to values for future suggestions; an empty iterator frees
+    /// them all, as blop's `fixed_dofs = None` does.
+    pub fn set_fixed_dofs<'a>(
+        &self,
+        fixed: impl IntoIterator<Item = (&'a Dof, Value)>,
+    ) -> Result<()> {
+        let fixed: Params = fixed
+            .into_iter()
+            .map(|(dof, value)| (dof.parameter_name().to_owned(), value))
+            .collect();
+        self.optimizer
+            .lock()
+            .unwrap()
+            .set_fixed_parameters((!fixed.is_empty()).then_some(fixed))
+    }
+
+    /// Update the bounds or values of existing DOFs for future suggestions.
+    pub fn reconfigure_search_space<'a>(
+        &self,
+        updates: impl IntoIterator<Item = (&'a Dof, SearchSpace)>,
+    ) -> Result<()> {
+        let updates = updates
+            .into_iter()
+            .map(|(dof, space)| (dof.parameter_name().to_owned(), space))
+            .collect();
+        self.optimizer
+            .lock()
+            .unwrap()
+            .reconfigure_search_space(updates)
     }
 
     /// The degrees of freedom.

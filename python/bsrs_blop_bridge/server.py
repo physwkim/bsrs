@@ -36,6 +36,16 @@ Methods, with ``params`` and ``result``:
     ``{}`` → ``[bool, reason | null]``
 ``checkpoint``
     ``{}`` → ``null``
+``restore``
+    ``{"checkpoint_path": str, "backend": {...}}`` → as ``configure``; the
+    backend restores its optimizer from the file (``ax`` only).
+``checkpoint_path`` / ``set_checkpoint_path``
+    ``{}`` → ``str | null``; ``{"path": str | null}`` → ``null``
+``fixed_parameters`` / ``set_fixed_parameters``
+    ``{}`` → ``{<param>: value} | null``; ``{"fixed": {...} | null}`` → ``null``
+``reconfigure_search_space``
+    ``{"updates": {<param>: {"bounds": [lo, hi]} | {"values": [...]}}}`` →
+    ``null``. The shape names the parameter kind, since JSON has no tuple.
 ``ping``
     ``{}`` → ``"pong"``
 
@@ -77,25 +87,54 @@ def _jsonable(value: Any) -> Any:
 
 
 def capabilities(optimizer: Any) -> dict[str, bool]:
-    """Which optional blop protocols the optimizer implements."""
+    """Which optional blop protocols, and which of Ax's extras, the optimizer has."""
+    cls = type(optimizer)
     return {
         "register_suggestions": callable(getattr(optimizer, "register_suggestions", None)),
         "stopping_criteria": callable(getattr(optimizer, "should_stop", None)),
         "checkpoint": callable(getattr(optimizer, "checkpoint", None)),
+        "checkpoint_path": isinstance(getattr(cls, "checkpoint_path", None), property),
+        "fixed_parameters": isinstance(getattr(cls, "fixed_parameters", None), property),
+        "reconfigure_search_space": callable(getattr(optimizer, "reconfigure_search_space", None)),
     }
 
 
-class Server:
-    """Dispatch bridge requests to one optimizer built by ``make_optimizer``.
+def search_space_updates(updates: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    """``{"bounds": [lo, hi]}`` → ``(lo, hi)``, ``{"values": [...]}`` → ``[...]``."""
+    converted = {}
+    for name, update in updates.items():
+        if "bounds" in update:
+            lo, hi = update["bounds"]
+            converted[name] = (lo, hi)
+        elif "values" in update:
+            converted[name] = list(update["values"])
+        else:
+            raise ValueError(f"update for {name!r} needs 'bounds' or 'values', got {dict(update)}")
+    return converted
+
+
+class Backend:
+    """How a backend builds its optimizer.
 
     Parameters
     ----------
-    make_optimizer
+    make
         ``(spec, backend) -> optimizer``; called on ``configure``.
+    restore
+        ``(checkpoint_path, backend) -> optimizer``; called on ``restore``.
+        ``None`` when the backend has no checkpoints.
     """
 
-    def __init__(self, make_optimizer: OptimizerFactory) -> None:
-        self._make_optimizer = make_optimizer
+    def __init__(self, make: OptimizerFactory, restore: Callable[[str, Mapping[str, Any]], Any] | None = None) -> None:
+        self.make = make
+        self.restore = restore
+
+
+class Server:
+    """Dispatch bridge requests to one optimizer built by ``backend``."""
+
+    def __init__(self, backend: Backend) -> None:
+        self._backend = backend
         self._optimizer: Any = None
 
     @property
@@ -124,11 +163,13 @@ class Server:
         if method == "ping":
             return "pong"
         if method == "configure":
-            self._optimizer = self._make_optimizer(params["spec"], params.get("backend") or {})
-            return {
-                "name": type(self._optimizer).__name__,
-                "capabilities": capabilities(self._optimizer),
-            }
+            self._optimizer = self._backend.make(params["spec"], params.get("backend") or {})
+            return self._configured()
+        if method == "restore":
+            if self._backend.restore is None:
+                raise ValueError("this backend cannot restore a checkpoint")
+            self._optimizer = self._backend.restore(params["checkpoint_path"], params.get("backend") or {})
+            return self._configured()
         optimizer = self._require()
         if method == "suggest":
             return list(optimizer.suggest(int(params.get("n", 1))))
@@ -151,12 +192,28 @@ class Server:
         if method == "checkpoint":
             optimizer.checkpoint()
             return None
+        if method == "checkpoint_path":
+            return optimizer.checkpoint_path
+        if method == "set_checkpoint_path":
+            optimizer.checkpoint_path = params.get("path")
+            return None
+        if method == "fixed_parameters":
+            return optimizer.fixed_parameters
+        if method == "set_fixed_parameters":
+            optimizer.fixed_parameters = params.get("fixed") or None
+            return None
+        if method == "reconfigure_search_space":
+            optimizer.reconfigure_search_space(search_space_updates(params["updates"]))
+            return None
         raise ValueError(f"unknown method {method!r}")
+
+    def _configured(self) -> dict[str, Any]:
+        return {"name": type(self._optimizer).__name__, "capabilities": capabilities(self._optimizer)}
 
 
 def serve(
     endpoint: str,
-    make_optimizer: OptimizerFactory,
+    backend: Backend,
     *,
     stop: threading.Event | None = None,
     ready: Callable[[str], None] | None = None,
@@ -167,7 +224,7 @@ def serve(
     ``ready`` receives the bound endpoint (a wildcard port resolved) once
     the socket is listening.
     """
-    server = Server(make_optimizer)
+    server = Server(backend)
     context = zmq.Context.instance()
     socket = context.socket(zmq.REP)
     socket.setsockopt(zmq.LINGER, 0)

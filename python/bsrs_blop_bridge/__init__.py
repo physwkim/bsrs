@@ -8,6 +8,6 @@ surface (``suggest`` / ``ingest`` / ``get_best_points``), plus the optional
 ``checkpoint`` methods, which the server reports as capabilities.
 """
 
-from .server import Server, serve
+from .server import Backend, Server, serve
 
-__all__ = ["Server", "serve"]
+__all__ = ["Backend", "Server", "serve"]

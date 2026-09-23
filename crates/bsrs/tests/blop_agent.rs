@@ -9,6 +9,7 @@
 
 #![cfg(feature = "blop")]
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
@@ -18,8 +19,8 @@ use bsrs::backends::soft::{SoftDetector, SoftMotor};
 use bsrs::blop::{
     shared, AcquisitionPlan, AcquisitionUid, Actuator, Agent, BestPoint, ChoiceDof, Dof,
     DofBinding, DofConstraint, EvaluationFunction, ExperimentSpec, Objective, Optimizer, Outcome,
-    OutcomeConstraint, ParameterType, RangeDof, RangeType, ScalarizedObjective, Sensor,
-    SharedOptimizer, Suggestion, TrialId,
+    OutcomeConstraint, ParameterType, Params, RangeDof, RangeType, ScalarizedObjective,
+    SearchSpace, Sensor, SharedOptimizer, Suggestion, TrialId,
 };
 use bsrs::callbacks::CapturingSink;
 use bsrs::core::plan::plan_box;
@@ -40,6 +41,9 @@ struct RecordingOptimizer {
     ingested: Vec<Outcome>,
     checkpoints: usize,
     best: Vec<BestPoint>,
+    checkpoint_path: Option<String>,
+    fixed: Option<Params>,
+    search_space: BTreeMap<String, SearchSpace>,
 }
 
 impl RecordingOptimizer {
@@ -85,6 +89,30 @@ impl Optimizer for RecordingOptimizer {
         self.checkpoints += 1;
         Ok(())
     }
+    fn checkpoint_path(&self) -> Result<Option<String>> {
+        Ok(self.checkpoint_path.clone())
+    }
+    fn set_checkpoint_path(&mut self, path: Option<String>) -> Result<()> {
+        self.checkpoint_path = path;
+        Ok(())
+    }
+    fn fixed_parameters(&self) -> Result<Option<Params>> {
+        Ok(self.fixed.clone())
+    }
+    fn set_fixed_parameters(&mut self, fixed: Option<Params>) -> Result<()> {
+        if let (Some(fixed), Some(spec)) = (&fixed, &self.spec) {
+            let known = spec.parameter_names();
+            if let Some(unknown) = fixed.keys().find(|k| !known.contains(&k.as_str())) {
+                return Err(BsrsError::Plan(format!("Unknown parameter: {unknown}")));
+            }
+        }
+        self.fixed = fixed;
+        Ok(())
+    }
+    fn reconfigure_search_space(&mut self, updates: BTreeMap<String, SearchSpace>) -> Result<()> {
+        self.search_space.extend(updates);
+        Ok(())
+    }
 }
 
 /// The optimizer the agent built, once `build` has run.
@@ -126,6 +154,21 @@ impl Optimizer for Forward {
     }
     fn checkpoint(&mut self) -> Result<()> {
         self.0.lock().unwrap().checkpoint()
+    }
+    fn checkpoint_path(&self) -> Result<Option<String>> {
+        self.0.lock().unwrap().checkpoint_path()
+    }
+    fn set_checkpoint_path(&mut self, path: Option<String>) -> Result<()> {
+        self.0.lock().unwrap().set_checkpoint_path(path)
+    }
+    fn fixed_parameters(&self) -> Result<Option<Params>> {
+        self.0.lock().unwrap().fixed_parameters()
+    }
+    fn set_fixed_parameters(&mut self, fixed: Option<Params>) -> Result<()> {
+        self.0.lock().unwrap().set_fixed_parameters(fixed)
+    }
+    fn reconfigure_search_space(&mut self, updates: BTreeMap<String, SearchSpace>) -> Result<()> {
+        self.0.lock().unwrap().reconfigure_search_space(updates)
     }
 }
 
@@ -207,7 +250,7 @@ fn agent_init() {
     );
     let configured = handle.lock().unwrap().clone().unwrap();
     let spec = configured.lock().unwrap().spec.clone().unwrap();
-    assert_eq!(spec, *agent.spec());
+    assert_eq!(Some(&spec), agent.spec());
     assert_eq!(spec.parameter_names(), ["test_movable1", "test_movable2"]);
     assert_eq!(spec.objective, "test_objective");
     assert_eq!(
@@ -232,7 +275,7 @@ fn agent_spec_is_json_for_a_bridge() {
     .build(make)
     .unwrap();
     assert_eq!(
-        serde_json::to_value(agent.spec()).unwrap(),
+        serde_json::to_value(agent.spec().unwrap()).unwrap(),
         json!({
             "parameters": [
                 {"kind": "choice", "name": "filter", "values": ["none", "Al"], "parameter_type": "str"},
@@ -446,7 +489,7 @@ fn agent_scalarized_objective() {
     let agent = Agent::builder([range("test1")], scalarized, mock_eval::<String>())
         .build(make)
         .unwrap();
-    assert_eq!(agent.spec().objective, "-50 * obj1 + 100 * obj2");
+    assert_eq!(agent.spec().unwrap().objective, "-50 * obj1 + 100 * obj2");
 }
 
 #[tokio::test]
@@ -533,4 +576,185 @@ async fn agent_navigate_to_best_moves_the_actuators() {
 fn shared_helper_builds_a_shared_optimizer() {
     let opt: SharedOptimizer = shared(RecordingOptimizer::default());
     assert_eq!(opt.lock().unwrap().name(), "RecordingOptimizer");
+}
+
+// ---------------------------------------------------------------------------
+//  the Ax-only surface, through the optimizer
+// ---------------------------------------------------------------------------
+
+/// `test_agent_suggest_fixed_dofs`: DOF keys map to parameter names; the
+/// suggestion side is the optimizer's (the bridge tests cover Ax).
+#[test]
+fn agent_set_fixed_dofs() {
+    let (movable2, movable3) = (movable("test_movable2"), movable("test_movable3"));
+    let dof1 = range(movable("test_movable1"));
+    let dof2 = range(movable2);
+    let dof3: Dof = ChoiceDof::new(movable3, ["A", "B", "C", "D", "E"], ParameterType::Str).into();
+    let (handle, make) = recording();
+    let agent = Agent::builder(
+        [dof1, dof2.clone(), dof3.clone()],
+        Objective::maximize("test_objective"),
+        mock_eval::<String>(),
+    )
+    .build(make)
+    .unwrap();
+
+    assert_eq!(agent.fixed_dofs().unwrap(), None);
+    agent
+        .set_fixed_dofs([(&dof2, json!(4)), (&dof3, json!("B"))])
+        .unwrap();
+    assert_eq!(
+        agent.fixed_dofs().unwrap(),
+        Some(Params::from([
+            ("test_movable2".to_string(), json!(4)),
+            ("test_movable3".to_string(), json!("B")),
+        ]))
+    );
+    let configured = handle.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        configured.lock().unwrap().fixed.as_ref().map(|f| f.len()),
+        Some(2)
+    );
+
+    // Empty frees them all, as blop's `fixed_dofs = None`.
+    agent.set_fixed_dofs([]).unwrap();
+    assert_eq!(agent.fixed_dofs().unwrap(), None);
+
+    // A DOF outside the search space is the optimizer's error.
+    let other = range(movable("other"));
+    let err = agent.set_fixed_dofs([(&other, json!(1))]).unwrap_err();
+    assert!(
+        err.to_string().contains("Unknown parameter: other"),
+        "{err}"
+    );
+}
+
+/// `test_reconfigure_search_space`, on the wire to the optimizer.
+#[test]
+fn agent_reconfigure_search_space() {
+    let dof1 = range(movable("test_movable1"));
+    let dof3: Dof = ChoiceDof::new(
+        movable("test_movable3"),
+        ["A", "B", "C", "D", "E"],
+        ParameterType::Str,
+    )
+    .into();
+    let (handle, make) = recording();
+    let agent = Agent::builder(
+        [dof1.clone(), range(movable("test_movable2")), dof3.clone()],
+        Objective::maximize("test_objective"),
+        mock_eval::<String>(),
+    )
+    .build(make)
+    .unwrap();
+
+    agent
+        .reconfigure_search_space([
+            (&dof1, SearchSpace::Bounds(3.0, 6.0)),
+            (&dof3, SearchSpace::Values(vec![json!("A"), json!("B")])),
+        ])
+        .unwrap();
+    let configured = handle.lock().unwrap().clone().unwrap();
+    let configured = configured.lock().unwrap();
+    assert_eq!(
+        configured.search_space,
+        BTreeMap::from([
+            ("test_movable1".to_string(), SearchSpace::Bounds(3.0, 6.0)),
+            (
+                "test_movable3".to_string(),
+                SearchSpace::Values(vec![json!("A"), json!("B")])
+            ),
+        ])
+    );
+}
+
+/// `test_agent_set_checkpoint_after_init`.
+#[test]
+fn agent_set_checkpoint_path_after_build() {
+    let (_, make) = recording();
+    let agent = Agent::builder(
+        [range("x1")],
+        Objective::maximize("obj"),
+        mock_eval::<String>(),
+    )
+    .build(make)
+    .unwrap();
+    assert_eq!(agent.checkpoint_path().unwrap(), None);
+    agent.set_checkpoint_path("/tmp/checkpoint.json").unwrap();
+    assert_eq!(
+        agent.checkpoint_path().unwrap().as_deref(),
+        Some("/tmp/checkpoint.json")
+    );
+}
+
+/// An optimizer without the surface reports so, rather than pretending.
+#[test]
+fn agent_surface_unsupported_by_the_optimizer() {
+    struct Bare;
+    impl Optimizer for Bare {
+        fn suggest(&mut self, _n: usize) -> Result<Vec<Suggestion>> {
+            Ok(vec![])
+        }
+        fn ingest(&mut self, _outcomes: Vec<Outcome>) -> Result<()> {
+            Ok(())
+        }
+        fn best_points(&self) -> Result<Vec<BestPoint>> {
+            Ok(vec![])
+        }
+    }
+    let dof = range("x1");
+    let agent = Agent::builder(
+        [dof.clone()],
+        Objective::maximize("obj"),
+        mock_eval::<String>(),
+    )
+    .build(|_| Ok(shared(Bare)))
+    .unwrap();
+    for err in [
+        agent.fixed_dofs().unwrap_err(),
+        agent.set_fixed_dofs([(&dof, json!(1))]).unwrap_err(),
+        agent
+            .reconfigure_search_space([(&dof, SearchSpace::Bounds(1.0, 2.0))])
+            .unwrap_err(),
+        agent.checkpoint_path().unwrap_err(),
+    ] {
+        assert!(
+            err.to_string().contains("optimizer Bare does not support"),
+            "{err}"
+        );
+    }
+}
+
+/// `Agent.from_checkpoint`'s shape: an agent around a restored optimizer
+/// has no DOFs and no spec, and still runs the plans.
+#[tokio::test]
+async fn agent_from_optimizer_runs_without_a_spec() {
+    let spec = ExperimentSpec {
+        parameters: vec![bsrs::blop::ParameterConfig::Range {
+            name: "test_movable1".into(),
+            bounds: (0.0, 10.0),
+            parameter_type: RangeType::Float,
+            step_size: None,
+            scaling: None,
+        }],
+        objective: "test_objective".into(),
+        parameter_constraints: vec![],
+        outcome_constraints: vec![],
+    };
+    let restored = Arc::new(Mutex::new(RecordingOptimizer::configured(&spec)));
+    let agent = Agent::from_optimizer(
+        Arc::new(Mutex::new(Forward(restored.clone()))),
+        [movable("test_movable1")],
+        [readable("test_readable")],
+        mock_eval::<String>(),
+        Some(mock_acquisition()),
+    );
+    assert!(agent.spec().is_none());
+    assert!(agent.dofs().is_empty());
+    assert_eq!(agent.actuators().len(), 1);
+
+    let re = RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new());
+    let result = re.run_async(agent.optimize(Some(2), 1)).await.unwrap();
+    assert_eq!(result.exit_status, "success", "{}", result.reason);
+    assert_eq!(restored.lock().unwrap().ingested.len(), 2);
 }

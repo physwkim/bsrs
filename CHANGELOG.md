@@ -24,7 +24,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `bsrs::blop::bridge` (feature `blop-bridge`) — `BridgeOptimizer`, an
   `Optimizer` served by another process over ZMQ REQ/REP as JSON, with the
   `bsrs_blop_bridge` Python server in `python/` (`random` and `ax`
-  backends). This is how Ax is driven from bsrs.
+  backends). This is how Ax is driven from bsrs. Ax's extras are optional
+  `Optimizer` methods forwarded by the agent (`set_fixed_dofs`,
+  `reconfigure_search_space`, `set_checkpoint_path`), and
+  `BridgeOptimizer::from_checkpoint` plus `Agent::from_optimizer` resume
+  from a checkpoint.
 - `bsrs::blop::callbacks` — `OptimizationRouter` (forward the `primary`
   stream of optimization runs to a shared, editable sink list) and
   `OptimizationLogger` (plain-text progress tables and running statistics),

@@ -4,6 +4,7 @@
 
 #![cfg(feature = "blop-bridge")]
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -19,7 +20,7 @@ use bsrs::blop::bridge::{BridgeOptimizer, BridgeOptions};
 use bsrs::blop::{
     AcquisitionPlan, AcquisitionUid, Actuator, Agent, Candidate, Dof, DofBinding,
     EvaluationFunction, ExperimentSpec, Objective, Optimizer, Outcome, ParameterConfig, Params,
-    RangeDof, RangeType, Sensor, Suggestion, TrialId,
+    RangeDof, RangeType, SearchSpace, Sensor, Suggestion, TrialId,
 };
 use bsrs::callbacks::CapturingSink;
 use bsrs::core::plan::plan_box;
@@ -67,6 +68,8 @@ impl FakeServer {
         let thread = std::thread::spawn(move || {
             let mut next_id = 0i64;
             let mut points: Vec<Value> = Vec::new();
+            let mut checkpoint_path = Value::Null;
+            let mut fixed = Value::Null;
             while !stop2.load(Ordering::SeqCst) {
                 let bytes = match socket.recv_bytes(0) {
                     Ok(b) => b,
@@ -123,6 +126,20 @@ impl FakeServer {
                     }
                     "should_stop" => json!({ "result": [false, null] }),
                     "checkpoint" | "register_failures" => json!({ "result": null }),
+                    "checkpoint_path" => json!({ "result": checkpoint_path }),
+                    "set_checkpoint_path" => {
+                        checkpoint_path = params["path"].clone();
+                        json!({ "result": null })
+                    }
+                    "fixed_parameters" => json!({ "result": fixed }),
+                    "set_fixed_parameters" => {
+                        fixed = params["fixed"].clone();
+                        json!({ "result": null })
+                    }
+                    "reconfigure_search_space" => json!({ "result": null }),
+                    "restore" => json!({ "result": {
+                        "name": "RestoredOptimizer", "capabilities": capabilities,
+                    }}),
                     "boom" => json!({ "error": "RuntimeError: boom" }),
                     other => json!({ "error": format!("unknown method {other:?}") }),
                 };
@@ -163,7 +180,10 @@ impl Drop for FakeServer {
 }
 
 fn all_capabilities() -> Value {
-    json!({ "register_suggestions": true, "stopping_criteria": true, "checkpoint": true })
+    json!({
+        "register_suggestions": true, "stopping_criteria": true, "checkpoint": true,
+        "checkpoint_path": true, "fixed_parameters": true, "reconfigure_search_space": true,
+    })
 }
 
 fn spec() -> ExperimentSpec {
@@ -330,6 +350,90 @@ fn optional_protocols_go_over_the_wire() {
     );
     let failures = &server.requests()[2]["params"]["suggestions"];
     assert_eq!(failures, &json!([{ "_id": 0, "x1": 9.0, "x2": 1.0 }]));
+}
+
+#[test]
+fn ax_surface_goes_over_the_wire() {
+    let server = FakeServer::start(all_capabilities());
+    let mut bridge = BridgeOptimizer::connect(&server.endpoint, &spec(), options(2000)).unwrap();
+
+    assert_eq!(bridge.checkpoint_path().unwrap(), None);
+    bridge
+        .set_checkpoint_path(Some("/tmp/c.json".into()))
+        .unwrap();
+    assert_eq!(
+        bridge.checkpoint_path().unwrap().as_deref(),
+        Some("/tmp/c.json")
+    );
+
+    assert_eq!(bridge.fixed_parameters().unwrap(), None);
+    let fixed = Params::from([("x2".to_string(), json!(4.0))]);
+    bridge.set_fixed_parameters(Some(fixed.clone())).unwrap();
+    assert_eq!(bridge.fixed_parameters().unwrap(), Some(fixed));
+    bridge.set_fixed_parameters(None).unwrap();
+    assert_eq!(bridge.fixed_parameters().unwrap(), None);
+
+    bridge
+        .reconfigure_search_space(BTreeMap::from([
+            ("x1".to_string(), SearchSpace::Bounds(3.0, 6.0)),
+            (
+                "x2".to_string(),
+                SearchSpace::Values(vec![json!("A"), json!("B")]),
+            ),
+        ]))
+        .unwrap();
+
+    let requests = server.requests();
+    assert_eq!(requests[2]["params"], json!({ "path": "/tmp/c.json" }));
+    assert_eq!(requests[5]["params"], json!({ "fixed": { "x2": 4.0 } }));
+    assert_eq!(requests[7]["params"], json!({ "fixed": null }));
+    assert_eq!(
+        requests[9]["params"],
+        json!({ "updates": {
+            "x1": { "bounds": [3.0, 6.0] },
+            "x2": { "values": ["A", "B"] },
+        }})
+    );
+}
+
+#[test]
+fn ax_surface_is_refused_without_the_capability() {
+    let server = FakeServer::start(json!({ "checkpoint": true }));
+    let mut bridge = BridgeOptimizer::connect(&server.endpoint, &spec(), options(2000)).unwrap();
+    for err in [
+        bridge.checkpoint_path().unwrap_err(),
+        bridge.fixed_parameters().unwrap_err(),
+        bridge.set_fixed_parameters(None).unwrap_err(),
+        bridge
+            .reconfigure_search_space(BTreeMap::new())
+            .unwrap_err(),
+    ] {
+        assert!(
+            err.to_string()
+                .contains("optimizer FakeOptimizer does not support"),
+            "{err}"
+        );
+    }
+    assert_eq!(
+        server.methods(),
+        ["configure"],
+        "nothing went over the wire"
+    );
+}
+
+#[test]
+fn from_checkpoint_sends_restore() {
+    let server = FakeServer::start(all_capabilities());
+    let bridge =
+        BridgeOptimizer::from_checkpoint(&server.endpoint, "/tmp/c.json", options(2000)).unwrap();
+    assert_eq!(bridge.name(), "RestoredOptimizer");
+    assert!(bridge.supports_checkpoint());
+    let requests = server.requests();
+    assert_eq!(requests[0]["method"], "restore");
+    assert_eq!(
+        requests[0]["params"],
+        json!({ "checkpoint_path": "/tmp/c.json", "backend": { "seed": 1 } })
+    );
 }
 
 #[test]
@@ -570,4 +674,69 @@ async fn python_ax_backend_end_to_end() {
     let (best, events) = optimize_over(&endpoint, ax_options()).await;
     assert_eq!(events, 3);
     assert_eq!(best.len(), 1);
+
+    // The Ax-only surface: fix, narrow, checkpoint, restore.
+    let dir = tempdir();
+    let path = dir.join("checkpoint.json");
+    let mut ax = BridgeOptimizer::connect(&endpoint, &spec(), ax_options()).unwrap();
+    assert!(ax.capabilities().fixed_parameters);
+    ax.set_checkpoint_path(Some(path.to_string_lossy().into_owned()))
+        .unwrap();
+    ax.set_fixed_parameters(Some(Params::from([("x2".to_string(), json!(4.0))])))
+        .unwrap();
+    let suggestions = ax.suggest(3).unwrap();
+    for s in &suggestions[1..] {
+        // the first trial is the centre of the search space
+        assert_eq!(s.params["x2"], json!(4.0), "{s:?}");
+    }
+    ax.set_fixed_parameters(None).unwrap();
+    // Ax's Sobol node wants data before it generates more. The centre trial
+    // gets the top value: it is the one point sure to stay inside the
+    // narrowed bounds below, and Ax's best point is filtered to the space.
+    ax.ingest(
+        suggestions
+            .iter()
+            .enumerate()
+            .map(|(i, s)| out(s.id.clone(), -(i as f64)))
+            .collect(),
+    )
+    .unwrap();
+    ax.reconfigure_search_space(BTreeMap::from([(
+        "x1".to_string(),
+        SearchSpace::Bounds(3.0, 6.0),
+    )]))
+    .unwrap();
+    for s in ax.suggest(3).unwrap() {
+        let x1 = s.params["x1"].as_f64().unwrap();
+        assert!((3.0..=6.0).contains(&x1), "{s:?}");
+    }
+    ax.checkpoint().unwrap();
+    assert!(path.exists());
+    let best = ax.best_points().unwrap();
+    assert_eq!(best.len(), 1);
+    assert_eq!(best[0].id, suggestions[0].id);
+
+    let restored =
+        BridgeOptimizer::from_checkpoint(&endpoint, &path.to_string_lossy(), ax_options()).unwrap();
+    assert_eq!(restored.name(), "AxOptimizer");
+    assert_eq!(
+        restored.checkpoint_path().unwrap().as_deref(),
+        Some(&*path.to_string_lossy())
+    );
+    assert_eq!(restored.best_points().unwrap(), best);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A fresh directory under the target dir, so no temp-file crate is needed.
+fn tempdir() -> std::path::PathBuf {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "blop-bridge-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
 }

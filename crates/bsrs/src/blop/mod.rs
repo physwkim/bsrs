@@ -39,9 +39,13 @@
 //!   objective templates are validated by whole word, where blop tests for
 //!   a substring.
 //! - The agent takes an optimizer factory over the `ExperimentSpec` instead
-//!   of constructing Ax's client; the Ax-specific surface (`fixed_dofs`,
-//!   `reconfigure_search_space`, `from_checkpoint`, `plot_objective`) and
-//!   the per-agent callback list are not ported; blop's callbacks are
+//!   of constructing Ax's client. Ax's extras (`fixed_dofs`,
+//!   `reconfigure_search_space`, `checkpoint_path`) are optional
+//!   [`Optimizer`](crate::blop::protocol::Optimizer) methods the agent
+//!   forwards, and `from_checkpoint` is the optimizer's to offer, then
+//!   [`Agent::from_optimizer`](crate::blop::agent::Agent::from_optimizer).
+//!   `plot_objective` and the per-agent callback list are not ported;
+//!   blop's callbacks are
 //!   [`DocumentSink`](crate::engine::sink::DocumentSink)s in
 //!   [`callbacks`](crate::blop::callbacks), subscribed on the RunEngine.
 //! - Each blop run key is a bsrs run: bluesky's `set_run_key_wrapper` sets
@@ -81,8 +85,8 @@ pub use plans::{
 pub use protocol::{
     collect_optimization_metadata, shared, validate_outcomes, validate_suggestions, AcquireArgs,
     AcquisitionPlan, AcquisitionUid, Actuator, BestPoint, Candidate, EvaluationFunction,
-    OptimizationProblem, Optimizer, Outcome, Params, PlanWithResult, Sensor, SharedOptimizer,
-    Suggestion, TrialId, ID_KEY,
+    OptimizationProblem, Optimizer, Outcome, Params, PlanWithResult, SearchSpace, Sensor,
+    SharedOptimizer, Suggestion, TrialId, ID_KEY,
 };
 pub use routing::route_suggestions;
 pub use stubs::{

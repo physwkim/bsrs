@@ -16,7 +16,11 @@
 //! [`BridgeOptimizer::connect`] sends the agent's
 //! [`ExperimentSpec`] as `configure` and learns the server's optimizer
 //! name and which optional protocols it implements; those answer the
-//! `supports_*` methods of [`Optimizer`]. The calls block the caller for up
+//! `supports_*` methods of [`Optimizer`], and gate the Ax-only surface
+//! (`fixed_parameters`, `reconfigure_search_space`, `checkpoint_path`)
+//! so an unsupporting backend fails before the round trip.
+//! [`BridgeOptimizer::from_checkpoint`] has the backend restore the
+//! optimizer from a checkpoint file instead. The calls block the caller for up
 //! to [`BridgeOptions::timeout`]; on a multi-thread tokio runtime they run
 //! under `block_in_place` so the worker is released, on a current-thread
 //! runtime (`#[tokio::test]`) they block it, as no other task can make
@@ -27,6 +31,7 @@
 //! `ZMQ_REQ_CORRELATE`, so the next request goes out regardless and a late
 //! reply to the old one is dropped.
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -35,8 +40,8 @@ use serde_json::{json, Value};
 
 use crate::blop::agent::ExperimentSpec;
 use crate::blop::protocol::{
-    shared, BestPoint, Candidate, Optimizer, Outcome, Params, SharedOptimizer, Suggestion, TrialId,
-    ID_KEY,
+    shared, BestPoint, Candidate, Optimizer, Outcome, Params, SearchSpace, SharedOptimizer,
+    Suggestion, TrialId, ID_KEY,
 };
 use crate::core::error::{BsrsError, Result};
 
@@ -74,6 +79,15 @@ pub struct Capabilities {
     /// `Checkpointable`.
     #[serde(default)]
     pub checkpoint: bool,
+    /// A `checkpoint_path` attribute (Ax).
+    #[serde(default)]
+    pub checkpoint_path: bool,
+    /// A `fixed_parameters` attribute (Ax).
+    #[serde(default)]
+    pub fixed_parameters: bool,
+    /// A `reconfigure_search_space` method (Ax).
+    #[serde(default)]
+    pub reconfigure_search_space: bool,
 }
 
 #[derive(Deserialize)]
@@ -115,11 +129,38 @@ impl BridgeOptimizer {
     /// with `spec`. Fails if the server does not answer `configure` within
     /// the timeout, or its optimizer rejects the spec.
     pub fn connect(endpoint: &str, spec: &ExperimentSpec, options: BridgeOptions) -> Result<Self> {
+        let mut this = Self::open(endpoint, options.timeout)?;
+        this.configure(
+            "configure",
+            json!({ "spec": spec, "backend": options.backend }),
+        )?;
+        Ok(this)
+    }
+
+    /// Connect to the server at `endpoint` and have its backend restore
+    /// the optimizer from `checkpoint_path` — `AxOptimizer.from_checkpoint`
+    /// for the `ax` backend. Wrap in [`shared`] for
+    /// [`Agent::from_optimizer`](crate::blop::agent::Agent::from_optimizer).
+    pub fn from_checkpoint(
+        endpoint: &str,
+        checkpoint_path: &str,
+        options: BridgeOptions,
+    ) -> Result<Self> {
+        let mut this = Self::open(endpoint, options.timeout)?;
+        this.configure(
+            "restore",
+            json!({ "checkpoint_path": checkpoint_path, "backend": options.backend }),
+        )?;
+        Ok(this)
+    }
+
+    /// The socket, before any `configure`/`restore`.
+    fn open(endpoint: &str, timeout: Duration) -> Result<Self> {
         let context = zmq::Context::new();
         let socket = context
             .socket(zmq::REQ)
             .map_err(|e| Self::zmq_error(endpoint, "socket", e))?;
-        let millis = i32::try_from(options.timeout.as_millis()).unwrap_or(i32::MAX);
+        let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
         socket
             .set_linger(0)
             .and_then(|_| socket.set_rcvtimeo(millis))
@@ -128,23 +169,24 @@ impl BridgeOptimizer {
             .and_then(|_| socket.set_req_correlate(true))
             .and_then(|_| socket.connect(endpoint))
             .map_err(|e| Self::zmq_error(endpoint, "connect", e))?;
-        let mut this = Self {
+        Ok(Self {
             _context: context,
             socket: Mutex::new(socket),
             endpoint: endpoint.to_owned(),
-            timeout: options.timeout,
+            timeout,
             name: String::new(),
             capabilities: Capabilities::default(),
-        };
-        let reply = this.call(
-            "configure",
-            json!({ "spec": spec, "backend": options.backend }),
-        )?;
+        })
+    }
+
+    /// Send `configure` or `restore` and record what the server reports.
+    fn configure(&mut self, method: &str, params: Value) -> Result<()> {
+        let reply = self.call(method, params)?;
         let configured: Configured = serde_json::from_value(reply)
-            .map_err(|e| this.error("configure", format!("malformed reply: {e}")))?;
-        this.name = configured.name;
-        this.capabilities = configured.capabilities;
-        Ok(this)
+            .map_err(|e| self.error(method, format!("malformed reply: {e}")))?;
+        self.name = configured.name;
+        self.capabilities = configured.capabilities;
+        Ok(())
     }
 
     /// An optimizer factory for
@@ -200,6 +242,18 @@ impl BridgeOptimizer {
 
     fn zmq_error(endpoint: &str, what: &str, e: zmq::Error) -> BsrsError {
         BsrsError::Backend(format!("blop bridge {what} at {endpoint}: {e}"))
+    }
+
+    /// Fail before the round trip when the server said it cannot.
+    fn require(&self, capability: bool, what: &str) -> Result<()> {
+        if capability {
+            Ok(())
+        } else {
+            Err(BsrsError::Plan(format!(
+                "optimizer {} does not support {what}",
+                self.name
+            )))
+        }
     }
 
     fn suggestions(&self, method: &str, reply: Value) -> Result<Vec<Suggestion>> {
@@ -339,5 +393,44 @@ impl Optimizer for BridgeOptimizer {
 
     fn checkpoint(&mut self) -> Result<()> {
         self.call("checkpoint", json!({})).map(|_| ())
+    }
+
+    fn checkpoint_path(&self) -> Result<Option<String>> {
+        self.require(self.capabilities.checkpoint_path, "checkpoint_path")?;
+        let reply = self.call("checkpoint_path", json!({}))?;
+        serde_json::from_value(reply)
+            .map_err(|e| self.error("checkpoint_path", format!("malformed reply: {e}")))
+    }
+
+    fn set_checkpoint_path(&mut self, path: Option<String>) -> Result<()> {
+        self.require(self.capabilities.checkpoint_path, "checkpoint_path")?;
+        self.call("set_checkpoint_path", json!({ "path": path }))
+            .map(|_| ())
+    }
+
+    fn fixed_parameters(&self) -> Result<Option<Params>> {
+        self.require(self.capabilities.fixed_parameters, "fixed_parameters")?;
+        let reply = self.call("fixed_parameters", json!({}))?;
+        serde_json::from_value(reply)
+            .map_err(|e| self.error("fixed_parameters", format!("malformed reply: {e}")))
+    }
+
+    fn set_fixed_parameters(&mut self, fixed: Option<Params>) -> Result<()> {
+        self.require(self.capabilities.fixed_parameters, "fixed_parameters")?;
+        self.call("set_fixed_parameters", json!({ "fixed": fixed }))
+            .map(|_| ())
+    }
+
+    fn reconfigure_search_space(&mut self, updates: BTreeMap<String, SearchSpace>) -> Result<()> {
+        self.require(
+            self.capabilities.reconfigure_search_space,
+            "reconfigure_search_space",
+        )?;
+        let updates: serde_json::Map<String, Value> = updates
+            .iter()
+            .map(|(name, space)| (name.clone(), space.to_value()))
+            .collect();
+        self.call("reconfigure_search_space", json!({ "updates": updates }))
+            .map(|_| ())
     }
 }

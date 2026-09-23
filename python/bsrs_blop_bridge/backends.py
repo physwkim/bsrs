@@ -15,7 +15,7 @@ import random
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from .server import ID_KEY
+from .server import ID_KEY, Backend
 
 Spec = Mapping[str, Any]
 
@@ -44,14 +44,49 @@ class RandomOptimizer:
         self._parameters = list(spec["parameters"])
         self._objectives = parse_objectives(spec["objective"])
         self._rng = random.Random(seed)
+        self._fixed: dict[str, Any] | None = None
         self._next_id = 0
         self._params_by_id: dict[Any, dict[str, Any]] = {}
         self._outcomes_by_id: dict[Any, dict[str, Any]] = {}
 
+    @property
+    def fixed_parameters(self) -> dict[str, Any] | None:
+        """Parameters held at a value for future suggestions."""
+        return self._fixed
+
+    @fixed_parameters.setter
+    def fixed_parameters(self, fixed: Mapping[str, Any] | None) -> None:
+        if not fixed:
+            self._fixed = None
+            return
+        unknown = set(fixed) - {p["name"] for p in self._parameters}
+        if unknown:
+            raise KeyError(f"Unknown parameter(s): {sorted(unknown)}")
+        self._fixed = dict(fixed)
+
+    def reconfigure_search_space(self, updates: Mapping[str, tuple[float, float] | list]) -> None:
+        """Replace bounds (range) or values (choice); all or nothing."""
+        by_name = {p["name"]: p for p in self._parameters}
+        new = {}
+        for name, update in updates.items():
+            p = dict(by_name[name])
+            if p["kind"] == "range":
+                if not isinstance(update, tuple):
+                    raise TypeError(f"range parameter {name!r} takes (lower, upper), got {update!r}")
+                p["bounds"] = list(update)
+            else:
+                if not isinstance(update, list):
+                    raise TypeError(f"choice parameter {name!r} takes a list of values, got {update!r}")
+                p["values"] = list(update)
+            new[name] = p
+        self._parameters = [new.get(p["name"], p) for p in self._parameters]
+
     def _sample(self) -> dict[str, Any]:
         point = {}
         for p in self._parameters:
-            if p["kind"] == "range":
+            if self._fixed and p["name"] in self._fixed:
+                point[p["name"]] = self._fixed[p["name"]]
+            elif p["kind"] == "range":
                 lo, hi = p["bounds"]
                 value = self._rng.uniform(lo, hi)
                 step = p.get("step_size")
@@ -168,4 +203,13 @@ def make_ax(spec: Spec, backend: Mapping[str, Any]) -> Any:
     )
 
 
-BACKENDS = {"random": make_random, "ax": make_ax}
+def restore_ax(checkpoint_path: str, backend: Mapping[str, Any]) -> Any:
+    """``AxOptimizer.from_checkpoint``; ``backend`` is unused, the file has it all."""
+    try:
+        from blop.ax.optimizer import AxOptimizer
+    except ImportError as e:  # pragma: no cover - depends on the environment
+        raise ImportError("the ax backend needs `pip install blop[ax]`") from e
+    return AxOptimizer.from_checkpoint(checkpoint_path)
+
+
+BACKENDS = {"random": Backend(make_random), "ax": Backend(make_ax, restore_ax)}
