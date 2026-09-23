@@ -314,7 +314,7 @@ impl<U: AcquisitionUid> Agent<U> {
 
     /// Run the optimization loop: `iterations` steps of `n_points`, or
     /// until the optimizer's stopping criterion when `iterations` is
-    /// `None` — [`optimize`](super::plans::optimize) on the agent's problem.
+    /// `None` — [`optimize`] on the agent's problem.
     pub fn optimize(&self, iterations: Option<usize>, n_points: usize) -> Plan {
         optimize(
             &self.to_optimization_problem(),
@@ -323,9 +323,8 @@ impl<U: AcquisitionUid> Agent<U> {
         )
     }
 
-    /// Run the optimization loop inside one run —
-    /// [`optimize_in_run`](super::plans::optimize_in_run) on the agent's
-    /// problem.
+    /// Run the optimization loop inside one run — [`optimize_in_run`] on
+    /// the agent's problem.
     pub fn optimize_in_run(&self, iterations: usize, n_points: usize) -> Plan {
         optimize_in_run(
             &self.to_optimization_problem(),
