@@ -291,7 +291,7 @@ def test_xopt_backend_optimizes_a_quadratic(tmp_path):
     assert best["outcomes"]["loss"] < 100.0
 
     # A fitted Bayesian generator does not survive blop's model_dump /
-    # model_validate checkpoint (XoptError: cannot load torch module), so
+    # model_validate checkpoint (bluesky/blop#379), so
     # the roundtrip is on the random generator, as in blop's own tests.
     server = Server(BACKENDS["xopt"])
     call(server, "configure", spec=spec, backend={"generator": "random", "checkpoint_path": path})

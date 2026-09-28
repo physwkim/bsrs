@@ -53,8 +53,8 @@ surface, and ships three backends:
   neither, and an outcome constraint must be `name <= bound` or
   `name >= bound`. Xopt has none of Ax's extras, and its checkpoint
   path is read-only, so `checkpoint_path` is reported as unsupported.
-  A fitted Bayesian generator does not survive Xopt's checkpoint round
-  trip; the `random` generator does.
+  A fitted Bayesian generator does not survive blop's checkpoint round
+  trip (bluesky/blop#379); the `random` generator does.
 
 ```sh
 cd python && pip install -e '.[ax,xopt]'
