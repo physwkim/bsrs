@@ -290,9 +290,8 @@ def test_xopt_backend_optimizes_a_quadratic(tmp_path):
     assert set(best["params"]) == {"x1", "x2"}
     assert best["outcomes"]["loss"] < 100.0
 
-    # A fitted Bayesian generator does not survive blop's model_dump /
-    # model_validate checkpoint (bluesky/blop#379), so
-    # the roundtrip is on the random generator, as in blop's own tests.
+    # The random generator round-trips on any blop; the Bayesian one is
+    # its own test, as it needs the fix for bluesky/blop#379.
     server = Server(BACKENDS["xopt"])
     call(server, "configure", spec=spec, backend={"generator": "random", "checkpoint_path": path})
     suggestions = call(server, "suggest", n=3)
@@ -308,3 +307,29 @@ def test_xopt_backend_optimizes_a_quadratic(tmp_path):
 
     reply = json.loads(server.handle(json.dumps({"method": "configure", "params": {"spec": spec, "backend": {"seed": 1}}}).encode()))
     assert "unknown xopt backend option" in reply["error"]
+
+
+def test_xopt_bayesian_checkpoint_roundtrip(tmp_path):
+    pytest.importorskip("xopt")
+    path = str(tmp_path / "checkpoint.json")
+    spec = {
+        "parameters": [{"kind": "range", "name": "x1", "bounds": [-5.0, 5.0], "parameter_type": "float"}],
+        "objective": "-loss",
+        "parameter_constraints": [],
+        "outcome_constraints": [],
+    }
+    server = Server(BACKENDS["xopt"])
+    call(server, "configure", spec=spec, backend={"generator": "expected_improvement", "checkpoint_path": path})
+    for _ in range(2):  # the second round fits the model
+        suggestions = call(server, "suggest", n=2)
+        call(server, "ingest", points=[{"_id": s["_id"], "loss": (s["x1"] - 1) ** 2} for s in suggestions])
+    call(server, "checkpoint")
+    (best,) = call(server, "best_points")
+
+    restored = Server(BACKENDS["xopt"])
+    reply = json.loads(restored.handle(json.dumps({"method": "restore", "params": {"checkpoint_path": path}}).encode()))
+    if "cannot load torch module" in reply.get("error", ""):
+        pytest.skip("blop without the fix for bluesky/blop#379 cannot restore a fitted Bayesian generator")
+    assert reply["result"]["name"] == "XoptOptimizer"
+    assert call(restored, "best_points") == [best]
+    assert len(call(restored, "suggest", n=2)) == 2

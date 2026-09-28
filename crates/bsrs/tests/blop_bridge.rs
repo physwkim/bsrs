@@ -794,6 +794,45 @@ async fn python_xopt_backend_end_to_end() {
     assert_eq!(restored.name(), "XoptOptimizer");
     assert_eq!(restored.best_points().unwrap(), best);
     assert_eq!(restored.suggest(2).unwrap().len(), 2);
+
+    // A fitted Bayesian generator round-trips only with the fix for
+    // bluesky/blop#379; blop 1.1.0 fails on restore, and that is a skip.
+    let path = dir.join("bayesian.json");
+    let mut ei = BridgeOptimizer::connect(
+        &endpoint,
+        &spec(),
+        xopt_options(json!({ "generator": "expected_improvement", "checkpoint_path": path })),
+    )
+    .unwrap();
+    for _ in 0..2 {
+        let suggestions = ei.suggest(2).unwrap();
+        ei.ingest(
+            suggestions
+                .iter()
+                .map(|s| out(s.id.clone(), -s.params["x1"].as_f64().unwrap().powi(2)))
+                .collect(),
+        )
+        .unwrap();
+    }
+    ei.checkpoint().unwrap();
+    let best = ei.best_points().unwrap();
+    match BridgeOptimizer::from_checkpoint(
+        &endpoint,
+        &path.to_string_lossy(),
+        xopt_options(json!({})),
+    ) {
+        Ok(mut restored) => {
+            assert_eq!(restored.name(), "XoptOptimizer");
+            assert_eq!(restored.best_points().unwrap(), best);
+            assert_eq!(restored.suggest(2).unwrap().len(), 2);
+        }
+        Err(e) if e.to_string().contains("cannot load torch module") => {
+            eprintln!(
+                "blop without the fix for bluesky/blop#379; skipping the Bayesian round trip: {e}"
+            );
+        }
+        Err(e) => panic!("{e}"),
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
