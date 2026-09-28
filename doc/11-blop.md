@@ -38,15 +38,26 @@ The `blop-bridge` feature adds `blop::bridge::BridgeOptimizer`, an
 `Optimizer` whose calls go to another process over a ZMQ REQ/REP socket
 as JSON. The server is the `bsrs_blop_bridge` Python package in
 [`python/`](../python/); it serves any object with blop's `Optimizer`
-surface, and ships two backends:
+surface, and ships three backends:
 
 - `random` — uniform random search over the spec, no dependencies beyond
   pyzmq; the reference for tests and a random-search baseline.
 - `ax` — `blop.ax.optimizer.AxOptimizer` configured from the spec
   (`pip install blop[ax]`).
+- `xopt` — `blop.xopt.optimizer.XoptOptimizer` around one Xopt generator
+  (`pip install blop[xopt]`); `backend` picks it by Xopt's registry name
+  (`{"generator": "expected_improvement"}`, default `random`), passes
+  `generator_kwargs`, and fixes `checkpoint_path`. The spec's search space
+  becomes a `VOCS`: ranges are continuous, numeric choices are discrete,
+  string choices and parameter constraints are refused since Xopt has
+  neither, and an outcome constraint must be `name <= bound` or
+  `name >= bound`. Xopt has none of Ax's extras, and its checkpoint
+  path is read-only, so `checkpoint_path` is reported as unsupported.
+  A fitted Bayesian generator does not survive Xopt's checkpoint round
+  trip; the `random` generator does.
 
 ```sh
-cd python && pip install -e '.[ax]'
+cd python && pip install -e '.[ax,xopt]'
 python -m bsrs_blop_bridge --endpoint tcp://127.0.0.1:5590 --backend ax
 ```
 
@@ -97,9 +108,10 @@ is dropped.
 `crates/bsrs/tests/blop_bridge.rs` drives the client against a scripted
 REP server in a thread; set `BSRS_BLOP_PYTHON=/path/to/python` (an
 interpreter with pyzmq) to also run it against the real server's `random`
-backend, and against the `ax` backend when `blop[ax]` is installed there.
-`python/tests/` covers the server with pytest; its Ax case skips without
-Ax.
+backend, and against the `ax` and `xopt` backends when `blop[ax]` and
+`blop[xopt]` are installed there.
+`python/tests/` covers the server with pytest; its Ax and Xopt cases skip
+without them.
 
 ## Callbacks
 

@@ -222,3 +222,89 @@ def test_ax_checkpoint_restore_fixed_and_search_space(tmp_path):
     assert result["name"] == "AxOptimizer"
     assert call(restored, "checkpoint_path") == path
     assert call(restored, "best_points") == [best]
+
+
+def test_xopt_vocs_from_spec():
+    pytest.importorskip("xopt")
+    from bsrs_blop_bridge.backends import vocs_from_spec
+
+    spec = {
+        "parameters": [
+            {"kind": "range", "name": "x", "bounds": [0, 10], "parameter_type": "float"},
+            {"kind": "range", "name": "n", "bounds": [1, 4], "parameter_type": "int", "step_size": 1},
+            {"kind": "choice", "name": "gain", "values": [1, 10, 100], "parameter_type": "int"},
+        ],
+        "objective": "intensity, -width",
+        "parameter_constraints": [],
+        "outcome_constraints": ["width <= 1.5", "intensity >= 0"],
+    }
+    vocs = vocs_from_spec(spec)
+    assert vocs.variables["x"].domain == [0.0, 10.0]
+    assert vocs.variables["n"].domain == [1.0, 4.0]
+    assert vocs.variables["gain"].values == {1, 10, 100}
+    assert {name: type(o).__name__ for name, o in vocs.objectives.items()} == {
+        "intensity": "MaximizeObjective",
+        "width": "MinimizeObjective",
+    }
+    assert {name: type(c).__name__ for name, c in vocs.constraints.items()} == {
+        "width": "LessThanConstraint",
+        "intensity": "GreaterThanConstraint",
+    }
+
+    with pytest.raises(ValueError, match="non-numeric"):
+        vocs_from_spec({**spec, "parameters": [{"kind": "choice", "name": "f", "values": ["a"], "parameter_type": "str"}]})
+    with pytest.raises(ValueError, match="no parameter constraints"):
+        vocs_from_spec({**spec, "parameter_constraints": ["x + n <= 5"]})
+    with pytest.raises(ValueError, match="cannot express"):
+        vocs_from_spec({**spec, "outcome_constraints": ["width + 1 <= 2"]})
+
+
+def test_xopt_backend_optimizes_a_quadratic(tmp_path):
+    pytest.importorskip("xopt")
+    path = str(tmp_path / "checkpoint.json")
+    spec = {
+        "parameters": [
+            {"kind": "range", "name": "x1", "bounds": [-5.0, 5.0], "parameter_type": "float"},
+            {"kind": "range", "name": "x2", "bounds": [-5.0, 5.0], "parameter_type": "float"},
+        ],
+        "objective": "-loss",
+        "parameter_constraints": [],
+        "outcome_constraints": [],
+    }
+    server = Server(BACKENDS["xopt"])
+    configured = call(server, "configure", spec=spec, backend={"generator": "expected_improvement"})
+    assert configured["name"] == "XoptOptimizer"
+    assert configured["capabilities"] == {
+        "register_suggestions": True,
+        "stopping_criteria": False,
+        "checkpoint": True,
+        "checkpoint_path": False,  # read-only on XoptOptimizer
+        "fixed_parameters": False,
+        "reconfigure_search_space": False,
+    }
+    for _ in range(3):
+        suggestions = call(server, "suggest", n=2)
+        assert len(suggestions) == 2
+        call(server, "ingest", points=[{"_id": s["_id"], "loss": (s["x1"] - 1) ** 2 + (s["x2"] + 2) ** 2} for s in suggestions])
+    (best,) = call(server, "best_points")
+    assert set(best["params"]) == {"x1", "x2"}
+    assert best["outcomes"]["loss"] < 100.0
+
+    # A fitted Bayesian generator does not survive blop's model_dump /
+    # model_validate checkpoint (XoptError: cannot load torch module), so
+    # the roundtrip is on the random generator, as in blop's own tests.
+    server = Server(BACKENDS["xopt"])
+    call(server, "configure", spec=spec, backend={"generator": "random", "checkpoint_path": path})
+    suggestions = call(server, "suggest", n=3)
+    call(server, "ingest", points=[{"_id": s["_id"], "loss": float(i)} for i, s in enumerate(suggestions)])
+    call(server, "checkpoint")
+    (best,) = call(server, "best_points")
+    assert best["_id"] == suggestions[0]["_id"]  # "-loss" is maximised
+
+    restored = Server(BACKENDS["xopt"])
+    assert call(restored, "restore", checkpoint_path=path)["name"] == "XoptOptimizer"
+    assert call(restored, "best_points") == [best]
+    assert len(call(restored, "suggest", n=2)) == 2
+
+    reply = json.loads(server.handle(json.dumps({"method": "configure", "params": {"spec": spec, "backend": {"seed": 1}}}).encode()))
+    assert "unknown xopt backend option" in reply["error"]

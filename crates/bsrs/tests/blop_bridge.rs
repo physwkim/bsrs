@@ -727,6 +727,76 @@ async fn python_ax_backend_end_to_end() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn python_xopt_backend_end_to_end() {
+    let Some((_server, endpoint)) = spawn_python_server("xopt") else {
+        return;
+    };
+    let xopt_options = |backend: Value| BridgeOptions {
+        backend,
+        timeout: Duration::from_secs(120),
+    };
+    let probe = BridgeOptimizer::connect(&endpoint, &spec(), xopt_options(json!({})));
+    if let Err(e) = &probe {
+        if e.to_string().contains("ImportError") {
+            eprintln!("xopt not installed in BSRS_BLOP_PYTHON; skipping: {e}");
+            return;
+        }
+    }
+    let probe = probe.unwrap();
+    assert_eq!(probe.name(), "XoptOptimizer");
+    assert!(probe.supports_register_suggestions());
+    assert!(!probe.supports_stopping_criteria());
+    assert!(probe.supports_checkpoint());
+    assert!(!probe.capabilities().checkpoint_path, "read-only on Xopt");
+    assert!(!probe.capabilities().fixed_parameters);
+    drop(probe);
+
+    let (best, events) = optimize_over(&endpoint, xopt_options(json!({}))).await;
+    assert_eq!(events, 3);
+    assert_eq!(best.len(), 1);
+
+    // Checkpoint and restore; the path is fixed at construction on Xopt.
+    let dir = tempdir();
+    let path = dir.join("checkpoint.json");
+    let mut xopt = BridgeOptimizer::connect(
+        &endpoint,
+        &spec(),
+        xopt_options(json!({ "generator": "random", "checkpoint_path": path })),
+    )
+    .unwrap();
+    assert!(matches!(
+        xopt.set_checkpoint_path(None),
+        Err(e) if e.to_string().contains("does not support checkpoint_path")
+    ));
+    let suggestions = xopt.suggest(3).unwrap();
+    assert_eq!(suggestions.len(), 3);
+    xopt.ingest(
+        suggestions
+            .iter()
+            .enumerate()
+            .map(|(i, s)| out(s.id.clone(), i as f64))
+            .collect(),
+    )
+    .unwrap();
+    xopt.checkpoint().unwrap();
+    assert!(path.exists());
+    let best = xopt.best_points().unwrap();
+    assert_eq!(best.len(), 1);
+    assert_eq!(best[0].id, suggestions[2].id, "test_objective is maximised");
+
+    let mut restored = BridgeOptimizer::from_checkpoint(
+        &endpoint,
+        &path.to_string_lossy(),
+        xopt_options(json!({})),
+    )
+    .unwrap();
+    assert_eq!(restored.name(), "XoptOptimizer");
+    assert_eq!(restored.best_points().unwrap(), best);
+    assert_eq!(restored.suggest(2).unwrap().len(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A fresh directory under the target dir, so no temp-file crate is needed.
 fn tempdir() -> std::path::PathBuf {
     let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(

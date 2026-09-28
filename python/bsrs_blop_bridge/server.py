@@ -38,9 +38,10 @@ Methods, with ``params`` and ``result``:
     ``{}`` → ``null``
 ``restore``
     ``{"checkpoint_path": str, "backend": {...}}`` → as ``configure``; the
-    backend restores its optimizer from the file (``ax`` only).
+    backend restores its optimizer from the file (``ax`` and ``xopt``).
 ``checkpoint_path`` / ``set_checkpoint_path``
-    ``{}`` → ``str | null``; ``{"path": str | null}`` → ``null``
+    ``{}`` → ``str | null``; ``{"path": str | null}`` → ``null``. The
+    capability is reported only when the path can be set as well as read.
 ``fixed_parameters`` / ``set_fixed_parameters``
     ``{}`` → ``{<param>: value} | null``; ``{"fixed": {...} | null}`` → ``null``
 ``reconfigure_search_space``
@@ -88,15 +89,21 @@ def _jsonable(value: Any) -> Any:
 
 def capabilities(optimizer: Any) -> dict[str, bool]:
     """Which optional blop protocols, and which of Ax's extras, the optimizer has."""
-    cls = type(optimizer)
     return {
         "register_suggestions": callable(getattr(optimizer, "register_suggestions", None)),
         "stopping_criteria": callable(getattr(optimizer, "should_stop", None)),
         "checkpoint": callable(getattr(optimizer, "checkpoint", None)),
-        "checkpoint_path": isinstance(getattr(cls, "checkpoint_path", None), property),
-        "fixed_parameters": isinstance(getattr(cls, "fixed_parameters", None), property),
+        "checkpoint_path": _settable_property(optimizer, "checkpoint_path"),
+        "fixed_parameters": _settable_property(optimizer, "fixed_parameters"),
         "reconfigure_search_space": callable(getattr(optimizer, "reconfigure_search_space", None)),
     }
+
+
+def _settable_property(optimizer: Any, name: str) -> bool:
+    # One capability covers the getter and the setter, so a read-only
+    # property (Xopt's checkpoint_path is fixed at construction) is "absent".
+    prop = getattr(type(optimizer), name, None)
+    return isinstance(prop, property) and prop.fset is not None
 
 
 def search_space_updates(updates: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
