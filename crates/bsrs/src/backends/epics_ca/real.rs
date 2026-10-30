@@ -28,6 +28,10 @@ use tokio::sync::Notify;
 
 const SHARDS: usize = 64;
 
+/// Bound on each CA read and put-callback: the 30 s epics-ca-rs applied
+/// inside `get`, `get_with_metadata` and `put` before 0.33 made it explicit.
+const CA_IO_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn shard_for(pv: &str) -> usize {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
@@ -274,7 +278,7 @@ async fn ctrl_metadata(
     want_precision: bool,
 ) -> Result<SignalMetadata> {
     let snap = ch
-        .get_with_metadata(DbrClass::Ctrl)
+        .get_with_metadata(DbrClass::Ctrl, CA_IO_TIMEOUT)
         .await
         .map_err(|e| BsrsError::Backend(format!("ca ctrl get: {e}")))?;
     let mut meta = SignalMetadata::default();
@@ -295,7 +299,7 @@ async fn ctrl_metadata(
 
 /// Encode an `f64` payload as the `EpicsValue` variant that matches
 /// the channel's `native_type`. Required because
-/// `CaChannel::put` writes with `native_type` on the wire (see
+/// `CaChannel::put_with_timeout` writes with `native_type` on the wire (see
 /// `epics-ca-rs/src/client/mod.rs:1228`) and a mismatched payload
 /// width is read by the server as garbage (e.g. `EpicsValue::Double`
 /// sent to a `longout` produces an 8-byte f64-BE payload but the
@@ -360,7 +364,7 @@ fn epics_to_f64(v: &EpicsValue) -> Option<f64> {
 /// not numeric waveform data.
 fn epics_to_vec_f64(v: &EpicsValue) -> Option<Vec<f64>> {
     match v {
-        EpicsValue::DoubleArray(a) => Some(a.clone()),
+        EpicsValue::DoubleArray(a) => Some(a.to_vec()),
         EpicsValue::FloatArray(a) => Some(a.iter().map(|x| *x as f64).collect()),
         EpicsValue::LongArray(a) => Some(a.iter().map(|x| *x as f64).collect()),
         EpicsValue::ShortArray(a) => Some(a.iter().map(|x| *x as f64).collect()),
@@ -371,13 +375,13 @@ fn epics_to_vec_f64(v: &EpicsValue) -> Option<Vec<f64>> {
 
 /// Encode a `Vec<f64>` waveform payload as the array `EpicsValue` variant that
 /// matches the channel's `native_type`, mirroring [`f64_to_wire`] for arrays
-/// (`CaChannel::put` writes with `native_type`, so a width mismatch corrupts
-/// the wire payload). A `String`-native channel has no numeric-array form, so
-/// the closest `DoubleArray` is used — a `Vec<f64>` backend on a DBR_STRING PV
-/// is a misuse the type system can't forbid here.
+/// (`CaChannel::put_with_timeout` writes with `native_type`, so a width
+/// mismatch corrupts the wire payload). A `String`-native channel has no
+/// numeric-array form, so the closest `DoubleArray` is used — a `Vec<f64>`
+/// backend on a DBR_STRING PV is a misuse the type system can't forbid here.
 fn f64s_to_wire(t: DbFieldType, v: Vec<f64>) -> EpicsValue {
     match t {
-        DbFieldType::Double | DbFieldType::String => EpicsValue::DoubleArray(v),
+        DbFieldType::Double | DbFieldType::String => EpicsValue::DoubleArray(v.into()),
         DbFieldType::Float => EpicsValue::FloatArray(v.iter().map(|x| *x as f32).collect()),
         DbFieldType::Long => EpicsValue::LongArray(v.iter().map(|x| *x as i32).collect()),
         DbFieldType::Int64 => EpicsValue::Int64Array(v.iter().map(|x| *x as i64).collect()),
@@ -437,7 +441,7 @@ fn string_to_epics(s: &str, kind: CaStringKind) -> EpicsValue {
         CaStringKind::Long => {
             let mut bytes = s.as_bytes().to_vec();
             bytes.push(0);
-            EpicsValue::CharArray(bytes)
+            EpicsValue::CharArray(bytes.into())
         }
     }
 }
@@ -457,7 +461,7 @@ impl SignalBackend<f64> for EpicsCaBackend<f64> {
             .await
             .map_err(|e| BsrsError::Backend(format!("{e}")))?;
         let v = f64_to_wire(native, value);
-        ch.put(&v)
+        ch.put_with_timeout(&v, CA_IO_TIMEOUT)
             .await
             .map_err(|e| BsrsError::Backend(format!("ca put: {e}")))
     }
@@ -485,7 +489,7 @@ impl SignalBackend<f64> for EpicsCaBackend<f64> {
     async fn get_reading(&self) -> Result<ReadingValue> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
         let snap = ch
-            .get_with_metadata(DbrClass::Time)
+            .get_with_metadata(DbrClass::Time, CA_IO_TIMEOUT)
             .await
             .map_err(|e| BsrsError::Backend(format!("ca get: {e}")))?;
         let f = epics_to_f64(&snap.value)
@@ -500,7 +504,7 @@ impl SignalBackend<f64> for EpicsCaBackend<f64> {
     async fn get_value(&self) -> Result<f64> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
         let (_ty, v) = ch
-            .get()
+            .get_with_timeout(CA_IO_TIMEOUT)
             .await
             .map_err(|e| BsrsError::Backend(format!("ca get: {e}")))?;
         epics_to_f64(&v).ok_or_else(|| BsrsError::Backend(format!("ca: not numeric: {v:?}")))
@@ -557,7 +561,7 @@ impl SignalBackend<Vec<f64>> for EpicsCaBackend<Vec<f64>> {
             .await
             .map_err(|e| BsrsError::Backend(format!("{e}")))?;
         let v = f64s_to_wire(native, value);
-        ch.put(&v)
+        ch.put_with_timeout(&v, CA_IO_TIMEOUT)
             .await
             .map_err(|e| BsrsError::Backend(format!("ca put: {e}")))
     }
@@ -581,7 +585,7 @@ impl SignalBackend<Vec<f64>> for EpicsCaBackend<Vec<f64>> {
     async fn get_reading(&self) -> Result<ReadingValue> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
         let snap = ch
-            .get_with_metadata(DbrClass::Time)
+            .get_with_metadata(DbrClass::Time, CA_IO_TIMEOUT)
             .await
             .map_err(|e| BsrsError::Backend(format!("ca get: {e}")))?;
         let v = epics_to_vec_f64(&snap.value).ok_or_else(|| {
@@ -597,7 +601,7 @@ impl SignalBackend<Vec<f64>> for EpicsCaBackend<Vec<f64>> {
     async fn get_value(&self) -> Result<Vec<f64>> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
         let (_ty, v) = ch
-            .get()
+            .get_with_timeout(CA_IO_TIMEOUT)
             .await
             .map_err(|e| BsrsError::Backend(format!("ca get: {e}")))?;
         epics_to_vec_f64(&v)
@@ -649,7 +653,7 @@ impl SignalBackend<String> for EpicsCaBackend<String> {
             .await
             .map_err(|e| BsrsError::Backend(format!("{e}")))?;
         let v = string_to_epics(&value, self.string_kind);
-        ch.put(&v)
+        ch.put_with_timeout(&v, CA_IO_TIMEOUT)
             .await
             .map_err(|e| BsrsError::Backend(format!("ca put: {e}")))
     }
@@ -674,7 +678,7 @@ impl SignalBackend<String> for EpicsCaBackend<String> {
     async fn get_reading(&self) -> Result<ReadingValue> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
         let snap = ch
-            .get_with_metadata(DbrClass::Time)
+            .get_with_metadata(DbrClass::Time, CA_IO_TIMEOUT)
             .await
             .map_err(|e| BsrsError::Backend(format!("ca get: {e}")))?;
         let s = epics_to_string(&snap.value, self.string_kind)
@@ -689,7 +693,7 @@ impl SignalBackend<String> for EpicsCaBackend<String> {
     async fn get_value(&self) -> Result<String> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
         let (_ty, v) = ch
-            .get()
+            .get_with_timeout(CA_IO_TIMEOUT)
             .await
             .map_err(|e| BsrsError::Backend(format!("ca get: {e}")))?;
         epics_to_string(&v, self.string_kind)
@@ -745,7 +749,7 @@ impl SignalBackend<i64> for EpicsCaBackend<i64> {
             .await
             .map_err(|e| BsrsError::Backend(format!("{e}")))?;
         let v = i64_to_wire(native, value);
-        ch.put(&v)
+        ch.put_with_timeout(&v, CA_IO_TIMEOUT)
             .await
             .map_err(|e| BsrsError::Backend(format!("ca put: {e}")))
     }
@@ -773,7 +777,7 @@ impl SignalBackend<i64> for EpicsCaBackend<i64> {
     async fn get_reading(&self) -> Result<ReadingValue> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
         let snap = ch
-            .get_with_metadata(DbrClass::Time)
+            .get_with_metadata(DbrClass::Time, CA_IO_TIMEOUT)
             .await
             .map_err(|e| BsrsError::Backend(format!("ca get: {e}")))?;
         let i = epics_to_i64(&snap.value)
@@ -788,7 +792,7 @@ impl SignalBackend<i64> for EpicsCaBackend<i64> {
     async fn get_value(&self) -> Result<i64> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
         let (_ty, v) = ch
-            .get()
+            .get_with_timeout(CA_IO_TIMEOUT)
             .await
             .map_err(|e| BsrsError::Backend(format!("ca get: {e}")))?;
         epics_to_i64(&v).ok_or_else(|| BsrsError::Backend(format!("ca: not int: {v:?}")))
@@ -864,7 +868,7 @@ impl SignalBackend<bool> for EpicsCaBackend<bool> {
             .await
             .map_err(|e| BsrsError::Backend(format!("{e}")))?;
         let v = bool_to_wire(native, value);
-        ch.put(&v)
+        ch.put_with_timeout(&v, CA_IO_TIMEOUT)
             .await
             .map_err(|e| BsrsError::Backend(format!("ca put: {e}")))
     }
@@ -880,7 +884,7 @@ impl SignalBackend<bool> for EpicsCaBackend<bool> {
     async fn get_reading(&self) -> Result<ReadingValue> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
         let snap = ch
-            .get_with_metadata(DbrClass::Time)
+            .get_with_metadata(DbrClass::Time, CA_IO_TIMEOUT)
             .await
             .map_err(|e| BsrsError::Backend(format!("ca get: {e}")))?;
         let b = epics_to_bool(&snap.value)
@@ -895,7 +899,7 @@ impl SignalBackend<bool> for EpicsCaBackend<bool> {
     async fn get_value(&self) -> Result<bool> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
         let (_ty, v) = ch
-            .get()
+            .get_with_timeout(CA_IO_TIMEOUT)
             .await
             .map_err(|e| BsrsError::Backend(format!("ca get: {e}")))?;
         epics_to_bool(&v).ok_or_else(|| BsrsError::Backend(format!("ca: not bool: {v:?}")))
@@ -1024,7 +1028,7 @@ impl CaEnumBackend {
             return Ok(c.clone());
         }
         let snap = ch
-            .get_with_metadata(DbrClass::Ctrl)
+            .get_with_metadata(DbrClass::Ctrl, CA_IO_TIMEOUT)
             .await
             .map_err(|e| BsrsError::Backend(format!("ca enum ctrl get {}: {e}", self.pv)))?;
         let choices = snap
@@ -1041,7 +1045,7 @@ impl CaEnumBackend {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
         let choices = self.ensure_choices(&ch).await?;
         let (_ty, v) = ch
-            .get()
+            .get_with_timeout(CA_IO_TIMEOUT)
             .await
             .map_err(|e| BsrsError::Backend(format!("ca enum get: {e}")))?;
         epics_to_enum_label(&v, &choices)
@@ -1073,7 +1077,7 @@ impl SignalBackend<String> for CaEnumBackend {
         let idx = enum_label_to_index(&value, &choices)?;
         // Enum PVs are DBR_ENUM on the wire; put writes with native_type, so the
         // payload must be the 2-byte index, not a 40-byte DBR_STRING.
-        ch.put(&EpicsValue::Enum(idx))
+        ch.put_with_timeout(&EpicsValue::Enum(idx), CA_IO_TIMEOUT)
             .await
             .map_err(|e| BsrsError::Backend(format!("ca enum put: {e}")))
     }
@@ -1099,7 +1103,7 @@ impl SignalBackend<String> for CaEnumBackend {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
         let choices = self.ensure_choices(&ch).await?;
         let snap = ch
-            .get_with_metadata(DbrClass::Time)
+            .get_with_metadata(DbrClass::Time, CA_IO_TIMEOUT)
             .await
             .map_err(|e| BsrsError::Backend(format!("ca enum get: {e}")))?;
         let label = epics_to_enum_label(&snap.value, &choices).ok_or_else(|| {
@@ -1137,7 +1141,7 @@ impl SignalBackend<String> for CaEnumBackend {
             let choices = match cached {
                 Some(c) => c,
                 None => ch
-                    .get_with_metadata(DbrClass::Ctrl)
+                    .get_with_metadata(DbrClass::Ctrl, CA_IO_TIMEOUT)
                     .await
                     .ok()
                     .and_then(|s| s.enums.map(|e| enum_labels_to_strings(e.strings)))
@@ -1290,29 +1294,32 @@ mod tests {
     #[test]
     fn epics_to_vec_f64_widens_numeric_arrays_and_rejects_non_numeric() {
         assert_eq!(
-            epics_to_vec_f64(&EpicsValue::DoubleArray(vec![1.0, 2.0])),
+            epics_to_vec_f64(&EpicsValue::DoubleArray(vec![1.0, 2.0].into())),
             Some(vec![1.0, 2.0])
         );
         assert_eq!(
-            epics_to_vec_f64(&EpicsValue::FloatArray(vec![1.5, 2.5])),
+            epics_to_vec_f64(&EpicsValue::FloatArray(vec![1.5, 2.5].into())),
             Some(vec![1.5, 2.5])
         );
         assert_eq!(
-            epics_to_vec_f64(&EpicsValue::LongArray(vec![3, 4])),
+            epics_to_vec_f64(&EpicsValue::LongArray(vec![3, 4].into())),
             Some(vec![3.0, 4.0])
         );
         assert_eq!(
-            epics_to_vec_f64(&EpicsValue::ShortArray(vec![5, 6])),
+            epics_to_vec_f64(&EpicsValue::ShortArray(vec![5, 6].into())),
             Some(vec![5.0, 6.0])
         );
         assert_eq!(
-            epics_to_vec_f64(&EpicsValue::Int64Array(vec![7, 8])),
+            epics_to_vec_f64(&EpicsValue::Int64Array(vec![7, 8].into())),
             Some(vec![7.0, 8.0])
         );
         // Char/Enum/String arrays carry non-numeric-waveform meanings; excluded.
-        assert_eq!(epics_to_vec_f64(&EpicsValue::CharArray(vec![1, 2])), None);
         assert_eq!(
-            epics_to_vec_f64(&EpicsValue::StringArray(vec!["a".into()])),
+            epics_to_vec_f64(&EpicsValue::CharArray(vec![1, 2].into())),
+            None
+        );
+        assert_eq!(
+            epics_to_vec_f64(&EpicsValue::StringArray(["a".into()].into_iter().collect())),
             None
         );
         // A scalar is not a waveform.
@@ -1380,8 +1387,8 @@ mod tests {
     #[test]
     fn long_string_decode_strips_at_first_nul() {
         let bytes = b"/data/scan\0/tail/ignored".to_vec();
-        let s =
-            epics_to_string(&EpicsValue::CharArray(bytes), CaStringKind::Long).expect("CharArray");
+        let s = epics_to_string(&EpicsValue::CharArray(bytes.into()), CaStringKind::Long)
+            .expect("CharArray");
         assert_eq!(s, "/data/scan");
     }
 

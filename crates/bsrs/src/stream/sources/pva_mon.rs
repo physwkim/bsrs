@@ -5,7 +5,7 @@
 //!   any PV type. `pv_field_to_bytes` walks the structure and extracts a
 //!   payload.
 //! - **NTNDArray fast path**: when the field is `Structure` whose `value`
-//!   union carries a `ScalarArrayTyped`, we emit the underlying `Arc<[T]>` as
+//!   union carries a `ScalarArrayTyped`, we emit the underlying `PvArray<T>` as
 //!   `Bytes` via `Bytes::from_owner` — **zero-copy** (the bytes share the
 //!   refcount with the PVA decode path).
 //! - **NTScalar path**: scalar `value` field LE-encoded into 8 bytes.
@@ -15,7 +15,7 @@ use crate::protocols_async::{Frame, FrameSource};
 use async_trait::async_trait;
 use bytes::Bytes;
 use epics_pva_rs::client::PvaClient;
-use epics_pva_rs::pvdata::TypedScalarArray;
+use epics_pva_rs::pvdata::{PvArray, TypedScalarArray};
 use epics_pva_rs::{PvField, PvStructure, ScalarValue};
 use futures::stream::{BoxStream, StreamExt};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -158,37 +158,37 @@ fn scalar_to_bytes(v: &ScalarValue) -> Bytes {
     }
 }
 
-/// Zero-copy: `Arc<[T]>` is wrapped in a `Bytes::from_owner` adapter that
+/// Zero-copy: `PvArray<T>` is wrapped in a `Bytes::from_owner` adapter that
 /// reinterprets the storage as `&[u8]`. Refcount is shared with the original
 /// PvField, so when the last consumer drops, the buffer is freed exactly once.
 fn typed_array_to_bytes(arr: &TypedScalarArray) -> Bytes {
     match arr {
-        TypedScalarArray::Boolean(a) => arc_pod_to_bytes(a.clone()),
-        TypedScalarArray::Byte(a) => arc_pod_to_bytes(a.clone()),
-        TypedScalarArray::UByte(a) => arc_pod_to_bytes(a.clone()),
-        TypedScalarArray::Short(a) => arc_pod_to_bytes(a.clone()),
-        TypedScalarArray::UShort(a) => arc_pod_to_bytes(a.clone()),
-        TypedScalarArray::Int(a) => arc_pod_to_bytes(a.clone()),
-        TypedScalarArray::UInt(a) => arc_pod_to_bytes(a.clone()),
-        TypedScalarArray::Long(a) => arc_pod_to_bytes(a.clone()),
-        TypedScalarArray::ULong(a) => arc_pod_to_bytes(a.clone()),
-        TypedScalarArray::Float(a) => arc_pod_to_bytes(a.clone()),
-        TypedScalarArray::Double(a) => arc_pod_to_bytes(a.clone()),
+        TypedScalarArray::Boolean(a) => pod_array_to_bytes(a.clone()),
+        TypedScalarArray::Byte(a) => pod_array_to_bytes(a.clone()),
+        TypedScalarArray::UByte(a) => pod_array_to_bytes(a.clone()),
+        TypedScalarArray::Short(a) => pod_array_to_bytes(a.clone()),
+        TypedScalarArray::UShort(a) => pod_array_to_bytes(a.clone()),
+        TypedScalarArray::Int(a) => pod_array_to_bytes(a.clone()),
+        TypedScalarArray::UInt(a) => pod_array_to_bytes(a.clone()),
+        TypedScalarArray::Long(a) => pod_array_to_bytes(a.clone()),
+        TypedScalarArray::ULong(a) => pod_array_to_bytes(a.clone()),
+        TypedScalarArray::Float(a) => pod_array_to_bytes(a.clone()),
+        TypedScalarArray::Double(a) => pod_array_to_bytes(a.clone()),
         // String arrays don't have a stable byte layout — punt.
         TypedScalarArray::String(_) => Bytes::new(),
     }
 }
 
-/// `Arc<[T]>` → `Bytes` for plain-old-data `T`, zero-copy.
-fn arc_pod_to_bytes<T: Copy + Send + Sync + 'static>(arc: Arc<[T]>) -> Bytes {
-    struct PodArc<T: Copy + Send + Sync + 'static>(Arc<[T]>);
-    impl<T: Copy + Send + Sync + 'static> AsRef<[u8]> for PodArc<T> {
+/// `PvArray<T>` → `Bytes` for plain-old-data `T`, zero-copy.
+fn pod_array_to_bytes<T: Copy + Send + Sync + 'static>(arr: PvArray<T>) -> Bytes {
+    struct PodArray<T: Copy + Send + Sync + 'static>(PvArray<T>);
+    impl<T: Copy + Send + Sync + 'static> AsRef<[u8]> for PodArray<T> {
         fn as_ref(&self) -> &[u8] {
             // SAFETY: T is Copy (POD-like — we only call this with primitive
             // numeric and bool types). Reinterpreting `&[T]` as `&[u8]` is
             // sound because primitives have no uninitialized bytes and no
             // Drop. The lifetime of the returned slice is tied to `&self`,
-            // and the `Arc` keeps the storage alive while `self` lives.
+            // and the `PvArray` keeps the storage alive while `self` lives.
             unsafe {
                 std::slice::from_raw_parts(
                     self.0.as_ptr() as *const u8,
@@ -197,7 +197,7 @@ fn arc_pod_to_bytes<T: Copy + Send + Sync + 'static>(arc: Arc<[T]>) -> Bytes {
             }
         }
     }
-    Bytes::from_owner(PodArc(arc))
+    Bytes::from_owner(PodArray(arr))
 }
 
 fn structure_to_bytes(s: &PvStructure) -> Option<Bytes> {
@@ -216,7 +216,7 @@ mod tests {
     #[test]
     fn typed_double_array_zero_copy_round_trip() {
         let v: Arc<[f64]> = Arc::from(vec![1.0, 2.5, -3.25]);
-        let bytes = typed_array_to_bytes(&TypedScalarArray::Double(v.clone()));
+        let bytes = typed_array_to_bytes(&TypedScalarArray::Double(v.clone().into()));
         assert_eq!(bytes.len(), 3 * std::mem::size_of::<f64>());
         // Re-decode via le_bytes.
         let mut out = Vec::new();
@@ -246,7 +246,7 @@ mod tests {
             selector: 9,
             variant_name: "floatValue".into(),
             value: Box::new(PvField::ScalarArrayTyped(TypedScalarArray::Float(
-                arr.clone(),
+                arr.clone().into(),
             ))),
         };
         let s = PvStructure {
