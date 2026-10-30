@@ -4,7 +4,7 @@ use crate::core::error::Result;
 use crate::core::reading::ReadingValue;
 use crate::core::status::SubToken;
 use crate::event_model::{make_datakey, DataKey, Dtype, DtypeNumpy, SignalMetadata};
-use crate::protocols_async::{ReadingValueCallback, SignalBackend};
+use crate::protocols_async::{PutCompletion, ReadingValueCallback, SignalBackend};
 use async_trait::async_trait;
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -159,7 +159,7 @@ where
     async fn connect(&self, _timeout: Duration) -> Result<()> {
         Ok(())
     }
-    async fn put(&self, value: Option<T>) -> Result<()> {
+    async fn put_start(&self, value: Option<T>) -> Result<PutCompletion> {
         // `None` writes the configured initial value (ophyd-async
         // `_soft_signal_backend.py:164`).
         let value = value.unwrap_or_else(|| self.inner.initial.clone());
@@ -178,7 +178,7 @@ where
         for cb in cbs {
             cb(&value, ts, None);
         }
-        Ok(())
+        Ok(Box::pin(std::future::ready(Ok(()))))
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         Ok(make_datakey(

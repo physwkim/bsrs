@@ -4,7 +4,7 @@ use crate::core::error::{BsrsError, Result};
 use crate::core::reading::ReadingValue;
 use crate::core::status::SubToken;
 use crate::event_model::{make_datakey, DataKey, Dtype, Limits, LimitsRange, SignalMetadata};
-use crate::protocols_async::{ReadingValueCallback, SignalBackend};
+use crate::protocols_async::{PutCompletion, ReadingValueCallback, SignalBackend};
 use async_trait::async_trait;
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::pv_request::PvRequestExpr;
@@ -56,6 +56,18 @@ impl<T: Clone + Send + Sync + 'static> crate::devices::BackendFromPv for EpicsPv
 // Coerce one scalar to f64. The single source of truth for numeric→f64
 // widening, shared by the scalar `pv_field_to_f64` and the array
 // `pv_field_to_vec_f64` so both accept the same element types.
+/// PVA put of `f`, completed before this returns: `PutOp::commit` sends the
+/// DATA frame and awaits its status in one future, so there is no earlier
+/// point at which the request is known sent. Ordering holds because the put
+/// is done; the returned completion is already resolved.
+async fn put_whole(client: &PvaClient, pv: &str, f: &PvField) -> Result<PutCompletion> {
+    client
+        .pvput_pv_field(pv, f)
+        .await
+        .map_err(|e| BsrsError::Backend(format!("pva put: {e}")))?;
+    Ok(Box::pin(std::future::ready(Ok(()))))
+}
+
 fn scalar_to_f64(s: &ScalarValue) -> Option<f64> {
     match s {
         ScalarValue::Double(d) => Some(*d),
@@ -353,12 +365,9 @@ impl SignalBackend<f64> for EpicsPvaBackend<f64> {
             .map(|_| ())
             .map_err(|e| BsrsError::Backend(format!("pva connect {}: {e}", self.pv)))
     }
-    async fn put(&self, value: Option<f64>) -> Result<()> {
+    async fn put_start(&self, value: Option<f64>) -> Result<PutCompletion> {
         let f = PvField::Scalar(ScalarValue::Double(value.unwrap_or_default()));
-        self.client
-            .pvput_pv_field(&self.pv, &f)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("pva put: {e}")))
+        put_whole(&self.client, &self.pv, &f).await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         // pvget the full NTScalar (display/control/valueAlarm carry units,
@@ -465,15 +474,12 @@ impl SignalBackend<Vec<f64>> for EpicsPvaBackend<Vec<f64>> {
             .map(|_| ())
             .map_err(|e| BsrsError::Backend(format!("pva connect {}: {e}", self.pv)))
     }
-    async fn put(&self, value: Option<Vec<f64>>) -> Result<()> {
+    async fn put_start(&self, value: Option<Vec<f64>>) -> Result<PutCompletion> {
         // Written as a typed Double array; an EPICS waveform record coerces to
         // its FTVL element type server-side.
         let f =
             PvField::ScalarArrayTyped(TypedScalarArray::Double(value.unwrap_or_default().into()));
-        self.client
-            .pvput_pv_field(&self.pv, &f)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("pva put: {e}")))
+        put_whole(&self.client, &self.pv, &f).await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         // The descriptor shape needs the element count; pvget once (describe is
@@ -575,12 +581,9 @@ impl SignalBackend<String> for EpicsPvaBackend<String> {
             .map(|_| ())
             .map_err(|e| BsrsError::Backend(format!("pva connect {}: {e}", self.pv)))
     }
-    async fn put(&self, value: Option<String>) -> Result<()> {
+    async fn put_start(&self, value: Option<String>) -> Result<PutCompletion> {
         let f = PvField::Scalar(ScalarValue::String(value.unwrap_or_default().into()));
-        self.client
-            .pvput_pv_field(&self.pv, &f)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("pva put: {e}")))
+        put_whole(&self.client, &self.pv, &f).await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         Ok(make_datakey(
@@ -668,12 +671,9 @@ impl SignalBackend<i64> for EpicsPvaBackend<i64> {
             .map(|_| ())
             .map_err(|e| BsrsError::Backend(format!("pva connect {}: {e}", self.pv)))
     }
-    async fn put(&self, value: Option<i64>) -> Result<()> {
+    async fn put_start(&self, value: Option<i64>) -> Result<PutCompletion> {
         let f = PvField::Scalar(ScalarValue::Long(value.unwrap_or_default()));
-        self.client
-            .pvput_pv_field(&self.pv, &f)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("pva put: {e}")))
+        put_whole(&self.client, &self.pv, &f).await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         // pvget the full NTScalar for units + limits. Integers carry no
@@ -768,12 +768,9 @@ impl SignalBackend<bool> for EpicsPvaBackend<bool> {
             .map(|_| ())
             .map_err(|e| BsrsError::Backend(format!("pva connect {}: {e}", self.pv)))
     }
-    async fn put(&self, value: Option<bool>) -> Result<()> {
+    async fn put_start(&self, value: Option<bool>) -> Result<PutCompletion> {
         let f = PvField::Scalar(ScalarValue::Boolean(value.unwrap_or_default()));
-        self.client
-            .pvput_pv_field(&self.pv, &f)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("pva put: {e}")))
+        put_whole(&self.client, &self.pv, &f).await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         Ok(make_datakey(

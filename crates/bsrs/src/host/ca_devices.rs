@@ -41,7 +41,7 @@ use crate::event_model::DataKey;
 // `SignalBackend` is the trait that provides connect/put/get on the
 // CA backend; pulled in via the `bsrs-protocols-async` dep that
 // the `ca` feature toggles on.
-use crate::protocols_async::SignalBackend;
+use crate::protocols_async::{PutCompletion, SignalBackend};
 
 /// CA-backed motor: setpoint (`.VAL`) + readback (`.RBV`) Signal pair.
 ///
@@ -129,17 +129,22 @@ impl ReadableObj for CaMotor {
 #[async_trait::async_trait]
 impl MovableObj for CaMotor {
     async fn set_dyn(&self, value: f64) -> Status {
-        // The backend `put` awaits the motor settle (WRITE_NOTIFY). The
-        // 30 s move-timeout lives here, at the device layer (CP-11), not
-        // in the backend's channel-ensure step.
-        let setpoint = self.setpoint.clone();
-        move_status(async move {
-            match tokio::time::timeout(Duration::from_secs(30), setpoint.put(Some(value))).await {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(e)) => Err(format!("ca_motor set: {e}")),
-                Err(_) => Err("ca_motor set: timed out after 30s".into()),
-            }
-        })
+        // The put completion is the motor settle (WRITE_NOTIFY). The 30 s
+        // move-timeout lives here, at the device layer (CP-11), not in the
+        // backend's channel-ensure step.
+        move_status(
+            self.setpoint.as_ref(),
+            value,
+            "ca_motor set",
+            |done| async move {
+                match tokio::time::timeout(Duration::from_secs(30), done).await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err(format!("ca_motor set: {e}")),
+                    Err(_) => Err("ca_motor set: timed out after 30s".into()),
+                }
+            },
+        )
+        .await
     }
 }
 
@@ -309,14 +314,12 @@ impl MovableObj for CaPositioner {
         // put AND the done-PV wait. Done values come from int-ish
         // records (bi/bo/mbbi), so exact f64 equality is the intended
         // comparison.
-        let setpoint = self.setpoint.clone();
         let done = self.done.clone();
         let done_pv = self.done_pv.clone();
         let done_value = self.done_value;
-        move_status(async move {
+        let finish = move |put_done: PutCompletion| async move {
             let wait = async {
-                setpoint
-                    .put(Some(value))
+                put_done
                     .await
                     .map_err(|e| format!("ca_positioner set: {e}"))?;
                 loop {
@@ -336,7 +339,8 @@ impl MovableObj for CaPositioner {
                     "ca_positioner set: done PV {done_pv} did not reach {done_value} within 30s"
                 )),
             }
-        })
+        };
+        move_status(self.setpoint.as_ref(), value, "ca_positioner set", finish).await
     }
 }
 
@@ -459,22 +463,32 @@ async fn describe_pv(
     Ok(key)
 }
 
-/// Run `mv` behind a pending [`Status`] and return the status at once. The
-/// engine's `Set` handler awaits `set_dyn` before it moves on to the next
-/// message, so a `set_dyn` that awaited the move itself would serialize a
-/// multi-axis `mv`; bluesky's `set()` returns its status immediately and the
-/// motion completes it.
-fn move_status<F>(mv: F) -> Status
+/// Send `value` to `setpoint`, then return a pending [`Status`] that `finish`
+/// settles from the put's completion. The engine's `Set` handler awaits
+/// `set_dyn` before it moves on to the next message, so a `set_dyn` that
+/// awaited the move itself would serialize a multi-axis `mv`; bluesky's
+/// `set()` returns its status immediately and the motion completes it. Only
+/// the wait is spawned: a spawned send lets `set(a); set(b)` reach the IOC as
+/// b, a, and the IOC then finishes at `a`.
+async fn move_status<B, F, Fut>(setpoint: &B, value: f64, what: &str, finish: F) -> Status
 where
-    F: std::future::Future<Output = std::result::Result<(), String>> + Send + 'static,
+    B: SignalBackend<f64>,
+    F: FnOnce(PutCompletion) -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<(), String>> + Send + 'static,
 {
     let (status, setter) = Status::new();
-    tokio::spawn(async move {
-        match mv.await {
-            Ok(()) => setter.success(),
-            Err(e) => setter.fail(StatusError::Failed(e)),
+    match setpoint.put_start(Some(value)).await {
+        Ok(done) => {
+            let mv = finish(done);
+            tokio::spawn(async move {
+                match mv.await {
+                    Ok(()) => setter.success(),
+                    Err(e) => setter.fail(StatusError::Failed(e)),
+                }
+            });
         }
-    });
+        Err(e) => setter.fail(StatusError::Failed(format!("{what}: {e}"))),
+    }
     status
 }
 
@@ -483,4 +497,34 @@ where
 /// client is reused everywhere.
 pub fn bootstrap_ca() {
     let _ = crate::backends::epics_ca::ca_context();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backends::mock::MockSignalBackend;
+    use crate::core::Dtype;
+
+    #[tokio::test]
+    async fn move_status_sends_puts_in_call_order() {
+        let sp = MockSignalBackend::with_value(0.0_f64, Dtype::Number);
+        let blocked = sp.mock_puts_blocked();
+        let finish = |done: PutCompletion| async move { done.await.map_err(|e| e.to_string()) };
+
+        // No yield between the two calls: the puts must already be sent when
+        // `move_status` returns, not left to spawned tasks.
+        let a = move_status(&sp, 1.0, "t", finish).await;
+        assert_eq!(sp.put_calls(), vec![Some(1.0)]);
+        let b = move_status(&sp, 2.0, "t", finish).await;
+        assert_eq!(sp.put_calls(), vec![Some(1.0), Some(2.0)]);
+        assert!(!a.done_state() && !b.done_state());
+
+        drop(blocked);
+        let both = async { (a.await, b.await) };
+        let (ra, rb) = tokio::time::timeout(Duration::from_secs(1), both)
+            .await
+            .unwrap();
+        ra.unwrap();
+        rb.unwrap();
+    }
 }

@@ -2390,15 +2390,26 @@ impl DetectorControl for AreaDetectorCam {
         // acquiring (ophyd-async `set_and_wait_for_value(acquire, True,
         // wait_for_set_completion=False)`), so a fly scan's kickoff doesn't
         // complete with the detector still idle.
+        // Acquire=1 is sent here, not in the spawned task, so a later
+        // disarm's Acquire=0 cannot overtake it on the wire.
         let (status, setter) = Status::new();
-        let acquire = self.acquire.clone();
         let prefix = self.prefix.clone();
-        tokio::spawn(async move {
-            match SignalBackend::<bool>::put(acquire.as_ref(), Some(true)).await {
-                Ok(()) => setter.success(),
-                Err(e) => setter.fail(StatusError::Failed(format!("{prefix}arm: Acquire: {e}"))),
+        match SignalBackend::<bool>::put_start(self.acquire.as_ref(), Some(true)).await {
+            Ok(done) => {
+                tokio::spawn(async move {
+                    match done.await {
+                        Ok(()) => setter.success(),
+                        Err(e) => {
+                            setter.fail(StatusError::Failed(format!("{prefix}arm: Acquire: {e}")))
+                        }
+                    }
+                });
             }
-        });
+            Err(e) => {
+                setter.fail(StatusError::Failed(format!("{prefix}arm: Acquire: {e}")));
+                return status;
+            }
+        }
         if let Err(e) = wait_for_bool(
             self.acquire_rbv.as_ref(),
             true,

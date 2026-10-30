@@ -11,7 +11,7 @@ use crate::core::error::Result;
 use crate::core::reading::ReadingValue;
 use crate::core::status::SubToken;
 use crate::event_model::{DataKey, Dtype};
-use crate::protocols_async::{ReadingValueCallback, SignalBackend};
+use crate::protocols_async::{PutCompletion, ReadingValueCallback, SignalBackend};
 use async_trait::async_trait;
 use serde::Serialize;
 use tokio::sync::watch;
@@ -158,7 +158,7 @@ where
         // mock connects transparently. No-op.
         Ok(())
     }
-    async fn put(&self, value: Option<T>) -> Result<()> {
+    async fn put_start(&self, value: Option<T>) -> Result<PutCompletion> {
         self.inner.put_log.lock().unwrap().push(value.clone());
         // Callback may rewrite the value written to the readback; `None` keeps
         // the put value (ophyd: new_value = put_mock(value) or value).
@@ -170,8 +170,11 @@ where
         self.inner.soft.put(new_value).await?;
         // Completion gates on the proceeds flag (blocked puts write the value
         // but do not resolve until unblocked).
-        self.wait_proceeds().await;
-        Ok(())
+        let this = self.clone();
+        Ok(Box::pin(async move {
+            this.wait_proceeds().await;
+            Ok(())
+        }))
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         self.inner.soft.get_datakey(source).await
