@@ -44,7 +44,8 @@ pub trait SignalBackend<T: Clone + Send + Sync + 'static>: Send + Sync {
     /// Send a put and return its completion. The request is issued when
     /// this resolves, so puts started one after another reach the server
     /// in that order however their completions are awaited; a caller that
-    /// spawns the whole put instead lets two puts race to the wire.
+    /// spawns the whole put instead lets two puts race to the wire. The
+    /// completion carries no deadline; the caller that awaits it owns one.
     async fn put_start(&self, value: Option<T>) -> Result<PutCompletion>;
     /// Put a value to the signal, awaiting completion. `None` writes the
     /// backend's default value (used by trigger-style `SignalX` puts).
