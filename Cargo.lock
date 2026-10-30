@@ -1765,9 +1765,9 @@ checksum = "869b0adbda23651a9c5c0c3d270aac9fcb52e8622a8f2b17e57802d7791962f2"
 
 [[package]]
 name = "epics-base-rs"
-version = "0.30.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d13b1920244a2b9f3c26c115e651a3c4cb0c2b005753846d3a1753f66f7dcf0c"
+checksum = "6173afb3032f72626d24c801fd9966e35f12b3a845ba8bbdad775ada53ad7a20"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1778,22 +1778,23 @@ dependencies = [
  "epics-macros-rs",
  "epics-rtems-boot",
  "hostname",
- "if-addrs",
  "libc",
  "parking_lot",
  "rustyline 18.0.1",
  "serde_json",
+ "smallvec",
  "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "epics-ca-rs"
-version = "0.30.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2440edf87aa224122633bf760d7fd0296bcc2c6aa0e2b6347a5c64955c376ae3"
+checksum = "304b9dc2ecb05715110e6d9cd53c3f8eb1dc7a157d4d3e2d8d6d5f5ea9bf0687"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1801,9 +1802,9 @@ dependencies = [
  "clap",
  "dashmap",
  "epics-base-rs",
+ "epics-libcom-rs",
  "epics-rtems-boot",
  "futures-util",
- "if-addrs",
  "libc",
  "metrics 0.23.1",
  "parking_lot",
@@ -1816,26 +1817,26 @@ dependencies = [
 
 [[package]]
 name = "epics-libcom-rs"
-version = "0.30.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6bd99923add1e87f82b158424f2a1132fd3c3d1672aa7db65e7c38a546575c0"
+checksum = "1c4f520a089eab40e9b1069ea88fdb1b2295d72f324150a7f5b88c36a0e356d2"
 dependencies = [
  "chrono",
- "epics-rtems-boot",
  "hostname",
- "if-addrs",
  "libc",
  "parking_lot",
+ "parking_lot_core",
  "socket2 0.5.10",
  "tokio",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "epics-macros-rs"
-version = "0.30.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff6f583e29adb2ab0a4a1cf68e8fcedc9e96825cbb2dcc0f64d164f374aacc49"
+checksum = "152ef7e79aca6232c856a04606d8edc93560837d5901ae6515bd634c869e1058"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1845,21 +1846,22 @@ dependencies = [
 
 [[package]]
 name = "epics-pva-rs"
-version = "0.30.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d916e5354ca224dd15d3f78a201bad3b48260c7ce27bb67bac6e82cadc4e9f4"
+checksum = "32d7399fee9336f3022fed8f472aedba8efc187221453237bbd227b4966393d3"
 dependencies = [
+ "arc-swap",
  "bytes",
  "chrono",
  "clap",
  "dashmap",
  "der 0.8.2",
  "epics-base-rs",
+ "epics-libcom-rs",
  "epics-macros-rs",
  "futures-util",
  "hmac 0.13.0",
  "hostname",
- "if-addrs",
  "libc",
  "p12",
  "parking_lot",
@@ -1884,9 +1886,9 @@ dependencies = [
 
 [[package]]
 name = "epics-rtems-boot"
-version = "0.30.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "367c112d8968d4dc2de8ada433c25fb1b9e16c83380964bc097ba97b4a781cb0"
+checksum = "1e8b36c0a0e4b8f05859571fc9384b034d2978d3e0f65e0da8141e2f95955c3b"
 dependencies = [
  "cc",
  "libc",
@@ -2656,16 +2658,6 @@ checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
-]
-
-[[package]]
-name = "if-addrs"
-version = "0.13.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69b2eeee38fef3aa9b4cc5f1beea8a2444fc00e7377cafae396de3f5c2065e24"
-dependencies = [
- "libc",
- "windows-sys 0.59.0",
 ]
 
 [[package]]
