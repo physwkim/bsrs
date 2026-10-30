@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bsrs-blop-bridge"
+version = "0.1.0"
+description = "Serve a blop-protocol optimizer (Ax, Xopt, or a random baseline) to bsrs over ZMQ REQ/REP"
+requires-python = ">=3.11"
+dependencies = ["pyzmq>=25"]
+
+[project.optional-dependencies]
+ax = ["blop[ax]"]
+xopt = ["blop[xopt]"]
+test = ["pytest"]
+
+[project.scripts]
+bsrs-blop-bridge = "bsrs_blop_bridge.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["bsrs_blop_bridge*"]

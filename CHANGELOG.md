@@ -4,6 +4,44 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `bsrs::blop` (feature `blop`) — beamline optimization plans ported from
+  NSLS-II blop: the `Optimizer` ask/tell protocol, `OptimizationProblem`, and
+  `optimize`, `optimize_in_run`, `optimize_step`, `sample_suggestions`,
+  `sample_candidates`, `acquire_baseline`, `default_acquire`,
+  `list_scan_in_run`, `navigate_to_best`, `read_step`. Suggestions and
+  outcomes are typed, plans that produce a value return a `PlanWithResult`,
+  and routing is deterministic nearest-neighbour plus 2-opt. Optimizer
+  backends are not included. See `doc/11-blop.md`.
+- `bsrs::blop::{dof, objective, agent}` — the search-space layer of blop's
+  `ax` package: `RangeDof`/`ChoiceDof` with a `DofBinding`, `DofConstraint`,
+  `Objective`/`ScalarizedObjective`/`OutcomeConstraint`, and an `Agent` that
+  renders them into a backend-neutral, JSON-serializable `ExperimentSpec`
+  and builds its optimizer through a factory over it.
+- `bsrs::blop::bridge` (feature `blop-bridge`) — `BridgeOptimizer`, an
+  `Optimizer` served by another process over ZMQ REQ/REP as JSON, with the
+  `bsrs_blop_bridge` Python server in `python/` (`random`, `ax` and
+  `xopt` backends). This is how Ax and Xopt are driven from bsrs. Ax's extras are optional
+  `Optimizer` methods forwarded by the agent (`set_fixed_dofs`,
+  `reconfigure_search_space`, `set_checkpoint_path`), and
+  `BridgeOptimizer::from_checkpoint` plus `Agent::from_optimizer` resume
+  from a checkpoint.
+- `bsrs::blop::callbacks` — `OptimizationRouter` (forward the `primary`
+  stream of optimization runs to a shared, editable sink list) and
+  `OptimizationLogger` (plain-text progress tables and running statistics),
+  ports of blop's `callbacks` package as `DocumentSink`s.
+
+### Fixed
+
+- A `Read` inside an open run but outside any `Create`/`Save` pair failed the
+  run with "read with no open bundle". bluesky's `RunBundler.read` folds a
+  reading into the event only while bundling, so such a read is ad-hoc
+  inspection that returns the value and touches no document; the engine now
+  does the same.
+
 ## [0.5.8] - 2026-09-22
 
 ### Fixed

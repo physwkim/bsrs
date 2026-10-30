@@ -2306,18 +2306,23 @@ impl RunEngine {
             Msg::Read(obj) => {
                 let readings = obj.read_dyn().await?;
                 let result_snapshot = readings.clone();
-                // Bundle the reading only when a run is open. bluesky `_read`
-                // reads the object and returns its value unconditionally,
-                // folding it into the event bundle ONLY if the run_key has an
-                // open bundler (run_engine.py:1993-1997). A read with no open
-                // run is valid ad-hoc inspection: read and surface the value,
-                // do not bundle, do not error. (Contrast Create/DeclareStream,
-                // which DO raise without a run: run_engine.py:1942/1968.)
-                let bundler_present = {
+                // Bundle the reading only while a bundle is open. bluesky
+                // `_read` reads the object and returns its value
+                // unconditionally, handing it to the run_key's bundler if one
+                // exists (run_engine.py:1993-1997), and `RunBundler.read`
+                // folds it into the event ONLY `if self.bundling`
+                // (bundlers.py:412). A read with no open run, or between
+                // `create`/`save` pairs inside a run, is valid ad-hoc
+                // inspection: read and surface the value, do not bundle, do
+                // not error. (Contrast Create/DeclareStream, which DO raise
+                // without a run: run_engine.py:1942/1968.)
+                let bundling = {
                     let state = self.state.lock().await;
-                    state.run_open(&run_key)
+                    state
+                        .run(&run_key)
+                        .is_some_and(|slot| slot.bundler.is_bundling())
                 };
-                if bundler_present {
+                if bundling {
                     // describe() only matters for the bundle's descriptor, so
                     // compute it (awaiting before re-locking) only when bundling.
                     let data_keys = obj.describe_dyn().await?;

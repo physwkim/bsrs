@@ -157,6 +157,8 @@ All flags below are features of the `bsrs` crate:
 | `host`         | Lua host runtime (mlua bridge)                          |
 | `cli`          | `bsrs` binary: qs-manager, qs, repl, doctor, migrate    |
 | `frame-source` | wire PVA + HDF5 into `bsrs frame-source`                |
+| `blop`         | beamline optimization plans (blop port), see `doc/11-blop.md` |
+| `blop-bridge`  | drive an out-of-process optimizer (Ax) over ZMQ         |
 
 The default build is small and dependency-light. CI builds and tests
 each opt-in feature on every push.
@@ -180,6 +182,7 @@ Design notes (numbered for read-in-order):
 9. [`doc/08-decisions.md`](doc/08-decisions.md)
 10. [`doc/09-references.md`](doc/09-references.md)
 11. [`doc/10-roadmap.md`](doc/10-roadmap.md) — tracked open items
+12. [`doc/11-blop.md`](doc/11-blop.md) — beamline optimization (blop port)
 
 ## License
 

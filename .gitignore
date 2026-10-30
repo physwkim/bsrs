@@ -9,6 +9,11 @@
 # caucus multi-agent session scratch
 /.caucus/
 
+# python (python/bsrs_blop_bridge)
+__pycache__/
+.pytest_cache/
+*.egg-info/
+
 # editor / OS misc
 .idea/
 .vscode/

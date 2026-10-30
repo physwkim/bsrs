@@ -39,6 +39,10 @@ host = ["qs", "dep:mlua", "dep:roxmltree"]
 cli = ["host", "ca", "pva", "dep:clap", "dep:rustyline", "dep:reedline", "dep:nu-ansi-term", "dep:tracing-subscriber"]
 # --- `bsrs frame-source` real backends (PVA monitor source + HDF5 sink) ---
 frame-source = ["cli", "pva", "hdf5"]
+# --- beamline optimization plans (module `blop`); no extra dependencies ---
+blop = []
+# --- `blop::bridge`: an optimizer served by another process (Ax) over ZMQ ---
+blop-bridge = ["blop", "dep:zmq"]
 
 [dependencies]
 async-trait.workspace = true

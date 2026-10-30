@@ -684,6 +684,54 @@ async fn read_outside_run_returns_ok_without_bundling() {
     );
 }
 
+#[tokio::test]
+async fn read_inside_run_between_bundles_returns_ok_without_bundling() {
+    // The run_key having a bundler is not enough: `RunBundler.read` folds the
+    // reading into the event only `if self.bundling` (bundlers.py:412). A
+    // read inside an open run but outside any create/save pair — a plan
+    // taking a motor's position before deciding where to scan — must return
+    // the value and leave the run's documents untouched. Pre-fix the engine
+    // handed it to the bundler regardless and failed the run with "read with
+    // no open bundle".
+    let det = SoftDetector::new("rd_det");
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let det_clone = det.clone();
+    let (read, reply) = bsrs::core::plan::respond(bsrs::core::Msg::Read(
+        det_clone as Arc<dyn bsrs::core::msg::ReadableObj>,
+    ));
+    let plan = bsrs::core::plan::plan_items(async_stream::stream! {
+        yield bsrs::core::plan::PlanItem::from(bsrs::core::Msg::OpenRun(bsrs::core::msg::RunMetadata::default()));
+        yield read;
+        yield bsrs::core::plan::PlanItem::from(bsrs::core::Msg::CloseRun {
+            exit_status: "success".into(),
+            reason: None,
+        });
+    });
+    let result = re
+        .run_async(plan)
+        .await
+        .expect("run_async returns a RunResult");
+    assert_eq!(
+        result.exit_status, "success",
+        "a read between bundles must not fail the run (pre-fix: \"fail\"), reason: {}",
+        result.reason
+    );
+    match reply.await {
+        Ok(bsrs::core::msg::MsgResult::Reading { data }) => {
+            assert!(data.contains_key("rd_det_counts"))
+        }
+        other => panic!("read must surface its value, got {other:?}"),
+    }
+    let docs = sink.snapshot().await;
+    assert!(
+        !docs
+            .iter()
+            .any(|d| matches!(d, Document::Descriptor(_) | Document::Event(_))),
+        "an unbundled read emits no descriptor or event: {docs:?}"
+    );
+}
+
 struct ConfigurableDev {
     name: String,
 }
