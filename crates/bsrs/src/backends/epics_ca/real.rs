@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use epics_base_rs::server::snapshot::{ControlInfo, DbrClass, DisplayInfo};
 use epics_base_rs::types::WallTime;
 use epics_ca_rs::client::{CaChannel, CaClient};
-use epics_ca_rs::{CaError, DbFieldType, EpicsValue, PvString};
+use epics_ca_rs::{estdlib, CaError, DbFieldType, EpicsValue, PvString};
 use std::array;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -28,9 +28,22 @@ use tokio::sync::Notify;
 
 const SHARDS: usize = 64;
 
-/// Bound on each CA read and put-callback: the 30 s epics-ca-rs applied
-/// inside `get`, `get_with_metadata` and `put` before 0.33 made it explicit.
+/// Bound on each CA read: the 30 s epics-ca-rs applied inside `get` and
+/// `get_with_metadata` before 0.33 made it explicit.
 const CA_IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bound on a put-callback's completion: `EPICS_CA_PUT_TIMEOUT` seconds, 30 s
+/// when unset or unparseable, resolved once. epics-ca-rs read this inside
+/// `put` until 0.33 left the deadline to the caller.
+fn ca_put_timeout() -> Duration {
+    static RESOLVED: OnceLock<Duration> = OnceLock::new();
+    *RESOLVED.get_or_init(|| put_timeout_from(estdlib::env_double("EPICS_CA_PUT_TIMEOUT")))
+}
+
+fn put_timeout_from(secs: std::result::Result<f64, estdlib::EnvDoubleError>) -> Duration {
+    secs.map(estdlib::duration_from_secs)
+        .unwrap_or(Duration::from_secs(30))
+}
 
 fn shard_for(pv: &str) -> usize {
     use std::hash::{BuildHasher, Hasher};
@@ -222,13 +235,13 @@ async fn channel_native_type(ch: &CaChannel) -> Result<DbFieldType> {
 
 /// `ca_array_put_callback` of `v`: the request is queued on the circuit, in
 /// call order, when this returns; the returned completion is bounded by
-/// [`CA_IO_TIMEOUT`].
+/// [`ca_put_timeout`].
 fn put_callback(ch: &CaChannel, v: &EpicsValue, what: &'static str) -> Result<PutCompletion> {
     let done = ch
         .put_callback(v)
         .map_err(|e| BsrsError::Backend(format!("{what}: {e}")))?;
     Ok(Box::pin(async move {
-        tokio::time::timeout(CA_IO_TIMEOUT, done)
+        tokio::time::timeout(ca_put_timeout(), done)
             .await
             .unwrap_or(Err(CaError::Timeout))
             .map_err(|e| BsrsError::Backend(format!("{what}: {e}")))
@@ -1172,6 +1185,21 @@ impl SignalBackend<String> for CaEnumBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn put_timeout_from_env_double() {
+        use estdlib::EnvDoubleError;
+        assert_eq!(put_timeout_from(Ok(2.5)), Duration::from_millis(2500));
+        assert_eq!(
+            put_timeout_from(Err(EnvDoubleError::Unset)),
+            Duration::from_secs(30)
+        );
+        let bad = estdlib::epics_parse_double("abc").unwrap_err();
+        assert_eq!(
+            put_timeout_from(Err(EnvDoubleError::Invalid(bad))),
+            Duration::from_secs(30)
+        );
+    }
 
     // Regression for the bootstrap bug documented at doc/10-roadmap.md
     // Tier 1.1: calling `ca_context()` from inside a tokio runtime
