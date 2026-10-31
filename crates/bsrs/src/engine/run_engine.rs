@@ -349,7 +349,7 @@ impl RunControl {
         }
         let before = self
             .holds
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |h| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |h| {
                 Some(h.saturating_sub(1))
             })
             .unwrap_or(0);
