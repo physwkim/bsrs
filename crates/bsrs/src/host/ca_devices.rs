@@ -34,11 +34,11 @@ use crate::core::msg::{
     DynLocation, LocatableObj, MonitorableObj, MovableObj, NamedObj, ReadableObj, StoppableObj,
 };
 use crate::core::reading::ReadingValue;
-use crate::core::status::{Status, StatusError};
+use crate::core::status::Status;
 use crate::core::subscription::Subscription;
 use crate::devices::SignalCache;
 use crate::event_model::DataKey;
-use crate::host::motor_move::move_status;
+use crate::host::motor_move::{move_status, MotorChannels};
 // `SignalBackend` is the trait that provides connect/put/get on the
 // CA backend; pulled in via the `bsrs-protocols-async` dep that
 // the `ca` feature toggles on.
@@ -50,83 +50,9 @@ use crate::protocols_async::{PutCompletion, SignalBackend};
 /// becomes an Event, through one shared [`SignalCache`] (CP-08 / K2).
 pub struct CaMotor {
     name: String,
-    setpoint: Arc<EpicsCaBackend<f64>>,
-    readback: Arc<EpicsCaBackend<f64>>,
+    channels: MotorChannels<EpicsCaBackend<f64>>,
     rbv_pv: String,
     cache: Arc<SignalCache<f64, EpicsCaBackend<f64>>>,
-    /// `None` when the setpoint's record has no `.VELO`/`.ACCL` (not a
-    /// motor record); its moves then have no deadline.
-    timing: Option<MoveTiming>,
-}
-
-/// The motor record's `.VELO` and `.ACCL`, read at each move for its
-/// deadline.
-struct MoveTiming {
-    velo: Arc<EpicsCaBackend<f64>>,
-    accl: Arc<EpicsCaBackend<f64>>,
-}
-
-/// ophyd-async `DEFAULT_TIMEOUT`, the fixed term of
-/// `Motor.calculate_timeout`.
-const MOVE_TIMEOUT_MARGIN_SECS: f64 = 10.0;
-
-/// ophyd-async `Motor.calculate_timeout`, in seconds: the travel time at
-/// `velo`, plus the acceleration time on both ends, plus the margin. `None`
-/// for zero velocity, where ophyd-async raises instead of moving.
-fn move_timeout_secs(old: f64, new: f64, velo: f64, accl: f64) -> Option<f64> {
-    (velo != 0.0).then(|| ((new - old) / velo).abs() + 2.0 * accl + MOVE_TIMEOUT_MARGIN_SECS)
-}
-
-/// The channels of a [`CaMotor`] before connect: the setpoint, the readback
-/// and the `.VELO`/`.ACCL` of `val_pv`'s record.
-struct MotorChannels {
-    setpoint: Arc<EpicsCaBackend<f64>>,
-    readback: Arc<EpicsCaBackend<f64>>,
-    timing: MoveTiming,
-}
-
-impl MotorChannels {
-    fn new(val_pv: &str, rbv_pv: &str) -> Self {
-        let record = val_pv.split_once('.').map_or(val_pv, |(r, _)| r);
-        Self {
-            setpoint: Arc::new(EpicsCaBackend::new(val_pv)),
-            readback: Arc::new(EpicsCaBackend::new(rbv_pv)),
-            timing: MoveTiming {
-                velo: Arc::new(EpicsCaBackend::new(format!("{record}.VELO"))),
-                accl: Arc::new(EpicsCaBackend::new(format!("{record}.ACCL"))),
-            },
-        }
-    }
-
-    /// Connect all four channels into a [`CaMotor`]. A `.VELO`/`.ACCL` that
-    /// does not connect (no motor record behind `val_pv`) leaves its moves
-    /// without a deadline.
-    async fn connect(self, name: &str, rbv_pv: &str) -> Result<Arc<CaMotor>> {
-        let t = Duration::from_secs(5);
-        let (sp, rb, velo, accl) = tokio::join!(
-            self.setpoint.connect(t),
-            self.readback.connect(t),
-            self.timing.velo.connect(t),
-            self.timing.accl.connect(t),
-        );
-        sp?;
-        rb?;
-        let timing = match velo.and(accl) {
-            Ok(()) => Some(self.timing),
-            Err(e) => {
-                tracing::warn!("ca_motor {name}: moves have no deadline: {e}");
-                None
-            }
-        };
-        Ok(Arc::new(CaMotor {
-            name: name.to_string(),
-            setpoint: self.setpoint,
-            cache: SignalCache::new(self.readback.clone()),
-            readback: self.readback,
-            rbv_pv: rbv_pv.to_string(),
-            timing,
-        }))
-    }
 }
 
 impl CaMotor {
@@ -134,47 +60,25 @@ impl CaMotor {
     /// caller must invoke this from a sync context (see
     /// `bootstrap_ca` for the recommended order).
     pub fn connect_blocking(name: &str, val_pv: &str, rbv_pv: &str) -> Result<Arc<Self>> {
-        let ch = MotorChannels::new(val_pv, rbv_pv);
-        crate::core::runtime::bsrs_runtime().block_on(ch.connect(name, rbv_pv))
+        crate::core::runtime::bsrs_runtime().block_on(Self::connect(name, val_pv, rbv_pv))
     }
 
     /// Async equivalent — call from inside an existing tokio runtime
     /// (e.g. `bsrs qs-manager`'s `async fn run`). Same outcome as
     /// `connect_blocking` but doesn't trigger a nested-runtime panic.
     pub async fn connect_async(name: &str, val_pv: &str, rbv_pv: &str) -> Result<Arc<Self>> {
-        MotorChannels::new(val_pv, rbv_pv)
-            .connect(name, rbv_pv)
-            .await
+        Self::connect(name, val_pv, rbv_pv).await
     }
 
-    /// The deadline of a move to `target`, from the current `.RBV`, `.VELO`
-    /// and `.ACCL`. `Ok(None)` when there is no timing record or a read
-    /// fails; `Err` for zero velocity, refused before the put as
-    /// ophyd-async does.
-    async fn move_deadline(&self, target: f64) -> std::result::Result<Option<Duration>, String> {
-        let Some(timing) = &self.timing else {
-            return Ok(None);
-        };
-        let read = tokio::try_join!(
-            self.readback.get_value(),
-            timing.velo.get_value(),
-            timing.accl.get_value(),
-        );
-        let (old, velo, accl) = match read {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("ca_motor {}: move has no deadline: {e}", self.name);
-                return Ok(None);
-            }
-        };
-        match move_timeout_secs(old, target, velo, accl) {
-            // NaN or a travel time past `Duration::MAX` has no deadline.
-            Some(secs) => Ok(Duration::try_from_secs_f64(secs).ok()),
-            None => Err(format!(
-                "ca_motor set: motor {} has zero velocity",
-                self.name
-            )),
-        }
+    async fn connect(name: &str, val_pv: &str, rbv_pv: &str) -> Result<Arc<Self>> {
+        let channels: MotorChannels<EpicsCaBackend<f64>> =
+            MotorChannels::connect("ca_motor", name, val_pv, rbv_pv).await?;
+        Ok(Arc::new(Self {
+            name: name.to_string(),
+            cache: SignalCache::new(channels.readback.clone()),
+            channels,
+            rbv_pv: rbv_pv.to_string(),
+        }))
     }
 }
 
@@ -193,7 +97,7 @@ impl NamedObj for CaMotor {
 #[async_trait::async_trait]
 impl ReadableObj for CaMotor {
     async fn read_dyn(&self) -> Result<HashMap<String, ReadingValue>> {
-        let r = self.readback.get_reading().await?;
+        let r = self.channels.readback.get_reading().await?;
         let mut out = HashMap::new();
         out.insert(self.name.clone(), r);
         Ok(out)
@@ -201,7 +105,7 @@ impl ReadableObj for CaMotor {
     async fn describe_dyn(&self) -> Result<HashMap<String, DataKey>> {
         Ok(HashMap::from([(
             self.name.clone(),
-            describe_pv(self.readback.as_ref(), &self.rbv_pv, &self.name).await?,
+            describe_pv(self.channels.readback.as_ref(), &self.rbv_pv, &self.name).await?,
         )]))
     }
 }
@@ -209,39 +113,15 @@ impl ReadableObj for CaMotor {
 #[async_trait::async_trait]
 impl MovableObj for CaMotor {
     async fn set_dyn(&self, value: f64) -> Status {
-        // The put completion is the motor settle (WRITE_NOTIFY), bounded by
-        // the move's own deadline as ophyd-async's `Motor.set` bounds it.
-        let deadline = match self.move_deadline(value).await {
-            Ok(d) => d,
-            Err(e) => return Status::fail(StatusError::Failed(e)),
-        };
-        move_status(
-            self.setpoint.as_ref(),
-            value,
-            "ca_motor set",
-            move |done| async move {
-                let Some(d) = deadline else {
-                    return done.await.map_err(|e| format!("ca_motor set: {e}"));
-                };
-                match tokio::time::timeout(d, done).await {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(e)) => Err(format!("ca_motor set: {e}")),
-                    Err(_) => Err(format!(
-                        "ca_motor set: timed out after {:.3}s",
-                        d.as_secs_f64()
-                    )),
-                }
-            },
-        )
-        .await
+        self.channels.set("ca_motor", &self.name, value).await
     }
 }
 
 #[async_trait::async_trait]
 impl LocatableObj for CaMotor {
     async fn locate_dyn(&self) -> Result<DynLocation> {
-        let setpoint = self.setpoint.get_value().await?;
-        let readback = self.readback.get_value().await?;
+        let setpoint = self.channels.setpoint.get_value().await?;
+        let readback = self.channels.readback.get_value().await?;
         Ok(DynLocation { setpoint, readback })
     }
 }
@@ -548,21 +428,4 @@ async fn describe_pv(
 /// client is reused everywhere.
 pub fn bootstrap_ca() {
     let _ = crate::backends::epics_ca::ca_context();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn move_timeout_is_travel_plus_two_accelerations_plus_margin() {
-        assert_eq!(
-            move_timeout_secs(1.0, -3.0, 2.0, 0.5),
-            Some(2.0 + 1.0 + 10.0)
-        );
-        assert_eq!(move_timeout_secs(1.0, 1.0, 2.0, 0.0), Some(10.0));
-        assert_eq!(move_timeout_secs(0.0, 4.0, -2.0, 0.0), Some(12.0));
-        assert_eq!(move_timeout_secs(0.0, 4.0, 0.0, 0.5), None);
-        assert_eq!(move_timeout_secs(0.0, 0.0, -0.0, 0.5), None);
-    }
 }
