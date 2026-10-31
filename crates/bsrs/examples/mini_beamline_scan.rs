@@ -111,16 +111,10 @@ impl ReadableObj for CaMotor {
 impl MovableObj for CaMotor {
     async fn set_dyn(&self, value: f64) -> Status {
         // The backend `put` blocks until the motor record settles
-        // (WRITE_NOTIFY). The 30 s move-timeout lives here, at the device
-        // layer (CP-11).
-        match tokio::time::timeout(Duration::from_secs(30), self.setpoint.put(Some(value))).await {
-            Ok(Ok(())) => Status::done(),
-            Ok(Err(e)) => {
-                Status::fail(bsrs::core::status::StatusError::Failed(format!("set: {e}")))
-            }
-            Err(_) => Status::fail(bsrs::core::status::StatusError::Failed(
-                "set: timed out after 30s".into(),
-            )),
+        // (WRITE_NOTIFY), bounded by EPICS_CA_PUT_TIMEOUT.
+        match self.setpoint.put(Some(value)).await {
+            Ok(()) => Status::done(),
+            Err(e) => Status::fail(bsrs::core::status::StatusError::Failed(format!("set: {e}"))),
         }
     }
 }
