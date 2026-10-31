@@ -36,5 +36,7 @@ pub mod lua_env;
 #[cfg(feature = "tiled")]
 pub mod lua_tiled;
 pub mod manager_lua;
+#[cfg(any(feature = "ca", feature = "pva"))]
+mod motor_move;
 #[cfg(feature = "pva")]
 pub mod pva_devices;

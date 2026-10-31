@@ -37,6 +37,7 @@ use crate::core::status::Status;
 use crate::core::subscription::Subscription;
 use crate::devices::SignalCache;
 use crate::event_model::{DataKey, Dtype};
+use crate::host::motor_move::move_status;
 use crate::protocols_async::SignalBackend;
 
 /// PVA-backed motor: setpoint + readback Signal pair.
@@ -115,17 +116,21 @@ impl ReadableObj for PvaMotor {
 #[async_trait::async_trait]
 impl MovableObj for PvaMotor {
     async fn set_dyn(&self, value: f64) -> Status {
-        // The backend `put` awaits the put completion. The 30 s
-        // move-timeout lives here, at the device layer (CP-11).
-        match tokio::time::timeout(Duration::from_secs(30), self.setpoint.put(Some(value))).await {
-            Ok(Ok(())) => Status::done(),
-            Ok(Err(e)) => Status::fail(crate::core::status::StatusError::Failed(format!(
-                "pva_motor set: {e}"
-            ))),
-            Err(_) => Status::fail(crate::core::status::StatusError::Failed(
-                "pva_motor set: timed out after 30s".into(),
-            )),
-        }
+        // The put completion is the motor settle (`record[block=true]`). The
+        // 30 s move-timeout lives here, at the device layer (CP-11).
+        move_status(
+            self.setpoint.as_ref(),
+            value,
+            "pva_motor set",
+            |done| async move {
+                match tokio::time::timeout(Duration::from_secs(30), done).await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err(format!("pva_motor set: {e}")),
+                    Err(_) => Err("pva_motor set: timed out after 30s".into()),
+                }
+            },
+        )
+        .await
     }
 }
 
