@@ -266,7 +266,7 @@ impl Server {
     }
 
     /// Async entry point. The REP-socket loop runs on a dedicated plain
-    /// `std::thread` (libzmq REP is sync in the `zmq` crate) — NOT on the
+    /// `std::thread` (the REP socket is a blocking one) — NOT on the
     /// tokio blocking pool: runtime shutdown waits for blocking-pool tasks,
     /// so a server leaked without [`ServerShutdown::shutdown`] (e.g. a
     /// panicking test) would deadlock the runtime drop. A plain thread is

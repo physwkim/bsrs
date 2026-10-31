@@ -22,7 +22,7 @@ required-features = ["cli"]
 # `--no-default-features` still yields the stub-backend / EPICS-free build.
 default = ["ca", "pva"]
 # --- document sinks / integrations (callbacks) ---
-zmq = ["dep:zmq", "dep:rmp-serde"]
+zmq = ["dep:omq", "dep:rmp-serde"]
 kafka = ["dep:rskafka", "dep:rmp-serde"]
 tiled = ["dep:tiled-rs", "dep:url"]
 # --- EPICS backends (real, otherwise stubs) ---
@@ -42,7 +42,7 @@ frame-source = ["cli", "pva", "hdf5"]
 # --- beamline optimization plans (module `blop`); no extra dependencies ---
 blop = []
 # --- `blop::bridge`: an optimizer served by another process (Ax) over ZMQ ---
-blop-bridge = ["blop", "dep:zmq"]
+blop-bridge = ["blop", "dep:omq"]
 
 [dependencies]
 async-trait.workspace = true
@@ -61,7 +61,7 @@ uuid.workspace = true
 bsrs-derive.workspace = true
 
 # optional integrations / backends
-zmq = { workspace = true, optional = true }
+omq = { workspace = true, optional = true }
 rmp-serde = { version = "1", optional = true }
 regex = { version = "1", optional = true }
 toml = { version = "0.8", optional = true }

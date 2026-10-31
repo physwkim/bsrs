@@ -5,6 +5,7 @@
 //! If unset, CURVE is disabled and the server accepts plain-text connections.
 
 use crate::core::error::{BsrsError, Result};
+use omq::{CurveKeypair, CurveSecretKey, Options};
 
 /// Generate a new CURVE keypair.
 ///
@@ -15,48 +16,37 @@ use crate::core::error::{BsrsError, Result};
 /// or `QSERVER_ZMQ_PRIVATE_KEY`). The public key is distributed to clients
 /// out-of-band.
 pub fn generate_zmq_keys() -> Result<(String, String)> {
-    let pair = zmq::CurveKeyPair::new()
-        .map_err(|e| BsrsError::Backend(format!("zmq::CurveKeyPair::new: {e}")))?;
-    let public = zmq::z85_encode(&pair.public_key)
-        .map_err(|_| BsrsError::Backend("z85_encode public key failed".into()))?;
-    let secret = zmq::z85_encode(&pair.secret_key)
-        .map_err(|_| BsrsError::Backend("z85_encode secret key failed".into()))?;
-    Ok((public, secret))
+    let pair = CurveKeypair::generate();
+    Ok((pair.public.to_z85(), pair.secret.to_z85()))
 }
 
-/// Apply a CURVE private key to a REP socket.
+/// Socket options for a CURVE server holding the given private key.
 ///
-/// Sets `ZMQ_CURVE_SERVER=1` and `ZMQ_CURVE_SECRETKEY` to the provided
-/// Z85-encoded private key. Matches the reference:
+/// The equivalent of the reference's
 ///   `self._zmq_socket.set(zmq.CURVE_SERVER, 1)`
 ///   `self._zmq_socket.set(zmq.CURVE_SECRETKEY, key.encode("utf-8"))`
+/// with the public half derived from the private key, as libzmq does.
 ///
-/// The key is passed as raw Z85 bytes (40 bytes), which libzmq interprets
-/// as a Z85-encoded key per the ZMQ RFC 32 convention.
-///
-/// Returns an error if the key is not exactly 40 characters or the socket
-/// options cannot be set.
-pub(crate) fn apply_curve_server_key(socket: &zmq::Socket, private_key_z85: &str) -> Result<()> {
+/// Returns an error if the key is not a 40-character Z85 string.
+pub(crate) fn curve_server_options(private_key_z85: &str) -> Result<Options> {
     if private_key_z85.len() != 40 {
         return Err(BsrsError::Backend(format!(
             "QSERVER_ZMQ_PRIVATE_KEY must be a 40-char Z85 string, got {} chars",
             private_key_z85.len()
         )));
     }
-    socket
-        .set_curve_server(true)
-        .map_err(|e| BsrsError::Backend(format!("CURVE_SERVER: {e}")))?;
-    // Pass the Z85 string as ASCII bytes (40 bytes); libzmq accepts either
-    // 32 raw bytes or 40 Z85 bytes for CURVE_SECRETKEY.
-    socket
-        .set_curve_secretkey(private_key_z85.as_bytes())
+    let secret = CurveSecretKey::from_z85(private_key_z85)
         .map_err(|e| BsrsError::Backend(format!("CURVE_SECRETKEY: {e}")))?;
-    Ok(())
+    Ok(Options::default().curve_server(CurveKeypair {
+        public: secret.derive_public(),
+        secret,
+    }))
 }
 
-/// Returns `true` if ZMQ CURVE is available in this build (requires libsodium).
+/// Returns `true` if ZMQ CURVE is available in this build. omq implements
+/// CURVE in Rust and is always built with it.
 pub fn curve_supported() -> bool {
-    zmq::CurveKeyPair::new().is_ok()
+    true
 }
 
 #[cfg(test)]
@@ -65,10 +55,6 @@ mod tests {
 
     #[test]
     fn generate_zmq_keys_returns_two_valid_z85_strings() {
-        if !curve_supported() {
-            eprintln!("CURVE not available in this libzmq build (no libsodium) — skipping");
-            return;
-        }
         let (public, secret) = generate_zmq_keys().expect("keypair generation must succeed");
         assert_eq!(public.len(), 40, "public key must be 40 chars");
         assert_eq!(secret.len(), 40, "secret key must be 40 chars");

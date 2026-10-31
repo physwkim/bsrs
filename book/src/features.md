@@ -7,7 +7,7 @@ Opt-in functionality lives behind feature flags of the consolidated
 
 | Feature  | Pulls in                              | Use when                              |
 | -------- | ------------------------------------- | ------------------------------------- |
-| `zmq`    | libzmq + rmp-serde                    | bluesky `RemoteDispatcher` consumers  |
+| `zmq`    | pure-Rust `omq` crate + rmp-serde     | bluesky `RemoteDispatcher` consumers  |
 | `tiled`  | tiled-rs (HTTP)                       | Tiled catalog ingestion               |
 | `kafka`  | pure-Rust `rskafka` crate             | Kafka topics, no librdkafka           |
 
