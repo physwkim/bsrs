@@ -81,19 +81,11 @@ async fn put_block(client: &PvaClient, pv: &str, f: PvField) -> Result<PutComple
         Some(_) => "value",
         None => "",
     };
-    let mut done = async move {
-        op.commit_fields_typed(&[(path.to_string(), PutLeaf::Typed(f))])
-            .await
-            .map_err(put_err)
-    }
-    .boxed();
-    // Workaround: `PutOp::commit` queues DATA before it first parks, so one
-    // poll sends it now; epics-pva-rs has no put that is sent before its
-    // completion is awaited.
-    match (&mut done).now_or_never() {
-        Some(r) => r.map(|()| std::future::ready(Ok(())).boxed()),
-        None => Ok(done),
-    }
+    let sent = op
+        .send_fields_typed(&[(path.to_string(), PutLeaf::Typed(f))])
+        .await
+        .map_err(put_err)?;
+    Ok(async move { sent.wait().await.map_err(put_err) }.boxed())
 }
 
 // Coerce one scalar to f64. The single source of truth for numeric→f64
