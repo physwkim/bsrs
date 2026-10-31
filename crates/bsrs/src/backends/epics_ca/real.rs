@@ -10,6 +10,7 @@
 //!   whose Drop aborts the task; dropping the underlying `MonitorHandle` then
 //!   unsubscribes on the wire (rule **K2**).
 
+use super::channel::SharedChannel;
 use crate::core::error::{BsrsError, Result};
 use crate::core::reading::ReadingValue;
 use crate::core::status::SubToken;
@@ -18,7 +19,7 @@ use crate::protocols_async::{PutCompletion, ReadingValueCallback, SignalBackend}
 use async_trait::async_trait;
 use epics_base_rs::server::snapshot::{ControlInfo, DbrClass, DisplayInfo};
 use epics_base_rs::types::WallTime;
-use epics_ca_rs::client::{CaChannel, CaClient};
+use epics_ca_rs::client::CaClient;
 use epics_ca_rs::{estdlib, CaError, DbFieldType, EpicsValue, PvString};
 use std::array;
 use std::collections::HashMap;
@@ -63,7 +64,7 @@ fn ts_to_f64(t: WallTime) -> f64 {
 /// Process-wide CA context.
 pub struct CaContext {
     client: Arc<CaClient>,
-    shards: [Mutex<HashMap<String, Arc<CaChannel>>>; SHARDS],
+    shards: [Mutex<HashMap<String, Arc<SharedChannel>>>; SHARDS],
     pending: [Mutex<HashMap<String, Arc<Notify>>>; SHARDS],
 }
 
@@ -76,7 +77,7 @@ impl CaContext {
         }
     }
 
-    async fn get_or_open(&self, pv: &str, timeout: Duration) -> Result<Arc<CaChannel>> {
+    async fn get_or_open(&self, pv: &str, timeout: Duration) -> Result<Arc<SharedChannel>> {
         let s = shard_for(pv);
         // Fast path
         if let Some(ch) = self.shards[s].lock().unwrap().get(pv).cloned() {
@@ -110,7 +111,7 @@ impl CaContext {
         let res: epics_ca_rs::CaResult<()> = ch.wait_connected(timeout).await;
 
         // Commit and notify waiters either way.
-        let arc = Arc::new(ch);
+        let arc = Arc::new(SharedChannel::new(ch));
         let mut p = self.pending[s].lock().unwrap();
         let n = p.remove(pv);
         if res.is_ok() {
@@ -179,7 +180,7 @@ pub enum CaStringKind {
 pub struct EpicsCaBackend<T: Clone + Send + Sync + 'static> {
     pv: String,
     ctx: Arc<CaContext>,
-    channel: tokio::sync::OnceCell<Arc<CaChannel>>,
+    channel: tokio::sync::OnceCell<Arc<SharedChannel>>,
     /// Consulted only by `SignalBackend<String>`; ignored for other `T`.
     string_kind: CaStringKind,
     _marker: std::marker::PhantomData<T>,
@@ -216,7 +217,7 @@ impl<T: Clone + Send + Sync + 'static> crate::devices::BackendFromPv for EpicsCa
 }
 
 impl<T: Clone + Send + Sync + 'static> EpicsCaBackend<T> {
-    async fn ensure_channel(&self, timeout: Duration) -> Result<Arc<CaChannel>> {
+    async fn ensure_channel(&self, timeout: Duration) -> Result<Arc<SharedChannel>> {
         self.channel
             .get_or_try_init(|| self.ctx.get_or_open(&self.pv, timeout))
             .await
@@ -226,23 +227,28 @@ impl<T: Clone + Send + Sync + 'static> EpicsCaBackend<T> {
 
 /// Look up the channel's `native_type` (cheap — `info()` returns
 /// already-cached snapshot state).
-async fn channel_native_type(ch: &CaChannel) -> Result<DbFieldType> {
+async fn channel_native_type(ch: &SharedChannel) -> Result<DbFieldType> {
     ch.info()
         .await
         .map(|i| i.native_type)
         .map_err(|e| BsrsError::Backend(format!("ca info: {e}")))
 }
 
-/// `ca_array_put_callback` of `v`: the request is queued on the circuit, in
-/// call order, when this returns. The completion has no deadline of its own:
-/// a busy record's callback lasts as long as its operation, so whoever awaits
-/// it bounds it.
-fn put_callback(ch: &CaChannel, v: &EpicsValue, what: &'static str) -> Result<PutCompletion> {
+/// [`SharedChannel::put_callback`] of `v`: the request is queued on the
+/// circuit, in call order, when this returns. The completion has no deadline
+/// of its own: a busy record's callback lasts as long as its operation, so
+/// whoever awaits it bounds it.
+fn put_callback(
+    ch: &Arc<SharedChannel>,
+    v: &EpicsValue,
+    what: &'static str,
+) -> Result<PutCompletion> {
     let done = ch
         .put_callback(v)
         .map_err(|e| BsrsError::Backend(format!("{what}: {e}")))?;
     Ok(Box::pin(async move {
         done.await
+            .unwrap_or_else(|_| Err("put-callback driver gone".into()))
             .map_err(|e| BsrsError::Backend(format!("{what}: {e}")))
     }))
 }
@@ -308,7 +314,7 @@ fn ctrl_limits(display: Option<&DisplayInfo>, control: Option<&ControlInfo>) -> 
 ///
 /// A field stays `None` when the server published no display/control block.
 async fn ctrl_metadata(
-    ch: &CaChannel,
+    ch: &SharedChannel,
     want_units: bool,
     want_precision: bool,
 ) -> Result<SignalMetadata> {
@@ -886,8 +892,7 @@ impl EpicsCaBackend<bool> {
             .await
             .map_err(|e| BsrsError::Backend(format!("{e}")))?;
         let v = bool_to_wire(native, value);
-        ch.put_nowait(&v)
-            .await
+        ch.put_no_callback(&v)
             .map_err(|e| BsrsError::Backend(format!("ca put_nowait: {e}")))
     }
 }
@@ -1039,7 +1044,7 @@ fn enum_labels_to_strings(labels: Vec<PvString>) -> Vec<String> {
 pub struct CaEnumBackend {
     pv: String,
     ctx: Arc<CaContext>,
-    channel: tokio::sync::OnceCell<Arc<CaChannel>>,
+    channel: tokio::sync::OnceCell<Arc<SharedChannel>>,
     choices: OnceLock<Vec<String>>,
 }
 
@@ -1054,7 +1059,7 @@ impl CaEnumBackend {
         }
     }
 
-    async fn ensure_channel(&self, timeout: Duration) -> Result<Arc<CaChannel>> {
+    async fn ensure_channel(&self, timeout: Duration) -> Result<Arc<SharedChannel>> {
         self.channel
             .get_or_try_init(|| self.ctx.get_or_open(&self.pv, timeout))
             .await
@@ -1063,7 +1068,7 @@ impl CaEnumBackend {
 
     /// Fetch the enum choice labels via a `DbrClass::Ctrl` read and cache them.
     /// Returns the cached list on subsequent calls (no further network I/O).
-    async fn ensure_choices(&self, ch: &CaChannel) -> Result<Vec<String>> {
+    async fn ensure_choices(&self, ch: &SharedChannel) -> Result<Vec<String>> {
         if let Some(c) = self.choices.get() {
             return Ok(c.clone());
         }

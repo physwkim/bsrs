@@ -19,6 +19,8 @@ mod stub;
 pub use stub::EpicsCaBackend;
 
 #[cfg(feature = "ca")]
+mod channel;
+#[cfg(feature = "ca")]
 mod real;
 #[cfg(feature = "ca")]
 pub use real::{ca_context, CaEnumBackend, EpicsCaBackend};
