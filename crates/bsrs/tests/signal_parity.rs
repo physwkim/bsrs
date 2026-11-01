@@ -3,19 +3,25 @@
 
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::sync::atomic::Ordering::SeqCst;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bsrs::backends::mock::{MockBackend, MockSignalBackend};
 use bsrs::backends::soft::SoftSignalBackend;
+use bsrs::core::error::BsrsError;
 use bsrs::core::msg::{LocatableObj, MovableObj, ReadableObj};
+use bsrs::core::status::SubToken;
 use bsrs::core::{Kind, ReadingValue};
 use bsrs::devices::{
     observe_signals_value, observe_value, wait_for_value, BackendFromPv, Readable, Signal,
     SignalConfig, SignalR, SignalRW, SignalW,
 };
 use bsrs::event_model::{make_datakey, DataKey, Dtype, SignalMetadata};
-use bsrs::protocols_async::{AsyncMovable, AsyncSubscribable, Locatable, SignalBackend};
+use bsrs::protocols_async::{
+    AsyncMovable, AsyncSubscribable, Locatable, PutCompletion, ReadingValueCallback, SignalBackend,
+};
 use futures::StreamExt;
 use serde::Serialize;
 use serde_json::json;
@@ -108,6 +114,77 @@ async fn a_readable_signal_stages_through_its_readable_handle() {
     assert_eq!(backend.subscriber_count(), 1, "stage holds the monitor");
     stageable.unstage_dyn().await.unwrap();
     assert_eq!(backend.subscriber_count(), 0);
+}
+
+/// Soft state behind a connect that counts its calls, takes a while, and
+/// fails while `fail` is set.
+struct CountedConnect {
+    soft: SoftSignalBackend<i64>,
+    connects: AtomicUsize,
+    fail: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl SignalBackend<i64> for CountedConnect {
+    async fn connect(&self, _: Duration) -> bsrs::core::error::Result<()> {
+        self.connects.fetch_add(1, SeqCst);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        match self.fail.load(SeqCst) {
+            true => Err(BsrsError::Backend("no IOC".into())),
+            false => Ok(()),
+        }
+    }
+    async fn put_start(&self, v: Option<i64>) -> bsrs::core::error::Result<PutCompletion> {
+        self.soft.put_start(v).await
+    }
+    async fn get_datakey(&self, source: &str) -> bsrs::core::error::Result<DataKey> {
+        self.soft.get_datakey(source).await
+    }
+    async fn get_reading(&self) -> bsrs::core::error::Result<ReadingValue> {
+        self.soft.get_reading().await
+    }
+    async fn get_value(&self) -> bsrs::core::error::Result<i64> {
+        self.soft.get_value().await
+    }
+    async fn get_setpoint(&self) -> bsrs::core::error::Result<i64> {
+        self.soft.get_setpoint().await
+    }
+    fn set_callback(&self, cb: Option<ReadingValueCallback<i64>>) -> SubToken {
+        self.soft.set_callback(cb)
+    }
+    fn source(&self, name: &str, read: bool) -> String {
+        self.soft.source(name, read)
+    }
+}
+
+// ophyd-async test_signal_connects_to_previous_backend,
+// test_signal_connects_with_force_reconnect, and Device.connect retrying a
+// connect that failed.
+#[tokio::test(start_paused = true)]
+async fn connect_joins_a_running_or_successful_connect_and_retries_a_failed_one() {
+    let backend = Arc::new(CountedConnect {
+        soft: SoftSignalBackend::new(0, Dtype::Integer),
+        connects: AtomicUsize::new(0),
+        fail: AtomicBool::new(true),
+    });
+    let sig: SignalRW<i64, _> = Signal::new(backend.clone(), cfg("x"));
+    let connects = || backend.connects.load(SeqCst);
+    let t = Duration::from_secs(1);
+
+    let (a, b) = tokio::join!(sig.connect(t), sig.connect(t));
+    assert_eq!(connects(), 1, "concurrent connects share one");
+    assert_eq!(a.unwrap_err().to_string(), "backend error: no IOC");
+    assert_eq!(b.unwrap_err().to_string(), "backend error: no IOC");
+
+    backend.fail.store(false, SeqCst);
+    sig.connect(t).await.unwrap();
+    assert_eq!(connects(), 2, "a failed connect is retried");
+    let (a, b) = tokio::join!(sig.connect(t), sig.connect(t));
+    a.and(b).unwrap();
+    assert_eq!(connects(), 2, "a successful connect is kept");
+
+    sig.reconnect(t).await.unwrap();
+    assert_eq!(connects(), 3, "reconnect forces a new one");
 }
 
 async fn source_and_initial<A: Readable>(sig: Signal<String, SoftSignalBackend<String>, A>) {

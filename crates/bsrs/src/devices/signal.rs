@@ -7,7 +7,7 @@
 //! time. `A` defaults to [`ReadWrite`] so `Signal<T, B>` keeps the full
 //! surface and existing code is unaffected.
 
-use crate::core::error::Result;
+use crate::core::error::{BsrsError, Result};
 use crate::core::reading::ReadingValue;
 use crate::core::status::{Status, StatusError, SubToken};
 use crate::core::Kind;
@@ -17,6 +17,7 @@ use crate::protocols_async::{
     SignalBackend, Subscription, Triggerable,
 };
 use async_trait::async_trait;
+use futures::future::{BoxFuture, FutureExt, Shared};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -105,8 +106,14 @@ where
     /// subscribed or staged; afterwards the cache fans one backend monitor out
     /// to every subscriber and holds the latest value.
     cache: std::sync::Mutex<Option<Arc<crate::devices::signal_cache::SignalCache<T, B>>>>,
+    /// The last backend connect started (ophyd-async `Device._connect_task`).
+    connect_task: std::sync::Mutex<Option<ConnectTask>>,
     _marker: std::marker::PhantomData<(T, A)>,
 }
+
+/// A spawned backend connect: every caller that joins it gets its one
+/// outcome, and a caller dropped meanwhile does not cancel it.
+type ConnectTask = Shared<BoxFuture<'static, std::result::Result<(), Arc<BsrsError>>>>;
 
 // -- Available for every access role ----------------------------------------
 
@@ -122,13 +129,9 @@ where
             backend,
             config,
             cache: std::sync::Mutex::new(None),
+            connect_task: std::sync::Mutex::new(None),
             _marker: std::marker::PhantomData,
         }
-    }
-
-    /// Connect the underlying backend.
-    pub async fn connect(&self, timeout: Duration) -> Result<()> {
-        self.backend.connect(timeout).await
     }
 
     /// Get the kind.
@@ -148,6 +151,51 @@ where
     /// ophyd-async `Signal.source` (`core/_signal.py`).
     pub fn source(&self) -> String {
         self.backend.source(&self.config.source, true)
+    }
+}
+
+impl<T, B, A> Signal<T, B, A>
+where
+    T: Clone + Send + Sync + Serialize + 'static,
+    B: SignalBackend<T> + 'static,
+    A: Access,
+{
+    /// Connect the backend. A connect still running, or one that succeeded,
+    /// is joined instead of starting another; one that failed is retried
+    /// (ophyd-async `Device.connect`).
+    pub async fn connect(&self, timeout: Duration) -> Result<()> {
+        self.join_connect(timeout, false).await
+    }
+
+    /// Start a new backend connect even if the last one succeeded
+    /// (ophyd-async `connect(force_reconnect=True)`).
+    pub async fn reconnect(&self, timeout: Duration) -> Result<()> {
+        self.join_connect(timeout, true).await
+    }
+
+    async fn join_connect(&self, timeout: Duration, force: bool) -> Result<()> {
+        let task = {
+            let mut slot = self.connect_task.lock().unwrap();
+            match slot.as_ref() {
+                Some(task) if !force && !matches!(task.peek(), Some(Err(_))) => task.clone(),
+                _ => {
+                    let backend = self.backend.clone();
+                    let run = tokio::spawn(async move { backend.connect(timeout).await });
+                    let task = async move {
+                        match run.await {
+                            Ok(outcome) => outcome.map_err(Arc::new),
+                            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+                            Err(_) => Err(Arc::new(BsrsError::Cancelled)),
+                        }
+                    }
+                    .boxed()
+                    .shared();
+                    *slot = Some(task.clone());
+                    task
+                }
+            }
+        };
+        task.await.map_err(BsrsError::Connect)
     }
 }
 

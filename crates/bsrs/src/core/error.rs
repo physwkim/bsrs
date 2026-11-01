@@ -26,6 +26,11 @@ pub enum BsrsError {
         /// `BsrsError` small).
         last: Box<serde_json::Value>,
     },
+    /// A signal's backend connect failed; every caller that joined that
+    /// connect gets this same error, as ophyd-async callers share one
+    /// `_connect_task`.
+    #[error(transparent)]
+    Connect(std::sync::Arc<BsrsError>),
     /// Cancellation was requested.
     #[error("cancelled")]
     Cancelled,
