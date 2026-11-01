@@ -9,21 +9,23 @@
 //!
 //! # terminal 2: run bsrs
 //! cd ~/codes/bsrs
-//! cargo run --example mini_beamline_scan
+//! cargo run -p bsrs --features host --example mini_beamline_scan
 //! ```
 //!
 //! What it does:
 //!
 //! - Opens CA channels to the `mini:ph:*` PVs (motor + detector +
 //!   beam current).
-//! - Builds a bsrs `Motor` (wrapping `mini:ph:mtr.VAL` /
-//!   `.RBV`) and a bsrs `Detector` (wrapping
-//!   `mini:ph:DetValue_RBV`).
+//! - Connects a `bsrs::host::ca_devices::CaMotor` (`mini:ph:mtr.VAL` /
+//!   `.RBV`) and a `CaDetector` (`mini:ph:DetValue_RBV`).
 //! - Runs `scan(det, motor, -10, 10, 21)` against the daemon's
 //!   RunEngine.
 //! - Captures every Document into a `JsonlSink` at /tmp.
 //! - Asserts the run finished with `exit_status="success"` and at
 //!   least 21 events.
+//! - Checks the primary descriptor: each `source` names the PV read and
+//!   both devices are hinted, as ophyd-async's `Motor` and
+//!   `epics_signal_r` write it.
 //!
 //! Closes the "live IOC" hole — until now bsrs's CA backend was
 //! only build-tested in CI.
@@ -32,181 +34,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bsrs::backends::epics_ca::EpicsCaBackend;
-use bsrs::core::error::{BsrsError, Result};
-use bsrs::core::msg::{DynLocation, LocatableObj, MovableObj, NamedObj, ReadableObj, StoppableObj};
-use bsrs::core::reading::ReadingValue;
-use bsrs::core::status::Status;
-#[allow(unused_imports)]
-use bsrs::devices::{Signal, SignalConfig};
+use bsrs::core::msg::{MovableObj, NamedObj, ReadableObj};
 use bsrs::engine::{DocumentSink, RunEngine};
-use bsrs::event_model::{DataKey, Dtype};
+use bsrs::host::ca_devices::{bootstrap_ca, CaDetector, CaMotor};
 use bsrs::protocols_async::SignalBackend;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
-
-/// Minimal CA-backed motor: setpoint + readback Signal pair.
-struct CaMotor {
-    name: String,
-    setpoint: Arc<EpicsCaBackend<f64>>,
-    readback: Arc<EpicsCaBackend<f64>>,
-}
-
-impl CaMotor {
-    async fn new(name: &str, val_pv: &str, rbv_pv: &str) -> Result<Self> {
-        let sp = Arc::new(EpicsCaBackend::<f64>::new(val_pv));
-        let rb = Arc::new(EpicsCaBackend::<f64>::new(rbv_pv));
-        sp.connect(Duration::from_secs(5)).await?;
-        rb.connect(Duration::from_secs(5)).await?;
-        Ok(Self {
-            name: name.to_string(),
-            setpoint: sp,
-            readback: rb,
-        })
-    }
-}
-
-impl NamedObj for CaMotor {
-    fn name(&self) -> &str {
-        &self.name
-    }
-    fn inspect_dyn(&self) -> serde_json::Value {
-        serde_json::json!({
-            "name": self.name,
-            "type": "CaMotor",
-        })
-    }
-}
-
-#[async_trait::async_trait]
-impl ReadableObj for CaMotor {
-    async fn read_dyn(&self) -> Result<HashMap<String, ReadingValue>> {
-        let r = self.readback.get_reading().await?;
-        let mut out = HashMap::new();
-        out.insert(self.name.clone(), r);
-        Ok(out)
-    }
-    async fn describe_dyn(&self) -> Result<HashMap<String, DataKey>> {
-        let mut out = HashMap::new();
-        out.insert(
-            self.name.clone(),
-            DataKey {
-                source: format!("ca://{}.RBV", self.name),
-                dtype: Dtype::Number,
-                shape: vec![],
-                dtype_numpy: Some("<f8".into()),
-                external: None,
-                units: None,
-                precision: None,
-                object_name: Some(self.name.clone()),
-                dims: None,
-                limits: None,
-                choices: None,
-            },
-        );
-        Ok(out)
-    }
-}
-
-#[async_trait::async_trait]
-impl MovableObj for CaMotor {
-    async fn set_dyn(&self, value: f64) -> Status {
-        // The backend `put` blocks until the motor record settles
-        // (WRITE_NOTIFY), bounded by EPICS_CA_PUT_TIMEOUT.
-        match self.setpoint.put(Some(value)).await {
-            Ok(()) => Status::done(),
-            Err(e) => Status::fail(bsrs::core::status::StatusError::Failed(format!("set: {e}"))),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl LocatableObj for CaMotor {
-    async fn locate_dyn(&self) -> Result<DynLocation> {
-        let sp = self.setpoint.get_value().await?;
-        let rb = self.readback.get_value().await?;
-        Ok(DynLocation {
-            setpoint: sp,
-            readback: rb,
-        })
-    }
-}
-
-#[async_trait::async_trait]
-impl StoppableObj for CaMotor {
-    async fn stop_dyn(&self, _success: bool) -> Result<()> {
-        Ok(())
-    }
-}
-
-/// Minimal CA-backed scalar detector: one Signal on a `_RBV` PV.
-struct CaDetector {
-    name: String,
-    value: Arc<EpicsCaBackend<f64>>,
-    seen: AtomicI64,
-}
-
-impl CaDetector {
-    async fn new(name: &str, value_pv: &str) -> Result<Self> {
-        let v = Arc::new(EpicsCaBackend::<f64>::new(value_pv));
-        v.connect(Duration::from_secs(5)).await?;
-        Ok(Self {
-            name: name.to_string(),
-            value: v,
-            seen: AtomicI64::new(0),
-        })
-    }
-}
-
-impl NamedObj for CaDetector {
-    fn name(&self) -> &str {
-        &self.name
-    }
-    fn inspect_dyn(&self) -> serde_json::Value {
-        serde_json::json!({
-            "name": self.name,
-            "type": "CaDetector",
-            "frames_seen": self.seen.load(Ordering::SeqCst),
-        })
-    }
-}
-
-#[async_trait::async_trait]
-impl ReadableObj for CaDetector {
-    async fn read_dyn(&self) -> Result<HashMap<String, ReadingValue>> {
-        let r = self.value.get_reading().await?;
-        self.seen.fetch_add(1, Ordering::SeqCst);
-        let mut out = HashMap::new();
-        out.insert(self.name.clone(), r);
-        Ok(out)
-    }
-    async fn describe_dyn(&self) -> Result<HashMap<String, DataKey>> {
-        let mut out = HashMap::new();
-        out.insert(
-            self.name.clone(),
-            DataKey {
-                source: format!("ca://{}", self.name),
-                dtype: Dtype::Number,
-                shape: vec![],
-                dtype_numpy: Some("<f8".into()),
-                external: None,
-                units: None,
-                precision: None,
-                object_name: Some(self.name.clone()),
-                dims: None,
-                limits: None,
-                choices: None,
-            },
-        );
-        Ok(out)
-    }
-}
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Bootstrap the CA context outside any runtime — the CA backend's
     // `ca_context()` block_on's CaClient::new() once. Calling it from
     // inside a tokio runtime panics with "Cannot start a runtime from
     // within a runtime". After this call the global is cached.
-    let _ = bsrs::backends::epics_ca::ca_context();
+    bootstrap_ca();
 
     // Drive the rest on bsrs's runtime so all subsequent
     // block_on / spawn calls share the same handle.
@@ -216,12 +54,12 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 async fn async_main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     eprintln!("[bsrs] connecting to mini-beamline IOC via CA...");
 
-    let motor = Arc::new(CaMotor::new("ph_mtr", "mini:ph:mtr.VAL", "mini:ph:mtr.RBV").await?);
-    let det = Arc::new(CaDetector::new("ph_det", "mini:ph:DetValue_RBV").await?);
+    let motor = CaMotor::connect_async("ph_mtr", "mini:ph:mtr.VAL", "mini:ph:mtr.RBV").await?;
+    let det = CaDetector::connect_async("ph_det", "mini:ph:DetValue_RBV").await?;
 
-    // Mini-beamline's sim motor ships at VELO=0.2 (slow). Bump it
-    // so each scan step finishes inside the 30 s WRITE_NOTIFY put
-    // timeout. Real beamlines configure this once during setup.
+    // Mini-beamline's sim motor ships at VELO=0.2 (slow). Bump it so
+    // the scan takes seconds. Real beamlines configure this once
+    // during setup.
     let velo = Arc::new(EpicsCaBackend::<f64>::new("mini:ph:mtr.VELO"));
     velo.connect(Duration::from_secs(5)).await?;
     let _ = velo.put(Some(5.0)).await;
@@ -240,7 +78,8 @@ async fn async_main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let sink: Arc<dyn DocumentSink> =
         Arc::new(bsrs::callbacks::JsonlSink::open(&jsonl_path).await?);
 
-    let re = RunEngine::new(vec![sink.clone()]);
+    let capture = Arc::new(bsrs::callbacks::CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone(), capture.clone() as Arc<dyn DocumentSink>]);
 
     // Scan from -8 to 8 in 17 points (covers the PinHole gaussian
     // peak at center=0, sigma=5).
@@ -263,15 +102,37 @@ async fn async_main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     if result.exit_status != "success" {
         return Err(format!("expected exit_status=success, got {}", result.exit_status).into());
     }
-    let frames = det.seen.load(Ordering::SeqCst);
+    let frames = det.inspect_dyn()["frames_seen"].as_i64().unwrap_or(0);
     if frames < 17 {
         return Err(format!("expected ≥17 detector reads, got {frames}").into());
     }
+    check_descriptor(&capture.snapshot().await)?;
     eprintln!("[bsrs] OK — {frames} reads, exit=success");
     Ok(())
 }
 
-// BsrsError is referenced via Result<...> in the trait impls above.
-const _: fn() = || {
-    let _: Box<BsrsError> = Box::new(BsrsError::Backend("never constructed".into()));
-};
+/// The primary descriptor as ophyd-async's `Motor` and `epics_signal_r`
+/// write it: each source names the PV read, and both devices are hinted.
+fn check_descriptor(docs: &[bsrs::event_model::Document]) -> Result<(), String> {
+    let desc = docs
+        .iter()
+        .find_map(|d| match d {
+            bsrs::event_model::Document::Descriptor(d) => Some(d),
+            _ => None,
+        })
+        .ok_or("no descriptor")?;
+    for (key, pv) in [
+        ("ph_mtr", "mini:ph:mtr.RBV"),
+        ("ph_det", "mini:ph:DetValue_RBV"),
+    ] {
+        let source = desc.data_keys.get(key).map(|k| k.source.as_str());
+        if source != Some(&format!("ca://{pv}")) {
+            return Err(format!("{key}: source {source:?}, want ca://{pv}"));
+        }
+        let fields = desc.hints.as_ref().and_then(|h| h.get(key)?.fields.clone());
+        if fields != Some(vec![key.to_string()]) {
+            return Err(format!("{key}: hinted fields {fields:?}, want [{key}]"));
+        }
+    }
+    Ok(())
+}

@@ -93,6 +93,12 @@ impl ReadableObj for Dcm {
         out.extend(t?);
         Ok(out)
     }
+
+    /// ophyd `Device.hints`: the energy readback. `theta_rbv` is a
+    /// normal-kind component and hints nothing.
+    fn hint_fields(&self) -> Option<Vec<String>> {
+        self.energy.hint_fields()
+    }
 }
 
 #[async_trait]
@@ -141,5 +147,27 @@ impl Dcm {
         v.value
             .as_f64()
             .ok_or_else(|| format!("theta_rbv: expected number, got {:?}", v.value))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs BSRS_EPICS_RS; see crates/bsrs/tests/example_ioc"]
+    async fn hints_the_energy_readback() {
+        crate::example_ioc::boot("mini-ioc", "mini-beamline");
+        let dcm = Dcm::connect(
+            "dcm",
+            "mini:BraggEAO",
+            "mini:BraggERdbkAO",
+            "mini:KohzuMoving",
+            "mini:BraggThetaRdbkAO",
+        )
+        .await
+        .unwrap();
+        assert_eq!(dcm.hint_fields(), Some(vec!["dcm_energy".to_string()]));
+        assert!(dcm.describe_dyn().await.unwrap().contains_key("dcm_energy"));
     }
 }
