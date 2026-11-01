@@ -26,7 +26,8 @@ pub use plan::{plan_box, plan_items, respond, Plan, PlanItem};
 pub use reading::{ReadingF64, ReadingValue, TypedReading};
 pub use runtime::{bsrs_runtime, runtime_handle};
 pub use status::{
-    CancelGuard, Status, StatusError, StatusOutcome, SubToken, Watcher, WatcherUpdate,
+    CancelGuard, Status, StatusError, StatusOutcome, SubToken, TimedOut, WaitError, Watcher,
+    WatcherUpdate,
 };
 pub use subscription::Subscription;
 pub use suspender::Suspender;
