@@ -13,9 +13,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bsrs::backends::epics_ca::EpicsCaBackend;
-use bsrs::core::msg::{LocatableObj, MonitorableObj, MovableObj, ReadableObj};
+use bsrs::core::msg::{LocatableObj, MonitorableObj, MovableObj, ReadableObj, StoppableObj};
 use bsrs::core::runtime::bsrs_runtime;
 use bsrs::core::subscription::Subscription;
+use bsrs::core::Status;
 use bsrs::event_model::LimitsRange;
 use bsrs::host::ca_devices::{CaDetector, CaMotor};
 use bsrs::host::pva_devices::{PvaDetector, PvaMotor};
@@ -25,10 +26,13 @@ const BIN: &str = "ophyd-test-ioc";
 const MRES: f64 = 0.001;
 
 const X1: &str = "XF:31IDA-OP{Tbl-Ax:X1}Mtr";
+const X2: &str = "XF:31IDA-OP{Tbl-Ax:X2}Mtr";
+const X3: &str = "XF:31IDA-OP{Tbl-Ax:X3}Mtr";
 const X4: &str = "XF:31IDA-OP{Tbl-Ax:X4}Mtr";
 const X5: &str = "XF:31IDA-OP{Tbl-Ax:X5}Mtr";
 const X6: &str = "XF:31IDA-OP{Tbl-Ax:X6}Mtr";
 const FAKE: &str = "XF:31IDA-OP{Tbl-Ax:FakeMtr}";
+const SIM1: &str = "sim:mtr1";
 const SIM2: &str = "sim:mtr2";
 
 fn field(record: &str, f: &str) -> String {
@@ -143,6 +147,69 @@ async fn a_move_settles_once_the_motor_is_done() {
         .expect("the null move settles")
         .expect("the null move succeeds");
     assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+/// Start a long move and wait until the motor is underway.
+async fn underway(m: &CaMotor) -> (Status, f64, Subscription) {
+    let start = m.locate_dyn().await.unwrap().readback;
+    let target = inward(start, 8.0);
+    let sub = m.subscribe_dyn().await.unwrap();
+    let st = m.set_dyn(target).await;
+    readback_until(&sub, |v| (v - start).abs() >= 0.5).await;
+    (st, target, sub)
+}
+
+/// The motor halted short of `target` and its move is settled.
+async fn halted_short(m: &CaMotor, record: &str, target: f64) {
+    tokio::time::timeout(Duration::from_secs(3), done_moving(record))
+        .await
+        .expect("the motor halts once stopped");
+    let rb = m.locate_dyn().await.unwrap().readback;
+    assert!((rb - target).abs() > 4.0, "the motor ran on to {rb}");
+}
+
+/// test_epicsmotor.py `test_move` (`motor.stop()`); ophyd-async
+/// `test_motor_moving_stopped`: `stop(success=False)` writes `.STOP`, the
+/// motor halts, and the move fails.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+async fn stop_halts_the_motor_and_fails_its_move() {
+    example_ioc::boot(BIN, BIN);
+    let m = ca_motor("x2", X2).await;
+    let (st, target, _sub) = underway(&m).await;
+    m.stop_dyn(false).await.unwrap();
+    let err = tokio::time::timeout(Duration::from_secs(3), st)
+        .await
+        .expect("the move settles once stopped")
+        .expect_err("a move stopped with success=false fails");
+    assert!(err.to_string().contains("stopped"), "{err}");
+    halted_short(&m, X2, target).await;
+}
+
+/// ophyd-async `StandardMovable.stop(success=True)`, which bluesky sends on
+/// pause and at the end of a run (`stop_on_pause`): the motor halts and its
+/// move completes.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+async fn stop_with_success_halts_the_motor_and_completes_its_move() {
+    example_ioc::boot(BIN, BIN);
+    let m = ca_motor("x3", X3).await;
+
+    let (st, target, _sub) = underway(&m).await;
+    m.stop_dyn(true).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), st)
+        .await
+        .expect("the move settles once stopped")
+        .expect("a move stopped with success=true completes");
+    halted_short(&m, X3, target).await;
+
+    let (st, target, _sub) = underway(&m).await;
+    MovableObj::stop_on_pause(m.as_ref(), true).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), st)
+        .await
+        .expect("the move settles once the engine stops it")
+        .expect("the engine's stop completes the move");
+    halted_short(&m, X3, target).await;
 }
 
 /// test_epicsmotor.py `test_limits`/`check_value`; ophyd-async
@@ -305,6 +372,47 @@ async fn a_held_move_times_out_on_the_records_velocity_and_acceleration() {
     assert!(err.to_string().contains("timed out after 11.250s"), "{err}");
     assert!(took >= Duration::from_millis(11_200), "{took:?}");
     assert!(took < Duration::from_secs(13), "{took:?}");
+}
+
+/// test_epicsmotor.py `test_move` and `motor.stop()` over PVA: the
+/// `block=true` put settles once the motor is done, and `stop` halts the
+/// motor and fails its move.
+#[test]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+fn a_pva_move_settles_once_done_and_stop_halts_it() {
+    example_ioc::boot(BIN, BIN);
+    let m = pva_motor("sim_mtr1", SIM1);
+    bsrs_runtime().block_on(async {
+        let start = m.locate_dyn().await.unwrap().readback;
+        let target = inward(start, 1.0);
+        let started = Instant::now();
+        let st = m.set_dyn(target).await;
+        assert!(!st.done_state(), "settled before the motor moved");
+        tokio::time::timeout(Duration::from_secs(20), st)
+            .await
+            .expect("within the deadline")
+            .expect("the move succeeds");
+        assert!(started.elapsed() >= Duration::from_millis(900));
+        let rb = m.locate_dyn().await.unwrap().readback;
+        assert!((rb - target).abs() <= MRES + 1e-9, "{rb}");
+
+        let start = rb;
+        let target = inward(start, 8.0);
+        let sub = m.subscribe_dyn().await.unwrap();
+        let st = m.set_dyn(target).await;
+        readback_until(&sub, |v| (v - start).abs() >= 0.5).await;
+        m.stop_dyn(false).await.unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(3), st)
+            .await
+            .expect("the move settles once stopped")
+            .expect_err("a move stopped with success=false fails");
+        assert!(err.to_string().contains("stopped"), "{err}");
+        tokio::time::timeout(Duration::from_secs(3), done_moving(SIM1))
+            .await
+            .expect("the motor halts once stopped");
+        let rb = m.locate_dyn().await.unwrap().readback;
+        assert!((rb - target).abs() > 4.0, "the motor ran on to {rb}");
+    });
 }
 
 /// test_epicsmotor.py `test_hints` and ophyd-async `test_read_motor` over

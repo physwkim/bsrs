@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bsrs::core::error::Result;
-use bsrs::core::msg::{DynLocation, LocatableObj, MovableObj, NamedObj, ReadableObj};
+use bsrs::core::msg::{DynLocation, LocatableObj, MovableObj, NamedObj, ReadableObj, StoppableObj};
 use bsrs::core::reading::ReadingValue;
 use bsrs::core::status::Status;
 use bsrs::event_model::DataKey;
@@ -99,6 +99,16 @@ impl ReadableObj for Dcm {
 impl MovableObj for Dcm {
     async fn set_dyn(&self, value: f64) -> Status {
         self.energy.set_dyn(value).await
+    }
+    async fn stop_on_pause(&self, success: bool) -> Result<()> {
+        self.energy.stop_dyn(success).await
+    }
+}
+
+#[async_trait]
+impl StoppableObj for Dcm {
+    async fn stop_dyn(&self, success: bool) -> Result<()> {
+        self.energy.stop_dyn(success).await
     }
 }
 

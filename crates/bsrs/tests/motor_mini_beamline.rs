@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use bsrs::backends::epics_ca::EpicsCaBackend;
 use bsrs::callbacks::CapturingSink;
-use bsrs::core::msg::{LocatableObj, MovableObj, ReadableObj};
+use bsrs::core::msg::{LocatableObj, MovableObj, ReadableObj, StoppableObj};
 use bsrs::event_model::PerObjectHint;
 use bsrs::host::ca_devices::{CaDetector, CaMotor, CaPositioner};
 use bsrs::prelude::*;
@@ -168,4 +168,42 @@ async fn a_positioner_refuses_a_target_past_the_limit_and_settles_on_done() {
     assert_eq!(movn, 0.0);
     let rb = p.locate_dyn().await.unwrap().readback;
     assert!((rb - target).abs() <= MRES + 1e-9, "{rb}");
+}
+
+/// ophyd `PositionerBase.stop` (test_pvpositioner.py `test_pvpos`
+/// `m.stop()`): a positioner with no stop PV ends its move on `stop`, failed
+/// for `success=False`, done for `success=True`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+async fn stop_ends_a_positioners_move() {
+    example_ioc::boot(BIN, EXAMPLE);
+    let p = CaPositioner::connect_async(
+        "edge",
+        "mini:edge:mtr.VAL",
+        "mini:edge:mtr.RBV",
+        "mini:edge:mtr.MOVN",
+        0.0,
+    )
+    .await
+    .unwrap();
+
+    for success in [false, true] {
+        let start = p.locate_dyn().await.unwrap().readback;
+        let st = p.set_dyn(inward(start, 3.0)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        p.stop_dyn(success).await.unwrap();
+        let res = tokio::time::timeout(Duration::from_secs(1), st)
+            .await
+            .expect("stop ends the move");
+        assert_eq!(res.is_ok(), success, "{res:?}");
+        // The record carries on to the target; let it get there.
+        let done = ca_f64("mini:edge:mtr.DMOV").await;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while done.get_value().await.unwrap() != 1.0 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("the motor finishes");
+    }
 }

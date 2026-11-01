@@ -38,7 +38,7 @@ use crate::core::status::Status;
 use crate::core::subscription::Subscription;
 use crate::devices::SignalCache;
 use crate::event_model::DataKey;
-use crate::host::motor_move::{describe_pv, move_status, MotorChannels};
+use crate::host::motor_move::{describe_pv, move_status, Halt, MotorChannels};
 // `SignalBackend` is the trait that provides connect/put/get on the
 // CA backend; pulled in via the `bsrs-protocols-async` dep that
 // the `ca` feature toggles on.
@@ -119,6 +119,9 @@ impl MovableObj for CaMotor {
     async fn set_dyn(&self, value: f64) -> Status {
         self.channels.set("ca_motor", &self.name, value).await
     }
+    async fn stop_on_pause(&self, success: bool) -> Result<()> {
+        StoppableObj::stop_dyn(self, success).await
+    }
 }
 
 #[async_trait::async_trait]
@@ -132,8 +135,10 @@ impl LocatableObj for CaMotor {
 
 #[async_trait::async_trait]
 impl StoppableObj for CaMotor {
-    async fn stop_dyn(&self, _success: bool) -> Result<()> {
-        Ok(())
+    /// ophyd-async `Motor.stop`: press `.STOP` while the motor moves, then
+    /// settle the move, failed unless `success`.
+    async fn stop_dyn(&self, success: bool) -> Result<()> {
+        self.channels.stop(success).await
     }
 }
 
@@ -172,6 +177,7 @@ pub struct CaPositioner {
     done_pv: String,
     rbv_pv: String,
     done_value: f64,
+    halt: Halt,
 }
 
 /// The three channels of a [`CaPositioner`], already connected.
@@ -198,6 +204,7 @@ impl CaPositioner {
             done_pv: done_pv.to_string(),
             rbv_pv: rbv_pv.to_string(),
             done_value,
+            halt: Halt::new(),
         })
     }
 
@@ -308,7 +315,11 @@ impl MovableObj for CaPositioner {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         };
-        move_status(self.setpoint.as_ref(), value, "ca_positioner set", finish).await
+        let what = "ca_positioner set";
+        move_status(self.setpoint.as_ref(), value, what, &self.halt, finish).await
+    }
+    async fn stop_on_pause(&self, success: bool) -> Result<()> {
+        StoppableObj::stop_dyn(self, success).await
     }
 }
 
@@ -323,7 +334,11 @@ impl LocatableObj for CaPositioner {
 
 #[async_trait::async_trait]
 impl StoppableObj for CaPositioner {
-    async fn stop_dyn(&self, _success: bool) -> Result<()> {
+    /// ophyd `PositionerBase.stop`: settle the move, failed unless
+    /// `success`. With no stop PV the motion carries on, as for a
+    /// `PVPositioner` without `stop_signal`.
+    async fn stop_dyn(&self, success: bool) -> Result<()> {
+        self.halt.stop(success);
         Ok(())
     }
 }

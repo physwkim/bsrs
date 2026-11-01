@@ -103,6 +103,9 @@ impl MovableObj for PvaMotor {
     async fn set_dyn(&self, value: f64) -> Status {
         self.channels.set("pva_motor", &self.name, value).await
     }
+    async fn stop_on_pause(&self, success: bool) -> Result<()> {
+        StoppableObj::stop_dyn(self, success).await
+    }
 }
 
 #[async_trait::async_trait]
@@ -116,8 +119,10 @@ impl LocatableObj for PvaMotor {
 
 #[async_trait::async_trait]
 impl StoppableObj for PvaMotor {
-    async fn stop_dyn(&self, _success: bool) -> Result<()> {
-        Ok(())
+    /// ophyd-async `Motor.stop`: press `.STOP` while the motor moves, then
+    /// settle the move, failed unless `success`.
+    async fn stop_dyn(&self, success: bool) -> Result<()> {
+        self.channels.stop(success).await
     }
 }
 
