@@ -115,27 +115,14 @@ enum Phase {
     Done(End),
 }
 
-#[derive(Clone)]
-enum End {
-    Succeeded,
-    Failed(StatusError),
-    Cancelled,
-}
+/// How a status ended. `Err(StatusError::Cancelled)` is its only cancelled
+/// form, whether [`Status::cancel`] or the producer recorded it.
+type End = Result<(), StatusError>;
 
-impl End {
-    fn result(&self) -> Result<(), StatusError> {
-        match self {
-            End::Succeeded => Ok(()),
-            End::Failed(e) => Err(e.clone()),
-            End::Cancelled => Err(StatusError::Cancelled),
-        }
-    }
-
-    fn outcome(&self) -> StatusOutcome {
-        match self.result() {
-            Ok(()) => StatusOutcome::Success,
-            Err(e) => StatusOutcome::Failed(e),
-        }
+fn outcome(end: &End) -> StatusOutcome {
+    match end {
+        Ok(()) => StatusOutcome::Success,
+        Err(e) => StatusOutcome::Failed(e.clone()),
     }
 }
 
@@ -171,7 +158,7 @@ impl Inner {
             *phase = Phase::Done(end.clone());
             waiters
         };
-        let outcome = end.outcome();
+        let outcome = outcome(&end);
         for cb in callbacks {
             cb(&outcome);
         }
@@ -248,20 +235,21 @@ impl Status {
 
     /// Has the operation completed successfully?
     pub fn success(&self) -> bool {
-        matches!(self.inner.end(), Some(End::Succeeded))
+        matches!(self.inner.end(), Some(Ok(())))
     }
 
     /// If failed or cancelled, returns the error (cancellation surfaces as
     /// [`StatusError::Cancelled`]).
     pub fn exception(&self) -> Option<StatusError> {
-        self.inner.end()?.result().err()
+        self.inner.end()?.err()
     }
 
-    /// Did the operation end in cancellation? Mirrors ophyd-async
-    /// `Status.cancelled` (`_status.py:91`); a cancelled status is *not*
-    /// `success()`.
+    /// Did the operation end in cancellation, by [`Status::cancel`] or by the
+    /// producer failing with [`StatusError::Cancelled`]? Mirrors ophyd-async
+    /// `Status.cancelled` (`_status.py:91`), where a task that raises
+    /// `CancelledError` is cancelled; a cancelled status is *not* `success()`.
     pub fn cancelled(&self) -> bool {
-        matches!(self.inner.end(), Some(End::Cancelled))
+        matches!(self.inner.end(), Some(Err(StatusError::Cancelled)))
     }
 
     /// Request cancellation (consumer side). Signals the producer via the
@@ -276,7 +264,7 @@ impl Status {
     /// ophyd-async drives from `async with status:` (`_status.py:113-118`).
     pub fn cancel(&self) {
         self.inner.cancel.cancel();
-        self.inner.finish(End::Cancelled);
+        self.inner.finish(Err(StatusError::Cancelled));
     }
 
     /// Wrap this status in a [`CancelGuard`] that cancels it on scope exit —
@@ -303,12 +291,11 @@ impl Status {
     /// `success` is `null` while pending; once `done`, it's a bool.
     pub fn inspect(&self) -> serde_json::Value {
         let end = self.inner.end();
-        let result = end.as_ref().map(End::result);
         serde_json::json!({
             "done": end.is_some(),
-            "success": result.as_ref().map(Result::is_ok),
-            "cancelled": matches!(end, Some(End::Cancelled)),
-            "exception": result.and_then(Result::err).map(|e| e.to_string()),
+            "success": end.as_ref().map(Result::is_ok),
+            "cancelled": matches!(end, Some(Err(StatusError::Cancelled))),
+            "exception": end.and_then(Result::err).map(|e| e.to_string()),
             "progress": self.progress(),
         })
     }
@@ -325,14 +312,14 @@ impl Status {
     where
         F: FnOnce(&StatusOutcome) + Send + 'static,
     {
-        let end = match &mut *self.inner.phase.lock().unwrap() {
+        let outcome = match &mut *self.inner.phase.lock().unwrap() {
             Phase::Pending { callbacks, .. } => {
                 callbacks.push(Box::new(cb));
                 return;
             }
-            Phase::Done(end) => end.clone(),
+            Phase::Done(end) => outcome(end),
         };
-        cb(&end.outcome());
+        cb(&outcome);
     }
 
     /// Sync wait — blocks (via bsrs runtime) until completion, or until
@@ -399,12 +386,12 @@ impl Status {
 impl StatusSetter {
     /// Mark the status as successful and fire callbacks/wakers.
     pub fn success(self) {
-        self.inner.finish(End::Succeeded);
+        self.inner.finish(Ok(()));
     }
 
     /// Mark the status as failed.
     pub fn fail(self, err: StatusError) {
-        self.inner.finish(End::Failed(err));
+        self.inner.finish(Err(err));
     }
 
     /// Resolves when the consumer requests cancellation via [`Status::cancel`].
@@ -493,7 +480,7 @@ impl Future for Status {
                 }
                 Poll::Pending
             }
-            Phase::Done(end) => Poll::Ready(end.result()),
+            Phase::Done(end) => Poll::Ready(end.clone()),
         }
     }
 }
@@ -503,7 +490,7 @@ impl std::fmt::Debug for Status {
         let end = self.inner.end();
         f.debug_struct("Status")
             .field("done", &end.is_some())
-            .field("success", &matches!(end, Some(End::Succeeded)))
+            .field("success", &matches!(end, Some(Ok(()))))
             .finish()
     }
 }

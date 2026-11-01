@@ -99,7 +99,8 @@ fn blocking_wait_returns_the_outcome_and_a_wait_timeout_changes_nothing() {
 
 // ophyd-async test_async_status_success / _propagates_exception /
 // _has_no_exception_if_coroutine_successful / test_completed_status, and the
-// self-cancelling device of _propagates_cancelled_error_with_message.
+// self-cancelling device of _propagates_cancelled_error_with_message, whose
+// task ends cancelled.
 #[tokio::test(start_paused = true)]
 async fn awaiting_an_operation_yields_its_outcome() {
     for result in [
@@ -120,6 +121,9 @@ async fn awaiting_an_operation_yields_its_outcome() {
         assert!(status.done_state());
         assert_eq!(status.success(), result.is_ok());
         assert_eq!(dbg(status.exception()), dbg(result.as_ref().err()));
+        let cancelled = matches!(result, Err(StatusError::Cancelled));
+        assert_eq!(status.cancelled(), cancelled);
+        assert_eq!(status.inspect()["cancelled"], cancelled);
     }
 
     assert!(Status::done().await.is_ok());
