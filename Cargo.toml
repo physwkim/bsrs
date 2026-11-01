@@ -44,6 +44,13 @@ nu-ansi-term = "0.50"
 bsrs                = { version = "0.5.8", path = "crates/bsrs" }
 bsrs-derive         = { version = "0.5.8", path = "crates/bsrs-derive" }
 
+# PutOp::send (epics-rs #169) is on main but not in 0.33.0; drop this
+# section once a release carries it.
+[patch.crates-io]
+epics-base-rs = { git = "https://github.com/epics-rs/epics-rs.git", branch = "main" }
+epics-ca-rs   = { git = "https://github.com/epics-rs/epics-rs.git", branch = "main" }
+epics-pva-rs  = { git = "https://github.com/epics-rs/epics-rs.git", branch = "main" }
+
 [profile.dev]
 opt-level = 1
 
