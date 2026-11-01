@@ -208,8 +208,9 @@ fn h5_shape(path: &Path, dataset: &str) -> Vec<usize> {
 }
 
 /// ophyd-async `test_use_cases.py:17` `test_step_scan_hdf_detector_with_stats_and_temp`
-/// and `test_adsim_system.py:161` `test_software_triggering`: the image key
-/// points at the file, one resource per staging, one datum per trigger.
+/// and `test_adsim_system.py:161` `test_software_triggering`: describe needs
+/// a prepare or trigger, the image key points at the file, one resource per
+/// staging, one datum per trigger.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
 async fn hdf_step_scan_points_its_documents_at_the_file_the_ioc_wrote() {
@@ -220,6 +221,12 @@ async fn hdf_step_scan_points_its_documents_at_the_file_the_ioc_wrote() {
     let h5 = dir.path().join("step.h5");
 
     Stageable::stage(&det).await.expect("stage");
+    let err = ReadableObj::describe_dyn(&det)
+        .await
+        .expect_err("describe before prepare or trigger");
+    assert!(err.to_string().contains("Prepare not run"), "{err}");
+
+    trigger(&det).await.unwrap();
     let keys = ReadableObj::describe_dyn(&det).await.expect("describe");
     let image = &keys["det_image"];
     assert_eq!(image.shape, shape(&[1, HEIGHT as u64, WIDTH as u64]));
@@ -227,8 +234,6 @@ async fn hdf_step_scan_points_its_documents_at_the_file_the_ioc_wrote() {
     assert_eq!(numpy(image), Some("|u1"));
     assert_eq!(image.external.as_deref(), Some("STREAM:"));
     assert_eq!(image.source, file_uri(&h5));
-
-    trigger(&det).await.unwrap();
     assert_eq!(index(&det).await, 1);
     let (resources, datums) = drain(&det).await;
     assert_eq!(resources.len(), 1, "{resources:?}");
@@ -286,6 +291,7 @@ async fn hdf_ndattributes_get_a_key_resource_and_datum_each() {
         .unwrap();
 
     Stageable::stage(&det).await.expect("stage");
+    trigger(&det).await.unwrap();
     let keys = ReadableObj::describe_dyn(&det).await.expect("describe");
     let names: HashSet<&str> = keys.keys().map(String::as_str).collect();
     assert_eq!(names, HashSet::from(["det_image", "AcqTime", "Temp"]));
@@ -301,7 +307,6 @@ async fn hdf_ndattributes_get_a_key_resource_and_datum_each() {
         assert_eq!(k.external.as_deref(), Some("STREAM:"), "{name}");
     }
 
-    trigger(&det).await.unwrap();
     let (resources, datums) = drain(&det).await;
     Stageable::unstage(&det).await.expect("unstage");
     timeout(
@@ -625,6 +630,86 @@ async fn kickoff_beyond_the_prepared_frames_fails() {
     );
 }
 
+/// ophyd-async `test_use_cases.py:266` `test_flyscan_aravis_detector`
+/// (`collections_per_event=3`) and `_detector.py:466`
+/// `_update_prepare_context`/`get_index`: the image key leads with the
+/// collections per event, the index and datums count events, the kickoff
+/// bound counts collections, and a prepare with the same
+/// `collections_per_event` keeps the resource.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+async fn collections_per_event_groups_frames_into_events() {
+    boot();
+    let _cam = CAM_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let det = hdf_det("det", dir.path(), "cpe").await;
+    let h5 = dir.path().join("cpe.h5");
+    Stageable::stage(&det).await.expect("stage");
+    let info = |events| TriggerInfo {
+        number_of_events: events,
+        collections_per_event: 2,
+        ..TriggerInfo::default()
+    };
+    finish(Preparable::prepare(&det, info(2)).await, "prepare")
+        .await
+        .unwrap();
+    let keys = ReadableObj::describe_dyn(&det).await.expect("describe");
+    assert_eq!(
+        keys["det_image"].shape,
+        shape(&[2, HEIGHT as u64, WIDTH as u64])
+    );
+    assert_eq!(keys["det_image"].dtype, Dtype::Array);
+    finish(Flyable::kickoff(&det).await, "kickoff")
+        .await
+        .unwrap();
+    finish(Flyable::complete(&det).await, "complete")
+        .await
+        .unwrap();
+    assert_eq!(get::<i64>(&format!("{CAM}NumImages")).await, 4);
+    assert_eq!(index(&det).await, 2);
+    let (resources, datums) = drain(&det).await;
+    assert_eq!(resources.len(), 1, "{resources:?}");
+    assert_eq!(
+        resources[0].parameters["chunk_shape"],
+        json!([1, HEIGHT, WIDTH])
+    );
+    assert_eq!(datums.len(), 1, "{datums:?}");
+    assert_eq!((datums[0].indices.start, datums[0].indices.stop), (0, 2));
+
+    let again = finish(Flyable::kickoff(&det).await, "kickoff").await;
+    if again.is_ok() {
+        let _ = finish(Flyable::complete(&det).await, "complete").await;
+    }
+    finish(Preparable::prepare(&det, info(1)).await, "prepare")
+        .await
+        .unwrap();
+    finish(Flyable::kickoff(&det).await, "kickoff")
+        .await
+        .unwrap();
+    finish(Flyable::complete(&det).await, "complete")
+        .await
+        .unwrap();
+    let n = index(&det).await;
+    let (resources, datums) = drain(&det).await;
+    Stageable::unstage(&det).await.expect("unstage");
+    let err = again.expect_err("kickoff past the prepared events succeeded");
+    assert!(
+        err.contains("Kickoff requested 4:8, but detector was only prepared up to 4"),
+        "{err}"
+    );
+    assert_eq!(n, 3);
+    assert!(resources.is_empty(), "{resources:?}");
+    assert_eq!(datums.len(), 1, "{datums:?}");
+    assert_eq!((datums[0].indices.start, datums[0].indices.stop), (2, 3));
+    #[cfg(feature = "hdf5")]
+    assert_eq!(
+        h5_shape(&h5, "entry/data/data"),
+        vec![6, HEIGHT as usize, WIDTH as usize]
+    );
+    #[cfg(not(feature = "hdf5"))]
+    assert!(h5.exists());
+}
+
 /// ophyd-async `test_standard_detector.py:625`
 /// `test_config_signals_in_describe_configuration` and
 /// `test_adsim_system.py:209`/`:217`: the exposure time and period are the
@@ -711,21 +796,27 @@ async fn read_reports_only_described_fields() {
 }
 
 /// ophyd-async `test_data_logic.py:36` `test_hdf_writer_file_not_found` and
-/// `PathInfo.create_dir_depth`: a directory the IOC cannot see fails stage;
-/// allowed to create the last two levels, the IOC makes them.
+/// `PathInfo.create_dir_depth`: a directory the IOC cannot see fails
+/// `prepare(TriggerInfo())`; allowed to create the last two levels, the IOC
+/// makes them.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
-async fn hdf_stage_needs_the_directory_or_leave_to_create_it() {
+async fn hdf_prepare_needs_the_directory_or_leave_to_create_it() {
     boot();
     let _cam = CAM_LOCK.lock().await;
     let root = tempfile::tempdir().unwrap();
     let missing = root.path().join("a").join("b");
 
     let det = hdf_det("det", &missing, "nodir").await;
-    let err = Stageable::stage(&det)
-        .await
-        .expect_err("stage into a missing dir");
-    assert!(err.to_string().contains("doesn't exist"), "{err}");
+    Stageable::stage(&det).await.expect("stage");
+    let prepared = finish(
+        Preparable::prepare(&det, TriggerInfo::default()).await,
+        "prepare",
+    )
+    .await;
+    let _ = Stageable::unstage(&det).await;
+    let err = prepared.expect_err("prepare into a missing dir");
+    assert!(err.contains("doesn't exist"), "{err}");
     assert!(!missing.exists());
 
     let det = area_detector_hdf(
@@ -755,10 +846,16 @@ async fn rgb1_frames_get_a_colour_dimension() {
     put::<i64>(&format!("{CAM}ColorMode"), 2).await;
     det.control().warmup().await.expect("warmup");
     let staged = Stageable::stage(&det).await;
+    let prepared = finish(
+        Preparable::prepare(&det, TriggerInfo::default()).await,
+        "prepare",
+    )
+    .await;
     let keys = ReadableObj::describe_dyn(&det).await;
     let _ = Stageable::unstage(&det).await;
     put::<i64>(&format!("{CAM}ColorMode"), 0).await;
     staged.expect("stage");
+    prepared.unwrap();
     assert_eq!(
         keys.expect("describe")["det_image"].shape,
         shape(&[1, 3, HEIGHT as u64, WIDTH as u64])

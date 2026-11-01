@@ -397,13 +397,17 @@ impl FlyMotorInfo {
 /// Sealed: detector writer half (open / observe / collect_stream_docs / close).
 #[async_trait]
 pub trait DetectorWriter: Send + Sync {
-    /// Open the writer; returns the `data_keys` that the writer will produce.
+    /// Open the writer for `multiplier` collections per event
+    /// ([`TriggerInfo::collections_per_event`]), which leads each returned
+    /// `DataKey`'s shape (ophyd-async `make_datakeys`).
     async fn open(&self, multiplier: u32) -> Result<HashMap<String, DataKey>>;
-    /// Observe the per-frame index counter.
+    /// Observe the collections (frames) written; the detector divides by the
+    /// multiplier for its event index (ophyd-async
+    /// `collections_written_signal`).
     fn observe_indices_written(&self) -> watch::Receiver<u64>;
-    /// Read the current index synchronously (atomic load).
+    /// The collections (frames) written now.
     async fn indices_written(&self) -> u64;
-    /// Yield asset documents for frames up to `up_to`, stamping each
+    /// Yield asset documents for events up to `up_to`, stamping each
     /// `StreamDatum` with `descriptor` (the EventDescriptor UID; empty when
     /// the caller has no descriptor context).
     fn collect_stream_docs(&self, up_to: u64, descriptor: &str) -> BoxStream<'_, StreamAsset>;

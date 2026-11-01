@@ -26,9 +26,13 @@ pub use crate::protocols_async::{DetectorTrigger, TriggerInfo};
 #[derive(Clone)]
 struct PrepareCtx {
     trigger_info: TriggerInfo,
-    // Writer index at that prepare (refreshed by trigger); the prepared
-    // collections end at this + `trigger_info.number_of_collections()`.
+    // Collections the writer had written at that prepare (refreshed by
+    // trigger); the prepared ones end at this +
+    // `trigger_info.number_of_collections()`.
     collections_written: u64,
+    // What the writer, opened for `trigger_info.collections_per_event`,
+    // reported; `describe` reads these, never re-opening the writer.
+    data_keys: HashMap<String, DataKey>,
 }
 
 /// ophyd-async `_KickoffCtx`: what the last kickoff asked `complete` to wait
@@ -58,10 +62,6 @@ where
     // ophyd-async `events_to_kickoff`: `number_of_events` at prepare, 0 at
     // stage; a plan may lower it to split the prepared events over kickoffs.
     events_to_kickoff: AtomicU64,
-    // DataKeys captured when the writer is opened at `stage()`. `describe`
-    // reads from this cache rather than re-opening the writer mid-acquisition
-    // (DB-04); `None` until staged.
-    opened: std::sync::Mutex<Option<HashMap<String, DataKey>>>,
 }
 
 impl<C, W> StandardDetector<C, W>
@@ -78,7 +78,6 @@ where
             prepared: std::sync::Mutex::new(None),
             kicked_off: std::sync::Mutex::new(None),
             events_to_kickoff: AtomicU64::new(0),
-            opened: std::sync::Mutex::new(None),
         }
     }
 
@@ -108,36 +107,51 @@ where
         self.events_to_kickoff.store(events, Ordering::SeqCst);
     }
 
-    /// Read the DataKeys cached when the writer was opened at `stage()`.
-    /// Errors with `BsrsError::State` if the detector has not been staged
-    /// (the writer was never opened), so `describe` never re-opens it (DB-04).
-    fn cached_data_keys(&self) -> Result<HashMap<String, DataKey>> {
-        self.opened.lock().unwrap().clone().ok_or_else(|| {
-            BsrsError::State(format!(
-                "{}: describe before stage (writer not opened)",
-                self.name
-            ))
-        })
+    /// The prepare since stage; ophyd-async raises `{not_run}` without one.
+    fn prepare_ctx(&self, not_run: &str) -> Result<PrepareCtx> {
+        self.prepared
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| BsrsError::State(format!("{}: {not_run}", self.name)))
     }
 
     /// ophyd-async `StandardDetector.prepare`: set the hardware up for `info`,
     /// then record it as this scan's prepare.
     async fn prepare_for(&self, info: TriggerInfo) -> Result<PrepareCtx> {
         self.control.prepare(info.clone()).await?;
-        let ctx = self.update_prepare_context(info).await;
+        let ctx = self.update_prepare_context(info).await?;
         self.set_events_to_kickoff(ctx.trigger_info.number_of_events.into());
         Ok(ctx)
     }
 
-    /// ophyd-async `_update_prepare_context`: record `info` with the writer
-    /// index now as its baseline.
-    async fn update_prepare_context(&self, trigger_info: TriggerInfo) -> PrepareCtx {
+    /// ophyd-async `_update_prepare_context`: open the writer for
+    /// `collections_per_event` (kept while that is unchanged, since it shapes
+    /// the DataKeys) and record `trigger_info` with the collections written
+    /// now as its baseline.
+    async fn update_prepare_context(&self, trigger_info: TriggerInfo) -> Result<PrepareCtx> {
+        // Taken, not cloned: a failed re-open leaves no prepare behind.
+        let previous = self.prepared.lock().unwrap().take();
+        let data_keys = match previous {
+            Some(p)
+                if p.trigger_info.collections_per_event == trigger_info.collections_per_event =>
+            {
+                p.data_keys
+            }
+            previous => {
+                if previous.is_some() {
+                    self.writer.close().await?;
+                }
+                self.writer.open(trigger_info.collections_per_event).await?
+            }
+        };
         let ctx = PrepareCtx {
             trigger_info,
             collections_written: self.writer.indices_written().await,
+            data_keys,
         };
         *self.prepared.lock().unwrap() = Some(ctx.clone());
-        ctx
+        Ok(ctx)
     }
 
     /// The prepare since stage, or an implicit `TriggerInfo::default()` one
@@ -163,7 +177,7 @@ where
                     self.name, ctx.trigger_info.number_of_events
                 )));
             }
-            Some(ctx) => self.update_prepare_context(ctx.trigger_info).await,
+            Some(ctx) => self.update_prepare_context(ctx.trigger_info).await?,
         };
         self.control.arm().await.await?;
         self.wait_for_index(
@@ -274,26 +288,16 @@ where
         // the next acquisition. Mirrors ophyd-async `StandardDetector.stage()`
         // calling `_disarm_and_stop(on_unstage=False)`.
         self.control.disarm().await?;
-        // ophyd-async `stage` drops the prepare and kickoff contexts: they
-        // belong to the scan they were made for.
+        // ophyd-async `stage` stops the writer and drops the prepare and
+        // kickoff contexts; the writer is opened by the next prepare.
         *self.prepared.lock().unwrap() = None;
         *self.kicked_off.lock().unwrap() = None;
         self.set_events_to_kickoff(0);
-        // Ready the writer for this scan with multiplier=1 by default; plans
-        // can call configure() to change this. Cache the DataKeys the writer
-        // reports so describe() is a pure read and never re-opens the writer
-        // mid-acquisition (DB-04). (Relocating this open() into prepare() is
-        // DB-15's scope.)
-        let data_keys = self.writer.open(1).await?;
-        *self.opened.lock().unwrap() = Some(data_keys);
-        Ok(())
+        self.writer.close().await
     }
     async fn unstage(&self) -> Result<()> {
         self.control.disarm().await?;
-        self.writer.close().await?;
-        // Drop the cached DataKeys so a subsequent re-stage re-opens the writer.
-        *self.opened.lock().unwrap() = None;
-        Ok(())
+        self.writer.close().await
     }
 }
 
@@ -388,8 +392,12 @@ where
     fn name(&self) -> &str {
         &self.name
     }
+    /// ophyd-async `get_index`: whole events written,
+    /// `collections // collections_per_event`.
     async fn get_index(&self) -> Result<u64> {
-        Ok(self.writer.indices_written().await)
+        let ctx = self.prepare_ctx("Prepare not called")?;
+        let per_event = u64::from(ctx.trigger_info.collections_per_event.max(1));
+        Ok(self.writer.indices_written().await / per_event)
     }
     fn collect_asset_docs(&self, up_to: u64, descriptor: &str) -> BoxStream<'_, StreamAsset> {
         self.writer.collect_stream_docs(up_to, descriptor)
@@ -473,10 +481,10 @@ where
     W: DetectorWriter + Send + Sync + 'static,
 {
     async fn describe_collect_dyn(&self) -> Result<HashMap<String, HashMap<String, DataKey>>> {
-        // Read the DataKeys cached when the writer was opened at stage(); never
-        // re-open the writer here (DB-04) — that would re-emit a StreamResource
-        // with a new uid and disturb the in-progress frame counter.
-        let data_keys = self.cached_data_keys()?;
+        // The DataKeys the prepare opened the writer with; never re-open the
+        // writer here (DB-04) — that would re-emit a StreamResource with a
+        // new uid and disturb the in-progress frame counter.
+        let data_keys = self.prepare_ctx("Prepare not run")?.data_keys;
         let mut out = HashMap::new();
         out.insert(self.name.clone(), data_keys);
         Ok(out)
@@ -525,8 +533,8 @@ where
         Ok(HashMap::new())
     }
     async fn describe_dyn(&self) -> Result<HashMap<String, DataKey>> {
-        // Read cached DataKeys, never re-open the writer (DB-04).
-        self.cached_data_keys()
+        // The prepare's DataKeys, never re-opening the writer (DB-04).
+        Ok(self.prepare_ctx("Prepare not run")?.data_keys)
     }
     fn as_stageable(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn StageableObj>> {
         Some(self)
@@ -611,17 +619,47 @@ mod tests {
         }
     }
 
-    /// Minimal writer that counts `open()` calls.
+    /// The multiplier of every `open()` and the count of `close()`.
+    #[derive(Clone, Default)]
+    struct WriterLog {
+        opens: Arc<std::sync::Mutex<Vec<u32>>>,
+        closes: Arc<AtomicU64>,
+    }
+
+    impl WriterLog {
+        fn opens(&self) -> Vec<u32> {
+            self.opens.lock().unwrap().clone()
+        }
+        fn closes(&self) -> u64 {
+            self.closes.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Minimal writer that logs `open()`/`close()`; its one DataKey's shape
+    /// is the multiplier.
     struct CountingWriter {
-        opens: Arc<AtomicU64>,
+        log: WriterLog,
         rx: watch::Receiver<u64>,
     }
 
     #[async_trait]
     impl DetectorWriter for CountingWriter {
-        async fn open(&self, _multiplier: u32) -> Result<HashMap<String, DataKey>> {
-            self.opens.fetch_add(1, Ordering::SeqCst);
-            Ok(HashMap::new())
+        async fn open(&self, multiplier: u32) -> Result<HashMap<String, DataKey>> {
+            self.log.opens.lock().unwrap().push(multiplier);
+            let key = DataKey {
+                source: "test://det".into(),
+                dtype: crate::event_model::Dtype::Array,
+                shape: vec![Some(multiplier.into())],
+                dtype_numpy: None,
+                external: Some("STREAM:".into()),
+                units: None,
+                precision: None,
+                object_name: None,
+                dims: None,
+                limits: None,
+                choices: None,
+            };
+            Ok(HashMap::from([("det_image".to_string(), key)]))
         }
         fn observe_indices_written(&self) -> watch::Receiver<u64> {
             self.rx.clone()
@@ -637,18 +675,18 @@ mod tests {
             stream::iter(Vec::new()).boxed()
         }
         async fn close(&self) -> Result<()> {
+            self.log.closes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
 
-    #[allow(clippy::type_complexity)]
     fn detector() -> (
         StandardDetector<RecordingControl, CountingWriter>,
         Arc<AtomicU64>,
-        Arc<AtomicU64>,
+        WriterLog,
     ) {
         let disarms = Arc::new(AtomicU64::new(0));
-        let opens = Arc::new(AtomicU64::new(0));
+        let log = WriterLog::default();
         // The receiver keeps serving its last value after the sender drops;
         // this test never observes index changes, so the tx is discarded.
         let (_, rx) = watch::channel(0u64);
@@ -657,67 +695,100 @@ mod tests {
             idles: Arc::default(),
         };
         let writer = CountingWriter {
-            opens: opens.clone(),
+            log: log.clone(),
             rx,
         };
-        (
-            StandardDetector::new("det", control, writer),
-            disarms,
-            opens,
-        )
+        (StandardDetector::new("det", control, writer), disarms, log)
+    }
+
+    async fn prepare_per_event(det: &impl Preparable<TriggerInfo>, events: u32, per_event: u32) {
+        let info = TriggerInfo {
+            number_of_events: events,
+            collections_per_event: per_event,
+            ..Default::default()
+        };
+        Preparable::<TriggerInfo>::prepare(det, info)
+            .await
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
-    async fn stage_disarms_before_readying_writer() {
+    async fn stage_disarms_and_stops_the_writer() {
         // DB-03: a detector left armed by a previous scan must be disarmed at
         // stage time. Before the fix `stage()` never called `disarm()`, so a
         // detector armed by a prior (aborted) scan free-ran into the next one.
-        let (det, disarms, opens) = detector();
+        // ophyd-async `stage` also stops the data logic.
+        let (det, disarms, log) = detector();
         Stageable::stage(&det).await.unwrap();
         assert_eq!(
             disarms.load(Ordering::SeqCst),
             1,
             "stage() must disarm exactly once"
         );
-        assert_eq!(
-            opens.load(Ordering::SeqCst),
-            1,
-            "stage() still readies the writer"
-        );
+        assert_eq!(log.closes(), 1, "stage() stops the writer");
     }
 
     #[tokio::test]
-    async fn describe_reads_cache_without_reopening_writer() {
-        // DB-04: describe must read the DataKeys cached at stage(), never
-        // re-open the writer (which would re-emit a StreamResource with a new
-        // uid and disturb the in-progress frame counter).
-        let (det, _disarms, opens) = detector();
-
-        // Before stage: describe is a device-state error, with no open().
-        assert!(CollectableObj::describe_collect_dyn(&det).await.is_err());
-        assert!(ReadableObj::describe_dyn(&det).await.is_err());
-        assert_eq!(
-            opens.load(Ordering::SeqCst),
-            0,
-            "describe before stage must not open the writer"
-        );
-
+    async fn describe_reads_the_prepare_without_reopening_writer() {
+        // DB-04: describe must read the DataKeys the prepare opened the
+        // writer with, never re-open it (which would re-emit a StreamResource
+        // with a new uid and disturb the in-progress frame counter).
+        let (det, _disarms, log) = detector();
         Stageable::stage(&det).await.unwrap();
-        assert_eq!(opens.load(Ordering::SeqCst), 1, "stage opens exactly once");
 
-        // Repeated describe calls read the cache; the open count stays at 1.
+        // ophyd-async `describe` raises "Prepare not run" before a prepare.
+        let err = ReadableObj::describe_dyn(&det).await.unwrap_err();
+        assert!(err.to_string().contains("Prepare not run"), "{err}");
+        assert!(CollectableObj::describe_collect_dyn(&det).await.is_err());
+        assert!(log.opens().is_empty(), "describe must not open the writer");
+
+        prepare_per_event(&det, 1, 1).await;
         CollectableObj::describe_collect_dyn(&det).await.unwrap();
         ReadableObj::describe_dyn(&det).await.unwrap();
         CollectableObj::describe_collect_dyn(&det).await.unwrap();
         assert_eq!(
-            opens.load(Ordering::SeqCst),
-            1,
+            log.opens(),
+            [1],
             "describe must not re-open the writer (DB-04)"
         );
+    }
 
-        // After unstage the cache is cleared, so describe errors again.
-        Stageable::unstage(&det).await.unwrap();
-        assert!(ReadableObj::describe_dyn(&det).await.is_err());
+    #[tokio::test]
+    async fn prepare_opens_the_writer_for_its_collections_per_event() {
+        // ophyd-async `_update_prepare_context`: providers are made at
+        // prepare, shaped by collections_per_event, and remade only when it
+        // changes.
+        let (det, _disarms, log) = detector();
+        Stageable::stage(&det).await.unwrap();
+        assert!(log.opens().is_empty(), "stage opens nothing");
+
+        prepare_per_event(&det, 2, 2).await;
+        assert_eq!(log.opens(), [2]);
+        let keys = ReadableObj::describe_dyn(&det).await.unwrap();
+        assert_eq!(keys["det_image"].shape, [Some(2)]);
+
+        prepare_per_event(&det, 3, 2).await;
+        assert_eq!(log.opens(), [2], "same collections_per_event reuses it");
+
+        let closes = log.closes();
+        prepare_per_event(&det, 1, 1).await;
+        assert_eq!(log.opens(), [2, 1]);
+        assert_eq!(log.closes(), closes + 1, "stopped before re-opening");
+    }
+
+    #[tokio::test]
+    async fn get_index_counts_whole_events() {
+        // ophyd-async `get_index`: collections // collections_per_event.
+        let (det, tx, _) = controlled();
+        Stageable::stage(&det).await.unwrap();
+        let err = WritesStreamAssets::get_index(&det).await.unwrap_err();
+        assert!(err.to_string().contains("Prepare not called"), "{err}");
+        prepare_per_event(&det, 2, 2).await;
+        tx.send(3).unwrap();
+        assert_eq!(WritesStreamAssets::get_index(&det).await.unwrap(), 1);
+        tx.send(4).unwrap();
+        assert_eq!(WritesStreamAssets::get_index(&det).await.unwrap(), 2);
     }
 
     /// A writer whose index is driven externally by a `watch::Sender<u64>`.

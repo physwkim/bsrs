@@ -1737,7 +1737,7 @@ fn ad_stream_datum(resource_uid: String, descriptor: &str, start: u64, stop: u64
 /// Emit state for [`AdHdfWriter`]: the attribute set staged by the last
 /// `open()` (discovered from the XML sources, merged with the declared specs),
 /// the once-emitted `StreamResource` UIDs (main image + one per NDAttribute),
-/// and the frame cursor (`StreamDatum`s cover `[last_emitted, up_to)`).
+/// and the event cursor (`StreamDatum`s cover events `[last_emitted, up_to)`).
 /// `open()` is the only writer of `attrs`; `collect_stream_docs` only reads it,
 /// so the emitted datasets always match the data keys reported at `open()`.
 #[derive(Default)]
@@ -1746,9 +1746,6 @@ struct AdEmitState {
     main_resource_uid: Option<String>,
     attr_resource_uids: HashMap<String, String>,
     last_emitted: u64,
-    /// Frames per index (ophyd-async `collections_per_event`), staged by
-    /// `open(multiplier)`. `0` = not yet opened; readers clamp to 1.
-    multiplier: u64,
     /// Frame shape discovered at `open()`, for the main resource's
     /// `chunk_shape` parameter.
     frame_shape: Vec<u64>,
@@ -1874,17 +1871,6 @@ fn stream_datakey_dtype(multiplier: u64, shape_len: usize) -> Dtype {
 #[async_trait::async_trait]
 impl DetectorWriter for AdHdfWriter {
     async fn open(&self, multiplier: u32) -> Result<HashMap<String, DataKey>> {
-        // The frames-per-index multiplier shapes the DataKeys and divides the
-        // frame count into indices. >1 is rejected until the fly-mode index
-        // observation (`observe_indices_written`, raw frame counts) also
-        // scales by it — shipping one path divided and the other raw would
-        // complete a fly scan at the wrong frame count.
-        if multiplier > 1 {
-            return Err(BsrsError::Plan(format!(
-                "AdHdfWriter::open(multiplier={multiplier}): multiplier > 1 is \
-                 not supported yet"
-            )));
-        }
         let multiplier = u64::from(multiplier.max(1));
         // Frames per HDF chunk — read before the setup puts, then let the
         // plugin derive the rest of the chunking from the frame
@@ -1925,7 +1911,6 @@ impl DetectorWriter for AdHdfWriter {
             st.main_resource_uid = None;
             st.attr_resource_uids.clear();
             st.last_emitted = 0;
-            st.multiplier = multiplier;
             st.frame_shape = shape.clone();
             st.frames_per_chunk = frames_per_chunk;
         }
@@ -1980,15 +1965,10 @@ impl DetectorWriter for AdHdfWriter {
         Ok(out)
     }
     fn observe_indices_written(&self) -> watch::Receiver<u64> {
-        // Raw frame counts — equal to indices while `open` rejects
-        // multiplier > 1.
         self.io.observe_num_captured()
     }
     async fn indices_written(&self) -> u64 {
-        let frames = self.io.num_captured().await.unwrap_or(0);
-        // Frames -> indices (ophyd-async `collections_written //
-        // collections_per_event`).
-        frames / self.emit.lock().await.multiplier.max(1)
+        self.io.num_captured().await.unwrap_or(0)
     }
     fn collect_stream_docs(&self, up_to: u64, descriptor: &str) -> BoxStream<'_, StreamAsset> {
         let descriptor = descriptor.to_string();
@@ -2053,7 +2033,7 @@ impl DetectorWriter for AdHdfWriter {
                 }
             }
             // One StreamDatum per dataset (main + each attribute) for the new
-            // frames, all covering the same index range in the same event.
+            // events, all covering the same index range.
             if up_to > st.last_emitted {
                 let start = st.last_emitted;
                 st.last_emitted = up_to;
@@ -2097,13 +2077,11 @@ impl DetectorWriter for AdHdfWriter {
 }
 
 /// Emit state for [`AdMultipartWriter`]: the once-emitted `StreamResource`
-/// UID, the frame cursor, and the shape/multiplier staged by `open()`.
+/// UID, the event cursor, and the shape staged by `open()`.
 #[derive(Default)]
 struct AdMultipartEmitState {
     resource_uid: Option<String>,
     last_emitted: u64,
-    /// Frames per index; `0` = not yet opened, readers clamp to 1.
-    multiplier: u64,
     /// Frame shape discovered at `open()`, for the resource's `chunk_shape`
     /// parameter.
     frame_shape: Vec<u64>,
@@ -2217,16 +2195,6 @@ impl AdMultipartWriter {
 #[async_trait::async_trait]
 impl DetectorWriter for AdMultipartWriter {
     async fn open(&self, multiplier: u32) -> Result<HashMap<String, DataKey>> {
-        // Same guard as AdHdfWriter::open: the index observation
-        // (`observe_indices_written`) reports raw frame counts, so shipping
-        // a divided DataKey path with a raw observe path would complete a
-        // fly scan at the wrong frame count.
-        if multiplier > 1 {
-            return Err(BsrsError::Plan(format!(
-                "AdMultipartWriter::open(multiplier={multiplier}): multiplier \
-                 > 1 is not supported yet"
-            )));
-        }
         let multiplier = u64::from(multiplier.max(1));
         // Plugin callbacks on, then the file paths. ophyd-async's
         // `ADMultipartDataLogic.prepare_unbounded` does not enable callbacks
@@ -2252,7 +2220,6 @@ impl DetectorWriter for AdMultipartWriter {
             let mut st = self.emit.lock().await;
             st.resource_uid = None;
             st.last_emitted = 0;
-            st.multiplier = multiplier;
             st.frame_shape = shape.clone();
         }
         let image_shape: Vec<Option<u64>> =
@@ -2277,13 +2244,10 @@ impl DetectorWriter for AdMultipartWriter {
         Ok(out)
     }
     fn observe_indices_written(&self) -> watch::Receiver<u64> {
-        // Raw frame counts — equal to indices while `open` rejects
-        // multiplier > 1.
         self.io.observe_num_captured()
     }
     async fn indices_written(&self) -> u64 {
-        let frames = self.io.num_captured().await.unwrap_or(0);
-        frames / self.emit.lock().await.multiplier.max(1)
+        self.io.num_captured().await.unwrap_or(0)
     }
     fn collect_stream_docs(&self, up_to: u64, descriptor: &str) -> BoxStream<'_, StreamAsset> {
         let descriptor = descriptor.to_string();
@@ -2972,7 +2936,7 @@ mod tests {
 #[cfg(test)]
 mod ad_hdf_tests {
     use super::*;
-    use crate::protocols_async::{Stageable, WritesStreamAssets};
+    use crate::protocols_async::{Preparable, Stageable, WritesStreamAssets};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     /// What [`AdFileIo::configure`] received: `(directory, filename,
@@ -3355,11 +3319,29 @@ mod ad_hdf_tests {
     }
 
     #[tokio::test]
-    async fn open_rejects_multiplier_above_one() {
+    async fn open_leads_every_key_with_the_multiplier_and_counts_frames() {
+        // ophyd-async `make_datakeys(collections_per_event)` shapes, a
+        // `collections_written_signal` of frames, and datums of events
+        // (`make_stream_docs`, `_data_providers.py:138-155`).
         let io = FakeAdFileIo::new("/x.h5");
-        let w = writer_with(io);
-        let err = w.open(2).await.unwrap_err().to_string();
-        assert!(err.contains("multiplier=2"), "{err}");
+        let w =
+            writer_with(io.clone()).with_ndattributes(vec![NdAttributeDataset::new("temp", "<f8")]);
+        let keys = w.open(2).await.unwrap();
+        assert_eq!(keys["det_image"].shape, [Some(2), Some(20), Some(10)]);
+        assert_eq!(keys["temp"].shape, [Some(2)]);
+        assert_eq!(keys["temp"].dtype, Dtype::Array);
+        io.set_captured(4);
+        assert_eq!(w.indices_written().await, 4);
+        assert_eq!(*w.observe_indices_written().borrow(), 4);
+        let docs: Vec<StreamAsset> = w.collect_stream_docs(2, "d").collect().await;
+        let ranges: Vec<(u64, u64)> = docs
+            .iter()
+            .filter_map(|a| match a {
+                StreamAsset::Datum(d) => Some((d.indices.start, d.indices.stop)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ranges, [(0, 2), (0, 2)]);
     }
 
     #[test]
@@ -3594,9 +3576,7 @@ mod ad_hdf_tests {
         let det = StandardDetector::new("det", cam, writer);
         det.writer().open(1).await.unwrap();
         io.set_captured(2);
-        let up_to = WritesStreamAssets::get_index(&det).await.unwrap();
-        assert_eq!(up_to, 2);
-        let docs: Vec<StreamAsset> = det.collect_asset_docs(up_to, "descZ").collect().await;
+        let docs: Vec<StreamAsset> = det.collect_asset_docs(2, "descZ").collect().await;
         assert_eq!(docs.len(), 2);
         assert!(matches!(docs[0], StreamAsset::Resource(_)));
         match &docs[1] {
@@ -3637,8 +3617,12 @@ mod ad_hdf_tests {
             .expect("connect");
         // Prime array dims so the HDF plugin can open the file.
         det.control().warmup().await.expect("warmup");
-        // Stage opens (configures + starts capture) the writer.
         Stageable::stage(&det).await.expect("stage");
+        // Prepare opens (configures + starts capture) the writer.
+        Preparable::<TriggerInfo>::prepare(&det, TriggerInfo::default())
+            .await
+            .await
+            .expect("prepare");
         // One internal-trigger acquisition.
         det.control().arm().await.await.expect("acquire");
         // Fully-qualified: the inherent `wait_for_idle(timeout)` shadows the
@@ -3702,14 +3686,14 @@ mod ad_hdf_tests {
     }
 
     #[tokio::test]
-    async fn multipart_open_rejects_multiplier_above_one() {
+    async fn multipart_open_leads_the_key_with_the_multiplier_and_counts_frames() {
         let io = FakeAdFileIo::new("");
-        let w = multipart_writer_with(io);
-        let err = w.open(2).await.unwrap_err();
-        assert!(
-            err.to_string().contains("multiplier > 1"),
-            "unexpected error: {err}"
-        );
+        let w = multipart_writer_with(io.clone());
+        let keys = w.open(2).await.unwrap();
+        assert_eq!(keys["det_image"].shape, [Some(2), Some(20), Some(10)]);
+        io.set_captured(4);
+        assert_eq!(w.indices_written().await, 4);
+        assert_eq!(*w.observe_indices_written().borrow(), 4);
     }
 
     /// The one `StreamResource` points at the directory with the frame-number
