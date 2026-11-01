@@ -104,6 +104,10 @@ impl ReadableObj for PvaMotor {
         );
         Ok(out)
     }
+    /// The readback is the hinted field, as in ophyd's `EpicsMotor`.
+    fn hint_fields(&self) -> Option<Vec<String>> {
+        Some(vec![self.name.clone()])
+    }
 }
 
 #[async_trait::async_trait]
@@ -205,6 +209,10 @@ impl ReadableObj for PvaDetector {
             },
         );
         Ok(out)
+    }
+    /// The value is the hinted field, as in an ophyd `EpicsSignalRO`.
+    fn hint_fields(&self) -> Option<Vec<String>> {
+        Some(vec![self.name.clone()])
     }
 }
 

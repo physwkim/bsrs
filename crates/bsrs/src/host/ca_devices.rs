@@ -108,6 +108,10 @@ impl ReadableObj for CaMotor {
             describe_pv(self.channels.readback.as_ref(), &self.rbv_pv, &self.name).await?,
         )]))
     }
+    /// The readback is the hinted field, as in ophyd's `EpicsMotor`.
+    fn hint_fields(&self) -> Option<Vec<String>> {
+        Some(vec![self.name.clone()])
+    }
 }
 
 #[async_trait::async_trait]
@@ -274,6 +278,10 @@ impl ReadableObj for CaPositioner {
             describe_pv(self.readback.as_ref(), &self.rbv_pv, &self.name).await?,
         )]))
     }
+    /// The readback is the hinted field, as in ophyd's `PVPositioner`.
+    fn hint_fields(&self) -> Option<Vec<String>> {
+        Some(vec![self.name.clone()])
+    }
 }
 
 #[async_trait::async_trait]
@@ -398,6 +406,10 @@ impl ReadableObj for CaDetector {
             self.name.clone(),
             describe_pv(self.value.as_ref(), &self.value_pv, &self.name).await?,
         )]))
+    }
+    /// The value is the hinted field, as in an ophyd `EpicsSignalRO`.
+    fn hint_fields(&self) -> Option<Vec<String>> {
+        Some(vec![self.name.clone()])
     }
 }
 

@@ -13,8 +13,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bsrs::backends::epics_ca::EpicsCaBackend;
-use bsrs::core::msg::{LocatableObj, MonitorableObj, MovableObj};
+use bsrs::core::msg::{LocatableObj, MonitorableObj, MovableObj, ReadableObj};
 use bsrs::core::subscription::Subscription;
+use bsrs::event_model::LimitsRange;
 use bsrs::host::ca_devices::{CaDetector, CaMotor};
 use bsrs::protocols_async::SignalBackend;
 
@@ -22,6 +23,7 @@ const BIN: &str = "ophyd-test-ioc";
 const MRES: f64 = 0.001;
 
 const X1: &str = "XF:31IDA-OP{Tbl-Ax:X1}Mtr";
+const X5: &str = "XF:31IDA-OP{Tbl-Ax:X5}Mtr";
 const X6: &str = "XF:31IDA-OP{Tbl-Ax:X6}Mtr";
 const FAKE: &str = "XF:31IDA-OP{Tbl-Ax:FakeMtr}";
 
@@ -133,6 +135,39 @@ async fn a_move_settles_once_the_motor_is_done() {
         .expect("the null move settles")
         .expect("the null move succeeds");
     assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+/// test_epicsmotor.py `test_hints`; ophyd-async `Motor` (`user_readback` is
+/// HINTED) and `test_read_motor` (`motor_egu`): the readback is the motor's
+/// hinted field, described with the record's EGU, PREC and soft limits.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+async fn describe_carries_the_records_egu_precision_limits_and_hint() {
+    example_ioc::boot(BIN, BIN);
+    ca::<String>(X5, "EGU")
+        .await
+        .put(Some("mm".into()))
+        .await
+        .unwrap();
+    let (hlm, llm) = (ca::<f64>(X5, "HLM").await, ca::<f64>(X5, "LLM").await);
+    let (hlm, llm) = (
+        hlm.get_value().await.unwrap(),
+        llm.get_value().await.unwrap(),
+    );
+    let m = ca_motor("x5", X5).await;
+
+    let dk = m.describe_dyn().await.unwrap().remove("x5").unwrap();
+    assert_eq!(dk.source, format!("ca://{X5}.RBV"));
+    assert_eq!(dk.units.as_deref(), Some("mm"));
+    assert_eq!(dk.precision, Some(4));
+    let limits = dk.limits.expect("the record's limits");
+    let travel = Some(LimitsRange {
+        low: Some(llm),
+        high: Some(hlm),
+    });
+    assert_eq!(limits.control, travel);
+    assert_eq!(limits.display, travel);
+    assert_eq!(m.hint_fields(), Some(vec!["x5".to_string()]));
 }
 
 /// test_epicsmotor.py `test_calibration`: with `.SET` at Set, a move
