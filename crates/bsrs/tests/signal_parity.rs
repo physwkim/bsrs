@@ -221,6 +221,18 @@ async fn mock_put_callback_returning_none_keeps_the_put_value() {
     assert_eq!(sig.get().await.unwrap(), 10.0);
 }
 
+// ophyd-async test_reset_mock_put_calls.
+#[tokio::test]
+async fn reset_put_calls_forgets_earlier_puts() {
+    let backend = Arc::new(MockSignalBackend::with_value(0.0_f64, Dtype::Number));
+    let sig: SignalRW<f64, _> = Signal::new(backend.clone(), cfg("m"));
+    assert!(sig.put(1.0).await.success());
+    backend.reset_put_calls();
+    assert_eq!(backend.put_count(), 0);
+    assert!(sig.put(2.0).await.success());
+    assert_eq!(backend.put_calls(), vec![Some(2.0)]);
+}
+
 // ophyd-async test_can_unsubscribe_from_subscribe_callback; ophyd
 // test_signal_base (readback callback on put).
 #[tokio::test]

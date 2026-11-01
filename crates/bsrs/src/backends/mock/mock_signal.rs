@@ -106,6 +106,11 @@ where
         self.inner.put_log.lock().unwrap().len()
     }
 
+    /// Forget the recorded `put` calls (ophyd `get_mock_put(...).reset_mock()`).
+    pub fn reset_put_calls(&self) {
+        self.inner.put_log.lock().unwrap().clear();
+    }
+
     /// Block puts for the lifetime of the returned guard; puts unblock when it
     /// drops (ophyd `mock_puts_blocked` context manager).
     pub fn mock_puts_blocked(&self) -> PutsBlockedGuard<T> {
