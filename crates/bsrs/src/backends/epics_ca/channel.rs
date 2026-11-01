@@ -24,7 +24,7 @@ pub(super) type PutResult = std::result::Result<(), String>;
 
 type Completion = Pin<Box<dyn Future<Output = CaResult<()>> + Send>>;
 
-/// A connected channel. Reads go straight through; puts only through
+/// A PV's channel. Reads go straight through; puts only through
 /// [`Self::put_callback`] and [`Self::put_no_callback`].
 pub(super) struct SharedChannel {
     ca: CaChannel,
@@ -52,6 +52,13 @@ impl SharedChannel {
             ca,
             puts: Mutex::new(PutSlot::Idle),
         }
+    }
+
+    /// Resolves once the channel is connected, at once if it is. Any number
+    /// of callers may wait, each with its own `timeout`; the channel keeps
+    /// searching after one gives up.
+    pub(super) async fn wait_connected(&self, timeout: Duration) -> CaResult<()> {
+        self.ca.wait_connected(timeout).await
     }
 
     pub(super) async fn info(&self) -> CaResult<ChannelInfo> {

@@ -626,3 +626,38 @@ fn pva_many_signals_on_one_pv_connect_and_read() {
         }
     });
 }
+
+/// aioca's `connect(pv, timeout)`: every caller waits on the one cached
+/// channel with its own timeout, whichever caller created it.
+async fn assert_connect_timeout_is_per_caller(pv: &str, short_first: bool) {
+    async fn fails_after(b: EpicsCaBackend<f64>, timeout: Duration) -> Duration {
+        let start = std::time::Instant::now();
+        b.connect(timeout).await.expect_err("a PV no server has");
+        start.elapsed()
+    }
+    let (short, long) = (Duration::from_millis(500), Duration::from_secs(2));
+    let (a, b) = (EpicsCaBackend::new(pv), EpicsCaBackend::new(pv));
+    let (s, l) = if short_first {
+        tokio::join!(fails_after(a, short), fails_after(b, long))
+    } else {
+        let (l, s) = tokio::join!(fails_after(b, long), fails_after(a, short));
+        (s, l)
+    };
+    assert!(
+        s >= short && s < long,
+        "the {short:?} connect failed after {s:?}"
+    );
+    assert!(
+        l >= long && l < long + short,
+        "the {long:?} connect failed after {l:?}"
+    );
+}
+
+#[test]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+fn ca_connect_timeout_is_per_caller() {
+    run(async {
+        assert_connect_timeout_is_per_caller("BSRS:NO:SUCH:PV:1", true).await;
+        assert_connect_timeout_is_per_caller("BSRS:NO:SUCH:PV:2", false).await;
+    });
+}

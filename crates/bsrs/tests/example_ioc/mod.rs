@@ -11,21 +11,26 @@
 //! process boots one IOC, on the first [`boot`], and points both clients at
 //! it. Under `cargo test` that IOC is shared by every test in the binary.
 //! The IOC exits with this process: its iocsh ends on stdin EOF.
+//! `outage.rs` stops it and starts it again on the same ports.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, UdpSocket};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::{mpsc, OnceLock};
+use std::sync::{mpsc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
-struct Booted {
+pub struct Booted {
     bin: String,
-    // Holds the IOC's stdin open; the IOC ends when it closes.
-    _ioc: Child,
+    example: String,
+    ca: u16,
+    pva: u16,
+    /// Holds the IOC's stdin open; the IOC ends when it closes. `None`
+    /// while stopped.
+    ioc: Mutex<Option<Child>>,
 }
 
-static BOOTED: OnceLock<Booted> = OnceLock::new();
+pub static BOOTED: OnceLock<Booted> = OnceLock::new();
 
 const READY: &str = "BSRS_EXAMPLE_IOC_READY";
 const BOOT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -34,19 +39,42 @@ const ATTEMPTS: usize = 16;
 const MAX_ARRAY_BYTES: &str = "16000000";
 
 /// Boot `bin` from `examples/<example>` once per process and point the CA
-/// and PVA clients at it. Call it before any client exists.
+/// and PVA clients at it, or start it again if a test stopped it. Call it
+/// before any client exists.
 pub fn boot(bin: &str, example: &str) {
-    let booted = BOOTED.get_or_init(|| Booted {
-        bin: bin.to_string(),
-        _ioc: start(bin, example),
-    });
+    let booted = BOOTED.get_or_init(|| start(bin, example));
     assert_eq!(
         booted.bin, bin,
         "one example IOC per test binary: the clients read their environment once"
     );
+    let mut ioc = booted.lock();
+    if ioc.is_none() {
+        *ioc = Some(booted.start_again());
+    }
 }
 
-fn start(bin: &str, example: &str) -> Child {
+impl Booted {
+    pub fn lock(&self) -> MutexGuard<'_, Option<Child>> {
+        self.ioc.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The IOC on the ports the clients were pointed at, which the one
+    /// stopped may hold for a moment yet.
+    pub fn start_again(&self) -> Child {
+        for _ in 0..ATTEMPTS {
+            if let Some(ioc) = try_start(&self.bin, &self.example, self.ca, self.pva) {
+                return ioc;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        panic!(
+            "{} could not bind ports {}/{} again",
+            self.bin, self.ca, self.pva
+        );
+    }
+}
+
+fn start(bin: &str, example: &str) -> Booted {
     for _ in 0..ATTEMPTS {
         let (ca, pva) = free_ports();
         if let Some(ioc) = try_start(bin, example, ca, pva) {
@@ -61,7 +89,13 @@ fn start(bin: &str, example: &str) -> Child {
                 std::env::set_var("EPICS_PVA_ADDR_LIST", "");
                 std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
             }
-            return ioc;
+            return Booted {
+                bin: bin.to_string(),
+                example: example.to_string(),
+                ca,
+                pva,
+                ioc: Mutex::new(Some(ioc)),
+            };
         }
     }
     panic!("{bin} lost its port {ATTEMPTS} times in a row");

@@ -3,9 +3,9 @@
 //! Architecture:
 //!
 //! - One process-wide `CaClient`, lazily initialized via `OnceCell`.
-//! - Channel registry sharded across 64 mutexes (rule **K3**) — `connect()`
-//!   does the slow path (`wait_connected`) outside the shard lock.
-//! - In-flight de-dup via `pending: HashMap<PvName, Arc<Notify>>` (rule **K4**).
+//! - Channel registry sharded across 64 mutexes (rule **K3**), holding each
+//!   PV's one channel from its creation (rule **K4**). Every call waits for
+//!   the connection itself, outside the shard lock, with its own timeout.
 //! - `set_callback` spawns a forwarder task per channel, returning a `SubToken`
 //!   whose Drop aborts the task; dropping the underlying `MonitorHandle` then
 //!   unsubscribes on the wire (rule **K2**).
@@ -25,7 +25,6 @@ use std::array;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-use tokio::sync::Notify;
 
 const SHARDS: usize = 64;
 
@@ -67,7 +66,6 @@ fn ts_to_f64(t: WallTime) -> f64 {
 pub struct CaContext {
     client: Arc<CaClient>,
     shards: [Mutex<HashMap<String, Arc<SharedChannel>>>; SHARDS],
-    pending: [Mutex<HashMap<String, Arc<Notify>>>; SHARDS],
 }
 
 impl CaContext {
@@ -75,58 +73,20 @@ impl CaContext {
         Self {
             client: Arc::new(client),
             shards: array::from_fn(|_| Mutex::new(HashMap::new())),
-            pending: array::from_fn(|_| Mutex::new(HashMap::new())),
         }
     }
 
-    async fn get_or_open(&self, pv: &str, timeout: Duration) -> Result<Arc<SharedChannel>> {
-        let s = shard_for(pv);
-        // Fast path
-        if let Some(ch) = self.shards[s].lock().unwrap().get(pv).cloned() {
-            return Ok(ch);
+    /// The PV's one channel, created by its first caller and kept, searching
+    /// while unconnected, as aioca's channel cache keeps it. No caller's
+    /// timeout or failure is another's.
+    fn channel(&self, pv: &str) -> Arc<SharedChannel> {
+        let mut shard = self.shards[shard_for(pv)].lock().unwrap();
+        if let Some(ch) = shard.get(pv) {
+            return ch.clone();
         }
-        // K4: in-flight dedup
-        let notify = {
-            let mut p = self.pending[s].lock().unwrap();
-            if let Some(n) = p.get(pv).cloned() {
-                Some(n)
-            } else {
-                let n = Arc::new(Notify::new());
-                p.insert(pv.to_string(), n.clone());
-                None
-            }
-        };
-        if let Some(n) = notify {
-            n.notified().await;
-            // Either the in-flight winner inserted, or it failed — either way
-            // re-check the cache.
-            if let Some(ch) = self.shards[s].lock().unwrap().get(pv).cloned() {
-                return Ok(ch);
-            }
-            return Err(BsrsError::Backend(format!(
-                "ca: peer connect for {pv} failed"
-            )));
-        }
-
-        // K3: do the I/O (wait_connected) outside the shard lock.
-        let ch = self.client.create_channel(pv);
-        let res: epics_ca_rs::CaResult<()> = ch.wait_connected(timeout).await;
-
-        // Commit and notify waiters either way.
-        let arc = Arc::new(SharedChannel::new(ch));
-        let mut p = self.pending[s].lock().unwrap();
-        let n = p.remove(pv);
-        if res.is_ok() {
-            self.shards[s]
-                .lock()
-                .unwrap()
-                .insert(pv.to_string(), arc.clone());
-        }
-        if let Some(n) = n {
-            n.notify_waiters();
-        }
-        res.map_err(|e| BsrsError::Backend(format!("ca connect {pv}: {e}")))?;
-        Ok(arc)
+        let ch = Arc::new(SharedChannel::new(self.client.create_channel(pv)));
+        shard.insert(pv.to_string(), ch.clone());
+        ch
     }
 }
 
@@ -182,7 +142,7 @@ pub enum CaStringKind {
 pub struct EpicsCaBackend<T: Clone + Send + Sync + 'static> {
     pv: String,
     ctx: Arc<CaContext>,
-    channel: tokio::sync::OnceCell<Arc<SharedChannel>>,
+    channel: OnceLock<Arc<SharedChannel>>,
     /// Consulted only by `SignalBackend<String>`; ignored for other `T`.
     string_kind: CaStringKind,
     /// `SignalBackend<String>`'s codec, fixed once the channel connects.
@@ -199,7 +159,7 @@ impl<T: Clone + Send + Sync + 'static> EpicsCaBackend<T> {
         Self {
             pv: pv.into(),
             ctx: ca_context(),
-            channel: tokio::sync::OnceCell::new(),
+            channel: OnceLock::new(),
             string_kind: CaStringKind::Short,
             str_codec: tokio::sync::OnceCell::new(),
             initial: Mutex::new(None),
@@ -226,11 +186,19 @@ impl<T: Clone + Send + Sync + 'static> crate::devices::BackendFromPv for EpicsCa
 }
 
 impl<T: Clone + Send + Sync + 'static> EpicsCaBackend<T> {
+    fn channel(&self) -> &Arc<SharedChannel> {
+        self.channel.get_or_init(|| self.ctx.channel(&self.pv))
+    }
+
+    /// The channel, once connected within `timeout`. Asked on every call, as
+    /// aioca's `channel.wait()`: a call during an outage waits for the
+    /// reconnect.
     async fn ensure_channel(&self, timeout: Duration) -> Result<Arc<SharedChannel>> {
-        self.channel
-            .get_or_try_init(|| self.ctx.get_or_open(&self.pv, timeout))
+        let ch = self.channel();
+        ch.wait_connected(timeout)
             .await
-            .cloned()
+            .map_err(|e| BsrsError::Backend(format!("ca connect {}: {e}", self.pv)))?;
+        Ok(ch.clone())
     }
 }
 
@@ -679,14 +647,10 @@ impl SignalBackend<f64> for EpicsCaBackend<f64> {
             None => return SubToken::noop(),
             Some(cb) => Arc::new(cb),
         };
-        let ctx = self.ctx.clone();
-        let pv = self.pv.clone();
+        // Subscribed at once, connected or not: epics-ca-rs starts it on connect.
+        let ch = self.channel().clone();
         // Spawn a forwarder. Held tokio::JoinHandle is aborted on Drop (K1).
         let handle = tokio::spawn(async move {
-            let ch = match ctx.get_or_open(&pv, Duration::from_secs(2)).await {
-                Ok(c) => c,
-                Err(_) => return,
-            };
             let mut sub = match ch.subscribe().await {
                 Ok(s) => s,
                 Err(_) => return,
@@ -769,13 +733,9 @@ impl SignalBackend<Vec<f64>> for EpicsCaBackend<Vec<f64>> {
             None => return SubToken::noop(),
             Some(cb) => Arc::new(cb),
         };
-        let ctx = self.ctx.clone();
-        let pv = self.pv.clone();
+        // Subscribed at once, connected or not: epics-ca-rs starts it on connect.
+        let ch = self.channel().clone();
         let handle = tokio::spawn(async move {
-            let ch = match ctx.get_or_open(&pv, Duration::from_secs(2)).await {
-                Ok(c) => c,
-                Err(_) => return,
-            };
             let mut sub = match ch.subscribe().await {
                 Ok(s) => s,
                 Err(_) => return,
@@ -860,21 +820,22 @@ impl SignalBackend<String> for EpicsCaBackend<String> {
             None => return SubToken::noop(),
             Some(cb) => Arc::new(cb),
         };
-        let ctx = self.ctx.clone();
-        let pv = self.pv.clone();
+        let ch = self.channel().clone();
         let kind = self.string_kind;
         let cached = self.str_codec.get().cloned();
         let handle = tokio::spawn(async move {
-            let ch = match ctx.get_or_open(&pv, Duration::from_secs(2)).await {
-                Ok(c) => c,
-                Err(_) => return,
-            };
             let codec = match cached {
                 Some(c) => c,
-                None => match StrCodec::of(&ch, kind).await {
-                    Ok(c) => c,
-                    Err(_) => return,
-                },
+                None => {
+                    // The codec needs the channel's native type.
+                    if ch.wait_connected(Duration::from_secs(2)).await.is_err() {
+                        return;
+                    }
+                    match StrCodec::of(&ch, kind).await {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    }
+                }
             };
             let mut sub = match ch.subscribe().await {
                 Ok(s) => s,
@@ -953,13 +914,9 @@ impl SignalBackend<i64> for EpicsCaBackend<i64> {
             None => return SubToken::noop(),
             Some(cb) => Arc::new(cb),
         };
-        let ctx = self.ctx.clone();
-        let pv = self.pv.clone();
+        // Subscribed at once, connected or not: epics-ca-rs starts it on connect.
+        let ch = self.channel().clone();
         let handle = tokio::spawn(async move {
-            let ch = match ctx.get_or_open(&pv, Duration::from_secs(2)).await {
-                Ok(c) => c,
-                Err(_) => return,
-            };
             let mut sub = match ch.subscribe().await {
                 Ok(s) => s,
                 Err(_) => return,
@@ -1057,13 +1014,9 @@ impl SignalBackend<bool> for EpicsCaBackend<bool> {
             None => return SubToken::noop(),
             Some(cb) => Arc::new(cb),
         };
-        let ctx = self.ctx.clone();
-        let pv = self.pv.clone();
+        // Subscribed at once, connected or not: epics-ca-rs starts it on connect.
+        let ch = self.channel().clone();
         let handle = tokio::spawn(async move {
-            let ch = match ctx.get_or_open(&pv, Duration::from_secs(2)).await {
-                Ok(c) => c,
-                Err(_) => return,
-            };
             let mut sub = match ch.subscribe().await {
                 Ok(s) => s,
                 Err(_) => return,
