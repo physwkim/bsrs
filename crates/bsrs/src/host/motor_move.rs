@@ -61,7 +61,100 @@ pub(crate) struct Axis<'a, B> {
     pub(crate) name: &'a str,
     pub(crate) setpoint: &'a B,
     pub(crate) readback: &'a Readback<B>,
+    pub(crate) limits: Limits<'a, B>,
     pub(crate) halt: &'a Halt,
+}
+
+/// The check a move passes before [`move_status`] sends it, as the Python
+/// class the device ports makes it.
+pub(crate) enum Limits<'a, B> {
+    /// ophyd-async `Motor.check_move`, on the motor record's fields.
+    MotorRecord(&'a MotorLimits<B>),
+    /// The setpoint's control limits.
+    Control(ControlRule),
+}
+
+impl<B: SignalBackend<f64>> Limits<'_, B> {
+    /// Check a move from `from` to `target`, on limits read now.
+    async fn check(&self, setpoint: &B, from: f64, target: f64) -> std::result::Result<(), String> {
+        match self {
+            Self::MotorRecord(fields) => fields.check(from, target).await,
+            Self::Control(rule) => {
+                let key = setpoint
+                    .get_datakey("")
+                    .await
+                    .map_err(|e| format!("limits: {e}"))?;
+                rule.check(key.limits.and_then(|l| l.control).as_ref(), target)
+            }
+        }
+    }
+}
+
+/// ophyd's rules for a target against a setpoint's control limits, which
+/// differ in which ranges are no limit. An absent bound is open.
+#[derive(Clone, Copy)]
+pub(crate) enum ControlRule {
+    /// ophyd `EpicsSignal.check_value`, to which `EpicsMotor.check_value`
+    /// delegates: none when `low >= high`.
+    Signal,
+    /// ophyd `PVPositioner.check_value`: none when `low == high`.
+    Positioner,
+}
+
+impl ControlRule {
+    fn check(self, range: Option<&LimitsRange>, target: f64) -> std::result::Result<(), String> {
+        let Some(range) = range else {
+            return Ok(());
+        };
+        let low = range.low.unwrap_or(f64::NEG_INFINITY);
+        let high = range.high.unwrap_or(f64::INFINITY);
+        let none = match self {
+            Self::Signal => low >= high,
+            Self::Positioner => low == high,
+        };
+        if none || (low..=high).contains(&target) {
+            return Ok(());
+        }
+        Err(format!("{target} is outside the limits [{low}, {high}]"))
+    }
+}
+
+/// The motor record's `.LLM`, `.HLM`, `.DLLM` and `.DHLM`.
+pub(crate) struct MotorLimits<B> {
+    llm: B,
+    hlm: B,
+    dllm: B,
+    dhlm: B,
+}
+
+impl<B: SignalBackend<f64>> MotorLimits<B> {
+    async fn check(&self, from: f64, target: f64) -> std::result::Result<(), String> {
+        let (llm, hlm, dllm, dhlm) = tokio::try_join!(
+            self.llm.get_value(),
+            self.hlm.get_value(),
+            self.dllm.get_value(),
+            self.dhlm.get_value(),
+        )
+        .map_err(|e| format!("limits: {e}"))?;
+        check_motor_move([llm, hlm], [dllm, dhlm], from, target)
+    }
+}
+
+/// ophyd-async `Motor.check_move`: dial limits 0, 0 are no limits; otherwise
+/// both where the motor stands and `target` lie in `[LLM, HLM]`.
+fn check_motor_move(
+    [llm, hlm]: [f64; 2],
+    dial: [f64; 2],
+    from: f64,
+    target: f64,
+) -> std::result::Result<(), String> {
+    let within = |x: f64| hlm >= x && x >= llm;
+    if dial == [0.0, 0.0] || (within(from) && within(target)) {
+        return Ok(());
+    }
+    Err(format!(
+        "a move from {from} to {target} is outside the limits [{llm}, {hlm}]"
+    ))
 }
 
 /// A motor record's `.STOP` or `.SET`, written as 0 or 1.
@@ -175,6 +268,10 @@ pub(crate) struct MotorChannels<B: MotorBackend> {
     /// `None` when the setpoint's record has no `.DMOV`/`.STOP`; a stop then
     /// only settles the move.
     button: Option<StopButton<B>>,
+    /// `None` when the setpoint's record has no `.LLM`/`.HLM`/`.DLLM`/
+    /// `.DHLM`; its moves are then checked as ophyd's `EpicsMotor` checks
+    /// them, by [`ControlRule::Signal`].
+    limits: Option<MotorLimits<B>>,
     /// The setpoint record's `.SET`; `None` when it has none.
     set_use: Option<Arc<B::Switch>>,
     halt: Halt,
@@ -182,11 +279,13 @@ pub(crate) struct MotorChannels<B: MotorBackend> {
 
 impl<B: MotorBackend> MotorChannels<B> {
     /// Connect `val_pv`, `rbv_pv` and the `.VELO`/`.ACCL`/`.DMOV`/`.STOP`/
-    /// `.SET` of `val_pv`'s record. A `.VELO`/`.ACCL` that does not connect
-    /// (no motor record behind `val_pv`) leaves the moves without a
-    /// deadline; a `.DMOV`/`.STOP` that does not, the stop without a press;
-    /// a `.SET` that does not, no `set_current_position`. `kind` and `name`
-    /// label the motor in messages.
+    /// `.SET`/`.LLM`/`.HLM`/`.DLLM`/`.DHLM` of `val_pv`'s record. A `.VELO`/
+    /// `.ACCL` that does not connect (no motor record behind `val_pv`)
+    /// leaves the moves without a deadline; a `.DMOV`/`.STOP` that does not,
+    /// the stop without a press; a `.SET` that does not, no
+    /// `set_current_position`; a limit that does not, the moves checked on
+    /// the setpoint's control limits in place of ophyd-async's
+    /// `Motor.check_move`. `kind` and `name` label the motor in messages.
     pub(crate) async fn connect(
         kind: &str,
         name: &str,
@@ -205,8 +304,14 @@ impl<B: MotorBackend> MotorChannels<B> {
             stop: <B::Switch as SwitchField>::from_pv(&format!("{record}.STOP")),
         };
         let set_use = <B::Switch as SwitchField>::from_pv(&format!("{record}.SET"));
+        let limits = MotorLimits {
+            llm: B::from_pv(&format!("{record}.LLM")),
+            hlm: B::from_pv(&format!("{record}.HLM")),
+            dllm: B::from_pv(&format!("{record}.DLLM")),
+            dhlm: B::from_pv(&format!("{record}.DHLM")),
+        };
         let t = Duration::from_secs(5);
-        let (sp, rb, velo, accl, dmov, stop, set) = tokio::join!(
+        let (sp, rb, velo, accl, dmov, stop, set, llm, hlm, dllm, dhlm) = tokio::join!(
             setpoint.connect(t),
             readback.connect(t),
             timing.velo.connect(t),
@@ -214,6 +319,10 @@ impl<B: MotorBackend> MotorChannels<B> {
             button.dmov.connect(t),
             button.stop.connect(t),
             set_use.connect(t),
+            limits.llm.connect(t),
+            limits.hlm.connect(t),
+            limits.dllm.connect(t),
+            limits.dhlm.connect(t),
         );
         sp?;
         rb?;
@@ -238,11 +347,19 @@ impl<B: MotorBackend> MotorChannels<B> {
                 None
             }
         };
+        let limits = match llm.and(hlm).and(dllm).and(dhlm) {
+            Ok(()) => Some(limits),
+            Err(e) => {
+                tracing::warn!("{kind} {name}: moves are checked on the control limits: {e}");
+                None
+            }
+        };
         Ok(Self {
             setpoint,
             readback: Readback::new(readback),
             timing,
             button,
+            limits,
             set_use,
             halt: Halt::new(),
         })
@@ -271,6 +388,10 @@ impl<B: MotorBackend> MotorChannels<B> {
             name,
             setpoint: self.setpoint.as_ref(),
             readback: &self.readback,
+            limits: self
+                .limits
+                .as_ref()
+                .map_or(Limits::Control(ControlRule::Signal), Limits::MotorRecord),
             halt: &self.halt,
         };
         move_status(axis, target, &what, finish).await
@@ -351,8 +472,8 @@ impl<B: MotorBackend> MotorChannels<B> {
 /// that awaited the move itself would serialize a multi-axis `mv`; bluesky's
 /// `set()` returns its status immediately and the motion completes it. Only
 /// the wait is spawned: a spawned send lets `set(a); set(b)` reach the IOC as
-/// b, a, and the IOC then finishes at `a`. A `value` outside the setpoint's
-/// control limits fails the status with nothing sent. A [`Halt::stop`] once
+/// b, a, and the IOC then finishes at `a`. A move the axis's [`Limits`]
+/// refuses fails the status with nothing sent. A [`Halt::stop`] once
 /// this is called settles the status; halting the motion is the caller's.
 ///
 /// Until it settles, the status carries a [`WatcherUpdate`] for each readback
@@ -379,7 +500,7 @@ where
             axis.readback.backend.get_datakey(""),
         )
         .map_err(|e| e.to_string())?;
-        within_limits(axis.setpoint, value).await?;
+        axis.limits.check(axis.setpoint, initial, value).await?;
         let (readings, monitor) = axis.readback.cache.add_listener();
         let done = axis
             .setpoint
@@ -428,34 +549,6 @@ where
     status
 }
 
-/// ophyd `EpicsSignal.check_value`: `target` against the control limits of
-/// the setpoint, read at each move as ophyd-async's `Motor.check_move` reads
-/// its limits.
-async fn within_limits<B: SignalBackend<f64>>(
-    setpoint: &B,
-    target: f64,
-) -> std::result::Result<(), String> {
-    let key = setpoint
-        .get_datakey("")
-        .await
-        .map_err(|e| format!("limits: {e}"))?;
-    check_range(key.limits.and_then(|l| l.control).as_ref(), target)
-}
-
-/// A range with `low >= high` is no limit, as in ophyd (a motor record's dial
-/// limits 0, 0); an absent bound is open.
-fn check_range(range: Option<&LimitsRange>, target: f64) -> std::result::Result<(), String> {
-    let Some(range) = range else {
-        return Ok(());
-    };
-    let low = range.low.unwrap_or(f64::NEG_INFINITY);
-    let high = range.high.unwrap_or(f64::INFINITY);
-    if low >= high || (low..=high).contains(&target) {
-        return Ok(());
-    }
-    Err(format!("{target} is outside the limits [{low}, {high}]"))
-}
-
 /// The data key of one `f64` PV as `object_name` reports it: the backend's
 /// `get_datakey` reads the PV's units, precision and limit ranges — what
 /// ophyd's `EpicsSignal.describe()` carries — and sources it from the PV.
@@ -487,20 +580,55 @@ mod tests {
         assert_eq!(move_timeout_secs(0.0, 0.0, -0.0, 0.5), None);
     }
 
+    /// ophyd `EpicsSignal.check_value` and `PVPositioner.check_value`: a
+    /// target outside an ordered range is refused, a range with `low ==
+    /// high` is none; `low > high` is none to the first and refuses all to
+    /// the second.
     #[test]
-    fn check_range_refuses_only_a_target_outside_an_ordered_range() {
+    fn control_rules_refuse_a_target_outside_the_range() {
         let r = |low, high| Some(LimitsRange { low, high });
-        assert!(check_range(None, 1e9).is_ok());
-        assert!(check_range(r(Some(-1.0), Some(1.0)).as_ref(), -1.0).is_ok());
-        assert!(check_range(r(Some(-1.0), Some(1.0)).as_ref(), 1.0).is_ok());
-        assert!(check_range(r(Some(-1.0), Some(1.0)).as_ref(), 1.5).is_err());
-        assert!(check_range(r(Some(-1.0), Some(1.0)).as_ref(), -1.5).is_err());
-        assert!(check_range(r(Some(-1.0), Some(1.0)).as_ref(), f64::NAN).is_err());
-        assert!(check_range(r(Some(3.0), Some(3.0)).as_ref(), 9.0).is_ok());
-        assert!(check_range(r(Some(1.0), Some(-1.0)).as_ref(), 9.0).is_ok());
-        assert!(check_range(r(None, Some(1.0)).as_ref(), -1e9).is_ok());
-        assert!(check_range(r(None, Some(1.0)).as_ref(), 2.0).is_err());
-        assert!(check_range(r(Some(-1.0), None).as_ref(), -2.0).is_err());
+        for rule in [ControlRule::Signal, ControlRule::Positioner] {
+            assert!(rule.check(None, 1e9).is_ok());
+            assert!(rule.check(r(Some(-1.0), Some(1.0)).as_ref(), -1.0).is_ok());
+            assert!(rule.check(r(Some(-1.0), Some(1.0)).as_ref(), 1.0).is_ok());
+            assert!(rule.check(r(Some(-1.0), Some(1.0)).as_ref(), 1.5).is_err());
+            assert!(rule.check(r(Some(-1.0), Some(1.0)).as_ref(), -1.5).is_err());
+            assert!(rule
+                .check(r(Some(-1.0), Some(1.0)).as_ref(), f64::NAN)
+                .is_err());
+            assert!(rule.check(r(Some(3.0), Some(3.0)).as_ref(), 9.0).is_ok());
+            assert!(rule.check(r(None, Some(1.0)).as_ref(), -1e9).is_ok());
+            assert!(rule.check(r(None, Some(1.0)).as_ref(), 2.0).is_err());
+            assert!(rule.check(r(Some(-1.0), None).as_ref(), -2.0).is_err());
+        }
+        let inverted = r(Some(1.0), Some(-1.0));
+        assert!(ControlRule::Signal.check(inverted.as_ref(), 9.0).is_ok());
+        for target in [0.0, 1.0, -1.0, 9.0] {
+            assert!(ControlRule::Positioner
+                .check(inverted.as_ref(), target)
+                .is_err());
+        }
+    }
+
+    /// ophyd-async `test_move_outside_motor_limits_causes_error`,
+    /// `test_given_limits_of_0_0_then_move_causes_no_error` and
+    /// `Motor.check_move`: both ends of the move lie in `[LLM, HLM]` unless
+    /// the dial limits are 0, 0; NaN and an inverted range refuse.
+    #[test]
+    fn check_motor_move_refuses_a_move_that_starts_or_ends_past_a_limit() {
+        let lim = [-1.0, 1.0];
+        let dial = [-1.0, 1.0];
+        assert!(check_motor_move(lim, dial, 0.0, 1.0).is_ok());
+        assert!(check_motor_move(lim, dial, -1.0, 0.0).is_ok());
+        assert!(check_motor_move(lim, dial, 0.0, 1.5).is_err());
+        assert!(check_motor_move(lim, dial, 1.5, 0.0).is_err());
+        assert!(check_motor_move(lim, dial, -1.5, 0.0).is_err());
+        assert!(check_motor_move(lim, dial, f64::NAN, 0.0).is_err());
+        assert!(check_motor_move(lim, dial, 0.0, f64::NAN).is_err());
+        assert!(check_motor_move([1.0, -1.0], dial, 0.0, 0.0).is_err());
+        assert!(check_motor_move([-0.001, 0.001], [0.0, 0.0], 0.0, 100.0).is_ok());
+        assert!(check_motor_move([0.0, 0.0], [0.0, 0.5], 0.0, 0.0).is_ok());
+        assert!(check_motor_move([0.0, 0.0], [0.0, 0.5], 0.0, 0.1).is_err());
     }
 
     async fn put_done(done: PutCompletion) -> std::result::Result<(), String> {
@@ -516,6 +644,7 @@ mod tests {
             name: "motor",
             setpoint,
             readback,
+            limits: Limits::Control(ControlRule::Signal),
             halt,
         }
     }

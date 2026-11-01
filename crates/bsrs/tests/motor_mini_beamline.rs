@@ -202,9 +202,10 @@ async fn slit_positioner() -> Arc<CaPositioner> {
 
 /// test_pvpositioner.py `test_put_complete_setpoint_readback_done`: a
 /// positioner over VAL, RBV and MOVN (done at 0) refuses a target past the
-/// setpoint's high limit (`check_value`), and a move settles once the put
-/// completes and MOVN reads done, with the readback at the target; its
-/// watchers follow the readback meanwhile.
+/// setpoint's high limit, and every target while its limits are inverted,
+/// but not a move from past a limit (`PVPositioner.check_value`); a move
+/// settles once the put completes and MOVN reads done, with the readback at
+/// the target; its watchers follow the readback meanwhile.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
 async fn a_positioner_refuses_a_target_past_the_limit_and_settles_on_done() {
@@ -218,6 +219,35 @@ async fn a_positioner_refuses_a_target_past_the_limit_and_settles_on_done() {
         .expect("refused at once");
     assert!(res.is_err(), "a move past HLM {hlm} succeeded");
     assert_eq!(p.locate_dyn().await.unwrap().setpoint, before);
+
+    let llm = ca_f64("mini:slit:mtr.LLM").await.get_value().await.unwrap();
+    let hlm_pv = ca_f64("mini:slit:mtr.HLM").await;
+    hlm_pv.put(Some(llm - 1.0)).await.unwrap();
+    let inverted = hlm_pv.get_value().await.unwrap();
+    let res = tokio::time::timeout(Duration::from_secs(5), p.set_dyn(before).await)
+        .await
+        .expect("refused at once");
+    hlm_pv.put(Some(hlm)).await.unwrap();
+    assert!(inverted < llm, "HLM {inverted}, LLM {llm}");
+    assert!(
+        res.is_err(),
+        "a move with HLM {inverted} < LLM {llm} succeeded"
+    );
+
+    let pos = p.locate_dyn().await.unwrap().readback;
+    let (f, inside) = if pos > 0.0 {
+        ("HLM", pos - 0.2)
+    } else {
+        ("LLM", pos + 0.2)
+    };
+    let pulled = ca_f64(&format!("mini:slit:mtr.{f}")).await;
+    let limit = pulled.get_value().await.unwrap();
+    pulled.put(Some(inward(pos, 0.1))).await.unwrap();
+    let res = tokio::time::timeout(Duration::from_secs(25), p.set_dyn(inside).await)
+        .await
+        .expect("within ophyd's 25 s");
+    pulled.put(Some(limit)).await.unwrap();
+    res.unwrap_or_else(|e| panic!("a move from {pos} past .{f} back inside it: {e}"));
 
     let start = p.locate_dyn().await.unwrap().readback;
     let target = inward(start, 1.0);

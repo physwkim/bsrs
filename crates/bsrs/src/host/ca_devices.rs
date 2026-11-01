@@ -38,7 +38,9 @@ use crate::core::status::Status;
 use crate::core::subscription::Subscription;
 use crate::devices::SignalCache;
 use crate::event_model::DataKey;
-use crate::host::motor_move::{describe_pv, move_status, Axis, Halt, MotorChannels, Readback};
+use crate::host::motor_move::{
+    describe_pv, move_status, Axis, ControlRule, Halt, Limits, MotorChannels, Readback,
+};
 // `SignalBackend` is the trait that provides connect/put/get on the
 // CA backend; pulled in via the `bsrs-protocols-async` dep that
 // the `ca` feature toggles on.
@@ -329,6 +331,7 @@ impl MovableObj for CaPositioner {
             name: &self.name,
             setpoint: self.setpoint.as_ref(),
             readback: &self.readback,
+            limits: Limits::Control(ControlRule::Positioner),
             halt: &self.halt,
         };
         move_status(axis, value, what, finish).await

@@ -68,6 +68,34 @@ fn inward(from: f64, d: f64) -> f64 {
     }
 }
 
+/// ophyd-async `Motor.check_move`: with the limit on the side with room
+/// pulled to 1 short of where `record`'s motor stands, a move 2 back inside
+/// it is refused, with nothing sent. The limit is restored.
+async fn refused_from_past_a_limit<M: MovableObj + LocatableObj>(m: &M, record: &str) {
+    let before = m.locate_dyn().await.unwrap();
+    let (f, inside) = if before.readback > 0.0 {
+        ("HLM", before.readback - 2.0)
+    } else {
+        ("LLM", before.readback + 2.0)
+    };
+    let pulled = ca::<f64>(record, f).await;
+    let limit = pulled.get_value().await.unwrap();
+    pulled
+        .put(Some(inward(before.readback, 1.0)))
+        .await
+        .unwrap();
+    let res = tokio::time::timeout(Duration::from_secs(5), m.set_dyn(inside).await)
+        .await
+        .expect("refused at once");
+    pulled.put(Some(limit)).await.unwrap();
+    assert!(
+        res.is_err(),
+        "a move from {} past .{f} succeeded",
+        before.readback
+    );
+    assert_eq!(m.locate_dyn().await.unwrap().setpoint, before.setpoint);
+}
+
 /// Wait until the subscribed readback satisfies `pred`.
 async fn readback_until(sub: &Subscription, pred: impl Fn(f64) -> bool) {
     let mut rx = sub.clone_rx();
@@ -263,7 +291,8 @@ async fn stop_with_success_halts_the_motor_and_completes_its_move() {
 
 /// test_epicsmotor.py `test_limits`/`check_value`; ophyd-async
 /// `test_move_outside_motor_limits_causes_error`: a target past a soft limit
-/// is refused and the setpoint stays. ophyd-async
+/// is refused and the setpoint stays. ophyd-async `Motor.check_move`: so is
+/// any move of a motor that stands past one. ophyd-async
 /// `test_given_limits_of_0_0_then_move_causes_no_error`: dial limits 0, 0
 /// mean no limits.
 #[tokio::test(flavor = "multi_thread")]
@@ -288,6 +317,7 @@ async fn a_move_past_a_soft_limit_is_refused() {
         );
         assert_eq!(m.locate_dyn().await.unwrap().setpoint, before);
     }
+    refused_from_past_a_limit(m.as_ref(), X4).await;
 
     for f in ["DHLM", "DLLM"] {
         ca::<f64>(X4, f).await.put(Some(0.0)).await.unwrap();
@@ -453,13 +483,16 @@ async fn a_held_move_times_out_on_the_records_velocity_and_acceleration() {
 /// test_epicsmotor.py `test_move`, `test_watchers` and `motor.stop()` over
 /// PVA: the `block=true` put settles once the motor is done, its watchers
 /// following the readback meanwhile, and `stop` halts the motor and fails its
-/// move.
+/// move. ophyd-async `Motor.check_move`: a move of a motor past a limit is
+/// refused.
 #[test]
 #[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
 fn a_pva_move_settles_once_done_and_stop_halts_it() {
     example_ioc::boot(BIN, BIN);
     let m = pva_motor("sim_mtr1", SIM1);
     bsrs_runtime().block_on(async {
+        refused_from_past_a_limit(m.as_ref(), SIM1).await;
+
         let start = m.locate_dyn().await.unwrap().readback;
         let target = inward(start, 1.0);
         let key = m.describe_dyn().await.unwrap().remove("sim_mtr1").unwrap();
