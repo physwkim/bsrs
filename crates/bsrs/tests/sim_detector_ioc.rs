@@ -404,6 +404,40 @@ async fn fly_scan_takes_the_prepared_frames_and_continues_the_index() {
     assert!(h5.exists());
 }
 
+/// ophyd-async `test_acquire_logic.py:95`
+/// `test_start_acquiring_driver_and_ensure_status_timing` and
+/// `_detector.py:677` `kickoff`: kickoff's status is done once the detector
+/// is acquiring, not when the acquisition ends.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+async fn kickoff_resolves_once_the_detector_is_acquiring() {
+    boot();
+    let _cam = CAM_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let det = hdf_det("det", dir.path(), "kickoff").await;
+    Stageable::stage(&det).await.expect("stage");
+    let info = TriggerInfo {
+        number_of_events: 5,
+        livetime: Some(Duration::from_millis(200)),
+        deadtime: Some(Duration::ZERO),
+        ..TriggerInfo::default()
+    };
+    finish(Preparable::prepare(&det, info).await, "prepare")
+        .await
+        .unwrap();
+    let kickoff = Flyable::kickoff(&det).await;
+    let early = timeout(Duration::from_millis(500), kickoff).await;
+    let acquiring = get::<bool>(&format!("{CAM}Acquire_RBV")).await;
+    let completed = finish(Flyable::complete(&det).await, "complete").await;
+    Stageable::unstage(&det).await.expect("unstage");
+    assert!(acquiring, "the 1 s acquisition ended within 500 ms");
+    assert!(
+        matches!(early, Ok(Ok(()))),
+        "kickoff of a 1 s acquisition not done after 500 ms: {early:?}"
+    );
+    completed.unwrap();
+}
+
 /// ophyd-async `test_standard_detector.py:894` `test_unstage_disarms_detector`
 /// and `test_acquire_logic.py:123` `test_acquire_logic_disarm`: stage and
 /// unstage both leave a free-running cam stopped.

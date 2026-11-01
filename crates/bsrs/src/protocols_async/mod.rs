@@ -236,9 +236,10 @@ pub trait DetectorControl: Send + Sync {
     fn deadtime(&self, exposure: Option<Duration>) -> Duration;
     /// Configure trigger info (number, type, livetime, multiplier, ...).
     async fn prepare(&self, info: TriggerInfo) -> Result<()>;
-    /// Arm; status resolves when armed.
+    /// Arm; status resolves when armed (for an internal trigger, once
+    /// acquiring), not when the acquisition ends.
     async fn arm(&self) -> Status;
-    /// Wait for the detector to return to idle.
+    /// Wait for the armed acquisition to end and the detector to be idle.
     async fn wait_for_idle(&self) -> Result<()>;
     /// Disarm.
     async fn disarm(&self) -> Result<()>;

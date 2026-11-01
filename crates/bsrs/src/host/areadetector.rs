@@ -201,6 +201,9 @@ pub struct AreaDetectorCam {
     /// `ColorMode_RBV`) — the shape/dtype source for the emitted `DataKey`,
     /// read from the driver as in ophyd-async's `make_writer_data_logic`.
     pub frame_info: Arc<CamFrameInfo>,
+    /// The last arm's `Acquire=1` put-callback: done when that acquisition
+    /// ends (ophyd-async `ADAcquireLogic.acquire_status`).
+    acquire_status: std::sync::Mutex<Option<Status>>,
 }
 
 /// The driver-side NDArray description: `ArraySizeX/Y/Z_RBV`, `DataType_RBV`,
@@ -331,6 +334,7 @@ impl AreaDetectorCam {
                 "NDAttributesFile",
             ))),
             frame_info: Arc::new(CamFrameInfo::new(&prefix)),
+            acquire_status: std::sync::Mutex::new(None),
             prefix,
         }
     }
@@ -2400,17 +2404,12 @@ impl DetectorControl for AreaDetectorCam {
         Ok(())
     }
     async fn arm(&self) -> Status {
-        // Acquire is a busy record: its put-callback completes when the whole
-        // acquisition ends, so it becomes the returned Status — deliberately
-        // unbounded, an N-frame acquisition takes as long as it takes. Before
-        // returning, wait until Acquire_RBV confirms the driver is actually
-        // acquiring (ophyd-async `set_and_wait_for_value(acquire, True,
-        // wait_for_set_completion=False)`), so a fly scan's kickoff doesn't
-        // complete with the detector still idle.
+        // ophyd-async `ADAcquireLogic.start_acquiring`: armed once
+        // Acquire_RBV reports acquiring. Acquire is a busy record whose
+        // put-callback completes when the whole acquisition ends; that
+        // completion is stashed for `wait_for_idle`, deliberately unbounded.
         // Acquire=1 is sent here, not in the spawned task, so a later
         // disarm's Acquire=0 cannot overtake it on the wire.
-        let (status, setter) = Status::new();
-        let prefix = self.prefix.clone();
         match set_and_wait_for_bool(
             self.acquire_rbv.as_ref(),
             true,
@@ -2420,6 +2419,8 @@ impl DetectorControl for AreaDetectorCam {
         .await
         {
             Ok(done) => {
+                let (acquired, setter) = Status::new();
+                let prefix = self.prefix.clone();
                 tokio::spawn(async move {
                     match done.await {
                         Ok(()) => setter.success(),
@@ -2428,12 +2429,19 @@ impl DetectorControl for AreaDetectorCam {
                         }
                     }
                 });
+                *self.acquire_status.lock().unwrap() = Some(acquired);
+                Status::done()
             }
-            Err(e) => setter.fail(StatusError::Failed(format!("{prefix}{e}"))),
+            Err(e) => Status::fail(StatusError::Failed(format!("{}{e}", self.prefix))),
         }
-        status
     }
     async fn wait_for_idle(&self) -> Result<()> {
+        // ophyd-async `ADAcquireLogic.wait_for_idle`: the acquisition's end,
+        // then a good DetectorState.
+        let acquired = self.acquire_status.lock().unwrap().clone();
+        if let Some(acquired) = acquired {
+            acquired.await?;
+        }
         // Inherent `wait_for_idle(timeout)` takes priority in method resolution.
         self.wait_for_idle(WARMUP_IDLE_TIMEOUT).await
     }
