@@ -551,6 +551,43 @@ async fn stage_forgets_the_previous_prepare() {
     assert_eq!(n, 1);
 }
 
+/// ophyd-async `test_standard_detector.py:543`
+/// `test_kickoff_respects_prepare_bounds`: a second kickoff without a new
+/// prepare asks for frames beyond the prepared ones.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+async fn kickoff_beyond_the_prepared_frames_fails() {
+    boot();
+    let _cam = CAM_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let det = hdf_det("det", dir.path(), "bounds").await;
+    Stageable::stage(&det).await.expect("stage");
+    let info = TriggerInfo {
+        number_of_events: 2,
+        ..TriggerInfo::default()
+    };
+    finish(Preparable::prepare(&det, info).await, "prepare")
+        .await
+        .unwrap();
+    finish(Flyable::kickoff(&det).await, "kickoff")
+        .await
+        .unwrap();
+    finish(Flyable::complete(&det).await, "complete")
+        .await
+        .unwrap();
+    let again = finish(Flyable::kickoff(&det).await, "kickoff").await;
+    if again.is_ok() {
+        let _ = finish(Flyable::complete(&det).await, "complete").await;
+    }
+    let n = index(&det).await;
+    Stageable::unstage(&det).await.expect("unstage");
+    let err = again.expect_err(&format!("second kickoff took {} more frames", n - 2));
+    assert!(
+        err.contains("Kickoff requested 2:4, but detector was only prepared up to 2"),
+        "{err}"
+    );
+}
+
 /// ophyd-async `test_standard_detector.py:625`
 /// `test_config_signals_in_describe_configuration` and
 /// `test_adsim_system.py:209`/`:217`: the exposure time and period are the

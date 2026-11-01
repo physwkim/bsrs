@@ -22,6 +22,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// bsrs-devices.
 pub use crate::protocols_async::{DetectorTrigger, TriggerInfo};
 
+/// ophyd-async `_PrepareCtx`: what the last prepare since stage set up.
+#[derive(Clone)]
+struct PrepareCtx {
+    trigger_info: TriggerInfo,
+    // Writer index at that prepare (refreshed by trigger); the prepared
+    // collections end at this + `trigger_info.number_of_collections()`.
+    collections_written: u64,
+}
+
+/// ophyd-async `_KickoffCtx`: what the last kickoff asked `complete` to wait
+/// for.
+#[derive(Clone, Copy)]
+struct KickoffCtx {
+    collections_written: u64,
+    collections_requested: u64,
+    // Only the kickoff that reaches the prepared end waits for idle.
+    is_last_kickoff: bool,
+}
+
 /// A detector composed of an arming half (`DetectorControl`) and a writing half
 /// (`DetectorWriter`). Implements all eight bluesky protocols by delegation.
 pub struct StandardDetector<C, W>
@@ -32,13 +51,12 @@ where
     name: String,
     control: C,
     writer: W,
-    // ophyd-async `_prepare_ctx`: the TriggerInfo the hardware was last
-    // prepared with since stage; `None` after stage. Only `prepare_for`
-    // writes it, after `DetectorControl::prepare` succeeded.
-    prepared: std::sync::Mutex<Option<TriggerInfo>>,
-    // Absolute writer index that complete() waits for. Set in kickoff()
-    // from the current writer baseline + number_of_collections().
-    cached_target: AtomicU64,
+    // `None` after stage, as in ophyd-async.
+    prepared: std::sync::Mutex<Option<PrepareCtx>>,
+    kicked_off: std::sync::Mutex<Option<KickoffCtx>>,
+    // ophyd-async `events_to_kickoff`: `number_of_events` at prepare, 0 at
+    // stage; a plan may lower it to split the prepared events over kickoffs.
+    events_to_kickoff: AtomicU64,
     // DataKeys captured when the writer is opened at `stage()`. `describe`
     // reads from this cache rather than re-opening the writer mid-acquisition
     // (DB-04); `None` until staged.
@@ -57,7 +75,8 @@ where
             control,
             writer,
             prepared: std::sync::Mutex::new(None),
-            cached_target: AtomicU64::new(0),
+            kicked_off: std::sync::Mutex::new(None),
+            events_to_kickoff: AtomicU64::new(0),
             opened: std::sync::Mutex::new(None),
         }
     }
@@ -77,6 +96,17 @@ where
         &self.name
     }
 
+    /// Events the next `kickoff` acquires (ophyd-async `events_to_kickoff`).
+    pub fn events_to_kickoff(&self) -> u64 {
+        self.events_to_kickoff.load(Ordering::SeqCst)
+    }
+
+    /// Set the events the next `kickoff` acquires; a kickoff past the
+    /// prepared events fails.
+    pub fn set_events_to_kickoff(&self, events: u64) {
+        self.events_to_kickoff.store(events, Ordering::SeqCst);
+    }
+
     /// Read the DataKeys cached when the writer was opened at `stage()`.
     /// Errors with `BsrsError::State` if the detector has not been staged
     /// (the writer was never opened), so `describe` never re-opens it (DB-04).
@@ -91,18 +121,30 @@ where
 
     /// ophyd-async `StandardDetector.prepare`: set the hardware up for `info`,
     /// then record it as this scan's prepare.
-    async fn prepare_for(&self, info: TriggerInfo) -> Result<TriggerInfo> {
+    async fn prepare_for(&self, info: TriggerInfo) -> Result<PrepareCtx> {
         self.control.prepare(info.clone()).await?;
-        *self.prepared.lock().unwrap() = Some(info.clone());
-        Ok(info)
+        let ctx = self.update_prepare_context(info).await;
+        self.set_events_to_kickoff(ctx.trigger_info.number_of_events.into());
+        Ok(ctx)
+    }
+
+    /// ophyd-async `_update_prepare_context`: record `info` with the writer
+    /// index now as its baseline.
+    async fn update_prepare_context(&self, trigger_info: TriggerInfo) -> PrepareCtx {
+        let ctx = PrepareCtx {
+            trigger_info,
+            collections_written: self.writer.indices_written().await,
+        };
+        *self.prepared.lock().unwrap() = Some(ctx.clone());
+        ctx
     }
 
     /// The prepare since stage, or an implicit `TriggerInfo::default()` one
     /// (ophyd-async `trigger`; `kickoff` raises there instead).
-    async fn prepared_or_default(&self) -> Result<TriggerInfo> {
+    async fn prepared_or_default(&self) -> Result<PrepareCtx> {
         let prepared = self.prepared.lock().unwrap().clone();
         match prepared {
-            Some(info) => Ok(info),
+            Some(ctx) => Ok(ctx),
             None => self.prepare_for(TriggerInfo::default()).await,
         }
     }
@@ -110,16 +152,50 @@ where
     /// ophyd-async `StandardDetector.trigger`: one event of the prepare since
     /// stage, or of an implicit `TriggerInfo()` one.
     async fn trigger_one(&self) -> Result<()> {
-        let info = self.prepared_or_default().await?;
-        if info.number_of_events != 1 {
-            return Err(BsrsError::Plan(format!(
-                "{}: trigger() is not supported for multiple events, the detector \
-                 was prepared with number_of_events={}.",
-                self.name, info.number_of_events
-            )));
+        let prepared = self.prepared.lock().unwrap().clone();
+        match prepared {
+            None => {
+                self.prepare_for(TriggerInfo::default()).await?;
+            }
+            Some(ctx) if ctx.trigger_info.number_of_events != 1 => {
+                return Err(BsrsError::Plan(format!(
+                    "{}: trigger() is not supported for multiple events, the detector \
+                     was prepared with number_of_events={}.",
+                    self.name, ctx.trigger_info.number_of_events
+                )));
+            }
+            Some(ctx) => {
+                self.update_prepare_context(ctx.trigger_info).await;
+            }
         }
         self.control.arm().await.await?;
         self.control.wait_for_idle().await
+    }
+
+    /// ophyd-async `StandardDetector.kickoff` up to starting the acquisition:
+    /// `events_to_kickoff` events from the index now, within the prepare.
+    async fn kickoff_ctx(&self) -> Result<KickoffCtx> {
+        let ctx = self.prepared_or_default().await?;
+        let collections_written = self.writer.indices_written().await;
+        let collections_requested =
+            self.events_to_kickoff() * u64::from(ctx.trigger_info.collections_per_event);
+        let last_requested = collections_written + collections_requested;
+        let last_expected =
+            ctx.collections_written + u64::from(ctx.trigger_info.number_of_collections());
+        if last_requested > last_expected {
+            return Err(BsrsError::State(format!(
+                "{}: Kickoff requested {collections_written}:{last_requested}, but \
+                 detector was only prepared up to {last_expected}",
+                self.name
+            )));
+        }
+        let kickoff = KickoffCtx {
+            collections_written,
+            collections_requested,
+            is_last_kickoff: last_requested == last_expected,
+        };
+        *self.kicked_off.lock().unwrap() = Some(kickoff);
+        Ok(kickoff)
     }
 
     /// Drain the writer's buffered `StreamResource`/`StreamDatum` for frames up
@@ -163,9 +239,11 @@ where
         // the next acquisition. Mirrors ophyd-async `StandardDetector.stage()`
         // calling `_disarm_and_stop(on_unstage=False)`.
         self.control.disarm().await?;
-        // ophyd-async `stage` drops `_prepare_ctx`: a prepare belongs to the
-        // scan it was made for.
+        // ophyd-async `stage` drops the prepare and kickoff contexts: they
+        // belong to the scan they were made for.
         *self.prepared.lock().unwrap() = None;
+        *self.kicked_off.lock().unwrap() = None;
+        self.set_events_to_kickoff(0);
         // Ready the writer for this scan with multiplier=1 by default; plans
         // can call configure() to change this. Cache the DataKeys the writer
         // reports so describe() is a pure read and never re-opens the writer
@@ -214,26 +292,21 @@ where
     }
     async fn kickoff(&self) -> Status {
         // The hardware was set up by prepare, as in ophyd-async.
-        let info = match self.prepared_or_default().await {
-            Ok(info) => info,
-            Err(e) => {
-                return Status::fail(crate::core::status::StatusError::Failed(format!(
-                    "prepare: {e}"
-                )))
-            }
-        };
-        // Capture the write baseline so complete() waits for exactly
-        // number_of_collections NEW frames, not an absolute total.
-        let baseline = self.writer.indices_written().await;
-        self.cached_target.store(
-            baseline + info.number_of_collections() as u64,
-            Ordering::SeqCst,
-        );
+        if let Err(e) = self.kickoff_ctx().await {
+            return Status::fail(crate::core::status::StatusError::Failed(format!(
+                "kickoff: {e}"
+            )));
+        }
         self.control.arm().await
     }
     async fn complete(&self) -> Status {
-        // Wait for indices_written to reach cached_target, or until disarm.
-        let target = self.cached_target.load(Ordering::SeqCst);
+        let Some(kickoff) = *self.kicked_off.lock().unwrap() else {
+            return Status::fail(crate::core::status::StatusError::Failed(format!(
+                "{}: Kickoff not called",
+                self.name
+            )));
+        };
+        let target = kickoff.collections_written + kickoff.collections_requested;
         let mut rx = self.writer.observe_indices_written();
         let fut = async {
             while *rx.borrow_and_update() < target {
@@ -243,6 +316,9 @@ where
             }
         };
         fut.await;
+        if !kickoff.is_last_kickoff {
+            return Status::done();
+        }
         match self.control.wait_for_idle().await {
             Ok(()) => Status::done(),
             Err(e) => Status::fail(crate::core::status::StatusError::Failed(format!(
@@ -490,6 +566,7 @@ mod tests {
     /// `stage()` returns the detector to idle (DB-03).
     struct RecordingControl {
         disarms: Arc<AtomicU64>,
+        idles: Arc<AtomicU64>,
     }
 
     #[async_trait]
@@ -504,6 +581,7 @@ mod tests {
             Status::done()
         }
         async fn wait_for_idle(&self) -> Result<()> {
+            self.idles.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
         async fn disarm(&self) -> Result<()> {
@@ -555,6 +633,7 @@ mod tests {
         let (_, rx) = watch::channel(0u64);
         let control = RecordingControl {
             disarms: disarms.clone(),
+            idles: Arc::default(),
         };
         let writer = CountingWriter {
             opens: opens.clone(),
@@ -650,17 +729,16 @@ mod tests {
 
     #[tokio::test]
     async fn complete_blocks_until_indices_written_reaches_target() {
-        // Regression: complete() used to read cached_target == 0 (never set)
-        // and return immediately regardless of how many frames were requested.
-        // After the fix, kickoff() sets cached_target = baseline +
-        // number_of_collections, and complete() genuinely blocks until the
-        // writer reaches that count.
+        // Regression: complete() used to wait for a target that was never set
+        // and returned immediately; it must block until the writer reaches
+        // the kickoff baseline + the requested collections.
         let (tx, rx) = watch::channel(0u64);
         let disarms = Arc::new(AtomicU64::new(0));
         let det = Arc::new(StandardDetector::new(
             "d",
             RecordingControl {
                 disarms: disarms.clone(),
+                idles: Arc::default(),
             },
             ControlledWriter { rx },
         ));
@@ -695,5 +773,89 @@ mod tests {
             .expect("complete() timed out after frames were delivered")
             .expect("task panicked");
         assert!(succeeded, "complete() should succeed after frames arrive");
+    }
+
+    /// A detector whose index `tx` drives, and its count of `wait_for_idle`.
+    fn controlled() -> (
+        StandardDetector<RecordingControl, ControlledWriter>,
+        watch::Sender<u64>,
+        Arc<AtomicU64>,
+    ) {
+        let (tx, rx) = watch::channel(0u64);
+        let idles = Arc::new(AtomicU64::new(0));
+        let control = RecordingControl {
+            disarms: Arc::default(),
+            idles: idles.clone(),
+        };
+        (
+            StandardDetector::new("det", control, ControlledWriter { rx }),
+            tx,
+            idles,
+        )
+    }
+
+    async fn prepare_events(det: &StandardDetector<RecordingControl, ControlledWriter>, n: u32) {
+        let info = TriggerInfo {
+            number_of_events: n,
+            ..Default::default()
+        };
+        Preparable::<TriggerInfo>::prepare(det, info)
+            .await
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn kickoff_respects_prepare_bounds() {
+        // ophyd-async test_standard_detector.py:543.
+        let (det, tx, _) = controlled();
+        Stageable::stage(&det).await.unwrap();
+        prepare_events(&det, 5).await;
+        det.set_events_to_kickoff(3);
+        Flyable::kickoff(&det).await.await.unwrap();
+        tx.send(3).unwrap();
+        det.set_events_to_kickoff(2);
+        Flyable::kickoff(&det).await.await.unwrap();
+        tx.send(5).unwrap();
+        det.set_events_to_kickoff(1);
+        let err = Flyable::kickoff(&det).await.await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Kickoff requested 5:6, but detector was only prepared up to 5"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_waits_for_idle_only_after_the_last_kickoff() {
+        // ophyd-async `kickoff` sets `is_last_kickoff`; `complete` passes it
+        // as `wait_for_idle`.
+        let (det, tx, idles) = controlled();
+        Stageable::stage(&det).await.unwrap();
+        prepare_events(&det, 5).await;
+        det.set_events_to_kickoff(3);
+        Flyable::kickoff(&det).await.await.unwrap();
+        tx.send(3).unwrap();
+        Flyable::complete(&det).await.await.unwrap();
+        assert_eq!(idles.load(Ordering::SeqCst), 0, "3 of 5 events");
+        det.set_events_to_kickoff(2);
+        Flyable::kickoff(&det).await.await.unwrap();
+        tx.send(5).unwrap();
+        Flyable::complete(&det).await.await.unwrap();
+        assert_eq!(idles.load(Ordering::SeqCst), 1, "5 of 5 events");
+    }
+
+    #[tokio::test]
+    async fn stage_resets_the_prepare_and_kickoff() {
+        // ophyd-async test_standard_detector.py:574.
+        let (det, _tx, _) = controlled();
+        Stageable::stage(&det).await.unwrap();
+        prepare_events(&det, 5).await;
+        det.set_events_to_kickoff(3);
+        Flyable::kickoff(&det).await.await.unwrap();
+        Stageable::stage(&det).await.unwrap();
+        assert_eq!(det.events_to_kickoff(), 0);
+        let err = Flyable::complete(&det).await.await.unwrap_err();
+        assert!(err.to_string().contains("Kickoff not called"), "{err}");
     }
 }
