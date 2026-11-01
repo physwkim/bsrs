@@ -19,7 +19,9 @@
 use crate::core::error::{BsrsError, Result};
 use crate::engine::DocumentSink;
 use crate::event_model::Document;
+use crate::zmq_socket::LingeringSocket;
 use async_trait::async_trait;
+use omq::{Message, Options, SocketType};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
@@ -39,7 +41,7 @@ pub enum Serializer {
 /// Document sink that publishes over a 0MQ PUB socket. Bluesky-Publisher
 /// compatible envelope.
 pub struct ZmqDocumentSink {
-    socket: Arc<StdMutex<zmq::Socket>>,
+    socket: Arc<StdMutex<LingeringSocket>>,
     /// The resolved bind address. For a wildcard bind (`tcp://127.0.0.1:*`)
     /// this is the concrete OS-assigned address; for `connect` it is the
     /// address that was connected to.
@@ -51,19 +53,13 @@ pub struct ZmqDocumentSink {
 impl ZmqDocumentSink {
     /// Build sink that **binds** the given address (server side — clients connect to it).
     pub fn bind(address: &str) -> Result<Self> {
-        let ctx = zmq::Context::new();
-        let socket = ctx
-            .socket(zmq::PUB)
-            .map_err(|e| BsrsError::Backend(format!("zmq socket: {e}")))?;
-        socket
-            .bind(address)
-            .map_err(|e| BsrsError::Backend(format!("zmq bind {address}: {e}")))?;
-        // Resolve the actual bound address so a wildcard port (`tcp://...:*`)
-        // can be discovered by subscribers.
+        let socket = LingeringSocket::new(SocketType::Pub, pub_options());
+        // `bind` returns the actual bound address, so a wildcard port
+        // (`tcp://...:*`) can be discovered by subscribers.
         let endpoint = socket
-            .get_last_endpoint()
-            .map_err(|e| BsrsError::Backend(format!("zmq last endpoint: {e}")))?
-            .map_err(|_| BsrsError::Backend("zmq endpoint not valid UTF-8".into()))?;
+            .bind(address)
+            .map_err(|e| BsrsError::Backend(format!("zmq bind {address}: {e}")))?
+            .to_string();
         Ok(Self {
             socket: Arc::new(StdMutex::new(socket)),
             endpoint,
@@ -74,10 +70,7 @@ impl ZmqDocumentSink {
 
     /// Build sink that **connects** to a 0MQ proxy (e.g. a `bluesky.callbacks.zmq.Proxy`).
     pub fn connect(address: &str) -> Result<Self> {
-        let ctx = zmq::Context::new();
-        let socket = ctx
-            .socket(zmq::PUB)
-            .map_err(|e| BsrsError::Backend(format!("zmq socket: {e}")))?;
+        let socket = LingeringSocket::new(SocketType::Pub, pub_options());
         socket
             .connect(address)
             .map_err(|e| BsrsError::Backend(format!("zmq connect {address}: {e}")))?;
@@ -131,7 +124,7 @@ impl ZmqDocumentSink {
     #[doc(hidden)]
     pub fn send_raw_for_test(&self, bytes: &[u8]) -> Result<()> {
         let s = self.socket.lock().unwrap();
-        s.send(bytes, 0)
+        s.send(Message::single(bytes.to_vec()))
             .map_err(|e| BsrsError::Backend(format!("zmq send: {e}")))
     }
 
@@ -155,16 +148,23 @@ impl ZmqDocumentSink {
     }
 }
 
+/// PUB options under libzmq's mute rule: a subscriber is mute only at the
+/// message-count HWM. omq also mutes a peer once 512 KiB is queued for it,
+/// which drops documents from a burst of large events.
+fn pub_options() -> Options {
+    Options::default().transmit_slot_cap(usize::MAX)
+}
+
 #[async_trait]
 impl DocumentSink for ZmqDocumentSink {
     async fn dispatch(&self, doc: &Document) -> Result<()> {
         let envelope = self.build_envelope(doc)?;
         let socket = self.socket.clone();
         // PUB::send is non-blocking; we still hand it off to spawn_blocking so
-        // tokio's reactor doesn't park on the libzmq write.
+        // tokio's reactor doesn't park on the socket write.
         tokio::task::spawn_blocking(move || -> Result<()> {
             let s = socket.lock().unwrap();
-            s.send(&envelope, 0)
+            s.send(Message::single(envelope))
                 .map_err(|e| BsrsError::Backend(format!("zmq send: {e}")))
         })
         .await
@@ -191,8 +191,7 @@ mod tests {
     fn envelope_layout_no_prefix() {
         // We can't easily exercise the full zmq path without a context, so
         // test the envelope builder via a sink built without binding.
-        let ctx = zmq::Context::new();
-        let socket = ctx.socket(zmq::PUB).unwrap();
+        let socket = LingeringSocket::new(SocketType::Pub, Options::default());
         let sink = ZmqDocumentSink {
             socket: Arc::new(StdMutex::new(socket)),
             endpoint: String::new(),
@@ -209,8 +208,7 @@ mod tests {
 
     #[test]
     fn prefix_with_space_rejected() {
-        let ctx = zmq::Context::new();
-        let socket = ctx.socket(zmq::PUB).unwrap();
+        let socket = LingeringSocket::new(SocketType::Pub, Options::default());
         let sink = ZmqDocumentSink {
             socket: Arc::new(StdMutex::new(socket)),
             endpoint: String::new(),

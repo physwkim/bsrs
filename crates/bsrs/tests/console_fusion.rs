@@ -19,22 +19,28 @@ use bsrs::core::msg::{MovableObj, ReadableObj};
 use bsrs::engine::RunEngine;
 use bsrs::host::manager_lua::build_shared_lua;
 use bsrs::qs::{EState, Registry, Server};
+use omq::blocking::Socket;
+use omq::{Message, Options, SocketType};
 use serde_json::{json, Value};
 use tokio::sync::Mutex as TMutex;
 
+const RPC_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Send a plain bluesky-queueserver request and return the flat response dict.
-fn rpc(socket: &zmq::Socket, method: &str, params: Value) -> Value {
+fn rpc(socket: &Socket, method: &str, params: Value) -> Value {
     let req = json!({ "method": method, "params": params });
-    socket.send(serde_json::to_vec(&req).unwrap(), 0).unwrap();
-    let resp = socket.recv_bytes(0).unwrap();
-    serde_json::from_slice(&resp).unwrap()
+    socket
+        .send_timeout(
+            Message::single(serde_json::to_vec(&req).unwrap()),
+            RPC_TIMEOUT,
+        )
+        .unwrap();
+    let resp = socket.recv_timeout(RPC_TIMEOUT).unwrap();
+    serde_json::from_slice(resp.part_slice(0).unwrap()).unwrap()
 }
 
-fn req_socket(control: &str) -> zmq::Socket {
-    let ctx = zmq::Context::new();
-    let req = ctx.socket(zmq::REQ).unwrap();
-    req.set_rcvtimeo(3_000).unwrap();
-    req.set_sndtimeo(3_000).unwrap();
+fn req_socket(control: &str) -> Socket {
+    let req = omq::Context::new().blocking_socket(SocketType::Req, Options::default());
     req.connect(control).unwrap();
     req
 }

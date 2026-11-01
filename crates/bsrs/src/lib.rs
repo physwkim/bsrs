@@ -30,6 +30,9 @@ pub mod protocols_async;
 pub mod protocols_sync;
 pub mod stream;
 
+#[cfg(feature = "zmq")]
+mod zmq_socket;
+
 /// Queue-server-compatible 0MQ JSON-RPC daemon (feature `qs`).
 #[cfg(feature = "qs")]
 pub mod qs;

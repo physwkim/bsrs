@@ -2,9 +2,12 @@
 
 use crate::core::error::{BsrsError, Result};
 use crate::qs::methods::QsRequest;
+use crate::zmq_socket::LingeringSocket;
+use omq::{Message, Options, SocketType};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::time::Duration;
 
 /// Wire encoding for a single REQ/REP exchange.
 ///
@@ -21,7 +24,7 @@ pub enum MsgEncoding {
 /// Wraps a 0MQ REP socket. `try_recv` waits for a request; `send` posts a response.
 #[derive(Clone)]
 pub struct ReqRepSocket {
-    socket: Arc<StdMutex<zmq::Socket>>,
+    socket: Arc<StdMutex<LingeringSocket>>,
     /// The resolved bind endpoint. For a wildcard bind such as
     /// `tcp://127.0.0.1:*` this is the concrete OS-assigned address
     /// (`tcp://127.0.0.1:54321`), so clients can connect to it.
@@ -40,26 +43,19 @@ impl ReqRepSocket {
     /// `manager.py::zmq_server_comm`. Without a key the socket accepts
     /// plain-text connections (reference default).
     pub fn bind(address: &str, curve_private_key_z85: Option<&str>) -> Result<Self> {
-        let ctx = zmq::Context::new();
-        let socket = ctx
-            .socket(zmq::REP)
-            .map_err(|e| BsrsError::Backend(format!("zmq REP socket: {e}")))?;
-        // Use a 200 ms recv timeout so the rep loop can poll `shutdown` and
-        // exit cleanly when the server is dropped.
-        let _ = socket.set_rcvtimeo(200);
-        // Apply CURVE before bind, matching the reference's socket setup order.
-        if let Some(key) = curve_private_key_z85 {
-            crate::qs::curve::apply_curve_server_key(&socket, key)?;
-        }
-        socket
-            .bind(address)
-            .map_err(|e| BsrsError::Backend(format!("zmq REP bind {address}: {e}")))?;
-        // Resolve the actual bound address: a wildcard port (`tcp://...:*`)
-        // is assigned a concrete port by the OS, which clients need to connect.
+        // CURVE is a socket option, fixed before bind as in the reference.
+        let options = match curve_private_key_z85 {
+            Some(key) => crate::qs::curve::curve_server_options(key)?,
+            None => Options::default(),
+        };
+        let socket = LingeringSocket::new(SocketType::Rep, options);
+        // `bind` returns the actual bound address: a wildcard port
+        // (`tcp://...:*`) is assigned a concrete port by the OS, which
+        // clients need to connect.
         let endpoint = socket
-            .get_last_endpoint()
-            .map_err(|e| BsrsError::Backend(format!("zmq REP last endpoint: {e}")))?
-            .map_err(|_| BsrsError::Backend("zmq REP endpoint not valid UTF-8".into()))?;
+            .bind(address)
+            .map_err(|e| BsrsError::Backend(format!("zmq REP bind {address}: {e}")))?
+            .to_string();
         Ok(Self {
             socket: Arc::new(StdMutex::new(socket)),
             endpoint,
@@ -88,18 +84,19 @@ impl ReqRepSocket {
     /// valid request, `Err(_)` on a parse failure (error already replied in same encoding).
     pub fn try_recv(&self) -> Result<Option<(QsRequest, MsgEncoding)>> {
         let s = self.socket.lock().unwrap();
-        match s.recv_bytes(0) {
-            Ok(bytes) => {
+        // A 200 ms recv timeout so the rep loop can poll `shutdown` and exit
+        // cleanly when the server is dropped.
+        match s.recv_timeout(Duration::from_millis(200)) {
+            Ok(msg) => {
+                let bytes = msg.part_slice(0).unwrap_or_default();
                 let enc = if bytes.first() == Some(&b'{') {
                     MsgEncoding::Json
                 } else {
                     MsgEncoding::MsgPack
                 };
                 let parse_result: std::result::Result<QsRequest, String> = match enc {
-                    MsgEncoding::Json => serde_json::from_slice(&bytes).map_err(|e| e.to_string()),
-                    MsgEncoding::MsgPack => {
-                        rmp_serde::from_slice(&bytes).map_err(|e| e.to_string())
-                    }
+                    MsgEncoding::Json => serde_json::from_slice(bytes).map_err(|e| e.to_string()),
+                    MsgEncoding::MsgPack => rmp_serde::from_slice(bytes).map_err(|e| e.to_string()),
                 };
                 match parse_result {
                     Ok(req) => Ok(Some((req, enc))),
@@ -107,12 +104,12 @@ impl ReqRepSocket {
                         let resp =
                             json!({"success": false, "msg": format!("invalid request: {e}")});
                         let error_bytes = encode_value(&resp, enc);
-                        let _ = s.send(error_bytes, 0);
+                        let _ = s.send(Message::single(error_bytes));
                         Err(BsrsError::Backend(format!("zmq REP parse: {e}")))
                     }
                 }
             }
-            Err(zmq::Error::EAGAIN) => Ok(None),
+            Err(omq::Error::Timeout) => Ok(None),
             Err(e) => Err(BsrsError::Backend(format!("zmq REP recv: {e}"))),
         }
     }
@@ -122,7 +119,7 @@ impl ReqRepSocket {
     pub fn send(&self, resp: &Value, encoding: MsgEncoding) -> Result<()> {
         let s = self.socket.lock().unwrap();
         let bytes = encode_value(resp, encoding);
-        s.send(bytes, 0)
+        s.send(Message::single(bytes))
             .map_err(|e| BsrsError::Backend(format!("zmq REP send: {e}")))?;
         Ok(())
     }

@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use omq::{Message, Options, SocketType};
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
@@ -47,12 +48,8 @@ struct FakeServer {
 
 impl FakeServer {
     fn start(capabilities: Value) -> Self {
-        let context = zmq::Context::new();
-        let socket = context.socket(zmq::REP).unwrap();
-        socket.set_linger(0).unwrap();
-        socket.set_rcvtimeo(20).unwrap();
-        socket.bind("tcp://127.0.0.1:*").unwrap();
-        let endpoint = socket.get_last_endpoint().unwrap().unwrap();
+        let socket = omq::Context::new().blocking_socket(SocketType::Rep, Options::default());
+        let endpoint = socket.bind("tcp://127.0.0.1:*").unwrap().to_string();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let replies = Arc::new(AtomicUsize::new(0));
         let delay_next_suggest = Arc::new(AtomicBool::new(false));
@@ -71,12 +68,12 @@ impl FakeServer {
             let mut checkpoint_path = Value::Null;
             let mut fixed = Value::Null;
             while !stop2.load(Ordering::SeqCst) {
-                let bytes = match socket.recv_bytes(0) {
-                    Ok(b) => b,
-                    Err(zmq::Error::EAGAIN) => continue,
+                let msg = match socket.recv_timeout(Duration::from_millis(20)) {
+                    Ok(m) => m,
+                    Err(omq::Error::Timeout) => continue,
                     Err(e) => panic!("{e}"),
                 };
-                let request: Value = serde_json::from_slice(&bytes).unwrap();
+                let request: Value = serde_json::from_slice(msg.part_slice(0).unwrap()).unwrap();
                 req.lock().unwrap().push(request.clone());
                 let method = request["method"].as_str().unwrap();
                 let params = &request["params"];
@@ -143,7 +140,9 @@ impl FakeServer {
                     "boom" => json!({ "error": "RuntimeError: boom" }),
                     other => json!({ "error": format!("unknown method {other:?}") }),
                 };
-                socket.send(serde_json::to_vec(&reply).unwrap(), 0).unwrap();
+                socket
+                    .send(Message::single(serde_json::to_vec(&reply).unwrap()))
+                    .unwrap();
                 rep.fetch_add(1, Ordering::SeqCst);
             }
         });
@@ -485,7 +484,7 @@ fn no_reply_times_out_and_the_next_call_recovers() {
         "{err}"
     );
 
-    // Let the stale reply reach the client; REQ_CORRELATE must drop it.
+    // Let the stale reply go out; it must not reach the next call.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while server.replies.load(Ordering::SeqCst) < 2 {
         assert!(std::time::Instant::now() < deadline, "server never replied");
