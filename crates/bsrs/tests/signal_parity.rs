@@ -1,14 +1,20 @@
 //! Signal behaviour checked against ophyd / ophyd-async: soft and mock
 //! backends, the shared monitor, and the observe / wait combinators.
 
+use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bsrs::backends::mock::MockSignalBackend;
+use bsrs::backends::mock::{MockBackend, MockSignalBackend};
 use bsrs::backends::soft::SoftSignalBackend;
-use bsrs::core::Kind;
-use bsrs::devices::{BackendFromPv, Readable, Signal, SignalConfig, SignalR, SignalRW};
+use bsrs::core::{BsrsError, Kind, ReadingValue};
+use bsrs::devices::{
+    observe_signals_value, observe_value, wait_for_value, BackendFromPv, Readable, Signal,
+    SignalConfig, SignalR, SignalRW,
+};
 use bsrs::event_model::Dtype;
+use bsrs::protocols_async::AsyncSubscribable;
+use futures::StreamExt;
 use serde::Serialize;
 use serde_json::json;
 
@@ -25,6 +31,47 @@ fn soft<T: Clone + Send + Sync + Serialize + 'static>(
     dtype: Dtype,
 ) -> Arc<SoftSignalBackend<T>> {
     Arc::new(SoftSignalBackend::new(initial, dtype))
+}
+
+async fn lifecycle<T>(initial: T, put: T, dtype: Dtype)
+where
+    T: Clone + Send + Sync + Serialize + PartialEq + Debug + 'static,
+{
+    let sig: SignalRW<T, _> = Signal::new(soft(initial.clone(), dtype), cfg("test"));
+    sig.connect(Duration::from_secs(1)).await.unwrap();
+    let before = sig.describe().await.unwrap();
+    assert_eq!(before["test"].source, "soft://test");
+    assert_eq!(before["test"].dtype, dtype);
+
+    let mut values = Box::pin(observe_value(
+        AsyncSubscribable::subscribe(&sig).await.unwrap(),
+    ));
+    assert_eq!(values.next().await.unwrap().value, json!(initial));
+    assert_eq!(sig.get().await.unwrap(), initial);
+    assert_eq!(sig.get_setpoint().await.unwrap(), initial);
+
+    assert!(sig.put(put.clone()).await.success());
+    assert_eq!(values.next().await.unwrap().value, json!(put));
+    assert_eq!(sig.get().await.unwrap(), put);
+    assert_eq!(sig.get_setpoint().await.unwrap(), put);
+
+    assert_eq!(
+        sig.describe().await.unwrap(),
+        before,
+        "a put changes no DataKey"
+    );
+}
+
+// ophyd-async test_soft_signal_backend_get_put_monitor, test_signal_lifecycle,
+// test_soft_signal_backend_with_numpy_typing; ophyd test_set_method,
+// test_array_into_softsignal.
+#[tokio::test]
+async fn soft_signal_monitor_starts_at_initial_and_follows_puts() {
+    lifecycle(0_i64, 43, Dtype::Integer).await;
+    lifecycle(0.0_f64, 43.5, Dtype::Number).await;
+    lifecycle(String::new(), "goodbye".into(), Dtype::String).await;
+    lifecycle(true, false, Dtype::Boolean).await;
+    lifecycle(Vec::<f64>::new(), vec![1.0, 2.0], Dtype::Array).await;
 }
 
 async fn source_and_initial<A: Readable>(sig: Signal<String, SoftSignalBackend<String>, A>) {
@@ -90,4 +137,92 @@ async fn mock_put_callback_returning_none_keeps_the_put_value() {
     assert!(sig.put(10.0).await.success());
     assert_eq!(*seen.lock().unwrap(), vec![Some(10.0)]);
     assert_eq!(sig.get().await.unwrap(), 10.0);
+}
+
+// ophyd-async test_can_unsubscribe_from_subscribe_callback; ophyd
+// test_signal_base (readback callback on put).
+#[tokio::test]
+async fn subscribe_callback_gets_current_then_each_put_until_dropped() {
+    let sig: SignalRW<f64, _> = Signal::new(soft(0.0_f64, Dtype::Number), cfg("x"));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let token = sig.subscribe(Box::new(move |v, ts, _| log.lock().unwrap().push((*v, ts))));
+
+    sig.put(1.0).await;
+    sig.put(2.0).await;
+    let values: Vec<f64> = seen.lock().unwrap().iter().map(|(v, _)| *v).collect();
+    assert_eq!(values, vec![0.0, 1.0, 2.0]);
+    let last_ts = seen.lock().unwrap().last().unwrap().1;
+    assert_eq!(last_ts, sig.read().await.unwrap()["x"].timestamp);
+
+    drop(token);
+    sig.put(3.0).await;
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        3,
+        "no callback after unsubscribe"
+    );
+}
+
+// ophyd-async test_wait_for_value_with_value, test_wait_for_value_with_function;
+// the combinator's own timeout and wake-up are pinned in devices::observe.
+#[tokio::test(start_paused = true)]
+async fn wait_for_value_on_a_signal_sees_its_current_value_and_mock_sets() {
+    let backend = Arc::new(MockSignalBackend::with_value(0.0_f64, Dtype::Number));
+    let sig: SignalRW<f64, _> = Signal::new(backend.clone(), cfg("signal"));
+    backend.set_value(45.8);
+    let mut sub = AsyncSubscribable::subscribe(&sig).await.unwrap();
+    let timeout = Some(Duration::from_millis(100));
+
+    let current = wait_for_value(&mut sub, |r| r.value == json!(45.8), timeout).await;
+    assert_eq!(current.unwrap().value, json!(45.8));
+
+    let below_42 = |r: &ReadingValue| r.value.as_f64().is_some_and(|v| v < 42.0);
+    let err = wait_for_value(&mut sub, below_42, timeout)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BsrsError::Timeout(_)), "{err:?}");
+
+    let waiter = tokio::spawn(async move { wait_for_value(&mut sub, below_42, None).await });
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished());
+    backend.set_value(41.0);
+    assert_eq!(waiter.await.unwrap().unwrap().value, json!(41.0));
+}
+
+// ophyd-async test_observes_signals_values_working_correctly, and the
+// values test_observe_signals_value_timeout_message receives; merging and
+// tagging are pinned on raw channels in devices::observe.
+#[tokio::test]
+async fn observe_signals_value_tags_each_signal_from_its_current_value() {
+    let (b1, b2) = (soft(0.0_f64, Dtype::Number), soft(0.0_f64, Dtype::Number));
+    let s1: SignalR<f64, _> = Signal::new(b1.clone(), cfg("s1"));
+    let s2: SignalR<f64, _> = Signal::new(b2.clone(), cfg("s2"));
+    let mut merged = Box::pin(observe_signals_value([
+        AsyncSubscribable::subscribe(&s1).await.unwrap(),
+        AsyncSubscribable::subscribe(&s2).await.unwrap(),
+    ]));
+    let mut recv: [Vec<serde_json::Value>; 2] = Default::default();
+    for step in 0..4 {
+        match step {
+            2 => b1.write_now(1.0),
+            3 => b2.write_now(10.0),
+            _ => {}
+        }
+        let (i, r) = merged.next().await.unwrap();
+        recv[i].push(r.value);
+    }
+    assert_eq!(recv[0], vec![json!(0.0), json!(1.0)]);
+    assert_eq!(recv[1], vec![json!(0.0), json!(10.0)]);
+}
+
+// bsrs's fixed-value MockBackend has no ophyd counterpart; its monitor still
+// starts at the current value like every other backend's.
+#[tokio::test]
+async fn fixed_mock_backend_monitor_yields_its_value() {
+    let sig: SignalR<f64, _> = Signal::new(Arc::new(MockBackend::new(2.5)), cfg("fixed"));
+    let mut values = Box::pin(observe_value(
+        AsyncSubscribable::subscribe(&sig).await.unwrap(),
+    ));
+    assert_eq!(values.next().await.unwrap().value, json!(2.5));
 }

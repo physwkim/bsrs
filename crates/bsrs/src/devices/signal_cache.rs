@@ -191,7 +191,10 @@ where
 mod tests {
     use super::*;
     use crate::backends::soft::SoftSignalBackend;
-    use crate::event_model::Dtype;
+    use crate::core::error::Result;
+    use crate::event_model::{DataKey, Dtype};
+    use crate::protocols_async::PutCompletion;
+    use std::time::Duration;
 
     fn backend(v: f64) -> Arc<SoftSignalBackend<f64>> {
         Arc::new(SoftSignalBackend::new(v, Dtype::Number))
@@ -241,10 +244,9 @@ mod tests {
         let (mut rx_a, _ta) = cache.add_listener();
         let (mut rx_b, _tb) = cache.add_listener();
         assert_eq!(be.subscriber_count(), 1, "N listeners → 1 backend monitor");
-        assert!(
-            cache.cached_reading().is_none(),
-            "no value before first post"
-        );
+        // Opening the soft monitor delivers the current value to everyone.
+        assert_eq!(rx_a.borrow_and_update().value, serde_json::json!(0.0));
+        assert_eq!(rx_b.borrow_and_update().value, serde_json::json!(0.0));
 
         // A backend write fans out to every listener and seeds the cache.
         be.write_now(4.5);
@@ -258,17 +260,60 @@ mod tests {
         );
     }
 
-    // Boundary: a listener added before any reading is cached waits for the
-    // first update; one added after starts with the cached reading pending
+    /// Monitor whose first reading arrives after `set_callback` returns, as
+    /// a CA/PVA monitor's does; the soft backend delivers it inside the call.
+    #[derive(Default)]
+    struct DeferredBackend {
+        cb: Mutex<Option<ReadingValueCallback<f64>>>,
+    }
+
+    impl DeferredBackend {
+        fn post(&self, v: f64) {
+            let cb = self.cb.lock().unwrap();
+            cb.as_ref().expect("monitor open")(&v, 0.0, None);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SignalBackend<f64> for DeferredBackend {
+        async fn connect(&self, _: Duration) -> Result<()> {
+            Ok(())
+        }
+        async fn put_start(&self, _: Option<f64>) -> Result<PutCompletion> {
+            unimplemented!()
+        }
+        async fn get_datakey(&self, _: &str) -> Result<DataKey> {
+            unimplemented!()
+        }
+        async fn get_reading(&self) -> Result<ReadingValue> {
+            unimplemented!()
+        }
+        async fn get_value(&self) -> Result<f64> {
+            unimplemented!()
+        }
+        async fn get_setpoint(&self) -> Result<f64> {
+            unimplemented!()
+        }
+        fn set_callback(&self, cb: Option<ReadingValueCallback<f64>>) -> SubToken {
+            *self.cb.lock().unwrap() = cb;
+            SubToken::noop()
+        }
+        fn source(&self, name: &str, _: bool) -> String {
+            name.into()
+        }
+    }
+
+    // Boundary: a listener added before the monitor's first reading waits
+    // for it; one added after starts with the cached reading pending
     // (ophyd-async `_SignalCache.subscribe` notifies at once when valid).
     #[tokio::test]
     async fn a_listener_added_after_a_reading_starts_with_it_pending() {
-        let be = backend(0.0);
+        let be = Arc::new(DeferredBackend::default());
         let cache = SignalCache::new(be.clone());
         let (early, _t0) = cache.add_listener();
         assert!(!early.has_changed().unwrap(), "nothing cached yet");
 
-        be.write_now(3.0);
+        be.post(3.0);
         let (mut late, _t1) = cache.add_listener();
         assert!(late.has_changed().unwrap(), "cached reading is pending");
         assert_eq!(late.borrow_and_update().value, serde_json::json!(3.0));

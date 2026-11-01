@@ -216,11 +216,14 @@ where
             None => SubToken::noop(),
             Some(cb) => {
                 let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
-                self.inner
-                    .callbacks
-                    .lock()
-                    .unwrap()
-                    .push((id, Arc::new(cb)));
+                let cb = Arc::new(cb);
+                self.inner.callbacks.lock().unwrap().push((id, cb.clone()));
+                // A new monitor starts with the current reading, as ophyd-async
+                // `SoftSignalBackend.set_callback` calls `callback(self.reading)`.
+                // Read after registering so no write between the two is missed.
+                let value = self.inner.value.lock().unwrap().clone();
+                let ts = *self.inner.timestamp.lock().unwrap();
+                cb(&value, ts, None);
                 let inner = self.inner.clone();
                 SubToken::new(move || {
                     inner.callbacks.lock().unwrap().retain(|(i, _)| *i != id);
