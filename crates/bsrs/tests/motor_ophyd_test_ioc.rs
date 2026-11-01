@@ -286,41 +286,54 @@ async fn describe_carries_the_records_egu_precision_limits_and_hint() {
     assert_eq!(m.hint_fields(), Some(vec!["x5".to_string()]));
 }
 
-/// test_epicsmotor.py `test_calibration`: with `.SET` at Set, a move
-/// redefines the user position without motion (`set_current_position`), the
-/// offset takes the difference, and later moves land in the new user
-/// coordinates.
-#[tokio::test(flavor = "multi_thread")]
+/// test_epicsmotor.py `test_calibration`: `set_current_position` redefines
+/// the user position without motion, the offset takes the difference and
+/// `.SET` is back at Use; later moves land in the new user coordinates. Its
+/// put skips the limits (`force=True`), and the limits follow the offset.
+/// Through `CaMotor`, then `PvaMotor`, on the same record.
+#[test]
 #[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
-async fn a_move_in_set_mode_recalibrates_the_user_position() {
+fn set_current_position_recalibrates_without_motion() {
     example_ioc::boot(BIN, BIN);
-    let m = ca_motor("x6", X6).await;
+    let ca_m = CaMotor::connect_blocking("x6", &field(X6, "VAL"), &field(X6, "RBV")).unwrap();
+    let pva_m = pva_motor("x6_pva", X6);
+    bsrs_runtime().block_on(async {
+        calibrates(ca_m.as_ref(), |p| ca_m.set_current_position(p)).await;
+        calibrates(pva_m.as_ref(), |p| pva_m.set_current_position(p)).await;
+    });
+}
+
+async fn calibrates<M, F, Fut>(m: &M, set_current: F)
+where
+    M: MovableObj + LocatableObj,
+    F: Fn(f64) -> Fut,
+    Fut: std::future::Future<Output = bsrs::core::error::Result<()>>,
+{
     let set = ca::<i64>(X6, "SET").await;
+    let foff = ca::<i64>(X6, "FOFF").await;
     let off = ca::<f64>(X6, "OFF").await;
+    let hlm = ca::<f64>(X6, "HLM").await;
     let drbv = ca::<f64>(X6, "DRBV").await;
+    off.put(Some(0.0)).await.unwrap();
     let old = m.locate_dyn().await.unwrap().readback;
-    let (off0, dial) = (
-        off.get_value().await.unwrap(),
-        drbv.get_value().await.unwrap(),
-    );
+    let dial = drbv.get_value().await.unwrap();
     let pos = inward(old, 10.0);
 
-    set.put(Some(1)).await.unwrap();
     let started = Instant::now();
-    tokio::time::timeout(Duration::from_secs(5), m.set_dyn(pos).await)
+    tokio::time::timeout(Duration::from_secs(5), set_current(pos))
         .await
         .expect("settles without motion")
         .expect("the calibration succeeds");
     assert!(started.elapsed() < Duration::from_secs(1));
-    set.put(Some(0)).await.unwrap();
-
+    assert_eq!(set.get_value().await.unwrap(), 0, ".SET back at Use");
+    assert_eq!(foff.get_value().await.unwrap(), 0);
     let at = m.locate_dyn().await.unwrap();
     assert!((at.setpoint - pos).abs() < 1e-9, "{at:?}");
     assert!((at.readback - pos).abs() <= MRES + 1e-9, "{at:?}");
-    let shift = off.get_value().await.unwrap() - off0;
+    let offset = off.get_value().await.unwrap();
     assert!(
-        (shift - (pos - old)).abs() <= MRES + 1e-9,
-        "offset moved {shift}"
+        (offset - (pos - old)).abs() <= MRES + 1e-9,
+        "offset {offset}"
     );
     assert_eq!(drbv.get_value().await.unwrap(), dial);
 
@@ -335,6 +348,20 @@ async fn a_move_in_set_mode_recalibrates_the_user_position() {
         (travelled - (next - pos)).abs() <= MRES + 1e-9,
         "{travelled}"
     );
+
+    let high = hlm.get_value().await.unwrap();
+    let past = high + 10.0;
+    set_current(past)
+        .await
+        .expect("a calibration past the limit succeeds");
+    let rb = m.locate_dyn().await.unwrap().readback;
+    assert!((rb - past).abs() <= MRES + 1e-9, "{rb}");
+    let shifted = hlm.get_value().await.unwrap() - high;
+    assert!(
+        (shifted - (past - next)).abs() <= MRES + 1e-9,
+        "the limit moved {shifted}"
+    );
+    set_current(old).await.unwrap();
 }
 
 /// ophyd-async `Motor.calculate_timeout` (`test_motor_move_timeout`): a move

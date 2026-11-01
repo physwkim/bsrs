@@ -64,6 +64,14 @@ impl PvaMotor {
             rbv_pv: rbv_pv.to_string(),
         }))
     }
+
+    /// ophyd `EpicsMotor.set_current_position`: redefine the user position
+    /// as `pos` without moving the motor, past the limits if need be.
+    pub async fn set_current_position(&self, pos: f64) -> Result<()> {
+        self.channels
+            .set_current_position("pva_motor", &self.name, pos)
+            .await
+    }
 }
 
 impl NamedObj for PvaMotor {

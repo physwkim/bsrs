@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
-use crate::core::error::Result;
+use crate::core::error::{BsrsError, Result};
 use crate::core::status::{Status, StatusError};
 use crate::devices::BackendFromPv;
 use crate::event_model::{DataKey, LimitsRange};
@@ -41,26 +41,27 @@ impl Halt {
     }
 }
 
-/// A motor record's `.STOP`, pressed with a plain put: a put-callback to the
-/// record queues behind the move's own (dbNotify) and would press it only
-/// once the move is over.
+/// A motor record's `.STOP` or `.SET`, written as 0 or 1.
 #[async_trait::async_trait]
-pub(crate) trait StopField: Send + Sync + Sized {
+pub(crate) trait SwitchField: Send + Sync + Sized + 'static {
     fn from_pv(pv: &str) -> Self;
     async fn connect(&self, timeout: Duration) -> Result<()>;
-    /// Write 1 without waiting for the record to process.
+    /// Write 1 with a plain put: a put-callback to `.STOP` queues behind the
+    /// move's own (dbNotify) and would press it only once the move is over.
     async fn press(&self) -> Result<()>;
+    /// Write `on` and wait for the put to complete.
+    async fn put(&self, on: bool) -> Result<()>;
 }
 
 /// A backend for the motor record's numeric fields, with its kind of
-/// [`StopField`].
+/// [`SwitchField`].
 pub(crate) trait MotorBackend: SignalBackend<f64> + BackendFromPv {
-    type Stop: StopField;
+    type Switch: SwitchField;
 }
 
 #[cfg(feature = "ca")]
 #[async_trait::async_trait]
-impl StopField for crate::backends::epics_ca::EpicsCaBackend<bool> {
+impl SwitchField for crate::backends::epics_ca::EpicsCaBackend<bool> {
     fn from_pv(pv: &str) -> Self {
         Self::new(pv)
     }
@@ -70,21 +71,26 @@ impl StopField for crate::backends::epics_ca::EpicsCaBackend<bool> {
     async fn press(&self) -> Result<()> {
         self.put_nowait(true).await
     }
+    async fn put(&self, on: bool) -> Result<()> {
+        SignalBackend::put(self, Some(on)).await
+    }
 }
 
 #[cfg(feature = "ca")]
 impl MotorBackend for crate::backends::epics_ca::EpicsCaBackend<f64> {
-    type Stop = crate::backends::epics_ca::EpicsCaBackend<bool>;
+    type Switch = crate::backends::epics_ca::EpicsCaBackend<bool>;
 }
 
-/// A PVA `.STOP`: a put with the default pvRequest, which QSRV answers
-/// without `block`.
+/// A PVA `.STOP` or `.SET`: a put with the default pvRequest, which QSRV
+/// answers without `block`, so pressing and putting are one write. Its
+/// tokens are resolved against the PV's type, so `.SET` (an NTEnum) gets
+/// its `value.index`.
 #[cfg(feature = "pva")]
-pub(crate) struct PvaStop(String);
+pub(crate) struct PvaSwitch(String);
 
 #[cfg(feature = "pva")]
 #[async_trait::async_trait]
-impl StopField for PvaStop {
+impl SwitchField for PvaSwitch {
     fn from_pv(pv: &str) -> Self {
         Self(pv.to_string())
     }
@@ -93,21 +99,23 @@ impl StopField for PvaStop {
             .pvconnect(&self.0)
             .await
             .map(|_| ())
-            .map_err(|e| {
-                crate::core::error::BsrsError::Backend(format!("pva connect {}: {e}", self.0))
-            })
+            .map_err(|e| BsrsError::Backend(format!("pva connect {}: {e}", self.0)))
     }
     async fn press(&self) -> Result<()> {
+        self.put(true).await
+    }
+    async fn put(&self, on: bool) -> Result<()> {
+        let token = if on { "1" } else { "0" };
         crate::backends::epics_pva::pva_context()
-            .pvput(&self.0, "1")
+            .pvput_tokens(&self.0, &[token.to_string()], None)
             .await
-            .map_err(|e| crate::core::error::BsrsError::Backend(format!("pva put {}: {e}", self.0)))
+            .map_err(|e| BsrsError::Backend(format!("pva put {}: {e}", self.0)))
     }
 }
 
 #[cfg(feature = "pva")]
 impl MotorBackend for crate::backends::epics_pva::EpicsPvaBackend<f64> {
-    type Stop = PvaStop;
+    type Switch = PvaSwitch;
 }
 
 /// The motor record's `.VELO` and `.ACCL`, read at each move for its
@@ -120,7 +128,7 @@ struct MoveTiming<B> {
 /// The motor record's `.DMOV` and `.STOP`.
 struct StopButton<B: MotorBackend> {
     dmov: B,
-    stop: B::Stop,
+    stop: B::Switch,
 }
 
 impl<B: MotorBackend> StopButton<B> {
@@ -144,15 +152,18 @@ pub(crate) struct MotorChannels<B: MotorBackend> {
     /// `None` when the setpoint's record has no `.DMOV`/`.STOP`; a stop then
     /// only settles the move.
     button: Option<StopButton<B>>,
+    /// The setpoint record's `.SET`; `None` when it has none.
+    set_use: Option<Arc<B::Switch>>,
     halt: Halt,
 }
 
 impl<B: MotorBackend> MotorChannels<B> {
-    /// Connect `val_pv`, `rbv_pv` and the `.VELO`/`.ACCL`/`.DMOV`/`.STOP` of
-    /// `val_pv`'s record. A `.VELO`/`.ACCL` that does not connect (no motor
-    /// record behind `val_pv`) leaves the moves without a deadline; a
-    /// `.DMOV`/`.STOP` that does not, the stop without a press. `kind` and
-    /// `name` label the motor in messages.
+    /// Connect `val_pv`, `rbv_pv` and the `.VELO`/`.ACCL`/`.DMOV`/`.STOP`/
+    /// `.SET` of `val_pv`'s record. A `.VELO`/`.ACCL` that does not connect
+    /// (no motor record behind `val_pv`) leaves the moves without a
+    /// deadline; a `.DMOV`/`.STOP` that does not, the stop without a press;
+    /// a `.SET` that does not, no `set_current_position`. `kind` and `name`
+    /// label the motor in messages.
     pub(crate) async fn connect(
         kind: &str,
         name: &str,
@@ -168,16 +179,18 @@ impl<B: MotorBackend> MotorChannels<B> {
         };
         let button = StopButton {
             dmov: B::from_pv(&format!("{record}.DMOV")),
-            stop: <B::Stop as StopField>::from_pv(&format!("{record}.STOP")),
+            stop: <B::Switch as SwitchField>::from_pv(&format!("{record}.STOP")),
         };
+        let set_use = <B::Switch as SwitchField>::from_pv(&format!("{record}.SET"));
         let t = Duration::from_secs(5);
-        let (sp, rb, velo, accl, dmov, stop) = tokio::join!(
+        let (sp, rb, velo, accl, dmov, stop, set) = tokio::join!(
             setpoint.connect(t),
             readback.connect(t),
             timing.velo.connect(t),
             timing.accl.connect(t),
             button.dmov.connect(t),
             button.stop.connect(t),
+            set_use.connect(t),
         );
         sp?;
         rb?;
@@ -195,11 +208,19 @@ impl<B: MotorBackend> MotorChannels<B> {
                 None
             }
         };
+        let set_use = match set {
+            Ok(()) => Some(Arc::new(set_use)),
+            Err(e) => {
+                tracing::warn!("{kind} {name}: no set_current_position: {e}");
+                None
+            }
+        };
         Ok(Self {
             setpoint,
             readback,
             timing,
             button,
+            set_use,
             halt: Halt::new(),
         })
     }
@@ -224,6 +245,30 @@ impl<B: MotorBackend> MotorChannels<B> {
             }
         };
         move_status(self.setpoint.as_ref(), target, &what, &self.halt, finish).await
+    }
+
+    /// ophyd `EpicsMotor.set_current_position`: `.SET` to Set, `pos` to the
+    /// setpoint with no limits check (`force=True`), then `.SET` back to Use
+    /// whatever that put did. Spawned so that a dropped caller still restores
+    /// `.SET`: a motor left in Set recalibrates on its next move.
+    pub(crate) async fn set_current_position(&self, kind: &str, name: &str, pos: f64) -> Result<()>
+    where
+        B: 'static,
+    {
+        let Some(switch) = self.set_use.clone() else {
+            return Err(BsrsError::Backend(format!(
+                "{kind} {name}: set_current_position: no .SET"
+            )));
+        };
+        let setpoint = self.setpoint.clone();
+        tokio::spawn(async move {
+            switch.put(true).await?;
+            let put = setpoint.put(Some(pos)).await;
+            let restored = switch.put(false).await;
+            put.and(restored)
+        })
+        .await
+        .map_err(|e| BsrsError::Backend(format!("{kind} {name}: set_current_position: {e}")))?
     }
 
     /// ophyd-async `Motor.stop`, then `StandardMovable.stop`: press `.STOP`
