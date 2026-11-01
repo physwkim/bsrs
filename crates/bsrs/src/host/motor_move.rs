@@ -7,7 +7,7 @@ use std::time::Duration;
 use crate::core::error::Result;
 use crate::core::status::{Status, StatusError};
 use crate::devices::BackendFromPv;
-use crate::event_model::DataKey;
+use crate::event_model::{DataKey, LimitsRange};
 use crate::protocols_async::{PutCompletion, SignalBackend};
 
 /// ophyd-async `DEFAULT_TIMEOUT`, the fixed term of
@@ -140,7 +140,8 @@ impl<B: SignalBackend<f64> + BackendFromPv> MotorChannels<B> {
 /// awaited the move itself would serialize a multi-axis `mv`; bluesky's
 /// `set()` returns its status immediately and the motion completes it. Only
 /// the wait is spawned: a spawned send lets `set(a); set(b)` reach the IOC as
-/// b, a, and the IOC then finishes at `a`.
+/// b, a, and the IOC then finishes at `a`. A `value` outside the setpoint's
+/// control limits fails the status with nothing sent.
 pub(crate) async fn move_status<B, F, Fut>(
     setpoint: &B,
     value: f64,
@@ -153,7 +154,14 @@ where
     Fut: std::future::Future<Output = std::result::Result<(), String>> + Send + 'static,
 {
     let (status, setter) = Status::new();
-    match setpoint.put_start(Some(value)).await {
+    let started = match within_limits(setpoint, value).await {
+        Ok(()) => setpoint
+            .put_start(Some(value))
+            .await
+            .map_err(|e| e.to_string()),
+        Err(e) => Err(e),
+    };
+    match started {
         Ok(done) => {
             let mv = finish(done);
             tokio::spawn(async move {
@@ -166,6 +174,34 @@ where
         Err(e) => setter.fail(StatusError::Failed(format!("{what}: {e}"))),
     }
     status
+}
+
+/// ophyd `EpicsSignal.check_value`: `target` against the control limits of
+/// the setpoint, read at each move as ophyd-async's `Motor.check_move` reads
+/// its limits.
+async fn within_limits<B: SignalBackend<f64>>(
+    setpoint: &B,
+    target: f64,
+) -> std::result::Result<(), String> {
+    let key = setpoint
+        .get_datakey("")
+        .await
+        .map_err(|e| format!("limits: {e}"))?;
+    check_range(key.limits.and_then(|l| l.control).as_ref(), target)
+}
+
+/// A range with `low >= high` is no limit, as in ophyd (a motor record's dial
+/// limits 0, 0); an absent bound is open.
+fn check_range(range: Option<&LimitsRange>, target: f64) -> std::result::Result<(), String> {
+    let Some(range) = range else {
+        return Ok(());
+    };
+    let low = range.low.unwrap_or(f64::NEG_INFINITY);
+    let high = range.high.unwrap_or(f64::INFINITY);
+    if low >= high || (low..=high).contains(&target) {
+        return Ok(());
+    }
+    Err(format!("{target} is outside the limits [{low}, {high}]"))
 }
 
 /// The data key of one `f64` PV as `object_name` reports it: the backend's
@@ -197,6 +233,22 @@ mod tests {
         assert_eq!(move_timeout_secs(0.0, 4.0, -2.0, 0.0), Some(12.0));
         assert_eq!(move_timeout_secs(0.0, 4.0, 0.0, 0.5), None);
         assert_eq!(move_timeout_secs(0.0, 0.0, -0.0, 0.5), None);
+    }
+
+    #[test]
+    fn check_range_refuses_only_a_target_outside_an_ordered_range() {
+        let r = |low, high| Some(LimitsRange { low, high });
+        assert!(check_range(None, 1e9).is_ok());
+        assert!(check_range(r(Some(-1.0), Some(1.0)).as_ref(), -1.0).is_ok());
+        assert!(check_range(r(Some(-1.0), Some(1.0)).as_ref(), 1.0).is_ok());
+        assert!(check_range(r(Some(-1.0), Some(1.0)).as_ref(), 1.5).is_err());
+        assert!(check_range(r(Some(-1.0), Some(1.0)).as_ref(), -1.5).is_err());
+        assert!(check_range(r(Some(-1.0), Some(1.0)).as_ref(), f64::NAN).is_err());
+        assert!(check_range(r(Some(3.0), Some(3.0)).as_ref(), 9.0).is_ok());
+        assert!(check_range(r(Some(1.0), Some(-1.0)).as_ref(), 9.0).is_ok());
+        assert!(check_range(r(None, Some(1.0)).as_ref(), -1e9).is_ok());
+        assert!(check_range(r(None, Some(1.0)).as_ref(), 2.0).is_err());
+        assert!(check_range(r(Some(-1.0), None).as_ref(), -2.0).is_err());
     }
 
     #[tokio::test]

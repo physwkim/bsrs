@@ -25,6 +25,7 @@ const BIN: &str = "ophyd-test-ioc";
 const MRES: f64 = 0.001;
 
 const X1: &str = "XF:31IDA-OP{Tbl-Ax:X1}Mtr";
+const X4: &str = "XF:31IDA-OP{Tbl-Ax:X4}Mtr";
 const X5: &str = "XF:31IDA-OP{Tbl-Ax:X5}Mtr";
 const X6: &str = "XF:31IDA-OP{Tbl-Ax:X6}Mtr";
 const FAKE: &str = "XF:31IDA-OP{Tbl-Ax:FakeMtr}";
@@ -142,6 +143,47 @@ async fn a_move_settles_once_the_motor_is_done() {
         .expect("the null move settles")
         .expect("the null move succeeds");
     assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+/// test_epicsmotor.py `test_limits`/`check_value`; ophyd-async
+/// `test_move_outside_motor_limits_causes_error`: a target past a soft limit
+/// is refused and the setpoint stays. ophyd-async
+/// `test_given_limits_of_0_0_then_move_causes_no_error`: dial limits 0, 0
+/// mean no limits.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+async fn a_move_past_a_soft_limit_is_refused() {
+    example_ioc::boot(BIN, BIN);
+    let m = ca_motor("x4", X4).await;
+    let (hlm, llm) = (ca::<f64>(X4, "HLM").await, ca::<f64>(X4, "LLM").await);
+    let (hlm, llm) = (
+        hlm.get_value().await.unwrap(),
+        llm.get_value().await.unwrap(),
+    );
+    let before = m.locate_dyn().await.unwrap().setpoint;
+
+    for target in [hlm + 1.0, llm - 1.0] {
+        let res = tokio::time::timeout(Duration::from_secs(5), m.set_dyn(target).await)
+            .await
+            .expect("refused at once");
+        assert!(
+            res.is_err(),
+            "a move to {target} past the limits [{llm}, {hlm}] succeeded"
+        );
+        assert_eq!(m.locate_dyn().await.unwrap().setpoint, before);
+    }
+
+    for f in ["DHLM", "DLLM"] {
+        ca::<f64>(X4, f).await.put(Some(0.0)).await.unwrap();
+    }
+    let start = m.locate_dyn().await.unwrap().readback;
+    let target = inward(start, 0.5);
+    tokio::time::timeout(Duration::from_secs(15), m.set_dyn(target).await)
+        .await
+        .expect("within the deadline")
+        .expect("no limits, no refusal");
+    let rb = m.locate_dyn().await.unwrap().readback;
+    assert!((rb - target).abs() <= MRES + 1e-9, "{rb}");
 }
 
 /// test_epicsmotor.py `test_hints`; ophyd-async `Motor` (`user_readback` is

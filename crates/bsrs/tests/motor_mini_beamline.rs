@@ -13,11 +13,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bsrs::backends::epics_ca::EpicsCaBackend;
 use bsrs::callbacks::CapturingSink;
 use bsrs::core::msg::{LocatableObj, MovableObj, ReadableObj};
 use bsrs::event_model::PerObjectHint;
-use bsrs::host::ca_devices::{CaDetector, CaMotor};
+use bsrs::host::ca_devices::{CaDetector, CaMotor, CaPositioner};
 use bsrs::prelude::*;
+use bsrs::protocols_async::SignalBackend;
 
 const BIN: &str = "mini-ioc";
 const EXAMPLE: &str = "mini-beamline";
@@ -31,6 +33,12 @@ async fn ca_motor(name: &str, record: &str) -> Arc<CaMotor> {
     CaMotor::connect_async(name, &field(record, "VAL"), &field(record, "RBV"))
         .await
         .unwrap()
+}
+
+async fn ca_f64(pv: &str) -> EpicsCaBackend<f64> {
+    let b = EpicsCaBackend::new(pv);
+    b.connect(Duration::from_secs(10)).await.unwrap();
+    b
 }
 
 fn events(docs: &[Document]) -> Vec<HashMap<String, serde_json::Value>> {
@@ -104,4 +112,60 @@ async fn rel_scan_reads_the_hinted_motor_and_returns_it() {
     }
     let back = m.locate_dyn().await.unwrap().readback;
     assert!((back - here).abs() <= MRES + 1e-9, "{back} != {here}");
+}
+
+/// `d` away from `from`, toward the middle of the ±100 travel.
+fn inward(from: f64, d: f64) -> f64 {
+    if from > 0.0 {
+        from - d
+    } else {
+        from + d
+    }
+}
+
+async fn slit_positioner() -> Arc<CaPositioner> {
+    CaPositioner::connect_async(
+        "slit",
+        "mini:slit:mtr.VAL",
+        "mini:slit:mtr.RBV",
+        "mini:slit:mtr.MOVN",
+        0.0,
+    )
+    .await
+    .unwrap()
+}
+
+/// test_pvpositioner.py `test_put_complete_setpoint_readback_done`: a
+/// positioner over VAL, RBV and MOVN (done at 0) refuses a target past the
+/// setpoint's high limit (`check_value`), and a move settles once the put
+/// completes and MOVN reads done, with the readback at the target.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+async fn a_positioner_refuses_a_target_past_the_limit_and_settles_on_done() {
+    example_ioc::boot(BIN, EXAMPLE);
+    let p = slit_positioner().await;
+    let hlm = ca_f64("mini:slit:mtr.HLM").await.get_value().await.unwrap();
+    let before = p.locate_dyn().await.unwrap().setpoint;
+
+    let res = tokio::time::timeout(Duration::from_secs(5), p.set_dyn(hlm + 1.0).await)
+        .await
+        .expect("refused at once");
+    assert!(res.is_err(), "a move past HLM {hlm} succeeded");
+    assert_eq!(p.locate_dyn().await.unwrap().setpoint, before);
+
+    let target = inward(p.locate_dyn().await.unwrap().readback, 1.0);
+    let st = p.set_dyn(target).await;
+    assert!(!st.done_state(), "settled before the motor moved");
+    tokio::time::timeout(Duration::from_secs(25), st)
+        .await
+        .expect("within ophyd's 25 s")
+        .expect("the move succeeds");
+    let movn = ca_f64("mini:slit:mtr.MOVN")
+        .await
+        .get_value()
+        .await
+        .unwrap();
+    assert_eq!(movn, 0.0);
+    let rb = p.locate_dyn().await.unwrap().readback;
+    assert!((rb - target).abs() <= MRES + 1e-9, "{rb}");
 }
