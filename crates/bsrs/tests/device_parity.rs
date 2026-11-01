@@ -236,6 +236,83 @@ async fn standard_readable_uncached_formats_route_to_read() {
     assert_eq!(ReadableObj::hint_fields(&sr), Some(vec!["hu".to_string()]));
 }
 
+/// Delivers its value once on subscribe and never again, so a staged
+/// signal's cache keeps the old value while a backend read sees the new one.
+struct SilentMonitor {
+    value: Mutex<f64>,
+}
+
+#[async_trait::async_trait]
+impl SignalBackend<f64> for SilentMonitor {
+    async fn connect(&self, _timeout: Duration) -> Result<()> {
+        Ok(())
+    }
+    async fn put_start(&self, _value: Option<f64>) -> Result<PutCompletion> {
+        Err(BsrsError::Backend("read-only".into()))
+    }
+    async fn get_datakey(&self, _source: &str) -> Result<DataKey> {
+        Err(BsrsError::Backend("no datakey".into()))
+    }
+    async fn get_reading(&self) -> Result<ReadingValue> {
+        Ok(ReadingValue::new(
+            serde_json::json!(*self.value.lock().unwrap()),
+            0.0,
+        ))
+    }
+    async fn get_value(&self) -> Result<f64> {
+        Ok(*self.value.lock().unwrap())
+    }
+    async fn get_setpoint(&self) -> Result<f64> {
+        self.get_value().await
+    }
+    fn set_callback(&self, cb: Option<ReadingValueCallback<f64>>) -> SubToken {
+        if let Some(cb) = cb {
+            cb(&self.value.lock().unwrap(), 0.0, None);
+        }
+        SubToken::noop()
+    }
+    fn source(&self, name: &str, _read: bool) -> String {
+        format!("silent://{name}")
+    }
+}
+
+// ophyd-async test_readable::test_standard_readable_{uncached,
+// hinted_uncached}_signal: the Uncached formats read with cached=False, the
+// others take the staged cache.
+#[tokio::test]
+async fn standard_readable_uncached_formats_bypass_the_signal_cache() {
+    let mut sr = StandardReadable::new("sr");
+    let mut backends = Vec::new();
+    for (name, format) in [
+        ("cached", StandardReadableFormat::HintedSignal),
+        ("u", StandardReadableFormat::UncachedSignal),
+        ("hu", StandardReadableFormat::HintedUncachedSignal),
+    ] {
+        let backend = Arc::new(SilentMonitor {
+            value: Mutex::new(1.0),
+        });
+        let s: Arc<SignalR<f64, SilentMonitor>> = Arc::new(Signal::new(
+            backend.clone(),
+            SignalConfig {
+                source: name.into(),
+                kind: Kind::Normal,
+                name: name.into(),
+            },
+        ));
+        Stageable::stage(&*s).await.unwrap();
+        sr.add_signal(s, format);
+        backends.push(backend);
+    }
+    for backend in &backends {
+        *backend.value.lock().unwrap() = 2.0;
+    }
+    let read = sr.read().await.unwrap();
+    let value = |k: &str| read[k].value.clone();
+    assert_eq!(value("cached"), serde_json::json!(1.0));
+    assert_eq!(value("u"), serde_json::json!(2.0));
+    assert_eq!(value("hu"), serde_json::json!(2.0));
+}
+
 fn err_text<T>(r: Result<T>) -> String {
     match r {
         Ok(_) => panic!("expected an error"),

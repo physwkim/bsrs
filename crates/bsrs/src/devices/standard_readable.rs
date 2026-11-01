@@ -34,9 +34,10 @@ pub enum StandardReadableFormat {
     ConfigSignal,
     /// Contributes to `read` / `describe` and to `hints`.
     HintedSignal,
-    /// Contributes to `read` / `describe`.
+    /// Contributes to `read` / `describe`, read live even when the signal
+    /// holds a cached value.
     UncachedSignal,
-    /// Contributes to `read` / `describe` and to `hints`.
+    /// Contributes to `read` / `describe` and to `hints`, read live.
     HintedUncachedSignal,
 }
 
@@ -60,7 +61,7 @@ pub struct StandardReadable {
 /// signals of any value type and backend share one bucket.
 #[async_trait]
 trait SignalRead: Send + Sync {
-    async fn read_signal(&self) -> Result<HashMap<String, ReadingValue>>;
+    async fn read_signal(&self, cached: Option<bool>) -> Result<HashMap<String, ReadingValue>>;
     async fn describe_signal(&self) -> Result<HashMap<String, DataKey>>;
 }
 
@@ -71,8 +72,8 @@ where
     B: SignalBackend<T>,
     A: Readable,
 {
-    async fn read_signal(&self) -> Result<HashMap<String, ReadingValue>> {
-        self.read().await
+    async fn read_signal(&self, cached: Option<bool>) -> Result<HashMap<String, ReadingValue>> {
+        self.read_cached(cached).await
     }
     async fn describe_signal(&self) -> Result<HashMap<String, DataKey>> {
         self.describe().await
@@ -87,8 +88,12 @@ enum Source {
     Device(Arc<dyn ReadableObj>),
     /// A `CHILD` in the configuration bucket: its configuration view.
     DeviceConfig(Arc<dyn ReadableObj>),
-    /// A signal format: the signal's `read` / `describe`.
-    Signal(Arc<dyn SignalRead>),
+    /// A signal format: the signal's `read(cached)` / `describe`; the
+    /// `Uncached*` formats pass `Some(false)` (ophyd-async `_UncachedRead`).
+    Signal {
+        signal: Arc<dyn SignalRead>,
+        cached: Option<bool>,
+    },
 }
 
 impl Source {
@@ -99,7 +104,7 @@ impl Source {
                 Some(cfg) => cfg.read_configuration_dyn().await,
                 None => Ok(HashMap::new()),
             },
-            Self::Signal(s) => s.read_signal().await,
+            Self::Signal { signal, cached } => signal.read_signal(*cached).await,
         }
     }
 
@@ -110,7 +115,7 @@ impl Source {
                 Some(cfg) => cfg.describe_configuration_dyn().await,
                 None => Ok(HashMap::new()),
             },
-            Self::Signal(s) => s.describe_signal().await,
+            Self::Signal { signal, .. } => signal.describe_signal().await,
         }
     }
 }
@@ -178,7 +183,11 @@ impl StandardReadable {
     {
         use StandardReadableFormat::*;
         let name = signal.name().to_string();
-        let source = Source::Signal(signal);
+        let cached = match format {
+            UncachedSignal | HintedUncachedSignal => Some(false),
+            ConfigSignal | HintedSignal => None,
+        };
+        let source = Source::Signal { signal, cached };
         match format {
             ConfigSignal => self.config.push(source),
             UncachedSignal => self.read.push(source),
