@@ -84,6 +84,39 @@ fn kind_predicates_route_like_ophyd() {
     assert_eq!(Kind::default(), Kind::Normal);
 }
 
+#[derive(Device)]
+struct KindProbe {
+    name: String,
+    #[signal(rw, "{prefix}:normal", kind = normal)]
+    normal: SignalRW<f64, Soft>,
+    #[signal(ro, "{prefix}:hinted", kind = hinted)]
+    hinted: SignalR<f64, Soft>,
+    #[signal(rw, "{prefix}:config", kind = config)]
+    config: SignalRW<f64, Soft>,
+    #[signal(ro, "{prefix}:omitted", kind = omitted)]
+    omitted: SignalR<f64, Soft>,
+    #[signal(rw, "{prefix}:plain")]
+    plain: SignalRW<f64, Soft>,
+    #[signal(rw, "{prefix}:kind", kind = config)]
+    kind_in_template: SignalRW<f64, Soft>,
+    #[signal(ro, "{prefix}:capital", kind = Hinted)]
+    capitalised: SignalR<f64, Soft>,
+}
+
+// ophyd test_kind::test_strings: a kind given by name (case-insensitive,
+// `Kind[val.lower()]`) sets the component kind.
+#[test]
+fn derive_kind_attribute_sets_signal_kind() {
+    let d = KindProbe::new("P");
+    assert_eq!(d.normal.kind(), Kind::Normal);
+    assert_eq!(d.hinted.kind(), Kind::Hinted);
+    assert_eq!(d.config.kind(), Kind::Config);
+    assert_eq!(d.omitted.kind(), Kind::Omitted);
+    assert_eq!(d.plain.kind(), Kind::Normal);
+    assert_eq!(d.kind_in_template.kind(), Kind::Config);
+    assert_eq!(d.capitalised.kind(), Kind::Hinted);
+}
+
 fn leaf(prefix: &str) -> StandardReadable {
     let mut sr = StandardReadable::new(prefix);
     sr.add_readables(
