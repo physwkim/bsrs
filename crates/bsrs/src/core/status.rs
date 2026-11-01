@@ -474,7 +474,10 @@ impl Future for Status {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match &mut *self.inner.phase.lock().unwrap() {
             Phase::Pending { wakers, .. } => {
-                wakers.push(cx.waker().clone());
+                // A task re-polling in a select! loop must not add a waker per poll.
+                if !wakers.iter().any(|w| w.will_wake(cx.waker())) {
+                    wakers.push(cx.waker().clone());
+                }
                 Poll::Pending
             }
             Phase::Done(end) => Poll::Ready(end.result()),
@@ -748,6 +751,35 @@ mod tests {
         let fracs: Vec<_> = rec.lock().unwrap().iter().map(|u| u.fraction).collect();
         assert!(fracs.contains(&Some(0.2)), "immediate update: {fracs:?}");
         assert!(fracs.contains(&Some(0.8)), "subsequent update: {fracs:?}");
+    }
+
+    // Boundary: one task re-polling a pending status (a select! loop) is
+    // stored once, not once per poll, and is still woken on completion.
+    #[test]
+    fn repolling_a_pending_status_stores_its_waker_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Wakes(AtomicUsize);
+        impl std::task::Wake for Wakes {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let (s, setter) = Status::new();
+        let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+        let waker = Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = std::pin::pin!(s.clone());
+        for _ in 0..100 {
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+        }
+        let stored = match &*s.inner.phase.lock().unwrap() {
+            Phase::Pending { wakers, .. } => wakers.len(),
+            Phase::Done(_) => panic!("status finished early"),
+        };
+        assert_eq!(stored, 1);
+        setter.success();
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+        assert!(fut.as_mut().poll(&mut cx).is_ready());
     }
 
     // Boundary: no update ever posted → watcher never called, driver still
