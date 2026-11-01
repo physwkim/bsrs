@@ -376,9 +376,7 @@ fn pv_field_to_metadata(p: &PvField, want_units: bool, want_precision: bool) -> 
     if let Some(display) = sub_fields(top, "display") {
         if want_units {
             if let Some(PvField::Scalar(ScalarValue::String(u))) = field(display, "units") {
-                if !u.is_empty() {
-                    meta.units = Some(u.as_str_lossy().into_owned());
-                }
+                meta.units = Some(u.as_str_lossy().into_owned());
             }
         }
         if want_precision {
@@ -1199,6 +1197,22 @@ mod tests {
         let meta = pv_field_to_metadata(&ntscalar_with_meta(), true, false);
         assert_eq!(meta.units.as_deref(), Some("mm"));
         assert_eq!(meta.precision, None);
+    }
+
+    /// An empty EGU is a unit like any other, as ophyd-async keeps it.
+    #[test]
+    fn metadata_keeps_empty_units() {
+        let PvField::Structure(mut nt) = ntscalar_with_meta() else {
+            unreachable!()
+        };
+        let Some((_, PvField::Structure(display))) =
+            nt.fields.iter_mut().find(|(n, _)| n == "display")
+        else {
+            unreachable!()
+        };
+        display.fields[0].1 = PvField::Scalar(ScalarValue::String("".into()));
+        let meta = pv_field_to_metadata(&PvField::Structure(nt), true, false);
+        assert_eq!(meta.units.as_deref(), Some(""));
     }
 
     #[test]

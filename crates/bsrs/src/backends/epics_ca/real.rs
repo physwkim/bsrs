@@ -307,7 +307,8 @@ fn ctrl_limits(display: Option<&DisplayInfo>, control: Option<&ControlInfo>) -> 
 /// Fetch DBR_CTRL metadata (units, precision, and the four limit ranges) for
 /// a numeric channel and shape it into a [`SignalMetadata`], applying
 /// ophyd-async's per-field inclusion rules (`_aioca._metadata_from_augmented_value`):
-///   - `units` only when the datatype is not string/bool (`want_units`),
+///   - `units`, empty included, only when the datatype is not string/bool
+///     (`want_units`),
 ///   - `precision` only for floats — ints have no fractional digits
 ///     (`want_precision`),
 ///   - `limits` for any numeric, each range filtered by [`limits_range`].
@@ -324,7 +325,7 @@ async fn ctrl_metadata(
         .map_err(|e| BsrsError::Backend(format!("ca ctrl get: {e}")))?;
     let mut meta = SignalMetadata::default();
     if let Some(d) = snap.display.as_ref() {
-        if want_units && !d.units.is_empty() {
+        if want_units {
             meta.units = Some(d.units.as_str_lossy().into_owned());
         }
         if want_precision {

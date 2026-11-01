@@ -1,7 +1,7 @@
 //! CA and PVA signal backends against the epics-rs `ophyd-test-ioc`
 //! example: the soft sensors `XF:31IDA-BI{Dev:N}E-I` (ai, EGU mA, PREC 3,
-//! HOPR/LOPR ±1000), the simDetector's string, long-string, enum and array
-//! records under its two prefixes, and the sim motors.
+//! HOPR/LOPR ±1000), the simDetector's string, long-string, enum, integer
+//! and array records under its two prefixes, and the sim motors.
 //! Each test writes only records no other test here touches.
 #![cfg(all(feature = "ca", feature = "pva"))]
 
@@ -357,6 +357,35 @@ fn ca_enum_lifecycle() {
         assert!(err.to_string().contains("Bogus"), "{err}");
         assert!(err.to_string().contains("Continuous"), "{err}");
         assert_eq!(b.get_value().await.unwrap(), "Multiple");
+    });
+}
+
+/// A longout without EGU: an integer whose units are the empty EGU, as
+/// ophyd-async keeps them for any number, and with no precision.
+async fn assert_integer_lifecycle(b: &impl SignalBackend<i64>, pv: &str) {
+    let dk = assert_lifecycle(b, pv, 5).await;
+    assert_eq!(dk.dtype, Dtype::Integer);
+    assert_eq!(dk.dtype_numpy, numpy("<i8"));
+    assert!(dk.shape.is_empty());
+    assert_eq!(dk.units.as_deref(), Some(""));
+    assert_eq!(dk.precision, None);
+}
+
+#[test]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+fn ca_integer_lifecycle() {
+    run(async {
+        let pv = format!("{CAM}cam1:NumImages");
+        assert_integer_lifecycle(&EpicsCaBackend::<i64>::new(&pv), &pv).await;
+    });
+}
+
+#[test]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+fn pva_integer_lifecycle() {
+    run(async {
+        let pv = "ADSIM:cam1:NumImages";
+        assert_integer_lifecycle(&EpicsPvaBackend::<i64>::new(pv), pv).await;
     });
 }
 
