@@ -360,6 +360,24 @@ fn ca_enum_lifecycle() {
     });
 }
 
+/// An mbbo over PVA (NTEnum) as a string: a label puts and reads back, an
+/// index string puts as that index, as p4p assigns into an `enum_t`.
+#[test]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+fn pva_enum_lifecycle() {
+    run(async {
+        let pv = "ADSIM:cam1:ImageMode";
+        let b = EpicsPvaBackend::<String>::new(pv);
+        let dk = assert_lifecycle(&b, pv, "Multiple".to_string()).await;
+        assert_eq!(dk.dtype, Dtype::String);
+        assert!(dk.shape.is_empty());
+        b.put(Some("2".into())).await.unwrap();
+        assert_eq!(b.get_value().await.unwrap(), "Continuous");
+        b.put(Some("Bogus".into())).await.expect_err("not a label");
+        assert_eq!(b.get_value().await.unwrap(), "Continuous");
+    });
+}
+
 /// A longout without EGU: an integer whose units are the empty EGU, as
 /// ophyd-async keeps them for any number, and with no precision.
 async fn assert_integer_lifecycle(b: &impl SignalBackend<i64>, pv: &str) {

@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::client_native::ops_v2::PutLeaf;
 use epics_pva_rs::pv_request::{PvRequestBuilder, PvRequestExpr};
-use epics_pva_rs::pvdata::TypedScalarArray;
+use epics_pva_rs::pvdata::{FieldDesc, TypedScalarArray};
 use epics_pva_rs::{PvField, PvaError, ScalarValue};
 use futures::FutureExt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -88,21 +88,50 @@ async fn put_block(client: &PvaClient, pv: &str, f: PvField) -> Result<PutComple
         .field("value")
         .record("block", true)
         .build();
-    let begin = client.pvput_begin_unbounded(pv, Some(&req), false);
-    let op = tokio::time::timeout(OP_TIMEOUT, begin)
+    // A string may name an enum choice, which only the readback lists.
+    let fetch_present = matches!(f, PvField::Scalar(ScalarValue::String(_)));
+    let begin = client.pvput_begin_unbounded(pv, Some(&req), fetch_present);
+    let mut op = tokio::time::timeout(OP_TIMEOUT, begin)
         .await
         .unwrap_or(Err(PvaError::Timeout))
         .map_err(put_err)?;
-    // A PV that is no structure has no `value`: its root is the leaf.
-    let path = match op.introspection().bit_for_path("value") {
-        Some(_) => "value",
-        None => "",
-    };
+    let present = op.take_present().map(|(v, _)| v);
+    let (path, leaf) = put_leaf(op.introspection(), present.as_ref(), f);
     let sent = op
-        .send_fields_typed(&[(path.to_string(), PutLeaf::Typed(f))])
+        .send_fields_typed(&[(path.to_string(), PutLeaf::Typed(leaf))])
         .await
         .map_err(put_err)?;
     Ok(async move { sent.wait().await.map_err(put_err) }.boxed())
+}
+
+/// Where a put of `f` lands in a PV of shape `intro`, as p4p assigns into
+/// the remote type (`pvxs_value.cpp:319-352`): into an `enum_t` value its
+/// `index`, a string by its place in the readback's `choices` and else as
+/// an index the leaf's own coercion parses; otherwise `value`, or the root
+/// of a PV that is no structure.
+fn put_leaf(intro: &FieldDesc, present: Option<&PvField>, f: PvField) -> (&'static str, PvField) {
+    let FieldDesc::Structure { fields, .. } = intro else {
+        return ("", f);
+    };
+    match fields.iter().find(|(n, _)| n == "value").map(|(_, d)| d) {
+        Some(FieldDesc::Structure { struct_id, .. }) if struct_id == "enum_t" => {
+            let choice = match (&f, present) {
+                (PvField::Scalar(ScalarValue::String(s)), Some(PvField::Structure(p))) => {
+                    sub_fields(&p.fields, "value")
+                        .and_then(|v| field(v, "choices"))
+                        .and_then(pv_string_array)
+                        .and_then(|c| c.iter().position(|c| *c == s.as_str_lossy()))
+                }
+                _ => None,
+            };
+            match choice {
+                Some(i) => ("value.index", PvField::Scalar(ScalarValue::Int(i as i32))),
+                None => ("value.index", f),
+            }
+        }
+        Some(_) => ("value", f),
+        None => ("", f),
+    }
 }
 
 // Coerce one scalar to f64. The single source of truth for numeric→f64
@@ -868,7 +897,7 @@ impl SignalBackend<bool> for EpicsPvaBackend<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_pva_rs::pvdata::PvStructure;
+    use epics_pva_rs::pvdata::{PvStructure, ScalarType};
 
     fn ntscalar_with_ts(value: f64, secs: i64, nanos: i32) -> PvField {
         let mut ts = PvStructure::new("time_t");
@@ -914,6 +943,59 @@ mod tests {
         let mut nt = PvStructure::new("epics:nt/NTEnum:1.0");
         nt.fields.push(("value".into(), PvField::Structure(ev)));
         PvField::Structure(nt)
+    }
+
+    fn nt(value: FieldDesc) -> FieldDesc {
+        FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![("value".to_string(), value)].into(),
+        }
+    }
+
+    fn enum_t() -> FieldDesc {
+        FieldDesc::Structure {
+            struct_id: "enum_t".into(),
+            fields: vec![
+                ("index".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+                (
+                    "choices".to_string(),
+                    FieldDesc::ScalarArray(ScalarType::String),
+                ),
+            ]
+            .into(),
+        }
+    }
+
+    fn string(s: &str) -> PvField {
+        PvField::Scalar(ScalarValue::String(s.into()))
+    }
+
+    /// A put into an `enum_t` sets its index: a label by its place in the
+    /// readback's choices, anything else as the value the index coerces.
+    #[test]
+    fn put_leaf_assigns_an_enum_through_its_index() {
+        let present = ntenum(0, &["Single", "Multiple", "Continuous"], true);
+        let to = |f| put_leaf(&nt(enum_t()), Some(&present), f);
+        assert_eq!(
+            to(string("Continuous")),
+            ("value.index", PvField::Scalar(ScalarValue::Int(2)))
+        );
+        assert_eq!(to(string("1")), ("value.index", string("1")));
+        let on = PvField::Scalar(ScalarValue::Boolean(true));
+        assert_eq!(to(on.clone()), ("value.index", on));
+        assert_eq!(
+            put_leaf(&nt(enum_t()), None, string("Multiple")),
+            ("value.index", string("Multiple"))
+        );
+    }
+
+    #[test]
+    fn put_leaf_assigns_value_or_a_bare_root() {
+        let x = PvField::Scalar(ScalarValue::Double(1.5));
+        let scalar = nt(FieldDesc::Scalar(ScalarType::Double));
+        assert_eq!(put_leaf(&scalar, None, x.clone()), ("value", x.clone()));
+        let bare = FieldDesc::Scalar(ScalarType::Double);
+        assert_eq!(put_leaf(&bare, None, x.clone()), ("", x));
     }
 
     #[test]
