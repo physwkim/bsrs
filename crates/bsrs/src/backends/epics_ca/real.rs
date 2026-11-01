@@ -405,7 +405,8 @@ fn epics_to_f64(v: &EpicsValue) -> Option<f64> {
 /// element type the way [`epics_to_f64`] does for scalars. `UCharArray` /
 /// `EnumArray` / `StringArray` are intentionally excluded: they carry the
 /// long-string and enum-choice meanings owned by the `String` / enum backends,
-/// not numeric waveform data.
+/// not numeric waveform data. A one-element answer arrives as the scalar
+/// (`EpicsValue::from_bytes_array`).
 fn epics_to_vec_f64(v: &EpicsValue) -> Option<Vec<f64>> {
     match v {
         EpicsValue::DoubleArray(a) => Some(a.to_vec()),
@@ -413,6 +414,11 @@ fn epics_to_vec_f64(v: &EpicsValue) -> Option<Vec<f64>> {
         EpicsValue::LongArray(a) => Some(a.iter().map(|x| *x as f64).collect()),
         EpicsValue::ShortArray(a) => Some(a.iter().map(|x| *x as f64).collect()),
         EpicsValue::Int64Array(a) => Some(a.iter().map(|x| *x as f64).collect()),
+        EpicsValue::Double(_)
+        | EpicsValue::Float(_)
+        | EpicsValue::Long(_)
+        | EpicsValue::Short(_)
+        | EpicsValue::Int64(_) => epics_to_f64(v).map(|x| vec![x]),
         _ => None,
     }
 }
@@ -464,17 +470,18 @@ fn epics_to_bool(v: &EpicsValue) -> Option<bool> {
 fn epics_to_string(v: &EpicsValue, kind: CaStringKind) -> Option<String> {
     match (kind, v) {
         (CaStringKind::Short, EpicsValue::String(s)) => Some(s.as_str_lossy().into_owned()),
-        (CaStringKind::Long, EpicsValue::UCharArray(bytes)) => {
-            let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
-            Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
-        }
+        (CaStringKind::Long, EpicsValue::UCharArray(bytes)) => Some(nul_terminated(bytes)),
+        // A one-element char waveform: the lone NUL of an empty string.
+        (CaStringKind::Long, EpicsValue::UChar(c)) => Some(nul_terminated(&[*c])),
         (CaStringKind::Long, EpicsValue::String(s)) => Some(s.as_str_lossy().into_owned()),
-        (CaStringKind::Short, EpicsValue::UCharArray(bytes)) => {
-            let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
-            Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
-        }
+        (CaStringKind::Short, EpicsValue::UCharArray(bytes)) => Some(nul_terminated(bytes)),
         _ => None,
     }
+}
+
+fn nul_terminated(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
 /// Build the wire `EpicsValue` for a String put according to `kind`.
@@ -1386,8 +1393,23 @@ mod tests {
             epics_to_vec_f64(&EpicsValue::StringArray(["a".into()].into_iter().collect())),
             None
         );
-        // A scalar is not a waveform.
-        assert_eq!(epics_to_vec_f64(&EpicsValue::Double(1.0)), None);
+    }
+
+    /// A read of the current element count decodes 0, 1 and n elements: the
+    /// one-element answer arrives as the scalar.
+    #[test]
+    fn autosized_reads_decode_at_every_count() {
+        for n in [0, 1, 3] {
+            let put: Vec<f64> = (0..n).map(|i| i as f64 + 0.5).collect();
+            let wire = f64s_to_wire(DbFieldType::Double, put.clone()).to_bytes();
+            let v = EpicsValue::from_bytes_array(DbFieldType::Double, &wire, n).unwrap();
+            assert_eq!(epics_to_vec_f64(&v), Some(put), "{n} elements");
+        }
+        for s in ["", "a", "/data/scan42"] {
+            let v = string_to_epics(s, CaStringKind::Long);
+            let back = epics_to_string(&off_the_wire(&v, s.len() + 1), CaStringKind::Long);
+            assert_eq!(back.as_deref(), Some(s), "{s:?}");
+        }
     }
 
     #[test]

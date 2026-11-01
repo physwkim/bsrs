@@ -361,18 +361,32 @@ fn ca_enum_lifecycle() {
 }
 
 /// A LONG waveform (NELM 10) written and read as `Vec<f64>`.
+/// A put reads back at its own length, one element included: the reads ask
+/// for the current element count, as aioca's and p4p's do.
 async fn assert_array_put_reads_back(b: &impl SignalBackend<Vec<f64>>, pv: &str) {
     b.connect(CONNECT).await.unwrap();
-    let put = vec![3.0, 4.0, 5.0];
     let (token, mut rx) = subscribe(b);
     next(&mut rx).await;
-    b.put(Some(put.clone())).await.unwrap();
-    next_where(&mut rx, |v| *v == put).await;
-    assert_eq!(b.get_value().await.unwrap(), put);
+    for put in [vec![3.0, 4.0, 5.0], vec![7.0]] {
+        b.put(Some(put.clone())).await.unwrap();
+        next_where(&mut rx, |v| *v == put).await;
+        assert_eq!(b.get_value().await.unwrap(), put);
+        let reading = b.get_reading().await.unwrap();
+        assert_eq!(reading.value, serde_json::json!(put));
+    }
     assert_unsubscribed(token, rx).await;
     let dk = b.get_datakey(pv).await.unwrap();
     assert_eq!(dk.dtype_numpy, numpy("<f8"));
     assert_eq!(dk.shape.len(), 1, "{:?}", dk.shape);
+}
+
+#[test]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+fn ca_array_put_reads_back() {
+    run(async {
+        let pv = format!("{CAM}cam1:Dimensions");
+        assert_array_put_reads_back(&EpicsCaBackend::<Vec<f64>>::new(&pv), &pv).await;
+    });
 }
 
 #[test]
