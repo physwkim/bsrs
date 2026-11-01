@@ -114,6 +114,53 @@ async fn rel_scan_reads_the_hinted_motor_and_returns_it() {
     assert!((back - here).abs() <= MRES + 1e-9, "{back} != {here}");
 }
 
+/// ophyd-async test_sim_motor.py `test_move_sim_in_plan`: `spiral_square`
+/// over a 4 × 4 square of 10 × 10 points leaves both motors at the corner
+/// two below the center.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+async fn spiral_square_leaves_both_motors_at_the_low_corner() {
+    example_ioc::boot(BIN, EXAMPLE);
+    let x = ca_motor("dot_x", "mini:dot:mtrx").await;
+    let y = ca_motor("dot_y", "mini:dot:mtry").await;
+    // Clear of the ±500 soft limits by more than the half-range.
+    let cx = x.locate_dyn().await.unwrap().readback.clamp(-490.0, 490.0);
+    let cy = y.locate_dyn().await.unwrap().readback.clamp(-490.0, 490.0);
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let plan = bsrs::plans::spiral_square(
+        vec![],
+        x.clone() as Arc<dyn MovableObj>,
+        x.clone() as Arc<dyn ReadableObj>,
+        y.clone() as Arc<dyn MovableObj>,
+        y.clone() as Arc<dyn ReadableObj>,
+        cx,
+        cy,
+        4.0,
+        4.0,
+        10,
+        10,
+    );
+    tokio::time::timeout(Duration::from_secs(300), re.run_async(plan))
+        .await
+        .expect("the scan ends")
+        .unwrap();
+
+    assert_eq!(events(&sink.snapshot().await).len(), 100);
+    let (xe, ye) = (
+        x.locate_dyn().await.unwrap().readback,
+        y.locate_dyn().await.unwrap().readback,
+    );
+    assert!(
+        (xe - (cx - 2.0)).abs() <= MRES + 1e-9,
+        "x at {xe}, center {cx}"
+    );
+    assert!(
+        (ye - (cy - 2.0)).abs() <= MRES + 1e-9,
+        "y at {ye}, center {cy}"
+    );
+}
+
 /// `d` away from `from`, toward the middle of the ±100 travel.
 fn inward(from: f64, d: f64) -> f64 {
     if from > 0.0 {
