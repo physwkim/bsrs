@@ -5,7 +5,7 @@
 #![deny(missing_docs)]
 
 pub mod mock_signal;
-pub use mock_signal::{MockPutCallback, MockSignalBackend, PutsBlockedGuard};
+pub use mock_signal::{MockPutCallback, MockSignalBackend, PutsBlockedGuard, SetValues};
 
 use crate::core::error::Result;
 use crate::core::reading::ReadingValue;
@@ -65,7 +65,12 @@ impl<T: Clone + Send + Sync + Serialize + 'static> SignalBackend<T> for MockBack
     async fn get_setpoint(&self) -> Result<T> {
         Ok(self.value.clone())
     }
-    fn set_callback(&self, _cb: Option<ReadingValueCallback<T>>) -> SubToken {
+    fn set_callback(&self, cb: Option<ReadingValueCallback<T>>) -> SubToken {
+        // A monitor starts with the current reading; the value never changes,
+        // so nothing follows and there is nothing to unregister.
+        if let Some(cb) = cb {
+            cb(&self.value, 0.0, None);
+        }
         SubToken::noop()
     }
     fn source(&self, name: &str, _read: bool) -> String {
