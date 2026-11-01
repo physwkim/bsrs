@@ -1,0 +1,224 @@
+//! `CaMotor` and `PvaMotor` on the motor records ophyd-test-ioc serves, held
+//! to what ophyd's `EpicsMotor` (test_epicsmotor.py) and ophyd-async's
+//! `Motor` (epics/test_motor.py) do with them. Every record has VELO 1,
+//! ACCL 0.5, MRES 0.001, PREC 4, soft limits ±100 and no EGU.
+//!
+//! Under `cargo test` the tests share one IOC, so each owns its motors and
+//! none assumes where its motor starts.
+#![cfg(all(feature = "ca", feature = "pva", feature = "host"))]
+
+mod example_ioc;
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use bsrs::backends::epics_ca::EpicsCaBackend;
+use bsrs::core::msg::{LocatableObj, MonitorableObj, MovableObj};
+use bsrs::core::subscription::Subscription;
+use bsrs::host::ca_devices::{CaDetector, CaMotor};
+use bsrs::protocols_async::SignalBackend;
+
+const BIN: &str = "ophyd-test-ioc";
+const MRES: f64 = 0.001;
+
+const X1: &str = "XF:31IDA-OP{Tbl-Ax:X1}Mtr";
+const X6: &str = "XF:31IDA-OP{Tbl-Ax:X6}Mtr";
+const FAKE: &str = "XF:31IDA-OP{Tbl-Ax:FakeMtr}";
+
+fn field(record: &str, f: &str) -> String {
+    format!("{record}.{f}")
+}
+
+async fn ca_motor(name: &str, record: &str) -> Arc<CaMotor> {
+    CaMotor::connect_async(name, &field(record, "VAL"), &field(record, "RBV"))
+        .await
+        .unwrap()
+}
+
+async fn ca<T>(record: &str, f: &str) -> EpicsCaBackend<T>
+where
+    T: Clone + Send + Sync + 'static,
+    EpicsCaBackend<T>: SignalBackend<T>,
+{
+    let b = EpicsCaBackend::new(field(record, f));
+    b.connect(Duration::from_secs(10)).await.unwrap();
+    b
+}
+
+/// `d` away from `from`, toward the middle of the ±100 travel.
+fn inward(from: f64, d: f64) -> f64 {
+    if from > 0.0 {
+        from - d
+    } else {
+        from + d
+    }
+}
+
+/// Wait until the subscribed readback satisfies `pred`.
+async fn readback_until(sub: &Subscription, pred: impl Fn(f64) -> bool) {
+    let mut rx = sub.clone_rx();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        rx.wait_for(|r| r.value.as_f64().is_some_and(&pred)),
+    )
+    .await
+    .expect("the readback gets there")
+    .unwrap();
+}
+
+/// Wait until `.DMOV` reads done, from its monitor.
+async fn done_moving(record: &str) {
+    let dmov = CaDetector::connect_async("dmov", &field(record, "DMOV"))
+        .await
+        .unwrap();
+    let sub = dmov.subscribe_dyn().await.unwrap();
+    readback_until(&sub, |v| v == 1.0).await;
+}
+
+/// test_epicsmotor.py `test_move`, `test_read_in_motor_callback`; ophyd-async
+/// `test_motor_moving_well`: the status is pending while the motor travels,
+/// settles once it is done, and the readback passes through the travel to
+/// land within MRES of the target. A move to where it stands settles at once.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+async fn a_move_settles_once_the_motor_is_done() {
+    example_ioc::boot(BIN, BIN);
+    let m = ca_motor("x1", X1).await;
+    let dmov = ca::<f64>(X1, "DMOV").await;
+    let start = m.locate_dyn().await.unwrap().readback;
+    let target = inward(start, 1.5);
+    let sub = m.subscribe_dyn().await.unwrap();
+    let mut rx = sub.clone_rx();
+    rx.borrow_and_update();
+    let seen = tokio::spawn(async move {
+        let mut seen = Vec::new();
+        while rx.changed().await.is_ok() {
+            let v = rx.borrow_and_update().value.as_f64().unwrap();
+            seen.push(v);
+            if (v - target).abs() <= MRES {
+                break;
+            }
+        }
+        seen
+    });
+
+    let started = Instant::now();
+    let st = m.set_dyn(target).await;
+    assert!(!st.done_state(), "settled before the motor moved");
+    tokio::time::timeout(Duration::from_secs(20), st)
+        .await
+        .expect("within the deadline")
+        .expect("the move succeeds");
+    let took = started.elapsed();
+
+    // 1.5 s of travel at VELO 1.
+    assert!(took >= Duration::from_millis(1_400), "{took:?}");
+    assert_eq!(dmov.get_value().await.unwrap(), 1.0);
+    let at = m.locate_dyn().await.unwrap();
+    assert!((at.setpoint - target).abs() < 1e-9, "{at:?}");
+    assert!((at.readback - target).abs() <= MRES + 1e-9, "{at:?}");
+    let seen = tokio::time::timeout(Duration::from_secs(5), seen)
+        .await
+        .expect("the readback reached the target")
+        .unwrap();
+    let (lo, hi) = (start.min(target), start.max(target));
+    assert!(
+        seen.iter().any(|&v| v > lo + MRES && v < hi - MRES),
+        "no readback between {start} and {target}: {seen:?}"
+    );
+
+    let started = Instant::now();
+    tokio::time::timeout(Duration::from_secs(5), m.set_dyn(target).await)
+        .await
+        .expect("the null move settles")
+        .expect("the null move succeeds");
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+/// test_epicsmotor.py `test_calibration`: with `.SET` at Set, a move
+/// redefines the user position without motion (`set_current_position`), the
+/// offset takes the difference, and later moves land in the new user
+/// coordinates.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+async fn a_move_in_set_mode_recalibrates_the_user_position() {
+    example_ioc::boot(BIN, BIN);
+    let m = ca_motor("x6", X6).await;
+    let set = ca::<i64>(X6, "SET").await;
+    let off = ca::<f64>(X6, "OFF").await;
+    let drbv = ca::<f64>(X6, "DRBV").await;
+    let old = m.locate_dyn().await.unwrap().readback;
+    let (off0, dial) = (
+        off.get_value().await.unwrap(),
+        drbv.get_value().await.unwrap(),
+    );
+    let pos = inward(old, 10.0);
+
+    set.put(Some(1)).await.unwrap();
+    let started = Instant::now();
+    tokio::time::timeout(Duration::from_secs(5), m.set_dyn(pos).await)
+        .await
+        .expect("settles without motion")
+        .expect("the calibration succeeds");
+    assert!(started.elapsed() < Duration::from_secs(1));
+    set.put(Some(0)).await.unwrap();
+
+    let at = m.locate_dyn().await.unwrap();
+    assert!((at.setpoint - pos).abs() < 1e-9, "{at:?}");
+    assert!((at.readback - pos).abs() <= MRES + 1e-9, "{at:?}");
+    let shift = off.get_value().await.unwrap() - off0;
+    assert!(
+        (shift - (pos - old)).abs() <= MRES + 1e-9,
+        "offset moved {shift}"
+    );
+    assert_eq!(drbv.get_value().await.unwrap(), dial);
+
+    let next = inward(pos, 0.5);
+    tokio::time::timeout(Duration::from_secs(15), m.set_dyn(next).await)
+        .await
+        .expect("within the deadline")
+        .expect("the move succeeds");
+    assert!((m.locate_dyn().await.unwrap().readback - next).abs() <= MRES + 1e-9);
+    let travelled = drbv.get_value().await.unwrap() - dial;
+    assert!(
+        (travelled - (next - pos)).abs() <= MRES + 1e-9,
+        "{travelled}"
+    );
+}
+
+/// ophyd-async `Motor.calculate_timeout` (`test_motor_move_timeout`): a move
+/// is bounded by `|Δ/VELO| + 2·ACCL + 10 s` from the record's own VELO and
+/// ACCL. SPMG at Pause holds the put-callback the motor would answer.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+async fn a_held_move_times_out_on_the_records_velocity_and_acceleration() {
+    example_ioc::boot(BIN, BIN);
+    let m = ca_motor("fake", FAKE).await;
+    let spmg = ca::<i64>(FAKE, "SPMG").await;
+    ca::<f64>(FAKE, "VELO").await.put(Some(2.0)).await.unwrap();
+    let start = m.locate_dyn().await.unwrap().readback;
+    spmg.put(Some(1)).await.unwrap();
+
+    let started = Instant::now();
+    let res = tokio::time::timeout(Duration::from_secs(20), m.set_dyn(inward(start, 0.5)).await)
+        .await
+        .expect("the move's own deadline ends it");
+    let took = started.elapsed();
+    // The held VAL put-callback owns the record, so a put-callback to SPMG
+    // would queue behind it (dbNotify): Go goes as a plain put.
+    let client = epics_ca_rs::client::CaClient::new().await.unwrap();
+    let go = client.create_channel(field(FAKE, "SPMG"));
+    go.wait_connected(Duration::from_secs(5)).await.unwrap();
+    go.put_nowait(&epics_ca_rs::EpicsValue::Enum(3))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), done_moving(FAKE))
+        .await
+        .expect("Go ends the held move");
+
+    // 0.5 / 2 + 2 × 0.5 + 10.
+    let err = res.expect_err("a held move times out");
+    assert!(err.to_string().contains("timed out after 11.250s"), "{err}");
+    assert!(took >= Duration::from_millis(11_200), "{took:?}");
+    assert!(took < Duration::from_secs(13), "{took:?}");
+}
