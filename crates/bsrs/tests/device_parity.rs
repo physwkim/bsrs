@@ -19,7 +19,7 @@ use bsrs::devices::{
 };
 use bsrs::protocols_async::{
     AsyncConfigurable, AsyncMovable, AsyncReadable, AsyncSubscribable, Locatable, PutCompletion,
-    ReadingValueCallback, SignalBackend, Stageable, Triggerable,
+    ReadingValueCallback, SignalBackend, Stageable, Stoppable, Triggerable,
 };
 use bsrs::protocols_sync::{Configurable, Movable, Readable, StageableSync};
 
@@ -683,6 +683,27 @@ fn protocol_surfaces_compile() {
     async_configurable::<StandardReadable>();
     stageable::<StandardReadable>();
     sync_readable::<StandardReadable>();
+}
+
+// ophyd-async test_sim_motor::test_stop / StandardMovable.stop: the sim motor
+// is Stoppable, stop leaves setpoint == readback, and a later set still moves.
+// SoftMotor moves instantly, so test_stop's cancelled in-flight move has no
+// counterpart.
+#[tokio::test]
+async fn soft_motor_stop_holds_position_and_allows_the_next_move() {
+    async fn stop<T: Stoppable + ?Sized>(dev: &T, success: bool) {
+        dev.stop(success).await.unwrap();
+    }
+    let motor = SoftMotor::new("m", Some(0.0));
+    AsyncMovable::set(&motor, 3.0).await.await.unwrap();
+    stop(&motor, false).await;
+    let loc = motor.locate().await.unwrap();
+    assert_eq!((loc.setpoint, loc.readback), (3.0, 3.0));
+
+    AsyncMovable::set(&motor, 5.0).await.await.unwrap();
+    stop(&motor, true).await;
+    let loc = motor.locate().await.unwrap();
+    assert_eq!((loc.setpoint, loc.readback), (5.0, 5.0));
 }
 
 // ophyd test_device::test_device_state and test_status_wait through the
