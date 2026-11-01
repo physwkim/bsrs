@@ -754,11 +754,14 @@ fn signal_subscription_token_unsubscribes() {
     let token = s.subscribe(Box::new(move |_, _, _| {
         h.fetch_add(1, Ordering::SeqCst);
     }));
-    backend.write_now(1.0);
+    // Subscribing delivers the current reading, as ophyd-async
+    // `SoftSignalBackend.set_callback` does.
     assert_eq!(hits.load(Ordering::SeqCst), 1);
+    backend.write_now(1.0);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
     drop(token);
     backend.write_now(2.0);
-    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
     assert_eq!(backend.subscriber_count(), 0);
 
     let own: Arc<Mutex<Option<SubToken>>> = Arc::new(Mutex::new(None));
@@ -773,10 +776,11 @@ fn signal_subscription_token_unsubscribes() {
     let _sitter = s.subscribe(Box::new(move |_, _, _| {
         st.fetch_add(1, Ordering::SeqCst);
     }));
+    // The remover's first call, on subscribe, ran before its token was stored.
     backend.write_now(3.0);
     backend.write_now(4.0);
-    assert_eq!(remover_hits.load(Ordering::SeqCst), 1);
-    assert_eq!(sitter_hits.load(Ordering::SeqCst), 2);
+    assert_eq!(remover_hits.load(Ordering::SeqCst), 2);
+    assert_eq!(sitter_hits.load(Ordering::SeqCst), 3);
     assert_eq!(backend.subscriber_count(), 1);
 }
 
