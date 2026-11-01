@@ -42,13 +42,11 @@ pub enum StandardReadableFormat {
 }
 
 /// A compositional device that merges its children's readings, configuration,
-/// staging and hints. Register children with [`add_child`] / [`add_signal`]
-/// and staging with [`add_stageable`]; the trait impls then expose the
-/// aggregate.
+/// staging and hints. Register children with [`add_child`] / [`add_signal`];
+/// the trait impls then expose the aggregate.
 ///
 /// [`add_child`]: StandardReadable::add_child
 /// [`add_signal`]: StandardReadable::add_signal
-/// [`add_stageable`]: StandardReadable::add_stageable
 pub struct StandardReadable {
     name: String,
     read: Vec<Source>,
@@ -134,9 +132,13 @@ impl StandardReadable {
 
     /// Register any readable device the way ophyd-async's `CHILD` format
     /// does: its reading goes to `read`, its configuration view (if
-    /// [`ReadableObj::as_configurable`] has one) to `read_configuration`, and
+    /// [`ReadableObj::as_configurable`] has one) to `read_configuration`, its
+    /// [`ReadableObj::as_stageable`] view (if any) to `stage` / `unstage`, and
     /// its [`ReadableObj::hint_fields`] to `hints`.
     pub fn add_child(&mut self, child: Arc<dyn ReadableObj>) {
+        if let Some(stageable) = child.clone().as_stageable() {
+            self.stageables.push(stageable);
+        }
         if let Some(fields) = child.hint_fields() {
             self.hints.extend(fields);
         }
@@ -149,7 +151,8 @@ impl StandardReadable {
     /// Register a readable signal under one of the signal formats. Only a
     /// signal with a readable access role is accepted, which is ophyd-async's
     /// `assert_device_is_signalr` check made at compile time. The `Hinted*`
-    /// formats hint the signal's name, or nothing when it is unnamed.
+    /// formats hint the signal's name, or nothing when it is unnamed, and
+    /// `HintedSignal` also stages the signal.
     ///
     /// ```
     /// # use std::sync::Arc;
@@ -182,30 +185,24 @@ impl StandardReadable {
         A: Readable,
     {
         use StandardReadableFormat::*;
-        let name = signal.name().to_string();
-        let cached = match format {
-            UncachedSignal | HintedUncachedSignal => Some(false),
-            ConfigSignal | HintedSignal => None,
+        let hint = (!signal.name().is_empty()).then(|| signal.name().to_string());
+        let source = |cached| Source::Signal {
+            signal: signal.clone(),
+            cached,
         };
-        let source = Source::Signal { signal, cached };
         match format {
-            ConfigSignal => self.config.push(source),
-            UncachedSignal => self.read.push(source),
-            HintedSignal | HintedUncachedSignal => {
-                if !name.is_empty() {
-                    self.hints.push(name);
-                }
-                self.read.push(source);
+            ConfigSignal => self.config.push(source(None)),
+            HintedSignal => {
+                self.read.push(source(None));
+                self.stageables.push(signal.clone());
+                self.hints.extend(hint);
+            }
+            UncachedSignal => self.read.push(source(Some(false))),
+            HintedUncachedSignal => {
+                self.read.push(source(Some(false)));
+                self.hints.extend(hint);
             }
         }
-    }
-
-    /// Register a child that is staged/unstaged together with this device.
-    /// (`StandardReadableFormat::CHILD` auto-stages a `Stageable` child in
-    /// ophyd-async; Rust trait objects can't be probed for capability, so
-    /// staging is registered explicitly.)
-    pub fn add_stageable(&mut self, child: Arc<dyn StageableObj>) {
-        self.stageables.push(child);
     }
 
     /// Stable name.

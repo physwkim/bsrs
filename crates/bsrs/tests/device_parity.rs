@@ -347,37 +347,34 @@ async fn standard_readable_rejects_duplicate_reading_keys() {
     assert!(err_text(unnamed.read().await).contains("Have you remembered to name the Device?"));
 }
 
-// ophyd-async test_readable add_readables_adds_to_expected_attrs (stage
-// buckets); ophyd test_device::test_device_state (stage, configure({}),
-// unstage on a device with no staged children).
+// ophyd-async test_readable add_readables_adds_to_expected_attrs and
+// test_standard_readable_{hinted,config,uncached,hinted_uncached}_signal
+// (stage buckets: a stageable CHILD and HINTED_SIGNAL stage, the other
+// signal formats do not); ophyd test_device::test_device_state (stage,
+// configure({}), unstage on a device with no staged children).
 #[tokio::test]
-async fn standard_readable_stage_holds_registered_monitors_until_unstage() {
+async fn standard_readable_stages_children_and_hinted_signals_only() {
     let (a, a_backend) = soft_signal("a", Kind::Normal, 1.0);
     let (b, b_backend) = soft_signal("b", Kind::Normal, 2.0);
+    let (c, c_backend) = soft_signal("c", Kind::Config, 3.0);
+    let (u, u_backend) = soft_signal("u", Kind::Normal, 4.0);
+    let (hu, hu_backend) = soft_signal("hu", Kind::Normal, 5.0);
     let mut inner = StandardReadable::new("inner");
-    inner.add_child(b.clone());
-    inner.add_stageable(b);
-    let inner = Arc::new(inner);
+    inner.add_signal(b, StandardReadableFormat::HintedSignal);
     let mut outer = StandardReadable::new("outer");
-    outer.add_child(a.clone());
-    outer.add_stageable(a);
-    outer.add_child(inner.clone());
-    outer.add_stageable(inner);
+    outer.add_signal(a, StandardReadableFormat::HintedSignal);
+    outer.add_child(Arc::new(inner));
+    outer.add_signal(c, StandardReadableFormat::ConfigSignal);
+    outer.add_signal(u, StandardReadableFormat::UncachedSignal);
+    outer.add_signal(hu, StandardReadableFormat::HintedUncachedSignal);
 
-    assert_eq!(
-        (a_backend.subscriber_count(), b_backend.subscriber_count()),
-        (0, 0)
-    );
+    let backends = [&a_backend, &b_backend, &c_backend, &u_backend, &hu_backend];
+    let counts = || backends.map(|b| b.subscriber_count());
+    assert_eq!(counts(), [0; 5]);
     Stageable::stage(&outer).await.unwrap();
-    assert_eq!(
-        (a_backend.subscriber_count(), b_backend.subscriber_count()),
-        (1, 1)
-    );
+    assert_eq!(counts(), [1, 1, 0, 0, 0]);
     Stageable::unstage(&outer).await.unwrap();
-    assert_eq!(
-        (a_backend.subscriber_count(), b_backend.subscriber_count()),
-        (0, 0)
-    );
+    assert_eq!(counts(), [0; 5]);
 
     let empty = StandardReadable::new("empty");
     Stageable::stage(&empty).await.unwrap();
@@ -564,8 +561,7 @@ fn sync_facade_drives_soft_motor_and_standard_readable() {
 
     let (x, x_backend) = soft_signal("x", Kind::Normal, 1.0);
     let mut sr = StandardReadable::new("dev");
-    sr.add_child(x.clone());
-    sr.add_stageable(x);
+    sr.add_signal(x, StandardReadableFormat::HintedSignal);
     sr.add_signal(sig("c", Kind::Config), StandardReadableFormat::ConfigSignal);
 
     sr.stage_blocking().unwrap();
