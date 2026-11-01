@@ -12,18 +12,27 @@ use std::time::Duration;
 use bsrs::backends::soft::SoftDetector;
 use bsrs::core::msg::ReadableObj;
 use bsrs::qs::{Registry, Server, ServerShutdown};
+use omq::blocking::Socket;
+use omq::{CurveKeypair, CurvePublicKey, CurveSecretKey, Message, Options, SocketType};
 use serde_json::{json, Value};
+
+const RPC_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Send a plain bluesky-queueserver request `{"method", "params"}` and return
 /// the flat response dict.
-fn rpc(socket: &zmq::Socket, method: &str, params: Value) -> Value {
+fn rpc(socket: &Socket, method: &str, params: Value) -> Value {
     let req = json!({
         "method": method,
         "params": params,
     });
-    socket.send(serde_json::to_vec(&req).unwrap(), 0).unwrap();
-    let resp = socket.recv_bytes(0).unwrap();
-    serde_json::from_slice(&resp).unwrap()
+    socket
+        .send_timeout(
+            Message::single(serde_json::to_vec(&req).unwrap()),
+            RPC_TIMEOUT,
+        )
+        .unwrap();
+    let resp = socket.recv_timeout(RPC_TIMEOUT).unwrap();
+    serde_json::from_slice(resp.part_slice(0).unwrap()).unwrap()
 }
 
 fn spawn_server(reg: Registry) -> ServerShutdown {
@@ -53,11 +62,8 @@ fn spawn_server_inner(reg: Registry, perms_path: Option<std::path::PathBuf>) -> 
     shutdown
 }
 
-fn req_socket(control: &str) -> zmq::Socket {
-    let ctx = zmq::Context::new();
-    let req = ctx.socket(zmq::REQ).unwrap();
-    req.set_rcvtimeo(3_000).unwrap();
-    req.set_sndtimeo(3_000).unwrap();
+fn req_socket(control: &str) -> Socket {
+    let req = omq::Context::new().blocking_socket(SocketType::Req, Options::default());
     req.connect(control).unwrap();
     req
 }
@@ -513,18 +519,16 @@ async fn manager_stop_shuts_down_server() {
     assert_eq!(r["success"], true, "manager_stop must succeed: {r}");
     // After manager_stop the server exits its rep loop; further requests time out.
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let ctx = zmq::Context::new();
-    let probe = ctx.socket(zmq::REQ).unwrap();
-    probe.set_rcvtimeo(300).unwrap();
-    probe.set_sndtimeo(300).unwrap();
-    probe.connect(shutdown.control_endpoint()).unwrap();
+    let probe = req_socket(shutdown.control_endpoint());
     probe
-        .send(
-            serde_json::to_vec(&json!({"method": "status", "params": {}})).unwrap(),
-            0,
+        .send_timeout(
+            Message::single(
+                serde_json::to_vec(&json!({"method": "status", "params": {}})).unwrap(),
+            ),
+            Duration::from_millis(300),
         )
         .unwrap();
-    let gone = probe.recv_bytes(0).is_err();
+    let gone = probe.recv_timeout(Duration::from_millis(300)).is_err();
     assert!(gone, "server should not respond after manager_stop");
 }
 
@@ -1424,7 +1428,7 @@ async fn queue_item_add_batch_atomic_reject_on_unknown_plan() {
 /// Build a server with `count` and add `n` count items; return (shutdown, req,
 /// uids) with the queue = [uids[0], uids[1], ...] in add order.
 #[cfg(test)]
-async fn move_batch_fixture(n: usize) -> (ServerShutdown, zmq::Socket, Vec<String>) {
+async fn move_batch_fixture(n: usize) -> (ServerShutdown, Socket, Vec<String>) {
     let det = SoftDetector::new("det1");
     let mut reg = Registry::new();
     reg.register_readable("det1", det as Arc<dyn ReadableObj>);
@@ -1445,7 +1449,7 @@ async fn move_batch_fixture(n: usize) -> (ServerShutdown, zmq::Socket, Vec<Strin
 }
 
 #[cfg(test)]
-fn queue_order(req: &zmq::Socket) -> Vec<String> {
+fn queue_order(req: &Socket) -> Vec<String> {
     let q = rpc(req, "queue_get", json!({}));
     q["items"]
         .as_array()
@@ -1874,7 +1878,7 @@ async fn rbac_admin_task_result_blocked_for_non_admin() {
 // -- QS-12: msgpack encoding -----------------------------------------------
 
 /// Send a raw msgpack request (not via the JSON `rpc` helper) and return raw response bytes.
-fn rpc_msgpack_raw(socket: &zmq::Socket, method: &str, params: serde_json::Value) -> Vec<u8> {
+fn rpc_msgpack_raw(socket: &Socket, method: &str, params: serde_json::Value) -> Vec<u8> {
     let msg = serde_json::json!({"method": method, "params": params});
     let bytes = rmp_serde::to_vec_named(&msg).expect("msgpack encode");
     // First byte must NOT be b'{' so the server routes to the msgpack path.
@@ -1883,8 +1887,15 @@ fn rpc_msgpack_raw(socket: &zmq::Socket, method: &str, params: serde_json::Value
         Some(b'{'),
         "msgpack-encoded message must not start with 0x7B"
     );
-    socket.send(bytes, 0).unwrap();
-    socket.recv_bytes(0).unwrap()
+    socket
+        .send_timeout(Message::single(bytes), RPC_TIMEOUT)
+        .unwrap();
+    socket
+        .recv_timeout(RPC_TIMEOUT)
+        .unwrap()
+        .part_slice(0)
+        .unwrap()
+        .to_vec()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1893,11 +1904,7 @@ async fn msgpack_request_receives_msgpack_response() {
     let shutdown = spawn_server(reg);
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let ctx = zmq::Context::new();
-    let sock = ctx.socket(zmq::REQ).unwrap();
-    sock.set_rcvtimeo(3_000).unwrap();
-    sock.set_sndtimeo(3_000).unwrap();
-    sock.connect(shutdown.control_endpoint()).unwrap();
+    let sock = req_socket(shutdown.control_endpoint());
 
     // Send status via msgpack; response must also be msgpack.
     let resp_bytes = rpc_msgpack_raw(&sock, "status", serde_json::json!({}));
@@ -1942,11 +1949,7 @@ async fn msgpack_ping_round_trip_returns_success() {
     let shutdown = spawn_server(reg);
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let ctx = zmq::Context::new();
-    let sock = ctx.socket(zmq::REQ).unwrap();
-    sock.set_rcvtimeo(3_000).unwrap();
-    sock.set_sndtimeo(3_000).unwrap();
-    sock.connect(shutdown.control_endpoint()).unwrap();
+    let sock = req_socket(shutdown.control_endpoint());
 
     let resp_bytes = rpc_msgpack_raw(&sock, "ping", serde_json::json!({}));
     assert_ne!(
@@ -1970,26 +1973,22 @@ fn curve_req_socket(
     server_public_z85: &str,
     client_pub_z85: &str,
     client_priv_z85: &str,
-) -> zmq::Socket {
-    let ctx = zmq::Context::new();
-    let sock = ctx.socket(zmq::REQ).unwrap();
-    sock.set_rcvtimeo(3_000).unwrap();
-    sock.set_sndtimeo(3_000).unwrap();
-    sock.set_curve_serverkey(server_public_z85.as_bytes())
-        .unwrap();
-    sock.set_curve_publickey(client_pub_z85.as_bytes()).unwrap();
-    sock.set_curve_secretkey(client_priv_z85.as_bytes())
-        .unwrap();
+) -> Socket {
+    let client = CurveKeypair {
+        public: CurvePublicKey::from_z85(client_pub_z85).unwrap(),
+        secret: CurveSecretKey::from_z85(client_priv_z85).unwrap(),
+    };
+    let server = CurvePublicKey::from_z85(server_public_z85).unwrap();
+    let sock = omq::Context::new().blocking_socket(
+        SocketType::Req,
+        Options::default().curve_client(client, server),
+    );
     sock.connect(control).unwrap();
     sock
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn curve_server_enabled_via_builder_key_round_trip() {
-    if !bsrs::qs::curve_supported() {
-        eprintln!("CURVE not available in this libzmq build — skipping");
-        return;
-    }
     let (server_pub, server_priv) = bsrs::qs::generate_zmq_keys().expect("generate server keypair");
     let (client_pub, client_priv) = bsrs::qs::generate_zmq_keys().expect("generate client keypair");
 
@@ -2031,10 +2030,6 @@ async fn curve_server_enabled_via_builder_key_round_trip() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn curve_server_enabled_via_env_var() {
-    if !bsrs::qs::curve_supported() {
-        eprintln!("CURVE not available in this libzmq build — skipping");
-        return;
-    }
     let (server_pub, server_priv) = bsrs::qs::generate_zmq_keys().expect("generate server keypair");
     let (client_pub, client_priv) = bsrs::qs::generate_zmq_keys().expect("generate client keypair");
 
@@ -2107,7 +2102,7 @@ fn register_pausable_loop(reg: &mut Registry, name: &str) {
 }
 
 /// Poll `status` until `pred` holds or ~3s elapse; returns the last status.
-async fn poll_status(req: &zmq::Socket, pred: impl Fn(&Value) -> bool) -> Value {
+async fn poll_status(req: &Socket, pred: impl Fn(&Value) -> bool) -> Value {
     let mut last = json!(null);
     for _ in 0..30 {
         tokio::time::sleep(Duration::from_millis(100)).await;

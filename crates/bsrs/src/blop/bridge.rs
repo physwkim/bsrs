@@ -27,14 +27,15 @@
 //! progress inside a plan step anyway.
 //!
 //! A reply that does not arrive in time fails that call and leaves the
-//! socket usable: the REQ socket runs with `ZMQ_REQ_RELAXED` and
-//! `ZMQ_REQ_CORRELATE`, so the next request goes out regardless and a late
-//! reply to the old one is dropped.
+//! client usable: the REQ socket that missed it is dropped, taking a late
+//! reply with it, and the next call connects a fresh one.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use omq::blocking::Socket;
+use omq::{Message, Options, SocketType};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -106,8 +107,8 @@ enum Reply {
 
 /// The client end of the bridge; one per served optimizer.
 pub struct BridgeOptimizer {
-    _context: zmq::Context,
-    socket: Mutex<zmq::Socket>,
+    /// `None` after a failed call, until the next call reconnects.
+    socket: Mutex<Option<Socket>>,
     endpoint: String,
     timeout: Duration,
     name: String,
@@ -156,22 +157,10 @@ impl BridgeOptimizer {
 
     /// The socket, before any `configure`/`restore`.
     fn open(endpoint: &str, timeout: Duration) -> Result<Self> {
-        let context = zmq::Context::new();
-        let socket = context
-            .socket(zmq::REQ)
-            .map_err(|e| Self::zmq_error(endpoint, "socket", e))?;
-        let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
-        socket
-            .set_linger(0)
-            .and_then(|_| socket.set_rcvtimeo(millis))
-            .and_then(|_| socket.set_sndtimeo(millis))
-            .and_then(|_| socket.set_req_relaxed(true))
-            .and_then(|_| socket.set_req_correlate(true))
-            .and_then(|_| socket.connect(endpoint))
-            .map_err(|e| Self::zmq_error(endpoint, "connect", e))?;
+        let socket = req_socket(endpoint)
+            .map_err(|e| BsrsError::Backend(format!("blop bridge connect at {endpoint}: {e}")))?;
         Ok(Self {
-            _context: context,
-            socket: Mutex::new(socket),
+            socket: Mutex::new(Some(socket)),
             endpoint: endpoint.to_owned(),
             timeout,
             name: String::new(),
@@ -214,19 +203,28 @@ impl BridgeOptimizer {
     pub fn call(&self, method: &str, params: Value) -> Result<Value> {
         let request = serde_json::to_vec(&json!({ "method": method, "params": params }))
             .map_err(|e| self.error(method, e.to_string()))?;
-        let bytes = blocking(|| {
-            let socket = self.socket.lock().unwrap();
-            socket
-                .send(request, 0)
-                .and_then(|_| socket.recv_bytes(0))
-                .map_err(|e| match e {
-                    zmq::Error::EAGAIN => {
-                        self.error(method, format!("no reply within {:?}", self.timeout))
-                    }
-                    other => self.error(method, other.to_string()),
-                })
+        let reply = blocking(|| {
+            let mut slot = self.socket.lock().unwrap();
+            let socket = match slot.take() {
+                Some(socket) => socket,
+                None => req_socket(&self.endpoint).map_err(|e| self.error(method, e))?,
+            };
+            let reply = socket
+                .send_timeout(Message::single(request), self.timeout)
+                .and_then(|()| socket.recv_timeout(self.timeout));
+            // A REQ socket that missed its reply cannot send again; it is
+            // dropped instead of put back.
+            if reply.is_ok() {
+                *slot = Some(socket);
+            }
+            reply.map_err(|e| match e {
+                omq::Error::Timeout => {
+                    self.error(method, format!("no reply within {:?}", self.timeout))
+                }
+                other => self.error(method, other),
+            })
         })?;
-        match serde_json::from_slice::<Reply>(&bytes) {
+        match serde_json::from_slice::<Reply>(reply.part_slice(0).unwrap_or_default()) {
             Ok(Reply::Result(value)) => Ok(value),
             Ok(Reply::Error(message)) => Err(self.error(method, message)),
             Err(e) => Err(self.error(method, format!("malformed reply: {e}"))),
@@ -238,10 +236,6 @@ impl BridgeOptimizer {
             "blop bridge {method} at {}: {message}",
             self.endpoint
         ))
-    }
-
-    fn zmq_error(endpoint: &str, what: &str, e: zmq::Error) -> BsrsError {
-        BsrsError::Backend(format!("blop bridge {what} at {endpoint}: {e}"))
     }
 
     /// Fail before the round trip when the server said it cannot.
@@ -269,6 +263,14 @@ impl BridgeOptimizer {
             })
             .collect()
     }
+}
+
+/// A REQ socket connected to `endpoint`, on its own context so that dropping
+/// it discards whatever it still holds.
+fn req_socket(endpoint: &str) -> omq::Result<Socket> {
+    let socket = omq::Context::new().blocking_socket(SocketType::Req, Options::default());
+    socket.connect(endpoint)?;
+    Ok(socket)
 }
 
 /// Run `f`, releasing the tokio worker while it blocks when there is one to

@@ -3,6 +3,8 @@
 use std::time::Duration;
 
 use clap::{Args, Subcommand};
+use omq::blocking::Socket;
+use omq::{Message, Options, SocketType};
 use serde_json::{json, Value};
 
 /// Top-level args for `bsrs qs`.
@@ -12,7 +14,7 @@ pub struct ClientArgs {
     #[arg(long, default_value = "tcp://localhost:60615", global = true)]
     address: String,
 
-    /// REQ recv timeout in milliseconds.
+    /// REQ send and recv timeout in milliseconds; negative waits forever.
     #[arg(long, default_value_t = 5_000, global = true)]
     timeout_ms: i32,
 
@@ -262,7 +264,9 @@ pub async fn run(args: ClientArgs) -> i32 {
 }
 
 mod repl {
-    use super::{ClientArgs, Cmd};
+    use super::{recv, req_socket, send, timeout, ClientArgs, Cmd};
+    use omq::blocking::Socket;
+    use omq::Message;
     use serde_json::{json, Value};
     use std::time::Duration;
 
@@ -276,8 +280,8 @@ mod repl {
             _ => unreachable!(),
         };
 
-        let ctx = zmq::Context::new();
-        let mut sock = match build_req_socket(&ctx, &args.address, args.timeout_ms) {
+        let timeout = timeout(args.timeout_ms);
+        let mut sock = match req_socket(&args.address) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("bsrs qs repl: {e}");
@@ -293,9 +297,8 @@ mod repl {
             };
             match send_resilient(
                 &mut sock,
-                &ctx,
                 &args.address,
-                args.timeout_ms,
+                timeout,
                 "environment_open",
                 env_params,
             ) {
@@ -361,14 +364,7 @@ mod repl {
             if let Some(k) = &api_key {
                 params["api_key"] = json!(k);
             }
-            let resp = match send_resilient(
-                &mut sock,
-                &ctx,
-                &args.address,
-                args.timeout_ms,
-                "lua_eval",
-                params,
-            ) {
+            let resp = match send_resilient(&mut sock, &args.address, timeout, "lua_eval", params) {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("lua_eval: {e}");
@@ -396,9 +392,8 @@ mod repl {
                 std::thread::sleep(Duration::from_millis(poll_ms));
                 let s = match send_resilient(
                     &mut sock,
-                    &ctx,
                     &args.address,
-                    args.timeout_ms,
+                    timeout,
                     "task_status",
                     status_params.clone(),
                 ) {
@@ -415,9 +410,8 @@ mod repl {
                 // Fetch the result.
                 let r = match send_resilient(
                     &mut sock,
-                    &ctx,
                     &args.address,
-                    args.timeout_ms,
+                    timeout,
                     "task_result",
                     status_params.clone(),
                 ) {
@@ -453,62 +447,77 @@ mod repl {
         0
     }
 
-    fn build_req_socket(
-        ctx: &zmq::Context,
-        address: &str,
-        timeout_ms: i32,
-    ) -> Result<zmq::Socket, String> {
-        let s = ctx
-            .socket(zmq::REQ)
-            .map_err(|e| format!("zmq REQ socket: {e}"))?;
-        s.set_rcvtimeo(timeout_ms)
-            .map_err(|e| format!("set_rcvtimeo: {e}"))?;
-        s.set_sndtimeo(timeout_ms)
-            .map_err(|e| format!("set_sndtimeo: {e}"))?;
-        let _ = s.set_linger(0);
-        s.connect(address)
-            .map_err(|e| format!("connect {address}: {e}"))?;
-        Ok(s)
+    /// A failed exchange: a socket failure leaves the REQ socket unusable,
+    /// a codec failure does not.
+    enum SendError {
+        Socket(String),
+        Codec(String),
     }
 
-    /// Try `send_one`; on a finite-state-machine error (REQ socket
-    /// stuck after a prior recv timeout) or send/recv timeout, drop
-    /// the socket and recreate it once. Daemon restarts mid-session
-    /// otherwise wedge the REPL until the user exits.
+    /// Try `send_one`; on a socket failure (a send or recv timeout, or the
+    /// REQ socket stuck after a prior one) drop the socket and recreate it
+    /// once. Daemon restarts mid-session otherwise wedge the REPL until the
+    /// user exits.
     pub(super) fn send_resilient(
-        sock: &mut zmq::Socket,
-        ctx: &zmq::Context,
+        sock: &mut Socket,
         address: &str,
-        timeout_ms: i32,
+        timeout: Option<Duration>,
         method: &str,
         params: Value,
     ) -> Result<Value, String> {
-        match send_one(sock, method, params.clone()) {
+        match send_one(sock, timeout, method, params.clone()) {
             Ok(v) => Ok(v),
-            Err(e) => {
-                // Recreate the socket and retry once. The error
-                // string covers both EFSM ("Operation cannot be
-                // performed in this state") and timeout shapes.
-                if e.contains("EFSM")
-                    || e.contains("Operation cannot")
-                    || e.contains("Resource temporarily unavailable")
-                    || e.contains("EAGAIN")
-                {
-                    *sock = build_req_socket(ctx, address, timeout_ms)?;
-                    send_one(sock, method, params)
-                } else {
-                    Err(e)
-                }
+            Err(SendError::Socket(_)) => {
+                *sock = req_socket(address)?;
+                send_one(sock, timeout, method, params).map_err(|e| match e {
+                    SendError::Socket(e) | SendError::Codec(e) => e,
+                })
             }
+            Err(SendError::Codec(e)) => Err(e),
         }
     }
 
-    fn send_one(sock: &zmq::Socket, method: &str, params: Value) -> Result<Value, String> {
+    fn send_one(
+        sock: &Socket,
+        timeout: Option<Duration>,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, SendError> {
         let req = json!({"method": method, "params": params});
-        let bytes = serde_json::to_vec(&req).map_err(|e| format!("encode: {e}"))?;
-        sock.send(bytes, 0).map_err(|e| format!("send: {e}"))?;
-        let resp = sock.recv_bytes(0).map_err(|e| format!("recv: {e}"))?;
-        serde_json::from_slice(&resp).map_err(|e| format!("decode: {e}"))
+        let bytes =
+            serde_json::to_vec(&req).map_err(|e| SendError::Codec(format!("encode: {e}")))?;
+        send(sock, Message::single(bytes), timeout)
+            .map_err(|e| SendError::Socket(format!("send: {e}")))?;
+        let resp = recv(sock, timeout).map_err(|e| SendError::Socket(format!("recv: {e}")))?;
+        serde_json::from_slice(resp.part_slice(0).unwrap_or_default())
+            .map_err(|e| SendError::Codec(format!("decode: {e}")))
+    }
+}
+
+/// `--timeout-ms` as a socket timeout: a negative value is libzmq's -1,
+/// no timeout.
+fn timeout(ms: i32) -> Option<Duration> {
+    u64::try_from(ms).ok().map(Duration::from_millis)
+}
+
+fn req_socket(address: &str) -> Result<Socket, String> {
+    let sock = omq::Context::new().blocking_socket(SocketType::Req, Options::default());
+    sock.connect(address)
+        .map_err(|e| format!("connect {address}: {e}"))?;
+    Ok(sock)
+}
+
+fn send(sock: &Socket, msg: Message, timeout: Option<Duration>) -> omq::Result<()> {
+    match timeout {
+        Some(t) => sock.send_timeout(msg, t),
+        None => sock.send(msg),
+    }
+}
+
+fn recv(sock: &Socket, timeout: Option<Duration>) -> omq::Result<Message> {
+    match timeout {
+        Some(t) => sock.recv_timeout(t),
+        None => sock.recv(),
     }
 }
 
@@ -619,30 +628,21 @@ fn dispatch(args: ClientArgs) -> Result<Value, String> {
     let req = json!({"method": &method, "params": params});
     let bytes = serde_json::to_vec(&req).map_err(|e| format!("encode request: {e}"))?;
 
-    let ctx = zmq::Context::new();
-    let sock = ctx
-        .socket(zmq::REQ)
-        .map_err(|e| format!("zmq REQ socket: {e}"))?;
-    sock.set_rcvtimeo(args.timeout_ms)
-        .map_err(|e| format!("set_rcvtimeo: {e}"))?;
-    sock.set_sndtimeo(args.timeout_ms)
-        .map_err(|e| format!("set_sndtimeo: {e}"))?;
-    sock.set_linger(0).map_err(|e| format!("set_linger: {e}"))?;
-    sock.connect(&args.address)
-        .map_err(|e| format!("connect {}: {e}", args.address))?;
-    sock.send(bytes, 0)
+    let timeout = timeout(args.timeout_ms);
+    let sock = req_socket(&args.address)?;
+    send(&sock, Message::single(bytes), timeout)
         .map_err(|e| format!("send: {e} (server not running?)"))?;
-    let resp = sock.recv_bytes(0).map_err(|e| {
+    let msg = recv(&sock, timeout).map_err(|e| {
         format!(
             "recv: {e} (server not responding within {} ms — start `bsrs qs-manager`?)",
             args.timeout_ms
         )
     })?;
-    let _ = Duration::from_millis(args.timeout_ms.unsigned_abs() as u64);
-    let value: Value = serde_json::from_slice(&resp).map_err(|e| {
+    let resp = msg.part_slice(0).unwrap_or_default();
+    let value: Value = serde_json::from_slice(resp).map_err(|e| {
         format!(
             "decode response: {e}; raw = {:?}",
-            String::from_utf8_lossy(&resp)
+            String::from_utf8_lossy(resp)
         )
     })?;
 

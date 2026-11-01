@@ -34,8 +34,11 @@
 use crate::core::error::{BsrsError, Result};
 use crate::engine::RunEngine;
 use crate::event_model::Document;
+use omq::blocking::Socket;
+use omq::{Message, Options, SocketType};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 pub use crate::callbacks::zmq_sink::Serializer;
@@ -43,11 +46,11 @@ pub use crate::callbacks::zmq_sink::Serializer;
 /// 0MQ SUB-side document receiver.
 ///
 /// The socket is wrapped in `Arc<StdMutex<...>>` so the blocking
-/// `recv_bytes` can be dispatched to `tokio::task::spawn_blocking`
-/// — without that, the 250ms `set_rcvtimeo` would pin a tokio worker
+/// `recv_timeout` can be dispatched to `tokio::task::spawn_blocking`
+/// — without that, the 250ms wait would pin a tokio worker
 /// thread and starve other tasks on a single-thread runtime.
 pub struct ZmqDocumentSource {
-    socket: Arc<StdMutex<zmq::Socket>>,
+    socket: Arc<StdMutex<Socket>>,
     serializer: Serializer,
     cancel: CancellationToken,
 }
@@ -58,14 +61,11 @@ impl ZmqDocumentSource {
     /// with no subscription filter — call [`with_subscribe_prefix`]
     /// to register one. Default serializer = msgpack.
     pub fn connect(endpoint: &str) -> Result<Self> {
-        let ctx = zmq::Context::new();
-        let sock = ctx
-            .socket(zmq::SUB)
-            .map_err(|e| BsrsError::Backend(format!("zmq sub: {e}")))?;
+        let sock = omq::Context::new().blocking_socket(SocketType::Sub, Options::default());
         sock.connect(endpoint)
             .map_err(|e| BsrsError::Backend(format!("zmq connect {endpoint}: {e}")))?;
         // Subscribe-all by default; users can narrow with prefix.
-        sock.set_subscribe(b"")
+        sock.subscribe(&b""[..])
             .map_err(|e| BsrsError::Backend(format!("zmq subscribe: {e}")))?;
         Ok(Self {
             socket: Arc::new(StdMutex::new(sock)),
@@ -93,8 +93,8 @@ impl ZmqDocumentSource {
             let s = self.socket.lock().unwrap();
             // Remove the all-match default before adding the narrower filter;
             // otherwise the additive `b""` subscription defeats `prefix`.
-            let _ = s.set_unsubscribe(b"");
-            let _ = s.set_subscribe(prefix);
+            let _ = s.unsubscribe(&b""[..]);
+            let _ = s.subscribe(prefix.to_vec());
         }
         self
     }
@@ -111,7 +111,7 @@ impl ZmqDocumentSource {
     /// chain (same path as engine-internal Documents) via
     /// [`RunEngine::inject_document`].
     ///
-    /// The blocking `recv_bytes` is dispatched to
+    /// The blocking `recv_timeout` is dispatched to
     /// `tokio::task::spawn_blocking` so the 250ms wait does not pin
     /// the tokio worker; a single-thread runtime stays responsive
     /// while waiting on the SUB socket.
@@ -121,14 +121,13 @@ impl ZmqDocumentSource {
                 return Ok(());
             }
             let socket = self.socket.clone();
-            let recv = tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>> {
+            let recv = tokio::task::spawn_blocking(move || -> Result<Option<Message>> {
                 let s = socket.lock().unwrap();
-                // Set a short receive timeout so the outer loop can
+                // A short receive timeout so the outer loop can
                 // re-check the cancel token periodically.
-                let _ = s.set_rcvtimeo(250);
-                match s.recv_bytes(0) {
-                    Ok(b) => Ok(Some(b)),
-                    Err(zmq::Error::EAGAIN) => Ok(None),
+                match s.recv_timeout(Duration::from_millis(250)) {
+                    Ok(m) => Ok(Some(m)),
+                    Err(omq::Error::Timeout) => Ok(None),
                     Err(e) => Err(BsrsError::Backend(format!("zmq recv: {e}"))),
                 }
             })
@@ -138,7 +137,7 @@ impl ZmqDocumentSource {
                 Some(b) => b,
                 None => continue,
             };
-            let doc = match decode_envelope(self.serializer, &envelope) {
+            let doc = match decode_envelope(self.serializer, first_frame(&envelope)) {
                 Ok(d) => d,
                 Err(e) => {
                     tracing::warn!("zmq doc source: drop malformed envelope: {e}");
@@ -157,17 +156,24 @@ impl ZmqDocumentSource {
     pub fn try_recv(&self) -> Result<Option<Document>> {
         let envelope = {
             let s = self.socket.lock().unwrap();
-            let _ = s.set_rcvtimeo(0);
-            match s.recv_bytes(0) {
-                Ok(b) => b,
-                Err(zmq::Error::EAGAIN) => return Ok(None),
+            match s.try_recv() {
+                Ok(m) => m,
+                Err(omq::Error::WouldBlock) => return Ok(None),
                 Err(e) => {
                     return Err(BsrsError::Backend(format!("zmq recv: {e}")));
                 }
             }
         };
-        Ok(Some(decode_envelope(self.serializer, &envelope)?))
+        Ok(Some(decode_envelope(
+            self.serializer,
+            first_frame(&envelope),
+        )?))
     }
+}
+
+/// The frame a libzmq `recv_bytes` would return: the first part.
+fn first_frame(msg: &Message) -> &[u8] {
+    msg.part_slice(0).unwrap_or_default()
 }
 
 /// Decode a `<prefix> <name> <body>` envelope into a `Document`.
@@ -288,17 +294,14 @@ mod tests {
     // `\x00<prefix>`. First wait for the empty-prefix subscribe to confirm the
     // connection is up — so the later unsubscribe is genuinely transmitted and
     // not coalesced away — then assert the empty-prefix UNSUBSCRIBE arrives.
-    // Neutering the fix (dropping `set_unsubscribe`) never emits that frame.
+    // Neutering the fix (dropping `unsubscribe`) never emits that frame.
     #[test]
     fn subscribe_prefix_drops_the_match_all_default() {
-        let ctx = zmq::Context::new();
-        let xpub = ctx.socket(zmq::XPUB).expect("xpub socket");
-        xpub.bind("tcp://127.0.0.1:*").expect("xpub bind");
+        let xpub = omq::Context::new().blocking_socket(SocketType::XPub, Options::default());
         let addr = xpub
-            .get_last_endpoint()
-            .unwrap()
-            .expect("xpub endpoint utf-8");
-        xpub.set_rcvtimeo(100).unwrap();
+            .bind("tcp://127.0.0.1:*")
+            .expect("xpub bind")
+            .to_string();
 
         // connect() subscribes the match-all default b"".
         let src = ZmqDocumentSource::connect(&addr).expect("connect source");
@@ -306,12 +309,12 @@ mod tests {
         // Wait for the match-all subscribe (one 0x01 byte) so the connection is
         // established before we narrow — otherwise the unsubscribe below could
         // cancel the not-yet-sent subscribe and never reach the XPUB.
-        let recv_frame = |sock: &zmq::Socket, want: [u8; 1]| -> bool {
+        let recv_frame = |sock: &Socket, want: [u8; 1]| -> bool {
             for _ in 0..50 {
-                match sock.recv_bytes(0) {
-                    Ok(f) if f == want => return true,
+                match sock.recv_timeout(Duration::from_millis(100)) {
+                    Ok(f) if f.part_slice(0) == Some(&want[..]) => return true,
                     Ok(_) => {}
-                    Err(zmq::Error::EAGAIN) => {}
+                    Err(omq::Error::Timeout) => {}
                     Err(e) => panic!("xpub recv: {e}"),
                 }
             }
@@ -337,7 +340,7 @@ mod tests {
     // never saw it. With `RunEngine::inject_document` wired, a
     // subscribe()'d callback on the engine observes every published
     // doc. Uses the default current-thread runtime — the receive loop
-    // now dispatches the blocking `recv_bytes` to
+    // now dispatches the blocking `recv_timeout` to
     // `tokio::task::spawn_blocking`, so the 250ms wait no longer pins
     // the worker and the publisher makes progress concurrently.
     #[tokio::test]
