@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bsrs::core::{Status, StatusError, StatusOutcome};
+use bsrs::core::{Status, StatusError, StatusOutcome, Watcher, WatcherUpdate};
 use tokio::time::{sleep, Instant};
 
 const MS: Duration = Duration::from_millis(1);
@@ -242,5 +242,64 @@ async fn cancel_guard_exit_before_completion_cancels_the_work() {
         sleep(100 * MS).await;
         assert!(!finished.load(Ordering::SeqCst), "work ran on after cancel");
         assert!(matches!(status.exception(), Some(StatusError::Cancelled)));
+    }
+}
+
+#[derive(Default)]
+struct Currents(Vec<f64>);
+
+impl Watcher for Currents {
+    fn watch(&mut self, update: &WatcherUpdate) {
+        self.0.push(update.current);
+    }
+}
+
+// ophyd-async test_asyncstatus_wraps_set_iterator_with_class_or_func_watcher,
+// test_watchableasyncstatus_wraps_failing_set_iterator,
+// test_watchableasyncstatus_times_out and
+// test_watchable_async_status_reports_watch_type_not_result_type: every
+// watcher sees every update, in order, up to the operation's outcome.
+#[tokio::test(start_paused = true)]
+async fn every_watcher_sees_every_update_up_to_the_outcome() {
+    // (currents posted 10 ms apart, one posted together with the outcome, outcome)
+    let cases = [
+        (vec![1.0, 2.0, 3.0, 4.0, 5.0], Some(6.0), Ok(())),
+        (vec![1.0, 2.0, 3.0], None, Err(failed("SetFailedError"))),
+        (vec![1.0], None, Err(StatusError::Timeout)),
+        (vec![], Some(1.5), Ok(())),
+    ];
+    for (spaced, last, result) in cases {
+        let expect: Vec<f64> = spaced.iter().copied().chain(last).collect();
+        let (status, setter) = Status::new();
+        let r = result.clone();
+        tokio::spawn(async move {
+            for c in spaced {
+                sleep(10 * MS).await;
+                setter.update_watcher(WatcherUpdate::new(c, 0.0, 6.0));
+            }
+            if let Some(c) = last {
+                setter.update_watcher(WatcherUpdate::new(c, 0.0, c));
+            }
+            match r {
+                Ok(()) => setter.success(),
+                Err(e) => setter.fail(e),
+            }
+        });
+        let watchers: Vec<_> = (0..2)
+            .map(|_| {
+                let s = status.clone();
+                tokio::spawn(async move {
+                    let mut w = Currents::default();
+                    s.observe_watcher(&mut w).await;
+                    w.0
+                })
+            })
+            .collect();
+        for w in watchers {
+            assert_eq!(w.await.unwrap(), expect);
+        }
+        assert_eq!(dbg(status.clone().await), dbg(&result));
+        assert_eq!(status.success(), result.is_ok());
+        assert_eq!(dbg(status.exception()), dbg(result.as_ref().err()));
     }
 }

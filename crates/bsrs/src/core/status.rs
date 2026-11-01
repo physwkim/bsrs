@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 const PENDING: u8 = 0;
@@ -101,7 +101,12 @@ struct Inner {
     state: AtomicU8,
     error: Mutex<Option<StatusError>>,
     progress: watch::Sender<f64>,
+    /// The latest update only; back-to-back updates replace each other here.
     watcher: watch::Sender<Option<WatcherUpdate>>,
+    /// One queue per running [`Status::observe_watcher`], fed every update.
+    /// Its lock also covers the `watcher` store, so an observer that registers
+    /// gets each update once: as the latest, or through its queue.
+    observers: Mutex<Vec<mpsc::UnboundedSender<WatcherUpdate>>>,
     callbacks: Mutex<Vec<StatusCallback>>,
     wakers: Mutex<Vec<Waker>>,
     /// Signalled by [`Status::cancel`] (consumer side) so a producer running
@@ -154,6 +159,7 @@ impl Status {
             error: Mutex::new(None),
             progress: tx,
             watcher: wtx,
+            observers: Mutex::new(Vec::new()),
             callbacks: Mutex::new(Vec::new()),
             wakers: Mutex::new(Vec::new()),
             cancel: CancellationToken::new(),
@@ -335,38 +341,31 @@ impl Status {
     ///
     /// Calls `watcher.watch(&update)` immediately if an update has already been
     /// posted (via [`StatusSetter::update_watcher`]), then on every subsequent
-    /// update, returning once the status completes. A final update that lands
-    /// together with completion is delivered exactly once.
+    /// update in the order posted, returning once the status completes. Updates
+    /// are never merged: one posted right after another, or together with
+    /// completion, is still delivered.
     pub async fn observe_watcher<W: Watcher>(&self, watcher: &mut W) {
-        let mut rx = self.watch_updates();
+        let (tx, mut queue) = mpsc::unbounded_channel();
+        let latest = {
+            let mut observers = self.inner.observers.lock().unwrap();
+            observers.push(tx);
+            self.inner.watcher.borrow().clone()
+        };
         // "called immediately if there has already been an update".
-        if let Some(update) = rx.borrow_and_update().clone() {
+        if let Some(update) = latest {
             watcher.watch(&update);
         }
         let mut done = self.clone();
         loop {
             tokio::select! {
                 biased;
-                _ = &mut done => {
-                    // A final update posted together with completion is
-                    // delivered here; the immediate/changed paths already
-                    // cleared the "seen" flag, so this fires only on new data.
-                    if rx.has_changed().unwrap_or(false) {
-                        if let Some(update) = rx.borrow_and_update().clone() {
-                            watcher.watch(&update);
-                        }
-                    }
-                    return;
-                }
-                res = rx.changed() => {
-                    if res.is_err() {
-                        return;
-                    }
-                    if let Some(update) = rx.borrow_and_update().clone() {
-                        watcher.watch(&update);
-                    }
-                }
+                _ = &mut done => break,
+                Some(update) = queue.recv() => watcher.watch(&update),
             }
+        }
+        // Updates posted before completion are already queued.
+        while let Ok(update) = queue.try_recv() {
+            watcher.watch(&update);
         }
     }
 }
@@ -418,9 +417,10 @@ impl StatusSetter {
         let _ = self.inner.progress.send(p);
     }
 
-    /// Push a structured progress update. Receivers see the latest update via
-    /// [`Status::watch_updates`]; the scalar [`Status::progress`] fraction is
-    /// also updated when the update carries one. Best-effort.
+    /// Push a structured progress update. [`Status::watch_updates`] receivers
+    /// see the latest update and each running [`Status::observe_watcher`] every
+    /// one; the scalar [`Status::progress`] fraction is also updated when the
+    /// update carries one. Best-effort.
     ///
     /// When the producer omits `time_elapsed`, it is back-filled from the
     /// operation's start instant before the update is stored and broadcast, so
@@ -434,6 +434,8 @@ impl StatusSetter {
         if let Some(f) = update.fraction {
             let _ = self.inner.progress.send(f);
         }
+        let mut observers = self.inner.observers.lock().unwrap();
+        observers.retain(|tx| tx.send(update.clone()).is_ok());
         let _ = self.inner.watcher.send(Some(update));
     }
 }
