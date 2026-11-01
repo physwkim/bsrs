@@ -371,10 +371,28 @@ fn pva_enum_lifecycle() {
         let dk = assert_lifecycle(&b, pv, "Multiple".to_string()).await;
         assert_eq!(dk.dtype, Dtype::String);
         assert!(dk.shape.is_empty());
+        let choices = ["Single", "Multiple", "Continuous"].map(String::from);
+        assert_eq!(dk.choices.as_deref(), Some(&choices[..]));
+        assert_eq!((dk.units, dk.precision, dk.limits), (None, None, None));
         b.put(Some("2".into())).await.unwrap();
         assert_eq!(b.get_value().await.unwrap(), "Continuous");
         b.put(Some("Bogus".into())).await.expect_err("not a label");
         assert_eq!(b.get_value().await.unwrap(), "Continuous");
+    });
+}
+
+/// A bool read off a longout keeps the integer's units, as ophyd-async's
+/// metadata follows the PV's value type.
+#[test]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+fn pva_bool_off_an_integer_keeps_its_units() {
+    run(async {
+        let pv = "ADSIM:cam1:NumImages";
+        let b = EpicsPvaBackend::<bool>::new(pv);
+        b.connect(CONNECT).await.unwrap();
+        let dk = b.get_datakey(pv).await.unwrap();
+        assert_eq!(dk.dtype, Dtype::Boolean);
+        assert_eq!((dk.units.as_deref(), dk.precision), (Some(""), None));
     });
 }
 

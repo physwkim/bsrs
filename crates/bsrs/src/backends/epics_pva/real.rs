@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::client_native::ops_v2::PutLeaf;
 use epics_pva_rs::pv_request::{PvRequestBuilder, PvRequestExpr};
-use epics_pva_rs::pvdata::{FieldDesc, TypedScalarArray};
+use epics_pva_rs::pvdata::{FieldDesc, ScalarType, TypedScalarArray};
 use epics_pva_rs::{PvField, PvaError, ScalarValue};
 use futures::FutureExt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -392,31 +392,65 @@ fn pv_limits(top: &[(String, PvField)]) -> Limits {
     limits
 }
 
-// Build SignalMetadata (units / precision / limits) from a full NTScalar GET,
-// mirroring ophyd-async `_metadata_from_value` (epics/core/_p4p.py:68-94):
-// `display.units` when numeric and not str (`want_units`), `display.precision`
-// only for floats (`want_precision`), and the limit ranges for any numeric.
-fn pv_field_to_metadata(p: &PvField, want_units: bool, want_precision: bool) -> SignalMetadata {
+/// The type a backend reads a PV as: ophyd-async's `datatype`.
+#[derive(Clone, Copy, PartialEq)]
+enum Datatype {
+    Float,
+    Int,
+    Bool,
+    Str,
+}
+
+// The element type of a `value` leaf: ophyd-async's specifier.
+fn scalar_type(v: &PvField) -> Option<ScalarType> {
+    match v {
+        PvField::Scalar(x) => Some(x.scalar_type()),
+        PvField::ScalarArrayTyped(a) => Some(a.scalar_type()),
+        PvField::ScalarArray(items) => items.first().map(ScalarValue::scalar_type),
+        _ => None,
+    }
+}
+
+// Build SignalMetadata from a full GET as ophyd-async `_metadata_from_value`
+// (epics/core/_p4p.py:69-95): units and limits of a numeric value, units not
+// when read as str, precision of a float value not read as int, and choices
+// from `display` or the `enum_t` value when read as str.
+fn pv_field_to_metadata(p: &PvField, datatype: Datatype) -> SignalMetadata {
+    use ScalarType::*;
     let mut meta = SignalMetadata::default();
     let PvField::Structure(s) = p else {
         return meta;
     };
     let top = &s.fields;
-    if let Some(display) = sub_fields(top, "display") {
-        if want_units {
+    let spec = field(top, "value").and_then(scalar_type);
+    let float = matches!(spec, Some(Float | Double));
+    let number = float
+        || matches!(
+            spec,
+            Some(Byte | Short | Int | Long | UByte | UShort | UInt | ULong)
+        );
+    let display = sub_fields(top, "display");
+    if let Some(display) = display {
+        if number && datatype != Datatype::Str {
             if let Some(PvField::Scalar(ScalarValue::String(u))) = field(display, "units") {
                 meta.units = Some(u.as_str_lossy().into_owned());
             }
         }
-        if want_precision {
+        if float && datatype != Datatype::Int {
             if let Some(prec) = field(display, "precision").and_then(pv_field_to_i64) {
                 meta.precision = Some(prec);
             }
         }
     }
     let limits = pv_limits(top);
-    if limits != Limits::default() {
+    if number && limits != Limits::default() {
         meta.limits = Some(limits);
+    }
+    if datatype == Datatype::Str {
+        meta.choices = display
+            .and_then(|d| field(d, "choices"))
+            .or_else(|| sub_fields(top, "value").and_then(|v| field(v, "choices")))
+            .and_then(pv_string_array);
     }
     meta
 }
@@ -443,7 +477,7 @@ impl SignalBackend<f64> for EpicsPvaBackend<f64> {
             Dtype::Number,
             vec![],
             Some("<f8".into()),
-            pv_field_to_metadata(&f, true, true),
+            pv_field_to_metadata(&f, Datatype::Float),
         ))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
@@ -554,7 +588,7 @@ impl SignalBackend<Vec<f64>> for EpicsPvaBackend<Vec<f64>> {
             Dtype::Number,
             vec![Some(len as u64)],
             Some("<f8".into()),
-            pv_field_to_metadata(&f, true, true),
+            pv_field_to_metadata(&f, Datatype::Float),
         ))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
@@ -639,12 +673,17 @@ impl SignalBackend<String> for EpicsPvaBackend<String> {
         put_block(&self.client, &self.pv, f).await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
+        let f = self
+            .client
+            .pvget(&self.pv)
+            .await
+            .map_err(|e| BsrsError::Backend(format!("pva get: {e}")))?;
         Ok(make_datakey(
             format!("pva://{source}"),
             Dtype::String,
             vec![],
             Some("|S".into()),
-            SignalMetadata::default(),
+            pv_field_to_metadata(&f, Datatype::Str),
         ))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
@@ -725,8 +764,6 @@ impl SignalBackend<i64> for EpicsPvaBackend<i64> {
         put_block(&self.client, &self.pv, f).await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
-        // pvget the full NTScalar for units + limits. Integers carry no
-        // precision (ophyd-async restricts precision to floats), so want_precision=false.
         let f = self
             .client
             .pvget(&self.pv)
@@ -737,7 +774,7 @@ impl SignalBackend<i64> for EpicsPvaBackend<i64> {
             Dtype::Integer,
             vec![],
             Some("<i8".into()),
-            pv_field_to_metadata(&f, true, false),
+            pv_field_to_metadata(&f, Datatype::Int),
         ))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
@@ -818,12 +855,17 @@ impl SignalBackend<bool> for EpicsPvaBackend<bool> {
         put_block(&self.client, &self.pv, f).await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
+        let f = self
+            .client
+            .pvget(&self.pv)
+            .await
+            .map_err(|e| BsrsError::Backend(format!("pva get: {e}")))?;
         Ok(make_datakey(
             format!("pva://{source}"),
             Dtype::Boolean,
             vec![],
             Some("|b1".into()),
-            SignalMetadata::default(),
+            pv_field_to_metadata(&f, Datatype::Bool),
         ))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
@@ -897,7 +939,7 @@ impl SignalBackend<bool> for EpicsPvaBackend<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_pva_rs::pvdata::{PvStructure, ScalarType};
+    use epics_pva_rs::pvdata::PvStructure;
 
     fn ntscalar_with_ts(value: f64, secs: i64, nanos: i32) -> PvField {
         let mut ts = PvStructure::new("time_t");
@@ -1239,7 +1281,7 @@ mod tests {
 
     #[test]
     fn metadata_extracts_units_precision_and_four_limit_ranges() {
-        let meta = pv_field_to_metadata(&ntscalar_with_meta(), true, true);
+        let meta = pv_field_to_metadata(&ntscalar_with_meta(), Datatype::Float);
         assert_eq!(meta.units.as_deref(), Some("mm"));
         assert_eq!(meta.precision, Some(3));
         let limits = meta.limits.expect("limits present");
@@ -1276,9 +1318,40 @@ mod tests {
     #[test]
     fn metadata_for_int_omits_precision_keeps_units() {
         // ophyd-async restricts precision to floats; integer datakeys keep units.
-        let meta = pv_field_to_metadata(&ntscalar_with_meta(), true, false);
+        let meta = pv_field_to_metadata(&ntscalar_with_meta(), Datatype::Int);
         assert_eq!(meta.units.as_deref(), Some("mm"));
         assert_eq!(meta.precision, None);
+    }
+
+    /// Read as str, an enum reports its choices and nothing numeric.
+    #[test]
+    fn metadata_for_str_is_the_enum_choices() {
+        let meta = pv_field_to_metadata(&ntenum(1, &["Off", "On"], true), Datatype::Str);
+        let choices = Some(vec!["Off".to_string(), "On".to_string()]);
+        assert_eq!(
+            meta,
+            SignalMetadata {
+                choices,
+                ..Default::default()
+            }
+        );
+    }
+
+    /// A bool read off an integer keeps its units and limits, but an integer
+    /// has no precision; a float read as str keeps all but its units.
+    #[test]
+    fn metadata_follows_the_value_type() {
+        let PvField::Structure(mut nt) = ntscalar_with_meta() else {
+            unreachable!()
+        };
+        nt.fields[0].1 = PvField::Scalar(ScalarValue::Int(1));
+        let meta = pv_field_to_metadata(&PvField::Structure(nt), Datatype::Bool);
+        assert_eq!(meta.units.as_deref(), Some("mm"));
+        assert_eq!(meta.precision, None);
+        assert!(meta.limits.is_some());
+        let meta = pv_field_to_metadata(&ntscalar_with_meta(), Datatype::Str);
+        assert_eq!((meta.units, meta.precision), (None, Some(3)));
+        assert!(meta.limits.is_some());
     }
 
     /// An empty EGU is a unit like any other, as ophyd-async keeps it.
@@ -1293,7 +1366,7 @@ mod tests {
             unreachable!()
         };
         display.fields[0].1 = PvField::Scalar(ScalarValue::String("".into()));
-        let meta = pv_field_to_metadata(&PvField::Structure(nt), true, false);
+        let meta = pv_field_to_metadata(&PvField::Structure(nt), Datatype::Int);
         assert_eq!(meta.units.as_deref(), Some(""));
     }
 
@@ -1313,13 +1386,13 @@ mod tests {
             .push(("value".into(), PvField::Scalar(ScalarValue::Double(1.0))));
         nt.fields
             .push(("display".into(), PvField::Structure(display)));
-        let meta = pv_field_to_metadata(&PvField::Structure(nt), true, true);
+        let meta = pv_field_to_metadata(&PvField::Structure(nt), Datatype::Float);
         assert_eq!(meta.limits, None);
 
         // A bare (non-Normative) scalar has no metadata substructures.
         let bare = PvField::Scalar(ScalarValue::Double(2.5));
         assert_eq!(
-            pv_field_to_metadata(&bare, true, true),
+            pv_field_to_metadata(&bare, Datatype::Float),
             SignalMetadata::default()
         );
     }
