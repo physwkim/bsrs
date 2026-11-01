@@ -36,8 +36,8 @@ use crate::core::reading::ReadingValue;
 use crate::core::status::Status;
 use crate::core::subscription::Subscription;
 use crate::devices::SignalCache;
-use crate::event_model::{DataKey, Dtype};
-use crate::host::motor_move::MotorChannels;
+use crate::event_model::DataKey;
+use crate::host::motor_move::{describe_pv, MotorChannels};
 use crate::protocols_async::SignalBackend;
 
 /// PVA-backed motor: setpoint + readback Signal pair.
@@ -47,6 +47,7 @@ use crate::protocols_async::SignalBackend;
 pub struct PvaMotor {
     name: String,
     channels: MotorChannels<EpicsPvaBackend<f64>>,
+    rbv_pv: String,
     cache: Arc<SignalCache<f64, EpicsPvaBackend<f64>>>,
 }
 
@@ -60,6 +61,7 @@ impl PvaMotor {
             name: name.to_string(),
             cache: SignalCache::new(channels.readback.clone()),
             channels,
+            rbv_pv: rbv_pv.to_string(),
         }))
     }
 }
@@ -85,24 +87,10 @@ impl ReadableObj for PvaMotor {
         Ok(out)
     }
     async fn describe_dyn(&self) -> Result<HashMap<String, DataKey>> {
-        let mut out = HashMap::new();
-        out.insert(
+        Ok(HashMap::from([(
             self.name.clone(),
-            DataKey {
-                source: format!("pva://{}.RBV", self.name),
-                dtype: Dtype::Number,
-                shape: vec![],
-                dtype_numpy: Some("<f8".into()),
-                external: None,
-                units: None,
-                precision: None,
-                object_name: Some(self.name.clone()),
-                dims: None,
-                limits: None,
-                choices: None,
-            },
-        );
-        Ok(out)
+            describe_pv(self.channels.readback.as_ref(), &self.rbv_pv, &self.name).await?,
+        )]))
     }
     /// The readback is the hinted field, as in ophyd's `EpicsMotor`.
     fn hint_fields(&self) -> Option<Vec<String>> {
@@ -148,6 +136,7 @@ impl MonitorableObj for PvaMotor {
 pub struct PvaDetector {
     name: String,
     value: Arc<EpicsPvaBackend<f64>>,
+    value_pv: String,
     cache: Arc<SignalCache<f64, EpicsPvaBackend<f64>>>,
     seen: AtomicI64,
 }
@@ -163,6 +152,7 @@ impl PvaDetector {
             name: name.to_string(),
             cache: SignalCache::new(v.clone()),
             value: v,
+            value_pv: value_pv.to_string(),
             seen: AtomicI64::new(0),
         }))
     }
@@ -191,24 +181,10 @@ impl ReadableObj for PvaDetector {
         Ok(out)
     }
     async fn describe_dyn(&self) -> Result<HashMap<String, DataKey>> {
-        let mut out = HashMap::new();
-        out.insert(
+        Ok(HashMap::from([(
             self.name.clone(),
-            DataKey {
-                source: format!("pva://{}", self.name),
-                dtype: Dtype::Number,
-                shape: vec![],
-                dtype_numpy: Some("<f8".into()),
-                external: None,
-                units: None,
-                precision: None,
-                object_name: Some(self.name.clone()),
-                dims: None,
-                limits: None,
-                choices: None,
-            },
-        );
-        Ok(out)
+            describe_pv(self.value.as_ref(), &self.value_pv, &self.name).await?,
+        )]))
     }
     /// The value is the hinted field, as in an ophyd `EpicsSignalRO`.
     fn hint_fields(&self) -> Option<Vec<String>> {

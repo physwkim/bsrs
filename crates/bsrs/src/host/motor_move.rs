@@ -1,5 +1,5 @@
 //! The moves of the CA and PVA motors: their channels, their deadline and
-//! the [`Status`] a move returns.
+//! the [`Status`] a move returns; and the data key of a host device's PV.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,6 +7,7 @@ use std::time::Duration;
 use crate::core::error::Result;
 use crate::core::status::{Status, StatusError};
 use crate::devices::BackendFromPv;
+use crate::event_model::DataKey;
 use crate::protocols_async::{PutCompletion, SignalBackend};
 
 /// ophyd-async `DEFAULT_TIMEOUT`, the fixed term of
@@ -165,6 +166,19 @@ where
         Err(e) => setter.fail(StatusError::Failed(format!("{what}: {e}"))),
     }
     status
+}
+
+/// The data key of one `f64` PV as `object_name` reports it: the backend's
+/// `get_datakey` reads the PV's units, precision and limit ranges — what
+/// ophyd's `EpicsSignal.describe()` carries — and sources it from the PV.
+pub(crate) async fn describe_pv<B: SignalBackend<f64>>(
+    backend: &B,
+    pv: &str,
+    object_name: &str,
+) -> Result<DataKey> {
+    let mut key = backend.get_datakey(pv).await?;
+    key.object_name = Some(object_name.to_string());
+    Ok(key)
 }
 
 #[cfg(test)]

@@ -14,9 +14,11 @@ use std::time::{Duration, Instant};
 
 use bsrs::backends::epics_ca::EpicsCaBackend;
 use bsrs::core::msg::{LocatableObj, MonitorableObj, MovableObj, ReadableObj};
+use bsrs::core::runtime::bsrs_runtime;
 use bsrs::core::subscription::Subscription;
 use bsrs::event_model::LimitsRange;
 use bsrs::host::ca_devices::{CaDetector, CaMotor};
+use bsrs::host::pva_devices::{PvaDetector, PvaMotor};
 use bsrs::protocols_async::SignalBackend;
 
 const BIN: &str = "ophyd-test-ioc";
@@ -26,6 +28,7 @@ const X1: &str = "XF:31IDA-OP{Tbl-Ax:X1}Mtr";
 const X5: &str = "XF:31IDA-OP{Tbl-Ax:X5}Mtr";
 const X6: &str = "XF:31IDA-OP{Tbl-Ax:X6}Mtr";
 const FAKE: &str = "XF:31IDA-OP{Tbl-Ax:FakeMtr}";
+const SIM2: &str = "sim:mtr2";
 
 fn field(record: &str, f: &str) -> String {
     format!("{record}.{f}")
@@ -35,6 +38,10 @@ async fn ca_motor(name: &str, record: &str) -> Arc<CaMotor> {
     CaMotor::connect_async(name, &field(record, "VAL"), &field(record, "RBV"))
         .await
         .unwrap()
+}
+
+fn pva_motor(name: &str, record: &str) -> Arc<PvaMotor> {
+    PvaMotor::connect_blocking(name, &field(record, "VAL"), &field(record, "RBV")).unwrap()
 }
 
 async fn ca<T>(record: &str, f: &str) -> EpicsCaBackend<T>
@@ -256,4 +263,53 @@ async fn a_held_move_times_out_on_the_records_velocity_and_acceleration() {
     assert!(err.to_string().contains("timed out after 11.250s"), "{err}");
     assert!(took >= Duration::from_millis(11_200), "{took:?}");
     assert!(took < Duration::from_secs(13), "{took:?}");
+}
+
+/// test_epicsmotor.py `test_hints` and ophyd-async `test_read_motor` over
+/// PVA: the readback is described from its own PV, with the record's EGU,
+/// PREC and soft limits, and is the hinted field; a detector's value is
+/// described from its PV too.
+#[test]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+fn pva_describe_carries_the_records_egu_precision_limits_and_hint() {
+    example_ioc::boot(BIN, BIN);
+    let (hlm, llm) = bsrs_runtime().block_on(async {
+        ca::<String>(SIM2, "EGU")
+            .await
+            .put(Some("mm".into()))
+            .await
+            .unwrap();
+        let (hlm, llm) = (ca::<f64>(SIM2, "HLM").await, ca::<f64>(SIM2, "LLM").await);
+        (
+            hlm.get_value().await.unwrap(),
+            llm.get_value().await.unwrap(),
+        )
+    });
+    let m = pva_motor("sim_mtr2", SIM2);
+
+    let dk = bsrs_runtime()
+        .block_on(m.describe_dyn())
+        .unwrap()
+        .remove("sim_mtr2")
+        .unwrap();
+    assert_eq!(dk.source, format!("pva://{SIM2}.RBV"));
+    assert_eq!(dk.units.as_deref(), Some("mm"));
+    assert_eq!(dk.precision, Some(4));
+    let limits = dk.limits.expect("the record's limits");
+    let travel = Some(LimitsRange {
+        low: Some(llm),
+        high: Some(hlm),
+    });
+    assert_eq!(limits.control, travel);
+    assert_eq!(limits.display, travel);
+    assert_eq!(m.hint_fields(), Some(vec!["sim_mtr2".to_string()]));
+
+    let det = PvaDetector::connect_blocking("sim_mtr2_rbv", &field(SIM2, "RBV")).unwrap();
+    let dk = bsrs_runtime()
+        .block_on(det.describe_dyn())
+        .unwrap()
+        .remove("sim_mtr2_rbv")
+        .unwrap();
+    assert_eq!(dk.source, format!("pva://{SIM2}.RBV"));
+    assert_eq!(dk.units.as_deref(), Some("mm"));
 }

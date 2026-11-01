@@ -38,7 +38,7 @@ use crate::core::status::Status;
 use crate::core::subscription::Subscription;
 use crate::devices::SignalCache;
 use crate::event_model::DataKey;
-use crate::host::motor_move::{move_status, MotorChannels};
+use crate::host::motor_move::{describe_pv, move_status, MotorChannels};
 // `SignalBackend` is the trait that provides connect/put/get on the
 // CA backend; pulled in via the `bsrs-protocols-async` dep that
 // the `ca` feature toggles on.
@@ -419,20 +419,6 @@ impl MonitorableObj for CaDetector {
         let (rx, token) = self.cache.add_listener();
         Ok(Subscription::new(rx, token, self.name.clone()))
     }
-}
-
-/// The data key of one `f64` PV as `object_name` reports it: the backend's
-/// `get_datakey` reads DBR_CTRL for `units`, `precision` and the limit
-/// ranges — what ophyd's `EpicsSignal.describe()` carries — and sources it
-/// as `ca://<pv>`.
-async fn describe_pv(
-    backend: &EpicsCaBackend<f64>,
-    pv: &str,
-    object_name: &str,
-) -> Result<DataKey> {
-    let mut key = backend.get_datakey(pv).await?;
-    key.object_name = Some(object_name.to_string());
-    Ok(key)
 }
 
 /// Bootstrap the CA backend's global client. Must be called from a
