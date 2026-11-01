@@ -84,6 +84,65 @@ fn kind_predicates_route_like_ophyd() {
     assert_eq!(Kind::default(), Kind::Normal);
 }
 
+fn leaf(prefix: &str) -> StandardReadable {
+    let mut sr = StandardReadable::new(prefix);
+    sr.add_readables(
+        sig(&format!("{prefix}-value"), Kind::Normal),
+        StandardReadableFormat::HintedSignal,
+    );
+    sr.add_readables(
+        sig(&format!("{prefix}-config"), Kind::Config),
+        StandardReadableFormat::ConfigSignal,
+    );
+    sr
+}
+
+// ophyd test_kind::test_nested_devices ("a_default comes along for the
+// ride"), test_device::test_complexdevice; ophyd-async test_readable
+// add_readables_adds_to_expected_attrs, add_children_multi_nested; epics/tango
+// declarative subdevices contributing to the readable verbs and nesting.
+#[tokio::test]
+async fn standard_readable_child_merges_nested_read_configuration_and_hints() {
+    let mut parent = StandardReadable::new("parent");
+    parent.add_readables(Arc::new(leaf("parent-sub")), StandardReadableFormat::Child);
+    assert_eq!(
+        keys(&parent.read().await.unwrap()),
+        set(&["parent-sub-value"])
+    );
+    assert_eq!(
+        keys(&parent.describe().await.unwrap()),
+        set(&["parent-sub-value"])
+    );
+    assert_eq!(
+        keys(&parent.read_configuration().await.unwrap()),
+        set(&["parent-sub-config"])
+    );
+    assert_eq!(
+        keys(&parent.describe_configuration().await.unwrap()),
+        set(&["parent-sub-config"])
+    );
+    assert_eq!(
+        ReadableObj::hint_fields(&parent),
+        Some(vec!["parent-sub-value".to_string()])
+    );
+
+    let mut mid = StandardReadable::new("top-mid");
+    mid.add_readables(
+        Arc::new(leaf("top-mid-leaf")),
+        StandardReadableFormat::Child,
+    );
+    let mut top = StandardReadable::new("top");
+    top.add_readables(Arc::new(mid), StandardReadableFormat::Child);
+    assert_eq!(
+        keys(&top.read().await.unwrap()),
+        set(&["top-mid-leaf-value"])
+    );
+    assert_eq!(
+        keys(&top.read_configuration().await.unwrap()),
+        set(&["top-mid-leaf-config"])
+    );
+}
+
 // ophyd-async test_readable::test_standard_readable_hints; ophyd
 // test_hints::test_device_hints, test_motor_bundle_hints.
 #[test]

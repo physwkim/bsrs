@@ -23,8 +23,10 @@ use async_trait::async_trait;
 /// ophyd-async `StandardReadableFormat` (`core/_readable.py`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StandardReadableFormat {
-    /// Auto-detect: contributes to `read` / `describe`, and to `hints` via the
-    /// child's [`ReadableObj::hint_fields`].
+    /// Auto-detect: contributes to `read` / `describe`, to `hints` via the
+    /// child's [`ReadableObj::hint_fields`], and to `read_configuration` /
+    /// `describe_configuration` via the child's
+    /// [`ReadableObj::as_configurable`] view when it has one.
     Child,
     /// Contributes to `read_configuration` / `describe_configuration` only.
     ConfigSignal,
@@ -46,9 +48,39 @@ pub enum StandardReadableFormat {
 pub struct StandardReadable {
     name: String,
     read: Vec<Arc<dyn ReadableObj>>,
-    config: Vec<Arc<dyn ReadableObj>>,
+    config: Vec<ConfigSource>,
     stageables: Vec<Arc<dyn StageableObj>>,
     hints: Vec<String>,
+}
+
+/// One contributor to `read_configuration` / `describe_configuration`.
+enum ConfigSource {
+    /// A `ConfigSignal`: its plain reading is configuration.
+    Signal(Arc<dyn ReadableObj>),
+    /// A `Child` registered because it had a configuration view.
+    Child(Arc<dyn ReadableObj>),
+}
+
+impl ConfigSource {
+    async fn read(&self) -> Result<HashMap<String, ReadingValue>> {
+        match self {
+            Self::Signal(s) => s.read_dyn().await,
+            Self::Child(c) => match c.as_configurable() {
+                Some(cfg) => cfg.read_configuration_dyn().await,
+                None => Ok(HashMap::new()),
+            },
+        }
+    }
+
+    async fn describe(&self) -> Result<HashMap<String, DataKey>> {
+        match self {
+            Self::Signal(s) => s.describe_dyn().await,
+            Self::Child(c) => match c.as_configurable() {
+                Some(cfg) => cfg.describe_configuration_dyn().await,
+                None => Ok(HashMap::new()),
+            },
+        }
+    }
 }
 
 impl StandardReadable {
@@ -75,11 +107,14 @@ impl StandardReadable {
     pub fn add_readables(&mut self, child: Arc<dyn ReadableObj>, format: StandardReadableFormat) {
         use StandardReadableFormat::*;
         match format {
-            ConfigSignal => self.config.push(child),
+            ConfigSignal => self.config.push(ConfigSource::Signal(child)),
             UncachedSignal => self.read.push(child),
             Child => {
                 if let Some(fields) = child.hint_fields() {
                     self.hints.extend(fields);
+                }
+                if child.as_configurable().is_some() {
+                    self.config.push(ConfigSource::Child(child.clone()));
                 }
                 self.read.push(child);
             }
@@ -137,15 +172,15 @@ impl AsyncConfigurable for StandardReadable {
     }
     async fn read_configuration(&self) -> Result<HashMap<String, ReadingValue>> {
         let mut out = HashMap::new();
-        for child in &self.config {
-            out.extend(child.read_dyn().await?);
+        for source in &self.config {
+            out.extend(source.read().await?);
         }
         Ok(out)
     }
     async fn describe_configuration(&self) -> Result<HashMap<String, DataKey>> {
         let mut out = HashMap::new();
-        for child in &self.config {
-            out.extend(child.describe_dyn().await?);
+        for source in &self.config {
+            out.extend(source.describe().await?);
         }
         Ok(out)
     }
