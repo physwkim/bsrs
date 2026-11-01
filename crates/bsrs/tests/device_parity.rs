@@ -10,8 +10,8 @@ use std::time::Duration;
 use bsrs::backends::soft::{SoftDetector, SoftMotor, SoftSignalBackend};
 use bsrs::core::msg::{ConfigurableObj, NamedObj, ReadableObj, StageableObj};
 use bsrs::core::{
-    BsrsError, ConfigureArgs, DataKey, Dtype, Kind, ReadingValue, Result, Status, StatusError,
-    StatusOutcome, SubToken,
+    BsrsError, ConfigureArgs, DataKey, Dtype, Kind, ReadingValue, Result, Status, StatusOutcome,
+    SubToken, WaitError,
 };
 use bsrs::devices::{
     BackendFromPv, Device, DeviceVector, Signal, SignalConfig, SignalR, SignalRW, SignalX,
@@ -797,7 +797,7 @@ fn status_wait_reports_finish_and_timeout() {
     });
     assert!(matches!(
         pending.wait(Some(Duration::from_millis(20))),
-        Err(StatusError::Timeout)
+        Err(WaitError::Timeout)
     ));
     assert!(!pending.done_state());
     assert_eq!(hits.load(Ordering::SeqCst), 0);
