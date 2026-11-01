@@ -116,6 +116,120 @@ async fn a_readable_signal_stages_through_its_readable_handle() {
     assert_eq!(backend.subscriber_count(), 0);
 }
 
+/// A device value behind a getter that counts its reads and fails while
+/// the value is `None`.
+#[derive(Clone)]
+struct Device {
+    value: Arc<Mutex<Option<f64>>>,
+    reads: Arc<AtomicUsize>,
+}
+
+impl Device {
+    fn new(start: f64) -> Self {
+        Self {
+            value: Arc::new(Mutex::new(Some(start))),
+            reads: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+    fn set(&self, value: Option<f64>) {
+        *self.value.lock().unwrap() = value;
+    }
+    fn reads(&self) -> usize {
+        self.reads.load(SeqCst)
+    }
+    fn getter(
+        &self,
+    ) -> impl Fn() -> futures::future::Ready<bsrs::core::error::Result<f64>> + Send + Sync + 'static
+    {
+        let d = self.clone();
+        move || {
+            d.reads.fetch_add(1, SeqCst);
+            let value = *d.value.lock().unwrap();
+            futures::future::ready(value.ok_or(BsrsError::Backend("offline".into())))
+        }
+    }
+}
+
+// ophyd-async test_soft_signal_backend_{getter,async_getter},
+// _getter_updates_reading, _getter_does_not_affect_setpoint.
+#[tokio::test]
+async fn soft_getter_supplies_value_and_reading_but_not_setpoint() {
+    let dev = Device::new(42.0);
+    let b = SoftSignalBackend::new(0.0, Dtype::Number).with_getter(dev.getter(), None);
+    assert_eq!(b.get_value().await.unwrap(), 42.0);
+    dev.set(Some(2.0));
+    assert_eq!(b.get_reading().await.unwrap().value, json!(2.0));
+
+    b.put(Some(5.0)).await.unwrap();
+    dev.set(Some(99.0));
+    assert_eq!(b.get_setpoint().await.unwrap(), 5.0);
+    assert_eq!(b.get_value().await.unwrap(), 99.0);
+    assert_eq!(b.get_setpoint().await.unwrap(), 5.0);
+}
+
+// ophyd-async test_soft_signal_backend_{setter_homogeneous_types,async_setter},
+// _setter_returns_settled_value, _setter_none_with_getter_refreshes,
+// _setter_none_without_getter_stores_write_value.
+#[tokio::test]
+async fn soft_setter_runs_on_put_and_settles_the_readback() {
+    let clamp = SoftSignalBackend::new(0.0, Dtype::Number)
+        .with_setter(|v: Option<f64>| async move { Ok(v.map(|v| v.clamp(0.0, 10.0))) });
+    clamp.put(Some(50.0)).await.unwrap();
+    assert_eq!(clamp.get_value().await.unwrap(), 10.0);
+    assert_eq!(clamp.get_setpoint().await.unwrap(), 50.0);
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let log = calls.clone();
+    let setter = move |v: Option<f64>| {
+        log.lock().unwrap().push(v);
+        async { Ok(None) }
+    };
+    let plain = SoftSignalBackend::new(0.0, Dtype::Number).with_setter(setter.clone());
+    plain.put(Some(6.0)).await.unwrap();
+    assert_eq!(plain.current_value(), 6.0);
+
+    let read_back = SoftSignalBackend::new(0.0, Dtype::Number)
+        .with_setter(setter)
+        .with_getter(Device::new(3.0).getter(), None);
+    read_back.put(Some(7.0)).await.unwrap();
+    assert_eq!(read_back.current_value(), 3.0, "taken from the getter");
+    assert_eq!(*calls.lock().unwrap(), vec![Some(6.0), Some(7.0)]);
+}
+
+// ophyd-async test_soft_signal_backend_poll_period_updates_via_callback,
+// _poll_task_starts_and_stops, _no_poll_without_poll_period, and _poll
+// skipping a getter that raises.
+#[tokio::test(start_paused = true)]
+async fn soft_getter_is_polled_only_while_subscribed_with_a_poll_period() {
+    let period = Duration::from_millis(50);
+    let dev = Device::new(0.0);
+    let b = SoftSignalBackend::new(0.0, Dtype::Number).with_getter(dev.getter(), Some(period));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let token = b.set_callback(Some(Box::new(move |v: &f64, _, _| {
+        log.lock().unwrap().push(*v)
+    })));
+
+    dev.set(Some(5.0));
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    dev.set(None);
+    tokio::time::sleep(period).await;
+    dev.set(Some(7.0));
+    tokio::time::sleep(period).await;
+    assert_eq!(*seen.lock().unwrap(), vec![0.0, 5.0, 7.0]);
+    assert_eq!(dev.reads(), 3);
+
+    drop(token);
+    tokio::time::sleep(4 * period).await;
+    assert_eq!(dev.reads(), 3, "unsubscribed: no more polls");
+
+    let dev = Device::new(0.0);
+    let unpolled = SoftSignalBackend::new(0.0, Dtype::Number).with_getter(dev.getter(), None);
+    let _token = unpolled.set_callback(Some(Box::new(|_: &f64, _, _| {})));
+    tokio::time::sleep(4 * period).await;
+    assert_eq!(dev.reads(), 0, "no poll period: no polls");
+}
+
 /// Soft state behind a connect that counts its calls, takes a while, and
 /// fails while `fail` is set.
 struct CountedConnect {

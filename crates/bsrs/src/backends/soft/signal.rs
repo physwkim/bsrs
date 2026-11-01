@@ -6,9 +6,11 @@ use crate::core::status::SubToken;
 use crate::event_model::{make_datakey, DataKey, Dtype, DtypeNumpy, SignalMetadata};
 use crate::protocols_async::{PutCompletion, ReadingValueCallback, SignalBackend};
 use async_trait::async_trait;
+use futures::future::BoxFuture;
 use serde::Serialize;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::future::Future;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// ophyd-async stamps every soft reading `alarm_severity=0` (no alarm).
@@ -35,6 +37,21 @@ struct State<T> {
     timestamp: f64,
     subscribers: Vec<(u64, Arc<Subscriber<T>>)>,
     next_id: u64,
+    /// `Some` iff the getter has a poll period and `subscribers` is not
+    /// empty; set and cleared only where `subscribers` gains its first entry
+    /// or loses its last.
+    poll: Option<tokio::task::AbortHandle>,
+}
+
+type GetterFn<T> = Arc<dyn Fn() -> BoxFuture<'static, Result<T>> + Send + Sync>;
+type SetterFn<T> = Arc<dyn Fn(Option<T>) -> BoxFuture<'static, Result<Option<T>>> + Send + Sync>;
+
+/// The device read behind a soft signal (ophyd-async `getter`), and how often
+/// to poll it while subscribed; a poll period has no meaning without it.
+#[derive(Clone)]
+struct Getter<T> {
+    read: GetterFn<T>,
+    poll_period: Option<Duration>,
 }
 
 /// One registered callback and the readings queued for it.
@@ -108,6 +125,10 @@ struct Inner<T: Clone + Send + Sync + 'static> {
     dtype: Dtype,
     dtype_numpy: Option<DtypeNumpy>,
     shape: Vec<Option<u64>>,
+    getter: Option<Getter<T>>,
+    /// The put action (ophyd-async `setter`); `Ok(Some(v))` is the settled
+    /// readback.
+    setter: Option<SetterFn<T>>,
 }
 
 /// Soft (in-memory) signal backend, parameterized by value type.
@@ -146,12 +167,15 @@ where
                     timestamp: now_ts(),
                     subscribers: Vec::new(),
                     next_id: 0,
+                    poll: None,
                 }),
                 initial,
                 metadata: Mutex::default(),
                 dtype,
                 dtype_numpy: None,
                 shape: vec![],
+                getter: None,
+                setter: None,
             }),
         }
     }
@@ -166,12 +190,15 @@ where
                 timestamp: st.timestamp,
                 subscribers: Vec::new(),
                 next_id: 0,
+                poll: None,
             }),
             initial: self.inner.initial.clone(),
             metadata: Mutex::new(self.inner.metadata.lock().unwrap().clone()),
             dtype: self.inner.dtype,
             dtype_numpy: self.inner.dtype_numpy.clone(),
             shape: self.inner.shape.clone(),
+            getter: self.inner.getter.clone(),
+            setter: self.inner.setter.clone(),
         }
     }
 
@@ -208,6 +235,53 @@ where
         Self {
             inner: Arc::new(inner),
         }
+    }
+
+    /// Take the value from `getter` on every `get_value`/`get_reading`, and
+    /// every `poll_period` while anything is subscribed (ophyd-async `getter`,
+    /// `poll_period`). A failed poll keeps the last value. Polling spawns on
+    /// the Tokio runtime current at the first subscription.
+    pub fn with_getter<F, Fut>(self, getter: F, poll_period: Option<Duration>) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<T>> + Send + 'static,
+    {
+        let read: GetterFn<T> = Arc::new(move || Box::pin(getter()));
+        let inner = Inner {
+            getter: Some(Getter { read, poll_period }),
+            ..self.rebuilt()
+        };
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// Run `setter` with the put value on every put (ophyd-async `setter`).
+    /// The readback becomes the `Some` it returns; on `None`, the getter's
+    /// value if there is a getter, else the setpoint.
+    pub fn with_setter<F, Fut>(self, setter: F) -> Self
+    where
+        F: Fn(Option<T>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Option<T>>> + Send + 'static,
+    {
+        let setter: SetterFn<T> = Arc::new(move |v| Box::pin(setter(v)));
+        let inner = Inner {
+            setter: Some(setter),
+            ..self.rebuilt()
+        };
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// Store the getter's value, if there is a getter (ophyd-async
+    /// `_update_value_from_getter`).
+    async fn refresh(&self) -> Result<()> {
+        if let Some(getter) = &self.inner.getter {
+            let value = (getter.read)().await?;
+            self.store(value, false);
+        }
+        Ok(())
     }
 
     /// Read the current value synchronously, for inspect/debug paths
@@ -268,8 +342,18 @@ where
     async fn put_start(&self, value: Option<T>) -> Result<PutCompletion> {
         // `None` writes the configured initial value (ophyd-async
         // `_soft_signal_backend.py:164`).
-        let value = value.unwrap_or_else(|| self.inner.initial.clone());
-        self.store(value, true);
+        let setpoint = value.clone().unwrap_or_else(|| self.inner.initial.clone());
+        match &self.inner.setter {
+            None => self.store(setpoint, true),
+            Some(setter) => {
+                self.inner.state.lock().unwrap().setpoint = setpoint.clone();
+                match setter(value).await? {
+                    Some(readback) => self.store(readback, false),
+                    None if self.inner.getter.is_some() => self.refresh().await?,
+                    None => self.store(setpoint, false),
+                }
+            }
+        }
         Ok(Box::pin(std::future::ready(Ok(()))))
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
@@ -282,6 +366,7 @@ where
         ))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
+        self.refresh().await?;
         // The value's last-change time, captured at construction / `put` /
         // `write_now` — NOT a fresh read-time stamp. Mirrors ophyd-async
         // returning the stored `self.reading` (`_soft_signal_backend.py:172`).
@@ -297,6 +382,7 @@ where
         })
     }
     async fn get_value(&self) -> Result<T> {
+        self.refresh().await?;
         Ok(self.current_value())
     }
     async fn get_setpoint(&self) -> Result<T> {
@@ -313,6 +399,12 @@ where
                 draining: false,
             }),
         });
+        // Taken before the lock: outside a runtime this panics, and must not
+        // poison the state.
+        let poller = self.inner.getter.as_ref().and_then(|g| {
+            let period = g.poll_period?;
+            Some((tokio::runtime::Handle::current(), g.read.clone(), period))
+        });
         let id = {
             let mut st = self.inner.state.lock().unwrap();
             // A new monitor starts with the current reading, as ophyd-async
@@ -322,6 +414,12 @@ where
             let id = st.next_id;
             st.next_id += 1;
             st.subscribers.push((id, sub.clone()));
+            if st.subscribers.len() == 1 {
+                st.poll = poller.map(|(rt, read, period)| {
+                    let inner = Arc::downgrade(&self.inner);
+                    rt.spawn(poll(inner, read, period)).abort_handle()
+                });
+            }
             id
         };
         sub.drain();
@@ -330,7 +428,13 @@ where
             let removed = {
                 let mut st = inner.state.lock().unwrap();
                 let at = st.subscribers.iter().position(|(i, _)| *i == id);
-                at.map(|at| st.subscribers.remove(at).1)
+                let removed = at.map(|at| st.subscribers.remove(at).1);
+                if st.subscribers.is_empty() {
+                    if let Some(poll) = st.poll.take() {
+                        poll.abort();
+                    }
+                }
+                removed
             };
             // No store reaches it now; drop what is still queued so no
             // delivery starts after unsubscribe.
@@ -341,6 +445,23 @@ where
     }
     fn source(&self, name: &str, _read: bool) -> String {
         format!("soft://{name}")
+    }
+}
+
+/// ophyd-async `SoftSignalBackend._poll`. Holds the backend weakly, so
+/// dropping it ends the loop as well as the last unsubscribe does.
+async fn poll<T>(inner: Weak<Inner<T>>, read: GetterFn<T>, period: Duration)
+where
+    T: Clone + Send + Sync + Serialize + 'static,
+{
+    loop {
+        tokio::time::sleep(period).await;
+        let Some(inner) = inner.upgrade() else {
+            return;
+        };
+        if let Ok(value) = read().await {
+            SoftSignalBackend { inner }.store(value, false);
+        }
     }
 }
 
