@@ -37,6 +37,7 @@ struct PrepareCtx {
 struct KickoffCtx {
     collections_written: u64,
     collections_requested: u64,
+    exposure_timeout: std::time::Duration,
     // Only the kickoff that reaches the prepared end waits for idle.
     is_last_kickoff: bool,
 }
@@ -153,10 +154,8 @@ where
     /// stage, or of an implicit `TriggerInfo()` one.
     async fn trigger_one(&self) -> Result<()> {
         let prepared = self.prepared.lock().unwrap().clone();
-        match prepared {
-            None => {
-                self.prepare_for(TriggerInfo::default()).await?;
-            }
+        let ctx = match prepared {
+            None => self.prepare_for(TriggerInfo::default()).await?,
             Some(ctx) if ctx.trigger_info.number_of_events != 1 => {
                 return Err(BsrsError::Plan(format!(
                     "{}: trigger() is not supported for multiple events, the detector \
@@ -164,12 +163,47 @@ where
                     self.name, ctx.trigger_info.number_of_events
                 )));
             }
-            Some(ctx) => {
-                self.update_prepare_context(ctx.trigger_info).await;
+            Some(ctx) => self.update_prepare_context(ctx.trigger_info).await,
+        };
+        self.control.arm().await.await?;
+        self.wait_for_index(
+            ctx.collections_written,
+            ctx.trigger_info.collections_per_event.into(),
+            ctx.trigger_info.effective_exposure_timeout(),
+            true,
+        )
+        .await
+    }
+
+    /// ophyd-async `_wait_for_index`: wait until `requested` collections past
+    /// `initial` are written, each update of the index within
+    /// `exposure_timeout`, then for the hardware to go idle if asked.
+    async fn wait_for_index(
+        &self,
+        initial: u64,
+        requested: u64,
+        exposure_timeout: std::time::Duration,
+        wait_for_idle: bool,
+    ) -> Result<()> {
+        let target = initial + requested;
+        let mut rx = self.writer.observe_indices_written();
+        while *rx.borrow_and_update() < target {
+            match tokio::time::timeout(exposure_timeout, rx.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    return Err(BsrsError::State(format!(
+                        "{}: writer closed at index {} of {target}",
+                        self.name,
+                        *rx.borrow()
+                    )))
+                }
+                Err(_) => return Err(BsrsError::Timeout(exposure_timeout)),
             }
         }
-        self.control.arm().await.await?;
-        self.control.wait_for_idle().await
+        if wait_for_idle {
+            self.control.wait_for_idle().await?;
+        }
+        Ok(())
     }
 
     /// ophyd-async `StandardDetector.kickoff` up to starting the acquisition:
@@ -192,6 +226,7 @@ where
         let kickoff = KickoffCtx {
             collections_written,
             collections_requested,
+            exposure_timeout: ctx.trigger_info.effective_exposure_timeout(),
             is_last_kickoff: last_requested == last_expected,
         };
         *self.kicked_off.lock().unwrap() = Some(kickoff);
@@ -306,23 +341,18 @@ where
                 self.name
             )));
         };
-        let target = kickoff.collections_written + kickoff.collections_requested;
-        let mut rx = self.writer.observe_indices_written();
-        let fut = async {
-            while *rx.borrow_and_update() < target {
-                if rx.changed().await.is_err() {
-                    break;
-                }
-            }
-        };
-        fut.await;
-        if !kickoff.is_last_kickoff {
-            return Status::done();
-        }
-        match self.control.wait_for_idle().await {
+        let waited = self
+            .wait_for_index(
+                kickoff.collections_written,
+                kickoff.collections_requested,
+                kickoff.exposure_timeout,
+                kickoff.is_last_kickoff,
+            )
+            .await;
+        match waited {
             Ok(()) => Status::done(),
             Err(e) => Status::fail(crate::core::status::StatusError::Failed(format!(
-                "wait_for_idle: {e}"
+                "complete: {e}"
             ))),
         }
     }
@@ -857,5 +887,54 @@ mod tests {
         assert_eq!(det.events_to_kickoff(), 0);
         let err = Flyable::complete(&det).await.await.unwrap_err();
         assert!(err.to_string().contains("Kickoff not called"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn trigger_times_out_when_the_index_does_not_advance() {
+        // ophyd-async test_use_cases.py:191: each index update must arrive
+        // within exposure_timeout.
+        let (det, _tx, idles) = controlled();
+        Stageable::stage(&det).await.unwrap();
+        let info = TriggerInfo {
+            exposure_timeout: Some(Duration::from_millis(50)),
+            ..Default::default()
+        };
+        Preparable::<TriggerInfo>::prepare(&det, info)
+            .await
+            .await
+            .unwrap();
+        let err = Triggerable::trigger(&det).await.await.unwrap_err();
+        assert!(err.to_string().contains("timeout after 50ms"), "{err}");
+        assert_eq!(idles.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn trigger_waits_for_the_index_then_idle() {
+        let (det, tx, idles) = controlled();
+        Stageable::stage(&det).await.unwrap();
+        let sent = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            tx.send(1).unwrap();
+            tx
+        });
+        Triggerable::trigger(&det).await.await.unwrap();
+        assert_eq!(idles.load(Ordering::SeqCst), 1);
+        drop(sent.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn complete_fails_when_the_writer_closes_short() {
+        let (det, tx, idles) = controlled();
+        Stageable::stage(&det).await.unwrap();
+        prepare_events(&det, 3).await;
+        Flyable::kickoff(&det).await.await.unwrap();
+        tx.send(1).unwrap();
+        drop(tx);
+        let err = Flyable::complete(&det).await.await.unwrap_err();
+        assert!(
+            err.to_string().contains("writer closed at index 1 of 3"),
+            "{err}"
+        );
+        assert_eq!(idles.load(Ordering::SeqCst), 0);
     }
 }

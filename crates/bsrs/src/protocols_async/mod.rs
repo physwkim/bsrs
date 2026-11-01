@@ -292,9 +292,9 @@ pub struct TriggerInfo {
     /// Collections published per emitted bluesky event — lets a fast detector
     /// zip several collections against a slower detector's single collection.
     pub collections_per_event: u32,
-    /// Maximum time to wait for one exposure (guards `complete()` loops).
-    /// `None` = derive from `livetime + deadtime` plus an implementation
-    /// default.
+    /// Maximum time to wait for each update of the written index. `None` =
+    /// `livetime + deadtime` + 10 s, see
+    /// [`effective_exposure_timeout`](Self::effective_exposure_timeout).
     pub exposure_timeout: Option<Duration>,
 }
 
@@ -312,7 +312,21 @@ impl Default for TriggerInfo {
     }
 }
 
+/// ophyd-async `DEFAULT_TIMEOUT`, the margin of the default
+/// `TriggerInfo.exposure_timeout`.
+const EXPOSURE_TIMEOUT_MARGIN: Duration = Duration::from_secs(10);
+
 impl TriggerInfo {
+    /// ophyd-async `TriggerInfo.exposure_timeout`: `exposure_timeout`, or
+    /// `livetime + deadtime` + 10 s.
+    pub fn effective_exposure_timeout(&self) -> Duration {
+        self.exposure_timeout.unwrap_or_else(|| {
+            self.livetime.unwrap_or_default()
+                + self.deadtime.unwrap_or_default()
+                + EXPOSURE_TIMEOUT_MARGIN
+        })
+    }
+
     /// Total collections taken: `number_of_events * collections_per_event`.
     /// Fly-scan kickoff watches the write index up to this count.
     pub fn number_of_collections(&self) -> u32 {
@@ -467,6 +481,29 @@ mod tests {
         assert_eq!(info.trigger, DetectorTrigger::Internal);
         assert_eq!(info.number_of_collections(), 1);
         assert_eq!(info.number_of_exposures(), 1);
+    }
+
+    #[test]
+    fn trigger_info_exposure_timeout_defaults_to_exposure_plus_ten_seconds() {
+        // ophyd-async _detector.py:101 default_factory.
+        let info = TriggerInfo {
+            livetime: Some(Duration::from_millis(1500)),
+            deadtime: Some(Duration::from_millis(500)),
+            ..Default::default()
+        };
+        assert_eq!(info.effective_exposure_timeout(), Duration::from_secs(12));
+        assert_eq!(
+            TriggerInfo::default().effective_exposure_timeout(),
+            Duration::from_secs(10)
+        );
+        let given = TriggerInfo {
+            exposure_timeout: Some(Duration::from_millis(100)),
+            ..info
+        };
+        assert_eq!(
+            given.effective_exposure_timeout(),
+            Duration::from_millis(100)
+        );
     }
 
     // FlyMotorInfo boundaries: velocity is signed by move direction, and the

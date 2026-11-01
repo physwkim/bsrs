@@ -511,6 +511,41 @@ async fn trigger_after_a_multi_event_prepare_fails() {
     );
 }
 
+/// ophyd-async `test_use_cases.py:191`: a trigger whose frame never reaches
+/// the file times out after `exposure_timeout` instead of reporting a frame
+/// that is not there.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+async fn trigger_fails_when_the_writer_does_not_advance() {
+    boot();
+    let _cam = CAM_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let det = hdf_det("det", dir.path(), "stall").await;
+    Stageable::stage(&det).await.expect("stage");
+    trigger(&det).await.unwrap();
+    assert_eq!(index(&det).await, 1);
+    // The plugin stops consuming frames; the cam still acquires.
+    file_plugin(HDF)
+        .await
+        .plugin
+        .set_enabled(false)
+        .await
+        .unwrap();
+    let info = TriggerInfo {
+        exposure_timeout: Some(Duration::from_millis(500)),
+        ..TriggerInfo::default()
+    };
+    finish(Preparable::prepare(&det, info).await, "prepare")
+        .await
+        .unwrap();
+    let triggered = trigger(&det).await;
+    let n = index(&det).await;
+    Stageable::unstage(&det).await.expect("unstage");
+    assert_eq!(n, 1);
+    let err = triggered.expect_err("trigger succeeded though the writer index stayed at 1");
+    assert!(err.contains("timeout after 500ms"), "{err}");
+}
+
 /// ophyd-async `test_standard_detector.py:574` `test_stage_resets_state`: a
 /// fresh stage forgets the previous scan's prepare, so a bare kickoff takes
 /// one frame.
