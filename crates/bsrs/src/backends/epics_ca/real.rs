@@ -46,9 +46,11 @@ fn put_timeout_from(secs: std::result::Result<f64, estdlib::EnvDoubleError>) -> 
         .unwrap_or(Duration::from_secs(30))
 }
 
+/// `DefaultHasher::new` hashes alike on every call; a fresh `RandomState`
+/// is seeded anew each time, scattering one PV over the shards.
 fn shard_for(pv: &str) -> usize {
-    use std::hash::{BuildHasher, Hasher};
-    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    use std::hash::Hasher;
+    let mut h = std::hash::DefaultHasher::new();
     h.write(pv.as_bytes());
     (h.finish() as usize) % SHARDS
 }
@@ -1491,6 +1493,13 @@ mod tests {
         assert!(enum_label_to_index("Bogus", &choices).is_err());
         // A numeric index outside a known choice list is rejected.
         assert!(enum_label_to_index("9", &choices).is_err());
+    }
+
+    /// Every backend on a PV must find the one registry slot its channel is in.
+    #[test]
+    fn shard_for_is_the_same_on_every_call() {
+        let first = shard_for("XF:31IDA-BI{Dev:1}E-I");
+        assert!((0..100).all(|_| shard_for("XF:31IDA-BI{Dev:1}E-I") == first));
     }
 
     #[test]
