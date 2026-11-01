@@ -54,6 +54,8 @@ use tokio::sync::watch;
 const PUT_TIMEOUT: Duration = Duration::from_secs(10);
 const WARMUP_IDLE_POLL: Duration = Duration::from_millis(100);
 const WARMUP_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+const ACQUIRE_TIME_RBV: &str = "AcquireTime_RBV";
+const ACQUIRE_PERIOD_RBV: &str = "AcquirePeriod_RBV";
 
 /// `DetectorState_RBV` value for the idle state. mbbi ordering from
 /// `ADBase.template`: 0=Idle, 1=Acquire, 2=Readout, 3=Correct, 4=Saving,
@@ -189,6 +191,10 @@ pub struct AreaDetectorCam {
     /// `AcquirePeriod` (ao) — seconds from one exposure start to the next
     /// (exposure + dead time).
     pub acquire_period: Arc<EpicsCaBackend<f64>>,
+    /// `AcquireTime_RBV` (ai) — the exposure time the driver applied.
+    pub acquire_time_rbv: Arc<EpicsCaBackend<f64>>,
+    /// `AcquirePeriod_RBV` (ai) — the period the driver applied.
+    pub acquire_period_rbv: Arc<EpicsCaBackend<f64>>,
     /// `ArrayCounter_RBV` (longin) — total frames produced.
     pub array_counter_rbv: Arc<EpicsCaBackend<i64>>,
     /// `DetectorState_RBV` (mbbi).
@@ -321,6 +327,11 @@ impl AreaDetectorCam {
             acquire_rbv: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "Acquire_RBV"))),
             acquire_time: Arc::new(EpicsCaBackend::<f64>::new(join(&prefix, "AcquireTime"))),
             acquire_period: Arc::new(EpicsCaBackend::<f64>::new(join(&prefix, "AcquirePeriod"))),
+            acquire_time_rbv: Arc::new(EpicsCaBackend::<f64>::new(join(&prefix, ACQUIRE_TIME_RBV))),
+            acquire_period_rbv: Arc::new(EpicsCaBackend::<f64>::new(join(
+                &prefix,
+                ACQUIRE_PERIOD_RBV,
+            ))),
             array_counter_rbv: Arc::new(EpicsCaBackend::<i64>::new(join(
                 &prefix,
                 "ArrayCounter_RBV",
@@ -341,13 +352,15 @@ impl AreaDetectorCam {
 
     /// Connect every channel in parallel.
     pub async fn connect(&self, timeout: Duration) -> Result<()> {
-        let (a, b, c, d, e, f, g, h, i, j) = tokio::join!(
+        let (a, b, c, d, e, f, g, h, i, j, k, l) = tokio::join!(
             SignalBackend::<i64>::connect(self.image_mode.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.num_images.as_ref(), timeout),
             SignalBackend::<bool>::connect(self.acquire.as_ref(), timeout),
             SignalBackend::<bool>::connect(self.acquire_rbv.as_ref(), timeout),
             SignalBackend::<f64>::connect(self.acquire_time.as_ref(), timeout),
             SignalBackend::<f64>::connect(self.acquire_period.as_ref(), timeout),
+            SignalBackend::<f64>::connect(self.acquire_time_rbv.as_ref(), timeout),
+            SignalBackend::<f64>::connect(self.acquire_period_rbv.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.array_counter_rbv.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.detector_state_rbv.as_ref(), timeout),
             SignalBackend::<String>::connect(self.nd_attributes_file.as_ref(), timeout),
@@ -363,7 +376,27 @@ impl AreaDetectorCam {
         h?;
         i?;
         j?;
+        k?;
+        l?;
         Ok(())
+    }
+
+    /// The descriptor `configuration` signals, as ophyd-async `AreaDetector`
+    /// registers them (`driver.acquire_time`, `driver.acquire_period`): read
+    /// from their `_RBV` PVs, which are also the `DataKey` source.
+    fn config_signals(&self) -> [(&'static str, &EpicsCaBackend<f64>, String); 2] {
+        [
+            (
+                "acquire_time",
+                self.acquire_time_rbv.as_ref(),
+                join(&self.prefix, ACQUIRE_TIME_RBV),
+            ),
+            (
+                "acquire_period",
+                self.acquire_period_rbv.as_ref(),
+                join(&self.prefix, ACQUIRE_PERIOD_RBV),
+            ),
+        ]
     }
 
     /// Poll `DetectorState_RBV` until it reports a good terminal state —
@@ -2452,30 +2485,26 @@ impl DetectorControl for AreaDetectorCam {
         )
         .await
     }
-    // Slow-changing acquisition parameters for the owning detector's
-    // descriptor `configuration` — ophyd-async `AreaDetector` registers
-    // `driver.acquire_time` / `driver.acquire_period` as CONFIG_SIGNALs.
     async fn read_configuration(&self, name: &str) -> Result<HashMap<String, ReadingValue>> {
-        let (time, period) = tokio::join!(
-            SignalBackend::<f64>::get_reading(self.acquire_time.as_ref()),
-            SignalBackend::<f64>::get_reading(self.acquire_period.as_ref()),
-        );
-        Ok(HashMap::from([
-            (format!("{name}_acquire_time"), time?),
-            (format!("{name}_acquire_period"), period?),
-        ]))
+        futures::future::try_join_all(self.config_signals().map(|(key, sig, _)| async move {
+            Ok::<_, BsrsError>((
+                format!("{name}_{key}"),
+                SignalBackend::<f64>::get_reading(sig).await?,
+            ))
+        }))
+        .await
+        .map(HashMap::from_iter)
     }
     async fn describe_configuration(&self, name: &str) -> Result<HashMap<String, DataKey>> {
-        let time_source = SignalBackend::<f64>::source(self.acquire_time.as_ref(), name, true);
-        let period_source = SignalBackend::<f64>::source(self.acquire_period.as_ref(), name, true);
-        let (time, period) = tokio::join!(
-            SignalBackend::<f64>::get_datakey(self.acquire_time.as_ref(), &time_source),
-            SignalBackend::<f64>::get_datakey(self.acquire_period.as_ref(), &period_source),
-        );
-        Ok(HashMap::from([
-            (format!("{name}_acquire_time"), time?),
-            (format!("{name}_acquire_period"), period?),
-        ]))
+        // `get_datakey` takes the bare PV and adds the `ca://` scheme itself.
+        futures::future::try_join_all(self.config_signals().map(|(key, sig, pv)| async move {
+            Ok::<_, BsrsError>((
+                format!("{name}_{key}"),
+                SignalBackend::<f64>::get_datakey(sig, &pv).await?,
+            ))
+        }))
+        .await
+        .map(HashMap::from_iter)
     }
 }
 

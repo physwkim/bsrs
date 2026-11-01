@@ -11,7 +11,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use bsrs::backends::epics_ca::EpicsCaBackend;
-use bsrs::core::msg::{ReadableObj, StageableObj};
+use bsrs::core::msg::{ConfigurableObj, ReadableObj, StageableObj};
 use bsrs::core::status::Status;
 use bsrs::devices::TriggerInfo;
 use bsrs::event_model::{DataKey, Dtype, DtypeNumpy, StreamDatum, StreamResource};
@@ -439,6 +439,57 @@ async fn kickoff_resolves_once_the_detector_is_acquiring() {
     );
     assert!(acquiring, "the 1 s acquisition ended within 500 ms");
     completed.unwrap();
+}
+
+/// ophyd-async `test_standard_detector.py:625`
+/// `test_config_signals_in_describe_configuration` and
+/// `test_adsim_system.py:209`/`:217`: the exposure time and period are the
+/// configuration, read from and described by their `_RBV` PVs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+async fn configuration_describes_the_cam_exposure_pvs() {
+    boot();
+    let _cam = CAM_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let det = hdf_det("cfg", dir.path(), "cfg").await;
+    put::<f64>(&format!("{CAM}AcquireTime"), 0.05).await;
+    put::<f64>(&format!("{CAM}AcquirePeriod"), 0.07).await;
+    // The readbacks update from the driver's callback, after the put returns.
+    let deadline = Instant::now() + TIMEOUT;
+    while get::<f64>(&format!("{CAM}AcquireTime_RBV")).await != 0.05
+        || get::<f64>(&format!("{CAM}AcquirePeriod_RBV")).await != 0.07
+    {
+        assert!(
+            Instant::now() < deadline,
+            "AcquireTime/AcquirePeriod_RBV did not follow"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let described = ConfigurableObj::describe_configuration_dyn(&det)
+        .await
+        .expect("describe_configuration");
+    let read = ConfigurableObj::read_configuration_dyn(&det)
+        .await
+        .expect("read_configuration");
+    let names: HashSet<&str> = described.keys().map(String::as_str).collect();
+    assert_eq!(
+        names,
+        HashSet::from(["cfg_acquire_time", "cfg_acquire_period"])
+    );
+    let read_names: HashSet<&str> = read.keys().map(String::as_str).collect();
+    assert_eq!(read_names, names);
+    for (key, pv, value) in [
+        ("cfg_acquire_time", "AcquireTime", 0.05),
+        ("cfg_acquire_period", "AcquirePeriod", 0.07),
+    ] {
+        let k = &described[key];
+        assert_eq!(k.source, format!("ca://{CAM}{pv}_RBV"), "{key}");
+        assert_eq!(k.dtype, Dtype::Number, "{key}");
+        assert_eq!(k.shape, Vec::<Option<u64>>::new(), "{key}");
+        assert_eq!(numpy(k), Some("<f8"), "{key}");
+        assert_eq!(read[key].value, json!(value), "{key}");
+    }
 }
 
 /// ophyd-async `test_data_logic.py:36` `test_hdf_writer_file_not_found` and
