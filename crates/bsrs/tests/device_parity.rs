@@ -1,0 +1,448 @@
+//! Device tree, naming, Kind, hints, readable/configurable, staging, protocol
+//! and connect behaviour checked against ophyd / ophyd-async device tests.
+//! IOC-backed connect tests live with the EPICS suites.
+
+use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use bsrs::backends::soft::{SoftDetector, SoftMotor, SoftSignalBackend};
+use bsrs::core::msg::ReadableObj;
+use bsrs::core::{
+    BsrsError, ConfigureArgs, DataKey, Dtype, Kind, ReadingValue, Result, Status, StatusError,
+    StatusOutcome, SubToken,
+};
+use bsrs::devices::{
+    BackendFromPv, Device, DeviceVector, Signal, SignalConfig, SignalR, SignalRW, SignalX,
+    StandardReadable, StandardReadableFormat,
+};
+use bsrs::protocols_async::{
+    AsyncConfigurable, AsyncMovable, AsyncReadable, AsyncSubscribable, Locatable, PutCompletion,
+    ReadingValueCallback, SignalBackend, Stageable, Triggerable,
+};
+use bsrs::protocols_sync::{Configurable, Movable, Readable, StageableSync};
+
+type Soft = SoftSignalBackend<f64>;
+
+fn soft_signal(name: &str, kind: Kind, v: f64) -> (Arc<SignalR<f64, Soft>>, Arc<Soft>) {
+    let backend = Arc::new(Soft::new(v, Dtype::Number));
+    let sig = Arc::new(Signal::new(
+        backend.clone(),
+        SignalConfig {
+            source: name.into(),
+            kind,
+            name: name.into(),
+        },
+    ));
+    (sig, backend)
+}
+
+fn sig(name: &str, kind: Kind) -> Arc<dyn ReadableObj> {
+    soft_signal(name, kind, 0.0).0
+}
+
+fn keys<V>(m: &HashMap<String, V>) -> BTreeSet<String> {
+    m.keys().cloned().collect()
+}
+
+fn set(names: &[&str]) -> BTreeSet<String> {
+    names.iter().map(|s| s.to_string()).collect()
+}
+
+// ophyd test_kind::test_standalone_signals, test_hints::test_device_hints
+// (signal part), test_bluesky_protocols::test_hinted.
+#[tokio::test]
+async fn signal_reads_under_its_own_name_and_hints_only_when_hinted() {
+    for kind in [Kind::Normal, Kind::Config, Kind::Hinted, Kind::Omitted] {
+        let name = format!("sig_{kind:?}");
+        let (s, _) = soft_signal(&name, kind, 1.0);
+        assert_eq!(s.kind(), kind);
+        assert_eq!(keys(&s.read().await.unwrap()), set(&[&name]));
+        assert_eq!(keys(&s.describe().await.unwrap()), set(&[&name]));
+        let expected = (kind == Kind::Hinted).then(|| vec![name.clone()]);
+        assert_eq!(ReadableObj::hint_fields(&*s), expected, "{kind:?}");
+    }
+}
+
+// ophyd test_kind::test_nested_devices routing: normal → event, config →
+// configuration, hinted → event + hints, omitted → nowhere; components
+// default to normal.
+#[test]
+fn kind_predicates_route_like_ophyd() {
+    let table = [
+        (Kind::Normal, true, false, false),
+        (Kind::Config, false, true, false),
+        (Kind::Hinted, true, false, true),
+        (Kind::Omitted, false, false, false),
+    ];
+    for (kind, event, config, hinted) in table {
+        assert_eq!(kind.in_event_data(), event, "{kind:?} event");
+        assert_eq!(kind.in_configuration(), config, "{kind:?} config");
+        assert_eq!(kind.is_hinted(), hinted, "{kind:?} hinted");
+    }
+    assert_eq!(Kind::default(), Kind::Normal);
+}
+
+// ophyd-async test_readable::test_standard_readable_hints; ophyd
+// test_hints::test_device_hints, test_motor_bundle_hints.
+#[test]
+fn standard_readable_hints_concatenate_in_registration_order() {
+    assert_eq!(
+        ReadableObj::hint_fields(&StandardReadable::new("empty")),
+        None
+    );
+
+    let mut first = StandardReadable::new("first");
+    first.add_readables(
+        sig("abc", Kind::Normal),
+        StandardReadableFormat::HintedSignal,
+    );
+    let mut second = StandardReadable::new("second");
+    second.add_readables(sig("def", Kind::Hinted), StandardReadableFormat::Child);
+    second.add_readables(
+        sig("ghi", Kind::Normal),
+        StandardReadableFormat::HintedSignal,
+    );
+
+    let mut sr = StandardReadable::new("sr");
+    sr.add_readables(Arc::new(first), StandardReadableFormat::Child);
+    sr.add_readables(Arc::new(second), StandardReadableFormat::Child);
+    sr.add_readables(sig("jkl", Kind::Hinted), StandardReadableFormat::Child);
+    sr.add_readables(sig("quiet", Kind::Normal), StandardReadableFormat::Child);
+    assert_eq!(
+        ReadableObj::hint_fields(&sr),
+        Some(vec![
+            "abc".to_string(),
+            "def".to_string(),
+            "ghi".to_string(),
+            "jkl".to_string()
+        ])
+    );
+}
+
+// ophyd-async test_readable add_readables_adds_to_expected_attrs and
+// test_standard_readable_{uncached,hinted_uncached}_signal; ophyd
+// test_device::test_attrs (describe keys track read keys, and likewise for
+// configuration).
+#[tokio::test]
+async fn standard_readable_uncached_formats_route_to_read() {
+    let mut sr = StandardReadable::new("sr");
+    sr.add_readables(
+        sig("u", Kind::Normal),
+        StandardReadableFormat::UncachedSignal,
+    );
+    sr.add_readables(
+        sig("hu", Kind::Normal),
+        StandardReadableFormat::HintedUncachedSignal,
+    );
+    sr.add_readables(sig("c", Kind::Config), StandardReadableFormat::ConfigSignal);
+
+    let read = keys(&sr.read().await.unwrap());
+    assert_eq!(read, set(&["u", "hu"]));
+    assert_eq!(keys(&sr.describe().await.unwrap()), read);
+    let config = keys(&sr.read_configuration().await.unwrap());
+    assert_eq!(config, set(&["c"]));
+    assert_eq!(keys(&sr.describe_configuration().await.unwrap()), config);
+    assert_eq!(ReadableObj::hint_fields(&sr), Some(vec!["hu".to_string()]));
+}
+
+// ophyd-async test_readable add_readables_adds_to_expected_attrs (stage
+// buckets); ophyd test_device::test_device_state (stage, configure({}),
+// unstage on a device with no staged children).
+#[tokio::test]
+async fn standard_readable_stage_holds_registered_monitors_until_unstage() {
+    let (a, a_backend) = soft_signal("a", Kind::Normal, 1.0);
+    let (b, b_backend) = soft_signal("b", Kind::Normal, 2.0);
+    let mut inner = StandardReadable::new("inner");
+    inner.add_readables(b.clone(), StandardReadableFormat::Child);
+    inner.add_stageable(b);
+    let inner = Arc::new(inner);
+    let mut outer = StandardReadable::new("outer");
+    outer.add_readables(a.clone(), StandardReadableFormat::Child);
+    outer.add_stageable(a);
+    outer.add_readables(inner.clone(), StandardReadableFormat::Child);
+    outer.add_stageable(inner);
+
+    assert_eq!(
+        (a_backend.subscriber_count(), b_backend.subscriber_count()),
+        (0, 0)
+    );
+    Stageable::stage(&outer).await.unwrap();
+    assert_eq!(
+        (a_backend.subscriber_count(), b_backend.subscriber_count()),
+        (1, 1)
+    );
+    Stageable::unstage(&outer).await.unwrap();
+    assert_eq!(
+        (a_backend.subscriber_count(), b_backend.subscriber_count()),
+        (0, 0)
+    );
+
+    let empty = StandardReadable::new("empty");
+    Stageable::stage(&empty).await.unwrap();
+    empty.configure(ConfigureArgs::default()).await.unwrap();
+    Stageable::unstage(&empty).await.unwrap();
+}
+
+const CONNECT_DELAY: Duration = Duration::from_millis(100);
+
+/// Connects after `CONNECT_DELAY`; a PV containing `FAIL` refuses at once.
+struct ProbeBackend {
+    pv: String,
+    connected: AtomicBool,
+}
+
+impl BackendFromPv for ProbeBackend {
+    fn from_pv(pv: &str) -> Self {
+        Self {
+            pv: pv.to_string(),
+            connected: AtomicBool::new(false),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl SignalBackend<f64> for ProbeBackend {
+    async fn connect(&self, _timeout: Duration) -> Result<()> {
+        if self.pv.contains("FAIL") {
+            return Err(BsrsError::Backend(format!("cannot connect {}", self.pv)));
+        }
+        tokio::time::sleep(CONNECT_DELAY).await;
+        self.connected.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn put_start(&self, _value: Option<f64>) -> Result<PutCompletion> {
+        Err(BsrsError::Backend("probe does not put".into()))
+    }
+    async fn get_datakey(&self, _source: &str) -> Result<DataKey> {
+        Err(BsrsError::Backend("probe has no datakey".into()))
+    }
+    async fn get_reading(&self) -> Result<ReadingValue> {
+        Err(BsrsError::Backend("probe has no reading".into()))
+    }
+    async fn get_value(&self) -> Result<f64> {
+        if self.connected.load(Ordering::SeqCst) {
+            Ok(0.0)
+        } else {
+            Err(BsrsError::Backend(format!("{} not connected", self.pv)))
+        }
+    }
+    async fn get_setpoint(&self) -> Result<f64> {
+        self.get_value().await
+    }
+    fn set_callback(&self, _cb: Option<ReadingValueCallback<f64>>) -> SubToken {
+        SubToken::noop()
+    }
+    fn source(&self, name: &str, _read: bool) -> String {
+        format!("probe://{name}")
+    }
+}
+
+#[derive(Device)]
+struct ProbeAxis {
+    name: String,
+    #[signal(rw, "{prefix}.VAL")]
+    setpoint: SignalRW<f64, ProbeBackend>,
+    #[signal(ro, "{prefix}.RBV")]
+    readback: SignalR<f64, ProbeBackend>,
+}
+
+#[derive(Device)]
+struct ProbeStage {
+    name: String,
+    #[device("{prefix}:x")]
+    x: Arc<ProbeAxis>,
+    #[device("{prefix}:y")]
+    y: Arc<ProbeAxis>,
+}
+
+#[derive(Device)]
+struct MixedStage {
+    name: String,
+    #[device("{prefix}:ok")]
+    ok: Arc<ProbeAxis>,
+    #[device("{prefix}:FAIL")]
+    bad: Arc<ProbeAxis>,
+}
+
+async fn assert_axis_connected(axis: &ProbeAxis) {
+    axis.setpoint.get().await.unwrap();
+    axis.readback.get().await.unwrap();
+}
+
+// ophyd-async test_device::test_wait_for_connection,
+// test_children_of_device_have_set_names_and_get_connected (connect part),
+// test_many_individual_device_connects_not_slow.
+#[tokio::test(start_paused = true)]
+async fn connect_all_connects_every_child_concurrently() {
+    let stage = ProbeStage::new("P");
+    let t0 = tokio::time::Instant::now();
+    stage.connect_all(Duration::from_secs(1)).await.unwrap();
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed >= CONNECT_DELAY && elapsed < 2 * CONNECT_DELAY,
+        "{elapsed:?}"
+    );
+    assert_axis_connected(&stage.x).await;
+    assert_axis_connected(&stage.y).await;
+
+    let stages: DeviceVector<Arc<ProbeStage>> = (1..=50)
+        .map(|i| (i, ProbeStage::new(&format!("P{i}"))))
+        .collect();
+    let t0 = tokio::time::Instant::now();
+    stages.connect_all(Duration::from_secs(1)).await.unwrap();
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed >= CONNECT_DELAY && elapsed < 2 * CONNECT_DELAY,
+        "{elapsed:?}"
+    );
+    for s in stages.values() {
+        assert_axis_connected(&s.x).await;
+        assert_axis_connected(&s.y).await;
+    }
+}
+
+// ophyd-async test_device::test_wait_for_connection_propagates_error: one
+// failing child fails the device while its siblings still finish connecting.
+#[tokio::test(start_paused = true)]
+async fn connect_all_propagates_child_failure_after_attempting_all() {
+    let stage = MixedStage::new("M");
+    let err = stage.connect_all(Duration::from_secs(1)).await.unwrap_err();
+    assert!(err.to_string().contains("M:FAIL"), "{err}");
+    assert_axis_connected(&stage.ok).await;
+    assert!(stage.bad.readback.get().await.is_err());
+
+    let healthy = ProbeStage::new("H");
+    let mut vec: DeviceVector<Arc<dyn Device>> = DeviceVector::new();
+    vec.insert(1, healthy.clone());
+    vec.insert(2, MixedStage::new("N"));
+    let err = vec.connect_all(Duration::from_secs(1)).await.unwrap_err();
+    assert!(err.to_string().contains("N:FAIL"), "{err}");
+    assert_axis_connected(&healthy.x).await;
+    assert_axis_connected(&healthy.y).await;
+}
+
+fn async_readable<T: AsyncReadable + ?Sized>() {}
+fn async_configurable<T: AsyncConfigurable + ?Sized>() {}
+fn movable_and_locatable<T: AsyncMovable<f64> + Locatable<f64> + Movable<f64> + ?Sized>() {}
+fn stageable<T: Stageable + StageableSync + ?Sized>() {}
+fn subscribable<T: AsyncSubscribable<f64> + ?Sized>() {}
+fn triggerable<T: Triggerable + ?Sized>() {}
+fn sync_readable<T: Readable + Configurable + ?Sized>() {}
+
+// ophyd test_bluesky_protocols (Readable/Movable/Stageable/Subscribable/
+// Configurable conformance); ophyd-async test_protocol::test_readable.
+#[test]
+fn protocol_surfaces_compile() {
+    async_readable::<SoftMotor>();
+    movable_and_locatable::<SoftMotor>();
+    async_readable::<SoftDetector>();
+    async_readable::<SignalR<f64, Soft>>();
+    subscribable::<SignalR<f64, Soft>>();
+    stageable::<SignalR<f64, Soft>>();
+    triggerable::<SignalX<(), SoftSignalBackend<()>>>();
+    async_readable::<StandardReadable>();
+    async_configurable::<StandardReadable>();
+    stageable::<StandardReadable>();
+    sync_readable::<StandardReadable>();
+}
+
+// ophyd test_device::test_device_state and test_status_wait through the
+// blocking facade: set().wait(), read, stage, configure, unstage.
+#[test]
+fn sync_facade_drives_soft_motor_and_standard_readable() {
+    let motor = SoftMotor::new("m", Some(0.0));
+    motor
+        .set_blocking(2.5)
+        .wait(Some(Duration::from_secs(1)))
+        .unwrap();
+    assert_eq!(
+        motor.read_blocking().unwrap()["m"].value,
+        serde_json::json!(2.5)
+    );
+
+    let (x, x_backend) = soft_signal("x", Kind::Normal, 1.0);
+    let mut sr = StandardReadable::new("dev");
+    sr.add_readables(x.clone(), StandardReadableFormat::Child);
+    sr.add_stageable(x);
+    sr.add_readables(sig("c", Kind::Config), StandardReadableFormat::ConfigSignal);
+
+    sr.stage_blocking().unwrap();
+    assert_eq!(x_backend.subscriber_count(), 1);
+    assert_eq!(keys(&sr.read_blocking().unwrap()), set(&["x"]));
+    assert_eq!(keys(&sr.describe_blocking().unwrap()), set(&["x"]));
+    assert_eq!(
+        keys(&sr.read_configuration_blocking().unwrap()),
+        set(&["c"])
+    );
+    assert_eq!(
+        keys(&sr.describe_configuration_blocking().unwrap()),
+        set(&["c"])
+    );
+    sr.configure_blocking(ConfigureArgs::default()).unwrap();
+    sr.unstage_blocking().unwrap();
+    assert_eq!(x_backend.subscriber_count(), 0);
+}
+
+// ophyd test_ophydobj::test_unsubscribe, test_self_removing_cb.
+#[test]
+fn signal_subscription_token_unsubscribes() {
+    let (s, backend) = soft_signal("s", Kind::Normal, 0.0);
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let h = hits.clone();
+    let token = s.subscribe(Box::new(move |_, _, _| {
+        h.fetch_add(1, Ordering::SeqCst);
+    }));
+    backend.write_now(1.0);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    drop(token);
+    backend.write_now(2.0);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.subscriber_count(), 0);
+
+    let own: Arc<Mutex<Option<SubToken>>> = Arc::new(Mutex::new(None));
+    let (remover_hits, sitter_hits) =
+        (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let (r, slot) = (remover_hits.clone(), own.clone());
+    *own.lock().unwrap() = Some(s.subscribe(Box::new(move |_, _, _| {
+        r.fetch_add(1, Ordering::SeqCst);
+        drop(slot.lock().unwrap().take());
+    })));
+    let st = sitter_hits.clone();
+    let _sitter = s.subscribe(Box::new(move |_, _, _| {
+        st.fetch_add(1, Ordering::SeqCst);
+    }));
+    backend.write_now(3.0);
+    backend.write_now(4.0);
+    assert_eq!(remover_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(sitter_hits.load(Ordering::SeqCst), 2);
+    assert_eq!(backend.subscriber_count(), 1);
+}
+
+// ophyd test_ophydobj::test_status_basic, test_status_callback,
+// test_status_wait, test_status_wait_timeout.
+#[test]
+fn status_wait_reports_finish_and_timeout() {
+    let done = Status::done();
+    assert!(done.done_state() && done.success());
+    done.wait(Some(Duration::from_secs(1))).unwrap();
+
+    let (pending, setter) = Status::new();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let h = hits.clone();
+    pending.add_callback(move |outcome| {
+        assert!(matches!(outcome, StatusOutcome::Success));
+        h.fetch_add(1, Ordering::SeqCst);
+    });
+    assert!(matches!(
+        pending.wait(Some(Duration::from_millis(20))),
+        Err(StatusError::Timeout)
+    ));
+    assert!(!pending.done_state());
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    setter.success();
+    pending.wait(Some(Duration::from_secs(1))).unwrap();
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
