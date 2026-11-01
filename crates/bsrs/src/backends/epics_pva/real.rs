@@ -7,13 +7,13 @@ use crate::event_model::{make_datakey, DataKey, Dtype, Limits, LimitsRange, Sign
 use crate::protocols_async::{PutCompletion, ReadingValueCallback, SignalBackend};
 use async_trait::async_trait;
 use epics_pva_rs::client::PvaClient;
-use epics_pva_rs::client_native::ops_v2::PutLeaf;
+use epics_pva_rs::client_native::ops_v2::{effective_typed_put_path, PutLeaf};
 use epics_pva_rs::pv_request::{PvRequestBuilder, PvRequestExpr};
-use epics_pva_rs::pvdata::TypedScalarArray;
+use epics_pva_rs::pvdata::{FieldDesc, ScalarType, TypedScalarArray};
 use epics_pva_rs::{PvField, PvaError, ScalarValue};
 use futures::FutureExt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn now_ts() -> f64 {
@@ -38,6 +38,9 @@ pub fn pva_context() -> Arc<PvaClient> {
 pub struct EpicsPvaBackend<T: Clone + Send + Sync + 'static> {
     pv: String,
     client: Arc<PvaClient>,
+    /// ophyd-async's `initial_values`: what `connect` read, which
+    /// `put(None)` writes.
+    initial: Mutex<Option<T>>,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -47,8 +50,39 @@ impl<T: Clone + Send + Sync + 'static> EpicsPvaBackend<T> {
         Self {
             pv: pv.into(),
             client: pva_context(),
+            initial: Mutex::new(None),
             _marker: std::marker::PhantomData,
         }
+    }
+}
+
+impl<T: Clone + Send + Sync + 'static> EpicsPvaBackend<T>
+where
+    Self: SignalBackend<T>,
+{
+    /// `connect`: wait for the channel and read the value `put(None)`
+    /// writes, both within `timeout`, as ophyd-async's connect-time `pvget`.
+    async fn connect_reading(&self, timeout: Duration) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        pva_connect(&self.client, &self.pv, timeout).await?;
+        let v = tokio::time::timeout_at(deadline, self.get_value())
+            .await
+            .map_err(|_| {
+                BsrsError::Backend(format!("pva connect {}: no value in {timeout:?}", self.pv))
+            })??;
+        *self.initial.lock().unwrap() = Some(v);
+        Ok(())
+    }
+
+    /// `value`, or for `None` the value `connect` read, read now if no
+    /// `connect` has.
+    async fn or_initial(&self, value: Option<T>) -> Result<T> {
+        if let Some(v) = value.or_else(|| self.initial.lock().unwrap().clone()) {
+            return Ok(v);
+        }
+        let v = self.get_value().await?;
+        *self.initial.lock().unwrap() = Some(v.clone());
+        Ok(v)
     }
 }
 
@@ -56,6 +90,23 @@ impl<T: Clone + Send + Sync + 'static> crate::devices::BackendFromPv for EpicsPv
     fn from_pv(pv: &str) -> Self {
         Self::new(pv)
     }
+}
+
+/// Wait up to `timeout` for `pv` to connect. `pvconnect` is bounded by the
+/// client's `OP_TIMEOUT` instead; this watcher searches until the caller's
+/// deadline, and dropping its handle stops the watch, not the channel.
+async fn pva_connect(client: &PvaClient, pv: &str, timeout: Duration) -> Result<()> {
+    let connected = Arc::new(tokio::sync::Notify::new());
+    let on_connect = connected.clone();
+    let _watch = client
+        .connect(pv)
+        .on_connect(move || on_connect.notify_one())
+        .exec()
+        .await
+        .map_err(|e| BsrsError::Backend(format!("pva connect {pv}: {e}")))?;
+    tokio::time::timeout(timeout, connected.notified())
+        .await
+        .map_err(|_| BsrsError::Backend(format!("pva connect {pv}: not connected in {timeout:?}")))
 }
 
 /// PVA put of `f` with `record[block=true]`: QSRV answers it once the record
@@ -71,21 +122,42 @@ async fn put_block(client: &PvaClient, pv: &str, f: PvField) -> Result<PutComple
         .field("value")
         .record("block", true)
         .build();
-    let begin = client.pvput_begin_unbounded(pv, Some(&req), false);
-    let op = tokio::time::timeout(OP_TIMEOUT, begin)
+    // A string may name an enum choice, which only the readback lists.
+    let fetch_present = matches!(f, PvField::Scalar(ScalarValue::String(_)));
+    let begin = client.pvput_begin_unbounded(pv, Some(&req), fetch_present);
+    let mut op = tokio::time::timeout(OP_TIMEOUT, begin)
         .await
         .unwrap_or(Err(PvaError::Timeout))
         .map_err(put_err)?;
-    // A PV that is no structure has no `value`: its root is the leaf.
-    let path = match op.introspection().bit_for_path("value") {
-        Some(_) => "value",
-        None => "",
-    };
+    let present = op.take_present().map(|(v, _)| v);
+    let (path, leaf) = put_leaf(op.introspection(), present.as_ref(), f);
     let sent = op
-        .send_fields_typed(&[(path.to_string(), PutLeaf::Typed(f))])
+        .send_fields_typed(&[(path, PutLeaf::Typed(leaf))])
         .await
         .map_err(put_err)?;
     Ok(async move { sent.wait().await.map_err(put_err) }.boxed())
+}
+
+/// Where a put of `f` lands in a PV of shape `intro`, and what it writes
+/// there, as p4p assigns into the remote type (`pvxs_value.cpp:319-352`).
+/// The path is pvxs `linkBuildPut`'s, which ends at an `enum_t`'s `index`;
+/// a string naming one of the readback's `choices` writes its place, and
+/// anything else is left to the leaf's own coercion.
+fn put_leaf(intro: &FieldDesc, present: Option<&PvField>, f: PvField) -> (String, PvField) {
+    let path = effective_typed_put_path(intro, "");
+    let choice = match (&f, present) {
+        (PvField::Scalar(ScalarValue::String(s)), Some(PvField::Structure(p))) => {
+            sub_fields(&p.fields, "value")
+                .and_then(|v| field(v, "choices"))
+                .and_then(pv_string_array)
+                .and_then(|c| c.iter().position(|c| *c == s.as_str_lossy()))
+        }
+        _ => None,
+    };
+    match choice {
+        Some(i) => (path, PvField::Scalar(ScalarValue::Int(i as i32))),
+        None => (path, f),
+    }
 }
 
 // Coerce one scalar to f64. The single source of truth for numeric→f64
@@ -167,9 +239,17 @@ fn pv_field_to_i64(p: &PvField) -> Option<i64> {
     }
 }
 
+// An `enum_t` value reads as its index, as ophyd-async's
+// `PvaEnumBoolConverter` (`bool(value["value"]["index"])`, _p4p.py:183-188).
 fn pv_field_to_bool(p: &PvField) -> Option<bool> {
     match p {
         PvField::Scalar(ScalarValue::Boolean(b)) => Some(*b),
+        PvField::Structure(s) => match field(&s.fields, "value")? {
+            PvField::Structure(e) => field(&e.fields, "index")
+                .and_then(pv_field_to_i64)
+                .map(|i| i != 0),
+            v => pv_field_to_bool(v),
+        },
         _ => pv_field_to_i64(p).map(|i| i != 0),
     }
 }
@@ -346,50 +426,114 @@ fn pv_limits(top: &[(String, PvField)]) -> Limits {
     limits
 }
 
-// Build SignalMetadata (units / precision / limits) from a full NTScalar GET,
-// mirroring ophyd-async `_metadata_from_value` (epics/core/_p4p.py:68-94):
-// `display.units` when numeric and not str (`want_units`), `display.precision`
-// only for floats (`want_precision`), and the limit ranges for any numeric.
-fn pv_field_to_metadata(p: &PvField, want_units: bool, want_precision: bool) -> SignalMetadata {
+/// The type a backend reads a PV as: ophyd-async's `datatype`.
+#[derive(Clone, Copy, PartialEq)]
+enum Datatype {
+    Float,
+    Int,
+    Bool,
+    Str,
+}
+
+// The element type of a `value` leaf: ophyd-async's specifier.
+fn scalar_type(v: &PvField) -> Option<ScalarType> {
+    match v {
+        PvField::Scalar(x) => Some(x.scalar_type()),
+        PvField::ScalarArrayTyped(a) => Some(a.scalar_type()),
+        PvField::ScalarArray(items) => items.first().map(ScalarValue::scalar_type),
+        _ => None,
+    }
+}
+
+// Build SignalMetadata from a full GET as ophyd-async `_metadata_from_value`
+// (epics/core/_p4p.py:69-95): units and limits of a numeric value, units not
+// when read as str, precision of a float value not read as int, and choices
+// from `display` or the `enum_t` value when read as str.
+fn pv_field_to_metadata(p: &PvField, datatype: Datatype) -> SignalMetadata {
+    use ScalarType::*;
     let mut meta = SignalMetadata::default();
     let PvField::Structure(s) = p else {
         return meta;
     };
     let top = &s.fields;
-    if let Some(display) = sub_fields(top, "display") {
-        if want_units {
+    let spec = field(top, "value").and_then(scalar_type);
+    let float = matches!(spec, Some(Float | Double));
+    let number = float
+        || matches!(
+            spec,
+            Some(Byte | Short | Int | Long | UByte | UShort | UInt | ULong)
+        );
+    let display = sub_fields(top, "display");
+    if let Some(display) = display {
+        if number && datatype != Datatype::Str {
             if let Some(PvField::Scalar(ScalarValue::String(u))) = field(display, "units") {
-                if !u.is_empty() {
-                    meta.units = Some(u.as_str_lossy().into_owned());
-                }
+                meta.units = Some(u.as_str_lossy().into_owned());
             }
         }
-        if want_precision {
+        if float && datatype != Datatype::Int {
             if let Some(prec) = field(display, "precision").and_then(pv_field_to_i64) {
                 meta.precision = Some(prec);
             }
         }
     }
     let limits = pv_limits(top);
-    if limits != Limits::default() {
+    if number && limits != Limits::default() {
         meta.limits = Some(limits);
+    }
+    if datatype == Datatype::Str {
+        meta.choices = display
+            .and_then(|d| field(d, "choices"))
+            .or_else(|| sub_fields(top, "value").and_then(|v| field(v, "choices")))
+            .and_then(pv_string_array);
     }
     meta
 }
 
+/// A datatype ophyd-async's `make_datakey` gives shape `[]`, with its
+/// `dtype` and `dtype_numpy` there (`core/_signal_backend.py:128-195`).
+trait Primitive {
+    const DTYPE: Dtype;
+    const DTYPE_NUMPY: &'static str;
+}
+
+impl Primitive for f64 {
+    const DTYPE: Dtype = Dtype::Number;
+    const DTYPE_NUMPY: &'static str = "<f8";
+}
+
+impl Primitive for i64 {
+    const DTYPE: Dtype = Dtype::Integer;
+    const DTYPE_NUMPY: &'static str = "<i8";
+}
+
+impl Primitive for bool {
+    const DTYPE: Dtype = Dtype::Boolean;
+    const DTYPE_NUMPY: &'static str = "|b1";
+}
+
+/// Enum labels included: ophyd-async describes both as `S40`.
+impl Primitive for String {
+    const DTYPE: Dtype = Dtype::String;
+    const DTYPE_NUMPY: &'static str = "|S40";
+}
+
+fn primitive_datakey<T: Primitive>(source: String, meta: SignalMetadata) -> DataKey {
+    make_datakey(source, T::DTYPE, vec![], Some(T::DTYPE_NUMPY.into()), meta)
+}
+
+/// An `Array1D[np.float64]`'s datakey: shaped as the array read.
+fn array_datakey(source: String, value: &[f64], meta: SignalMetadata) -> DataKey {
+    let shape = vec![Some(value.len() as u64)];
+    make_datakey(source, Dtype::Array, shape, Some("<f8".into()), meta)
+}
+
 #[async_trait]
 impl SignalBackend<f64> for EpicsPvaBackend<f64> {
-    async fn connect(&self, _timeout: Duration) -> Result<()> {
-        // PvaClient connects lazily; the search system handles re-tries.
-        // pvconnect is the explicit handshake.
-        self.client
-            .pvconnect(&self.pv)
-            .await
-            .map(|_| ())
-            .map_err(|e| BsrsError::Backend(format!("pva connect {}: {e}", self.pv)))
+    async fn connect(&self, timeout: Duration) -> Result<()> {
+        self.connect_reading(timeout).await
     }
     async fn put_start(&self, value: Option<f64>) -> Result<PutCompletion> {
-        let f = PvField::Scalar(ScalarValue::Double(value.unwrap_or_default()));
+        let f = PvField::Scalar(ScalarValue::Double(self.or_initial(value).await?));
         put_block(&self.client, &self.pv, f).await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
@@ -400,12 +544,9 @@ impl SignalBackend<f64> for EpicsPvaBackend<f64> {
             .pvget(&self.pv)
             .await
             .map_err(|e| BsrsError::Backend(format!("pva get: {e}")))?;
-        Ok(make_datakey(
+        Ok(primitive_datakey::<f64>(
             format!("pva://{source}"),
-            Dtype::Number,
-            vec![],
-            Some("<f8".into()),
-            pv_field_to_metadata(&f, true, true),
+            pv_field_to_metadata(&f, Datatype::Float),
         ))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
@@ -490,38 +631,26 @@ impl SignalBackend<f64> for EpicsPvaBackend<f64> {
 
 #[async_trait]
 impl SignalBackend<Vec<f64>> for EpicsPvaBackend<Vec<f64>> {
-    async fn connect(&self, _timeout: Duration) -> Result<()> {
-        self.client
-            .pvconnect(&self.pv)
-            .await
-            .map(|_| ())
-            .map_err(|e| BsrsError::Backend(format!("pva connect {}: {e}", self.pv)))
+    async fn connect(&self, timeout: Duration) -> Result<()> {
+        self.connect_reading(timeout).await
     }
     async fn put_start(&self, value: Option<Vec<f64>>) -> Result<PutCompletion> {
         // Written as a typed Double array; an EPICS waveform record coerces to
         // its FTVL element type server-side.
-        let f =
-            PvField::ScalarArrayTyped(TypedScalarArray::Double(value.unwrap_or_default().into()));
+        let value = self.or_initial(value).await?;
+        let f = PvField::ScalarArrayTyped(TypedScalarArray::Double(value.into()));
         put_block(&self.client, &self.pv, f).await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
-        // The descriptor shape needs the element count; pvget once (describe is
-        // rare). Reports the waveform's current length.
         let f = self
             .client
             .pvget(&self.pv)
             .await
             .map_err(|e| BsrsError::Backend(format!("pva get: {e}")))?;
-        let len = pv_field_to_vec_f64(&f)
-            .ok_or_else(|| BsrsError::Backend(format!("pva: not a numeric array: {f:?}")))?
-            .len();
-        Ok(make_datakey(
-            format!("pva://{source}"),
-            Dtype::Number,
-            vec![Some(len as u64)],
-            Some("<f8".into()),
-            pv_field_to_metadata(&f, true, true),
-        ))
+        let v = pv_field_to_vec_f64(&f)
+            .ok_or_else(|| BsrsError::Backend(format!("pva: not a numeric array: {f:?}")))?;
+        let meta = pv_field_to_metadata(&f, Datatype::Float);
+        Ok(array_datakey(format!("pva://{source}"), &v, meta))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
         let f = self
@@ -597,24 +726,22 @@ impl SignalBackend<Vec<f64>> for EpicsPvaBackend<Vec<f64>> {
 
 #[async_trait]
 impl SignalBackend<String> for EpicsPvaBackend<String> {
-    async fn connect(&self, _timeout: Duration) -> Result<()> {
-        self.client
-            .pvconnect(&self.pv)
-            .await
-            .map(|_| ())
-            .map_err(|e| BsrsError::Backend(format!("pva connect {}: {e}", self.pv)))
+    async fn connect(&self, timeout: Duration) -> Result<()> {
+        self.connect_reading(timeout).await
     }
     async fn put_start(&self, value: Option<String>) -> Result<PutCompletion> {
-        let f = PvField::Scalar(ScalarValue::String(value.unwrap_or_default().into()));
+        let f = PvField::Scalar(ScalarValue::String(self.or_initial(value).await?.into()));
         put_block(&self.client, &self.pv, f).await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
-        Ok(make_datakey(
+        let f = self
+            .client
+            .pvget(&self.pv)
+            .await
+            .map_err(|e| BsrsError::Backend(format!("pva get: {e}")))?;
+        Ok(primitive_datakey::<String>(
             format!("pva://{source}"),
-            Dtype::String,
-            vec![],
-            Some("|S".into()),
-            SignalMetadata::default(),
+            pv_field_to_metadata(&f, Datatype::Str),
         ))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
@@ -687,31 +814,22 @@ impl SignalBackend<String> for EpicsPvaBackend<String> {
 
 #[async_trait]
 impl SignalBackend<i64> for EpicsPvaBackend<i64> {
-    async fn connect(&self, _timeout: Duration) -> Result<()> {
-        self.client
-            .pvconnect(&self.pv)
-            .await
-            .map(|_| ())
-            .map_err(|e| BsrsError::Backend(format!("pva connect {}: {e}", self.pv)))
+    async fn connect(&self, timeout: Duration) -> Result<()> {
+        self.connect_reading(timeout).await
     }
     async fn put_start(&self, value: Option<i64>) -> Result<PutCompletion> {
-        let f = PvField::Scalar(ScalarValue::Long(value.unwrap_or_default()));
+        let f = PvField::Scalar(ScalarValue::Long(self.or_initial(value).await?));
         put_block(&self.client, &self.pv, f).await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
-        // pvget the full NTScalar for units + limits. Integers carry no
-        // precision (ophyd-async restricts precision to floats), so want_precision=false.
         let f = self
             .client
             .pvget(&self.pv)
             .await
             .map_err(|e| BsrsError::Backend(format!("pva get: {e}")))?;
-        Ok(make_datakey(
+        Ok(primitive_datakey::<i64>(
             format!("pva://{source}"),
-            Dtype::Integer,
-            vec![],
-            Some("<i8".into()),
-            pv_field_to_metadata(&f, true, false),
+            pv_field_to_metadata(&f, Datatype::Int),
         ))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
@@ -784,24 +902,22 @@ impl SignalBackend<i64> for EpicsPvaBackend<i64> {
 
 #[async_trait]
 impl SignalBackend<bool> for EpicsPvaBackend<bool> {
-    async fn connect(&self, _timeout: Duration) -> Result<()> {
-        self.client
-            .pvconnect(&self.pv)
-            .await
-            .map(|_| ())
-            .map_err(|e| BsrsError::Backend(format!("pva connect {}: {e}", self.pv)))
+    async fn connect(&self, timeout: Duration) -> Result<()> {
+        self.connect_reading(timeout).await
     }
     async fn put_start(&self, value: Option<bool>) -> Result<PutCompletion> {
-        let f = PvField::Scalar(ScalarValue::Boolean(value.unwrap_or_default()));
+        let f = PvField::Scalar(ScalarValue::Boolean(self.or_initial(value).await?));
         put_block(&self.client, &self.pv, f).await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
-        Ok(make_datakey(
+        let f = self
+            .client
+            .pvget(&self.pv)
+            .await
+            .map_err(|e| BsrsError::Backend(format!("pva get: {e}")))?;
+        Ok(primitive_datakey::<bool>(
             format!("pva://{source}"),
-            Dtype::Boolean,
-            vec![],
-            Some("|b1".into()),
-            SignalMetadata::default(),
+            pv_field_to_metadata(&f, Datatype::Bool),
         ))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
@@ -921,6 +1037,63 @@ mod tests {
         let mut nt = PvStructure::new("epics:nt/NTEnum:1.0");
         nt.fields.push(("value".into(), PvField::Structure(ev)));
         PvField::Structure(nt)
+    }
+
+    fn nt(value: FieldDesc) -> FieldDesc {
+        FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![("value".to_string(), value)].into(),
+        }
+    }
+
+    fn enum_t() -> FieldDesc {
+        FieldDesc::Structure {
+            struct_id: "enum_t".into(),
+            fields: vec![
+                ("index".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+                (
+                    "choices".to_string(),
+                    FieldDesc::ScalarArray(ScalarType::String),
+                ),
+            ]
+            .into(),
+        }
+    }
+
+    fn string(s: &str) -> PvField {
+        PvField::Scalar(ScalarValue::String(s.into()))
+    }
+
+    fn at(path: &str, f: PvField) -> (String, PvField) {
+        (path.to_string(), f)
+    }
+
+    /// A put into an `enum_t` sets its index: a label by its place in the
+    /// readback's choices, anything else as the value the index coerces.
+    #[test]
+    fn put_leaf_assigns_an_enum_through_its_index() {
+        let present = ntenum(0, &["Single", "Multiple", "Continuous"], true);
+        let to = |f| put_leaf(&nt(enum_t()), Some(&present), f);
+        assert_eq!(
+            to(string("Continuous")),
+            at("value.index", PvField::Scalar(ScalarValue::Int(2)))
+        );
+        assert_eq!(to(string("1")), at("value.index", string("1")));
+        let on = PvField::Scalar(ScalarValue::Boolean(true));
+        assert_eq!(to(on.clone()), at("value.index", on));
+        assert_eq!(
+            put_leaf(&nt(enum_t()), None, string("Multiple")),
+            at("value.index", string("Multiple"))
+        );
+    }
+
+    #[test]
+    fn put_leaf_assigns_value_or_a_bare_root() {
+        let x = PvField::Scalar(ScalarValue::Double(1.5));
+        let scalar = nt(FieldDesc::Scalar(ScalarType::Double));
+        assert_eq!(put_leaf(&scalar, None, x.clone()), at("value", x.clone()));
+        let bare = FieldDesc::Scalar(ScalarType::Double);
+        assert_eq!(put_leaf(&bare, None, x.clone()), at("", x));
     }
 
     #[test]
@@ -1164,7 +1337,7 @@ mod tests {
 
     #[test]
     fn metadata_extracts_units_precision_and_four_limit_ranges() {
-        let meta = pv_field_to_metadata(&ntscalar_with_meta(), true, true);
+        let meta = pv_field_to_metadata(&ntscalar_with_meta(), Datatype::Float);
         assert_eq!(meta.units.as_deref(), Some("mm"));
         assert_eq!(meta.precision, Some(3));
         let limits = meta.limits.expect("limits present");
@@ -1201,9 +1374,69 @@ mod tests {
     #[test]
     fn metadata_for_int_omits_precision_keeps_units() {
         // ophyd-async restricts precision to floats; integer datakeys keep units.
-        let meta = pv_field_to_metadata(&ntscalar_with_meta(), true, false);
+        let meta = pv_field_to_metadata(&ntscalar_with_meta(), Datatype::Int);
         assert_eq!(meta.units.as_deref(), Some("mm"));
         assert_eq!(meta.precision, None);
+    }
+
+    #[test]
+    fn bool_reads_an_enum_index_and_a_scalar() {
+        assert_eq!(
+            pv_field_to_bool(&ntenum(1, &["No", "Yes"], true)),
+            Some(true)
+        );
+        assert_eq!(
+            pv_field_to_bool(&ntenum(0, &["No", "Yes"], false)),
+            Some(false)
+        );
+        assert_eq!(pv_field_to_bool(&ntscalar_with_ts(2.0, 0, 0)), Some(true));
+    }
+
+    /// Read as str, an enum reports its choices and nothing numeric.
+    #[test]
+    fn metadata_for_str_is_the_enum_choices() {
+        let meta = pv_field_to_metadata(&ntenum(1, &["Off", "On"], true), Datatype::Str);
+        let choices = Some(vec!["Off".to_string(), "On".to_string()]);
+        assert_eq!(
+            meta,
+            SignalMetadata {
+                choices,
+                ..Default::default()
+            }
+        );
+    }
+
+    /// A bool read off an integer keeps its units and limits, but an integer
+    /// has no precision; a float read as str keeps all but its units.
+    #[test]
+    fn metadata_follows_the_value_type() {
+        let PvField::Structure(mut nt) = ntscalar_with_meta() else {
+            unreachable!()
+        };
+        nt.fields[0].1 = PvField::Scalar(ScalarValue::Int(1));
+        let meta = pv_field_to_metadata(&PvField::Structure(nt), Datatype::Bool);
+        assert_eq!(meta.units.as_deref(), Some("mm"));
+        assert_eq!(meta.precision, None);
+        assert!(meta.limits.is_some());
+        let meta = pv_field_to_metadata(&ntscalar_with_meta(), Datatype::Str);
+        assert_eq!((meta.units, meta.precision), (None, Some(3)));
+        assert!(meta.limits.is_some());
+    }
+
+    /// An empty EGU is a unit like any other, as ophyd-async keeps it.
+    #[test]
+    fn metadata_keeps_empty_units() {
+        let PvField::Structure(mut nt) = ntscalar_with_meta() else {
+            unreachable!()
+        };
+        let Some((_, PvField::Structure(display))) =
+            nt.fields.iter_mut().find(|(n, _)| n == "display")
+        else {
+            unreachable!()
+        };
+        display.fields[0].1 = PvField::Scalar(ScalarValue::String("".into()));
+        let meta = pv_field_to_metadata(&PvField::Structure(nt), Datatype::Int);
+        assert_eq!(meta.units.as_deref(), Some(""));
     }
 
     #[test]
@@ -1222,13 +1455,13 @@ mod tests {
             .push(("value".into(), PvField::Scalar(ScalarValue::Double(1.0))));
         nt.fields
             .push(("display".into(), PvField::Structure(display)));
-        let meta = pv_field_to_metadata(&PvField::Structure(nt), true, true);
+        let meta = pv_field_to_metadata(&PvField::Structure(nt), Datatype::Float);
         assert_eq!(meta.limits, None);
 
         // A bare (non-Normative) scalar has no metadata substructures.
         let bare = PvField::Scalar(ScalarValue::Double(2.5));
         assert_eq!(
-            pv_field_to_metadata(&bare, true, true),
+            pv_field_to_metadata(&bare, Datatype::Float),
             SignalMetadata::default()
         );
     }

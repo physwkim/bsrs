@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
-use epics_ca_rs::client::{CaChannel, ChannelInfo, MonitorHandle};
+use epics_ca_rs::client::{CaChannel, ChannelInfo, MonitorHandle, ReqCount};
 use epics_ca_rs::{CaResult, DbFieldType, EpicsValue};
 use tokio::sync::oneshot;
 
@@ -24,7 +24,7 @@ pub(super) type PutResult = std::result::Result<(), String>;
 
 type Completion = Pin<Box<dyn Future<Output = CaResult<()>> + Send>>;
 
-/// A connected channel. Reads go straight through; puts only through
+/// A PV's channel. Reads go straight through; puts only through
 /// [`Self::put_callback`] and [`Self::put_no_callback`].
 pub(super) struct SharedChannel {
     ca: CaChannel,
@@ -54,15 +54,27 @@ impl SharedChannel {
         }
     }
 
+    /// Resolves once the channel is connected, at once if it is. Any number
+    /// of callers may wait, each with its own `timeout`; the channel keeps
+    /// searching after one gives up.
+    pub(super) async fn wait_connected(&self, timeout: Duration) -> CaResult<()> {
+        self.ca.wait_connected(timeout).await
+    }
+
     pub(super) async fn info(&self) -> CaResult<ChannelInfo> {
         self.ca.info().await
     }
 
+    /// Every read asks for count 0, the record's current element count, as
+    /// aioca's `ca_array_get_callback` and the monitor do; a one-element
+    /// answer decodes as the scalar `EpicsValue`.
     pub(super) async fn get_with_timeout(
         &self,
         timeout: Duration,
     ) -> CaResult<(DbFieldType, EpicsValue)> {
-        self.ca.get_with_timeout(timeout).await
+        self.ca
+            .get_with_timeout_count(timeout, ReqCount::Autosize(0))
+            .await
     }
 
     pub(super) async fn get_with_metadata(
@@ -70,7 +82,9 @@ impl SharedChannel {
         class: DbrClass,
         timeout: Duration,
     ) -> CaResult<Snapshot> {
-        self.ca.get_with_metadata(class, timeout).await
+        self.ca
+            .get_with_metadata_count(class, ReqCount::Autosize(0), timeout)
+            .await
     }
 
     pub(super) async fn subscribe(&self) -> CaResult<MonitorHandle> {
