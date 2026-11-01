@@ -125,28 +125,47 @@ where
     }
 }
 
-/// Poll a bool readback until it equals `want`, bounded by `timeout`. The
-/// wait half of ophyd-async's `set_and_wait_for_value(...,
-/// wait_for_set_completion=False)` / `stop_busy_record` for busy records,
-/// whose put-callback tracks the *operation*, not the value change.
-async fn wait_for_bool(
-    ch: &EpicsCaBackend<bool>,
+/// Run `set`, then wait until the bool readback `rbv` has been `want`,
+/// bounded by [`PUT_TIMEOUT`]; returns what `set` returned. Port of
+/// ophyd-async `set_and_wait_for_other_value(..., wait_for_set_completion=
+/// False)`, used for busy records whose put-callback tracks the operation,
+/// not the value. The readback's monitor has delivered its current value
+/// before `set` runs, so a transition back out of `want` (a 1 ms
+/// acquisition's Acquire_RBV pulse) is still seen.
+async fn set_and_wait_for_bool<R>(
+    rbv: &EpicsCaBackend<bool>,
     want: bool,
-    timeout: Duration,
+    set: impl std::future::Future<Output = Result<R>>,
     what: &str,
-) -> Result<()> {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if SignalBackend::<bool>::get_value(ch).await? == want {
-            return Ok(());
-        }
-        if std::time::Instant::now() >= deadline {
+) -> Result<R> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let _sub = SignalBackend::<bool>::set_callback(
+        rbv,
+        Some(Box::new(move |v: &bool, _, _| {
+            let _ = tx.send(*v);
+        })),
+    );
+    let deadline = tokio::time::Instant::now() + PUT_TIMEOUT;
+    let mut last = match tokio::time::timeout_at(deadline, rx.recv()).await {
+        Ok(Some(v)) => v,
+        _ => {
             return Err(BsrsError::Backend(format!(
-                "{what}: readback did not reach {want} within {timeout:?}"
-            )));
+                "{what}: no initial value within {PUT_TIMEOUT:?}, is it connected?"
+            )))
         }
-        tokio::time::sleep(WARMUP_IDLE_POLL).await;
+    };
+    let out = set.await?;
+    while last != want {
+        last = match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(v)) => v,
+            _ => {
+                return Err(BsrsError::Backend(format!(
+                    "{what}: readback did not reach {want} within {PUT_TIMEOUT:?}"
+                )))
+            }
+        };
     }
+    Ok(out)
 }
 
 /// Cam-side handle: `ImageMode`/`NumImages`/`Acquire`/`AcquireTime`
@@ -752,11 +771,10 @@ impl NdFile {
     /// `Capture_RBV=1` (ophyd-async `set_and_wait_for_value(capture, True,
     /// wait_for_set_completion=False)`).
     pub async fn start_capture(&self) -> Result<()> {
-        self.capture.put_nowait(true).await?;
-        wait_for_bool(
+        set_and_wait_for_bool(
             self.capture_rbv.as_ref(),
             true,
-            PUT_TIMEOUT,
+            self.capture.put_nowait(true),
             "NdFile::start_capture: Capture_RBV",
         )
         .await
@@ -766,11 +784,10 @@ impl NdFile {
     /// record: fire-and-forget the put, wait for `Capture_RBV=0`
     /// (ophyd-async `stop_busy_record`).
     pub async fn stop_capture(&self) -> Result<()> {
-        self.capture.put_nowait(false).await?;
-        wait_for_bool(
+        set_and_wait_for_bool(
             self.capture_rbv.as_ref(),
             false,
-            PUT_TIMEOUT,
+            self.capture.put_nowait(false),
             "NdFile::stop_capture: Capture_RBV",
         )
         .await
@@ -2394,7 +2411,14 @@ impl DetectorControl for AreaDetectorCam {
         // disarm's Acquire=0 cannot overtake it on the wire.
         let (status, setter) = Status::new();
         let prefix = self.prefix.clone();
-        match SignalBackend::<bool>::put_start(self.acquire.as_ref(), Some(true)).await {
+        match set_and_wait_for_bool(
+            self.acquire_rbv.as_ref(),
+            true,
+            SignalBackend::<bool>::put_start(self.acquire.as_ref(), Some(true)),
+            "arm: Acquire_RBV",
+        )
+        .await
+        {
             Ok(done) => {
                 tokio::spawn(async move {
                     match done.await {
@@ -2405,22 +2429,7 @@ impl DetectorControl for AreaDetectorCam {
                     }
                 });
             }
-            Err(e) => {
-                setter.fail(StatusError::Failed(format!("{prefix}arm: Acquire: {e}")));
-                return status;
-            }
-        }
-        if let Err(e) = wait_for_bool(
-            self.acquire_rbv.as_ref(),
-            true,
-            PUT_TIMEOUT,
-            "arm: Acquire_RBV",
-        )
-        .await
-        {
-            let (failed, setter) = Status::new();
-            setter.fail(StatusError::Failed(format!("{}{e}", self.prefix)));
-            return failed;
+            Err(e) => setter.fail(StatusError::Failed(format!("{prefix}{e}"))),
         }
         status
     }
@@ -2431,11 +2440,10 @@ impl DetectorControl for AreaDetectorCam {
     async fn disarm(&self) -> Result<()> {
         // stop_busy_record: a put-callback for Acquire=0 can deadlock on a
         // busy record, so fire-and-forget then wait for the readback.
-        self.acquire.put_nowait(false).await?;
-        wait_for_bool(
+        set_and_wait_for_bool(
             self.acquire_rbv.as_ref(),
             false,
-            PUT_TIMEOUT,
+            self.acquire.put_nowait(false),
             "disarm: Acquire_RBV",
         )
         .await
