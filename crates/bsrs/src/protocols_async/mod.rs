@@ -32,18 +32,29 @@ use tokio::sync::watch;
 /// signals, or a PVA monitor whose projection omits the `alarm` field).
 pub type ReadingValueCallback<T> = Box<dyn Fn(&T, f64, Option<i32>) + Send + Sync>;
 
+/// Completion of a put already sent by [`SignalBackend::put_start`].
+pub type PutCompletion = futures::future::BoxFuture<'static, Result<()>>;
+
 /// Sealed: backend for one signal. Direct port of
 /// `ophyd_async/core/_signal_backend.py:16-59`.
 #[async_trait]
 pub trait SignalBackend<T: Clone + Send + Sync + 'static>: Send + Sync {
     /// Connect to the underlying transport.
     async fn connect(&self, timeout: Duration) -> Result<()>;
+    /// Send a put and return its completion. The request is issued when
+    /// this resolves, so puts started one after another reach the server
+    /// in that order however their completions are awaited; a caller that
+    /// spawns the whole put instead lets two puts race to the wire. The
+    /// completion carries no deadline; the caller that awaits it owns one.
+    async fn put_start(&self, value: Option<T>) -> Result<PutCompletion>;
     /// Put a value to the signal, awaiting completion. `None` writes the
     /// backend's default value (used by trigger-style `SignalX` puts).
     /// Mirrors `ophyd_async/core/_signal_backend.py:82` `put(value: T | None)`:
     /// waiting-for-completion is implicit, and any timeout lives on the
     /// `Signal` layer (`SignalW::set` / `SignalX::trigger`), not here.
-    async fn put(&self, value: Option<T>) -> Result<()>;
+    async fn put(&self, value: Option<T>) -> Result<()> {
+        self.put_start(value).await?.await
+    }
     /// Describe the signal as a `DataKey`.
     async fn get_datakey(&self, source: &str) -> Result<DataKey>;
     /// Read current value as a `Reading` (JSON-erased).

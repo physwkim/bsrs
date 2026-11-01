@@ -4,7 +4,7 @@ use crate::core::error::{BsrsError, Result};
 use crate::core::reading::ReadingValue;
 use crate::core::status::SubToken;
 use crate::event_model::DataKey;
-use crate::protocols_async::{ReadingValueCallback, SignalBackend};
+use crate::protocols_async::{PutCompletion, ReadingValueCallback, SignalBackend};
 use async_trait::async_trait;
 use serde::Serialize;
 use std::time::Duration;
@@ -38,7 +38,7 @@ impl<T: Clone + Send + Sync + Serialize + 'static> SignalBackend<T> for EpicsPva
     async fn connect(&self, _timeout: Duration) -> Result<()> {
         Err(BsrsError::Backend(DISABLED.into()))
     }
-    async fn put(&self, _value: Option<T>) -> Result<()> {
+    async fn put_start(&self, _value: Option<T>) -> Result<PutCompletion> {
         Err(BsrsError::Backend(DISABLED.into()))
     }
     async fn get_datakey(&self, _source: &str) -> Result<DataKey> {

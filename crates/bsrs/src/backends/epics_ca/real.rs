@@ -10,16 +10,17 @@
 //!   whose Drop aborts the task; dropping the underlying `MonitorHandle` then
 //!   unsubscribes on the wire (rule **K2**).
 
+use super::channel::SharedChannel;
 use crate::core::error::{BsrsError, Result};
 use crate::core::reading::ReadingValue;
 use crate::core::status::SubToken;
 use crate::event_model::{make_datakey, DataKey, Dtype, Limits, LimitsRange, SignalMetadata};
-use crate::protocols_async::{ReadingValueCallback, SignalBackend};
+use crate::protocols_async::{PutCompletion, ReadingValueCallback, SignalBackend};
 use async_trait::async_trait;
 use epics_base_rs::server::snapshot::{ControlInfo, DbrClass, DisplayInfo};
 use epics_base_rs::types::WallTime;
-use epics_ca_rs::client::{CaChannel, CaClient};
-use epics_ca_rs::{DbFieldType, EpicsValue, PvString};
+use epics_ca_rs::client::CaClient;
+use epics_ca_rs::{estdlib, CaError, DbFieldType, EpicsValue, PvString};
 use std::array;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -28,9 +29,22 @@ use tokio::sync::Notify;
 
 const SHARDS: usize = 64;
 
-/// Bound on each CA read and put-callback: the 30 s epics-ca-rs applied
-/// inside `get`, `get_with_metadata` and `put` before 0.33 made it explicit.
+/// Bound on each CA read: the 30 s epics-ca-rs applied inside `get` and
+/// `get_with_metadata` before 0.33 made it explicit.
 const CA_IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bound on `put`'s wait for its completion: `EPICS_CA_PUT_TIMEOUT` seconds,
+/// 30 s when unset or unparseable, resolved once. epics-ca-rs read this
+/// inside `put` until 0.33 left the deadline to the caller.
+fn ca_put_timeout() -> Duration {
+    static RESOLVED: OnceLock<Duration> = OnceLock::new();
+    *RESOLVED.get_or_init(|| put_timeout_from(estdlib::env_double("EPICS_CA_PUT_TIMEOUT")))
+}
+
+fn put_timeout_from(secs: std::result::Result<f64, estdlib::EnvDoubleError>) -> Duration {
+    secs.map(estdlib::duration_from_secs)
+        .unwrap_or(Duration::from_secs(30))
+}
 
 fn shard_for(pv: &str) -> usize {
     use std::hash::{BuildHasher, Hasher};
@@ -50,7 +64,7 @@ fn ts_to_f64(t: WallTime) -> f64 {
 /// Process-wide CA context.
 pub struct CaContext {
     client: Arc<CaClient>,
-    shards: [Mutex<HashMap<String, Arc<CaChannel>>>; SHARDS],
+    shards: [Mutex<HashMap<String, Arc<SharedChannel>>>; SHARDS],
     pending: [Mutex<HashMap<String, Arc<Notify>>>; SHARDS],
 }
 
@@ -63,7 +77,7 @@ impl CaContext {
         }
     }
 
-    async fn get_or_open(&self, pv: &str, timeout: Duration) -> Result<Arc<CaChannel>> {
+    async fn get_or_open(&self, pv: &str, timeout: Duration) -> Result<Arc<SharedChannel>> {
         let s = shard_for(pv);
         // Fast path
         if let Some(ch) = self.shards[s].lock().unwrap().get(pv).cloned() {
@@ -97,7 +111,7 @@ impl CaContext {
         let res: epics_ca_rs::CaResult<()> = ch.wait_connected(timeout).await;
 
         // Commit and notify waiters either way.
-        let arc = Arc::new(ch);
+        let arc = Arc::new(SharedChannel::new(ch));
         let mut p = self.pending[s].lock().unwrap();
         let n = p.remove(pv);
         if res.is_ok() {
@@ -166,7 +180,7 @@ pub enum CaStringKind {
 pub struct EpicsCaBackend<T: Clone + Send + Sync + 'static> {
     pv: String,
     ctx: Arc<CaContext>,
-    channel: tokio::sync::OnceCell<Arc<CaChannel>>,
+    channel: tokio::sync::OnceCell<Arc<SharedChannel>>,
     /// Consulted only by `SignalBackend<String>`; ignored for other `T`.
     string_kind: CaStringKind,
     _marker: std::marker::PhantomData<T>,
@@ -203,7 +217,7 @@ impl<T: Clone + Send + Sync + 'static> crate::devices::BackendFromPv for EpicsCa
 }
 
 impl<T: Clone + Send + Sync + 'static> EpicsCaBackend<T> {
-    async fn ensure_channel(&self, timeout: Duration) -> Result<Arc<CaChannel>> {
+    async fn ensure_channel(&self, timeout: Duration) -> Result<Arc<SharedChannel>> {
         self.channel
             .get_or_try_init(|| self.ctx.get_or_open(&self.pv, timeout))
             .await
@@ -213,11 +227,38 @@ impl<T: Clone + Send + Sync + 'static> EpicsCaBackend<T> {
 
 /// Look up the channel's `native_type` (cheap — `info()` returns
 /// already-cached snapshot state).
-async fn channel_native_type(ch: &CaChannel) -> Result<DbFieldType> {
+async fn channel_native_type(ch: &SharedChannel) -> Result<DbFieldType> {
     ch.info()
         .await
         .map(|i| i.native_type)
         .map_err(|e| BsrsError::Backend(format!("ca info: {e}")))
+}
+
+/// [`SharedChannel::put_callback`] of `v`: the request is queued on the
+/// circuit, in call order, when this returns. The completion has no deadline
+/// of its own: a busy record's callback lasts as long as its operation, so
+/// whoever awaits it bounds it.
+fn put_callback(
+    ch: &Arc<SharedChannel>,
+    v: &EpicsValue,
+    what: &'static str,
+) -> Result<PutCompletion> {
+    let done = ch
+        .put_callback(v)
+        .map_err(|e| BsrsError::Backend(format!("{what}: {e}")))?;
+    Ok(Box::pin(async move {
+        done.await
+            .unwrap_or_else(|_| Err("put-callback driver gone".into()))
+            .map_err(|e| BsrsError::Backend(format!("{what}: {e}")))
+    }))
+}
+
+/// `put`'s wait on `done`, bounded by [`ca_put_timeout`]: a plain put has no
+/// caller deadline to defer to.
+async fn await_put(done: PutCompletion, what: &'static str) -> Result<()> {
+    tokio::time::timeout(ca_put_timeout(), done)
+        .await
+        .unwrap_or_else(|_| Err(BsrsError::Backend(format!("{what}: {}", CaError::Timeout))))
 }
 
 /// Map a CA wire alarm severity (`DBR_STS_*` `severity`, a `u16`) to the
@@ -273,7 +314,7 @@ fn ctrl_limits(display: Option<&DisplayInfo>, control: Option<&ControlInfo>) -> 
 ///
 /// A field stays `None` when the server published no display/control block.
 async fn ctrl_metadata(
-    ch: &CaChannel,
+    ch: &SharedChannel,
     want_units: bool,
     want_precision: bool,
 ) -> Result<SignalMetadata> {
@@ -299,7 +340,7 @@ async fn ctrl_metadata(
 
 /// Encode an `f64` payload as the `EpicsValue` variant that matches
 /// the channel's `native_type`. Required because
-/// `CaChannel::put_with_timeout` writes with `native_type` on the wire (see
+/// `CaChannel::put_callback` writes with `native_type` on the wire (see
 /// `epics-ca-rs/src/client/mod.rs:1228`) and a mismatched payload
 /// width is read by the server as garbage (e.g. `EpicsValue::Double`
 /// sent to a `longout` produces an 8-byte f64-BE payload but the
@@ -375,7 +416,7 @@ fn epics_to_vec_f64(v: &EpicsValue) -> Option<Vec<f64>> {
 
 /// Encode a `Vec<f64>` waveform payload as the array `EpicsValue` variant that
 /// matches the channel's `native_type`, mirroring [`f64_to_wire`] for arrays
-/// (`CaChannel::put_with_timeout` writes with `native_type`, so a width
+/// (`CaChannel::put_callback` writes with `native_type`, so a width
 /// mismatch corrupts the wire payload). A `String`-native channel has no
 /// numeric-array form, so the closest `DoubleArray` is used — a `Vec<f64>`
 /// backend on a DBR_STRING PV is a misuse the type system can't forbid here.
@@ -451,7 +492,7 @@ impl SignalBackend<f64> for EpicsCaBackend<f64> {
     async fn connect(&self, timeout: Duration) -> Result<()> {
         self.ensure_channel(timeout).await.map(|_| ())
     }
-    async fn put(&self, value: Option<f64>) -> Result<()> {
+    async fn put_start(&self, value: Option<f64>) -> Result<PutCompletion> {
         let value = value.unwrap_or_default();
         let ch = self
             .ensure_channel(Duration::from_secs(2))
@@ -461,9 +502,10 @@ impl SignalBackend<f64> for EpicsCaBackend<f64> {
             .await
             .map_err(|e| BsrsError::Backend(format!("{e}")))?;
         let v = f64_to_wire(native, value);
-        ch.put_with_timeout(&v, CA_IO_TIMEOUT)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("ca put: {e}")))
+        put_callback(&ch, &v, "ca put")
+    }
+    async fn put(&self, value: Option<f64>) -> Result<()> {
+        await_put(self.put_start(value).await?, "ca put").await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
@@ -551,7 +593,7 @@ impl SignalBackend<Vec<f64>> for EpicsCaBackend<Vec<f64>> {
     async fn connect(&self, timeout: Duration) -> Result<()> {
         self.ensure_channel(timeout).await.map(|_| ())
     }
-    async fn put(&self, value: Option<Vec<f64>>) -> Result<()> {
+    async fn put_start(&self, value: Option<Vec<f64>>) -> Result<PutCompletion> {
         let value = value.unwrap_or_default();
         let ch = self
             .ensure_channel(Duration::from_secs(2))
@@ -561,9 +603,10 @@ impl SignalBackend<Vec<f64>> for EpicsCaBackend<Vec<f64>> {
             .await
             .map_err(|e| BsrsError::Backend(format!("{e}")))?;
         let v = f64s_to_wire(native, value);
-        ch.put_with_timeout(&v, CA_IO_TIMEOUT)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("ca put: {e}")))
+        put_callback(&ch, &v, "ca put")
+    }
+    async fn put(&self, value: Option<Vec<f64>>) -> Result<()> {
+        await_put(self.put_start(value).await?, "ca put").await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
@@ -646,16 +689,17 @@ impl SignalBackend<String> for EpicsCaBackend<String> {
     async fn connect(&self, timeout: Duration) -> Result<()> {
         self.ensure_channel(timeout).await.map(|_| ())
     }
-    async fn put(&self, value: Option<String>) -> Result<()> {
+    async fn put_start(&self, value: Option<String>) -> Result<PutCompletion> {
         let value = value.unwrap_or_default();
         let ch = self
             .ensure_channel(Duration::from_secs(2))
             .await
             .map_err(|e| BsrsError::Backend(format!("{e}")))?;
         let v = string_to_epics(&value, self.string_kind);
-        ch.put_with_timeout(&v, CA_IO_TIMEOUT)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("ca put: {e}")))
+        put_callback(&ch, &v, "ca put")
+    }
+    async fn put(&self, value: Option<String>) -> Result<()> {
+        await_put(self.put_start(value).await?, "ca put").await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
@@ -739,7 +783,7 @@ impl SignalBackend<i64> for EpicsCaBackend<i64> {
     async fn connect(&self, timeout: Duration) -> Result<()> {
         self.ensure_channel(timeout).await.map(|_| ())
     }
-    async fn put(&self, value: Option<i64>) -> Result<()> {
+    async fn put_start(&self, value: Option<i64>) -> Result<PutCompletion> {
         let value = value.unwrap_or_default();
         let ch = self
             .ensure_channel(Duration::from_secs(2))
@@ -749,9 +793,10 @@ impl SignalBackend<i64> for EpicsCaBackend<i64> {
             .await
             .map_err(|e| BsrsError::Backend(format!("{e}")))?;
         let v = i64_to_wire(native, value);
-        ch.put_with_timeout(&v, CA_IO_TIMEOUT)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("ca put: {e}")))
+        put_callback(&ch, &v, "ca put")
+    }
+    async fn put(&self, value: Option<i64>) -> Result<()> {
+        await_put(self.put_start(value).await?, "ca put").await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
@@ -847,8 +892,7 @@ impl EpicsCaBackend<bool> {
             .await
             .map_err(|e| BsrsError::Backend(format!("{e}")))?;
         let v = bool_to_wire(native, value);
-        ch.put_nowait(&v)
-            .await
+        ch.put_no_callback(&v)
             .map_err(|e| BsrsError::Backend(format!("ca put_nowait: {e}")))
     }
 }
@@ -858,7 +902,7 @@ impl SignalBackend<bool> for EpicsCaBackend<bool> {
     async fn connect(&self, timeout: Duration) -> Result<()> {
         self.ensure_channel(timeout).await.map(|_| ())
     }
-    async fn put(&self, value: Option<bool>) -> Result<()> {
+    async fn put_start(&self, value: Option<bool>) -> Result<PutCompletion> {
         let value = value.unwrap_or_default();
         let ch = self
             .ensure_channel(Duration::from_secs(2))
@@ -868,9 +912,10 @@ impl SignalBackend<bool> for EpicsCaBackend<bool> {
             .await
             .map_err(|e| BsrsError::Backend(format!("{e}")))?;
         let v = bool_to_wire(native, value);
-        ch.put_with_timeout(&v, CA_IO_TIMEOUT)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("ca put: {e}")))
+        put_callback(&ch, &v, "ca put")
+    }
+    async fn put(&self, value: Option<bool>) -> Result<()> {
+        await_put(self.put_start(value).await?, "ca put").await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         Ok(make_datakey(
@@ -999,7 +1044,7 @@ fn enum_labels_to_strings(labels: Vec<PvString>) -> Vec<String> {
 pub struct CaEnumBackend {
     pv: String,
     ctx: Arc<CaContext>,
-    channel: tokio::sync::OnceCell<Arc<CaChannel>>,
+    channel: tokio::sync::OnceCell<Arc<SharedChannel>>,
     choices: OnceLock<Vec<String>>,
 }
 
@@ -1014,7 +1059,7 @@ impl CaEnumBackend {
         }
     }
 
-    async fn ensure_channel(&self, timeout: Duration) -> Result<Arc<CaChannel>> {
+    async fn ensure_channel(&self, timeout: Duration) -> Result<Arc<SharedChannel>> {
         self.channel
             .get_or_try_init(|| self.ctx.get_or_open(&self.pv, timeout))
             .await
@@ -1023,7 +1068,7 @@ impl CaEnumBackend {
 
     /// Fetch the enum choice labels via a `DbrClass::Ctrl` read and cache them.
     /// Returns the cached list on subsequent calls (no further network I/O).
-    async fn ensure_choices(&self, ch: &CaChannel) -> Result<Vec<String>> {
+    async fn ensure_choices(&self, ch: &SharedChannel) -> Result<Vec<String>> {
         if let Some(c) = self.choices.get() {
             return Ok(c.clone());
         }
@@ -1067,7 +1112,7 @@ impl SignalBackend<String> for CaEnumBackend {
         self.ensure_choices(&ch).await?;
         Ok(())
     }
-    async fn put(&self, value: Option<String>) -> Result<()> {
+    async fn put_start(&self, value: Option<String>) -> Result<PutCompletion> {
         let value = value.unwrap_or_default();
         let ch = self
             .ensure_channel(Duration::from_secs(2))
@@ -1077,9 +1122,10 @@ impl SignalBackend<String> for CaEnumBackend {
         let idx = enum_label_to_index(&value, &choices)?;
         // Enum PVs are DBR_ENUM on the wire; put writes with native_type, so the
         // payload must be the 2-byte index, not a 40-byte DBR_STRING.
-        ch.put_with_timeout(&EpicsValue::Enum(idx), CA_IO_TIMEOUT)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("ca enum put: {e}")))
+        put_callback(&ch, &EpicsValue::Enum(idx), "ca enum put")
+    }
+    async fn put(&self, value: Option<String>) -> Result<()> {
+        await_put(self.put_start(value).await?, "ca enum put").await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
@@ -1169,6 +1215,21 @@ impl SignalBackend<String> for CaEnumBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn put_timeout_from_env_double() {
+        use estdlib::EnvDoubleError;
+        assert_eq!(put_timeout_from(Ok(2.5)), Duration::from_millis(2500));
+        assert_eq!(
+            put_timeout_from(Err(EnvDoubleError::Unset)),
+            Duration::from_secs(30)
+        );
+        let bad = estdlib::epics_parse_double("abc").unwrap_err();
+        assert_eq!(
+            put_timeout_from(Err(EnvDoubleError::Invalid(bad))),
+            Duration::from_secs(30)
+        );
+    }
 
     // Regression for the bootstrap bug documented at doc/10-roadmap.md
     // Tier 1.1: calling `ca_context()` from inside a tokio runtime

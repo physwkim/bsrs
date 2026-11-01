@@ -37,6 +37,7 @@ use crate::core::status::Status;
 use crate::core::subscription::Subscription;
 use crate::devices::SignalCache;
 use crate::event_model::{DataKey, Dtype};
+use crate::host::motor_move::MotorChannels;
 use crate::protocols_async::SignalBackend;
 
 /// PVA-backed motor: setpoint + readback Signal pair.
@@ -45,27 +46,20 @@ use crate::protocols_async::SignalBackend;
 /// an Event, through one shared [`SignalCache`] (CP-08 / K2).
 pub struct PvaMotor {
     name: String,
-    setpoint: Arc<EpicsPvaBackend<f64>>,
-    readback: Arc<EpicsPvaBackend<f64>>,
+    channels: MotorChannels<EpicsPvaBackend<f64>>,
     cache: Arc<SignalCache<f64, EpicsPvaBackend<f64>>>,
 }
 
 impl PvaMotor {
-    /// Build + connect both channels. Blocks on bsrs's runtime.
+    /// Build + connect the channels. Blocks on bsrs's runtime.
     pub fn connect_blocking(name: &str, val_pv: &str, rbv_pv: &str) -> Result<Arc<Self>> {
-        let sp = Arc::new(EpicsPvaBackend::<f64>::new(val_pv));
-        let rb = Arc::new(EpicsPvaBackend::<f64>::new(rbv_pv));
-        let sp_for_async = sp.clone();
-        let rb_for_async = rb.clone();
-        crate::core::runtime::bsrs_runtime().block_on(async move {
-            sp_for_async.connect(Duration::from_secs(5)).await?;
-            rb_for_async.connect(Duration::from_secs(5)).await
-        })?;
+        let connect = MotorChannels::connect("pva_motor", name, val_pv, rbv_pv);
+        let channels: MotorChannels<EpicsPvaBackend<f64>> =
+            crate::core::runtime::bsrs_runtime().block_on(connect)?;
         Ok(Arc::new(Self {
             name: name.to_string(),
-            setpoint: sp,
-            cache: SignalCache::new(rb.clone()),
-            readback: rb,
+            cache: SignalCache::new(channels.readback.clone()),
+            channels,
         }))
     }
 }
@@ -85,7 +79,7 @@ impl NamedObj for PvaMotor {
 #[async_trait::async_trait]
 impl ReadableObj for PvaMotor {
     async fn read_dyn(&self) -> Result<HashMap<String, ReadingValue>> {
-        let r = self.readback.get_reading().await?;
+        let r = self.channels.readback.get_reading().await?;
         let mut out = HashMap::new();
         out.insert(self.name.clone(), r);
         Ok(out)
@@ -115,25 +109,15 @@ impl ReadableObj for PvaMotor {
 #[async_trait::async_trait]
 impl MovableObj for PvaMotor {
     async fn set_dyn(&self, value: f64) -> Status {
-        // The backend `put` awaits the put completion. The 30 s
-        // move-timeout lives here, at the device layer (CP-11).
-        match tokio::time::timeout(Duration::from_secs(30), self.setpoint.put(Some(value))).await {
-            Ok(Ok(())) => Status::done(),
-            Ok(Err(e)) => Status::fail(crate::core::status::StatusError::Failed(format!(
-                "pva_motor set: {e}"
-            ))),
-            Err(_) => Status::fail(crate::core::status::StatusError::Failed(
-                "pva_motor set: timed out after 30s".into(),
-            )),
-        }
+        self.channels.set("pva_motor", &self.name, value).await
     }
 }
 
 #[async_trait::async_trait]
 impl LocatableObj for PvaMotor {
     async fn locate_dyn(&self) -> Result<DynLocation> {
-        let setpoint = self.setpoint.get_value().await?;
-        let readback = self.readback.get_value().await?;
+        let setpoint = self.channels.setpoint.get_value().await?;
+        let readback = self.channels.readback.get_value().await?;
         Ok(DynLocation { setpoint, readback })
     }
 }

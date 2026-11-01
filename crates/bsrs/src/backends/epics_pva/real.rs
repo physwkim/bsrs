@@ -4,12 +4,14 @@ use crate::core::error::{BsrsError, Result};
 use crate::core::reading::ReadingValue;
 use crate::core::status::SubToken;
 use crate::event_model::{make_datakey, DataKey, Dtype, Limits, LimitsRange, SignalMetadata};
-use crate::protocols_async::{ReadingValueCallback, SignalBackend};
+use crate::protocols_async::{PutCompletion, ReadingValueCallback, SignalBackend};
 use async_trait::async_trait;
 use epics_pva_rs::client::PvaClient;
-use epics_pva_rs::pv_request::PvRequestExpr;
+use epics_pva_rs::client_native::ops_v2::PutLeaf;
+use epics_pva_rs::pv_request::{PvRequestBuilder, PvRequestExpr};
 use epics_pva_rs::pvdata::TypedScalarArray;
-use epics_pva_rs::{PvField, ScalarValue};
+use epics_pva_rs::{PvField, PvaError, ScalarValue};
+use futures::FutureExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -21,11 +23,14 @@ fn now_ts() -> f64 {
         .unwrap_or_default()
 }
 
+/// Deadline of every client op but a put's completion, which is the caller's.
+const OP_TIMEOUT: Duration = Duration::from_secs(5);
+
 static CTX: OnceLock<Arc<PvaClient>> = OnceLock::new();
 
 /// Process-wide PVA client.
 pub fn pva_context() -> Arc<PvaClient> {
-    CTX.get_or_init(|| Arc::new(PvaClient::new().expect("PvaClient::new")))
+    CTX.get_or_init(|| Arc::new(PvaClient::builder().timeout(OP_TIMEOUT).build()))
         .clone()
 }
 
@@ -51,6 +56,36 @@ impl<T: Clone + Send + Sync + 'static> crate::devices::BackendFromPv for EpicsPv
     fn from_pv(pv: &str) -> Self {
         Self::new(pv)
     }
+}
+
+/// PVA put of `f` with `record[block=true]`: QSRV answers it once the record
+/// has processed (`dbProcessNotify`), as rsrv does a put-callback, so the
+/// completion is that of the move or acquisition the put starts, with no
+/// deadline of its own. Returns once DATA is queued on the circuit, so puts
+/// are sent in call order.
+async fn put_block(client: &PvaClient, pv: &str, f: PvField) -> Result<PutCompletion> {
+    fn put_err(e: PvaError) -> BsrsError {
+        BsrsError::Backend(format!("pva put: {e}"))
+    }
+    let req = PvRequestBuilder::new()
+        .field("value")
+        .record("block", true)
+        .build();
+    let begin = client.pvput_begin_unbounded(pv, Some(&req), false);
+    let op = tokio::time::timeout(OP_TIMEOUT, begin)
+        .await
+        .unwrap_or(Err(PvaError::Timeout))
+        .map_err(put_err)?;
+    // A PV that is no structure has no `value`: its root is the leaf.
+    let path = match op.introspection().bit_for_path("value") {
+        Some(_) => "value",
+        None => "",
+    };
+    let sent = op
+        .send_fields_typed(&[(path.to_string(), PutLeaf::Typed(f))])
+        .await
+        .map_err(put_err)?;
+    Ok(async move { sent.wait().await.map_err(put_err) }.boxed())
 }
 
 // Coerce one scalar to f64. The single source of truth for numeric→f64
@@ -353,12 +388,9 @@ impl SignalBackend<f64> for EpicsPvaBackend<f64> {
             .map(|_| ())
             .map_err(|e| BsrsError::Backend(format!("pva connect {}: {e}", self.pv)))
     }
-    async fn put(&self, value: Option<f64>) -> Result<()> {
+    async fn put_start(&self, value: Option<f64>) -> Result<PutCompletion> {
         let f = PvField::Scalar(ScalarValue::Double(value.unwrap_or_default()));
-        self.client
-            .pvput_pv_field(&self.pv, &f)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("pva put: {e}")))
+        put_block(&self.client, &self.pv, f).await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         // pvget the full NTScalar (display/control/valueAlarm carry units,
@@ -465,15 +497,12 @@ impl SignalBackend<Vec<f64>> for EpicsPvaBackend<Vec<f64>> {
             .map(|_| ())
             .map_err(|e| BsrsError::Backend(format!("pva connect {}: {e}", self.pv)))
     }
-    async fn put(&self, value: Option<Vec<f64>>) -> Result<()> {
+    async fn put_start(&self, value: Option<Vec<f64>>) -> Result<PutCompletion> {
         // Written as a typed Double array; an EPICS waveform record coerces to
         // its FTVL element type server-side.
         let f =
             PvField::ScalarArrayTyped(TypedScalarArray::Double(value.unwrap_or_default().into()));
-        self.client
-            .pvput_pv_field(&self.pv, &f)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("pva put: {e}")))
+        put_block(&self.client, &self.pv, f).await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         // The descriptor shape needs the element count; pvget once (describe is
@@ -575,12 +604,9 @@ impl SignalBackend<String> for EpicsPvaBackend<String> {
             .map(|_| ())
             .map_err(|e| BsrsError::Backend(format!("pva connect {}: {e}", self.pv)))
     }
-    async fn put(&self, value: Option<String>) -> Result<()> {
+    async fn put_start(&self, value: Option<String>) -> Result<PutCompletion> {
         let f = PvField::Scalar(ScalarValue::String(value.unwrap_or_default().into()));
-        self.client
-            .pvput_pv_field(&self.pv, &f)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("pva put: {e}")))
+        put_block(&self.client, &self.pv, f).await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         Ok(make_datakey(
@@ -668,12 +694,9 @@ impl SignalBackend<i64> for EpicsPvaBackend<i64> {
             .map(|_| ())
             .map_err(|e| BsrsError::Backend(format!("pva connect {}: {e}", self.pv)))
     }
-    async fn put(&self, value: Option<i64>) -> Result<()> {
+    async fn put_start(&self, value: Option<i64>) -> Result<PutCompletion> {
         let f = PvField::Scalar(ScalarValue::Long(value.unwrap_or_default()));
-        self.client
-            .pvput_pv_field(&self.pv, &f)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("pva put: {e}")))
+        put_block(&self.client, &self.pv, f).await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         // pvget the full NTScalar for units + limits. Integers carry no
@@ -768,12 +791,9 @@ impl SignalBackend<bool> for EpicsPvaBackend<bool> {
             .map(|_| ())
             .map_err(|e| BsrsError::Backend(format!("pva connect {}: {e}", self.pv)))
     }
-    async fn put(&self, value: Option<bool>) -> Result<()> {
+    async fn put_start(&self, value: Option<bool>) -> Result<PutCompletion> {
         let f = PvField::Scalar(ScalarValue::Boolean(value.unwrap_or_default()));
-        self.client
-            .pvput_pv_field(&self.pv, &f)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("pva put: {e}")))
+        put_block(&self.client, &self.pv, f).await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         Ok(make_datakey(

@@ -11,7 +11,7 @@ use crate::core::error::Result;
 use crate::core::reading::ReadingValue;
 use crate::core::status::SubToken;
 use crate::event_model::{make_datakey, DataKey, Dtype, SignalMetadata};
-use crate::protocols_async::{ReadingValueCallback, SignalBackend};
+use crate::protocols_async::{PutCompletion, ReadingValueCallback, SignalBackend};
 use async_trait::async_trait;
 use serde::Serialize;
 use std::time::Duration;
@@ -39,8 +39,8 @@ impl<T: Clone + Send + Sync + Serialize + 'static> SignalBackend<T> for MockBack
     async fn connect(&self, _timeout: Duration) -> Result<()> {
         Ok(())
     }
-    async fn put(&self, _value: Option<T>) -> Result<()> {
-        Ok(())
+    async fn put_start(&self, _value: Option<T>) -> Result<PutCompletion> {
+        Ok(Box::pin(std::future::ready(Ok(()))))
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         Ok(make_datakey(
