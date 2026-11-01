@@ -3384,7 +3384,7 @@ impl RunEngine {
                 match outcome {
                     Ok(()) => Ok(()),
                     Err(StatusError::Cancelled) => Err(BsrsError::Cancelled),
-                    Err(StatusError::Timeout) => Err(BsrsError::Timeout(Duration::from_secs(0))),
+                    Err(StatusError::Timeout) => Err(BsrsError::Status(StatusError::Timeout)),
                     Err(StatusError::Failed(s)) => Err(BsrsError::Backend(s)),
                 }
             }
@@ -3443,7 +3443,7 @@ impl RunEngine {
             };
             joined.map(|_| ()).map_err(|e| match e {
                 StatusError::Cancelled => BsrsError::Cancelled,
-                StatusError::Timeout => BsrsError::Timeout(Duration::from_secs(0)),
+                StatusError::Timeout => BsrsError::Status(StatusError::Timeout),
                 StatusError::Failed(s) => BsrsError::Backend(s),
             })
         };

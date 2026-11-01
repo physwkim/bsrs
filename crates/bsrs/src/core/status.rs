@@ -15,12 +15,25 @@ pub enum StatusError {
     /// The operation was cancelled before completion.
     #[error("cancelled")]
     Cancelled,
-    /// The operation timed out waiting for completion.
+    /// The operation did not complete in time — ophyd's `StatusTimeoutError`.
+    /// A [`Status::wait`] running out is not this: see [`WaitError::Timeout`].
     #[error("timed out")]
     Timeout,
     /// The operation completed with an error message.
     #[error("{0}")]
     Failed(String),
+}
+
+/// Why [`Status::wait`] returned without success.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum WaitError {
+    /// The wait ran out with the status still pending — ophyd's
+    /// `WaitTimeoutError`. Not an outcome, so no setter can record it.
+    #[error("status has not completed yet")]
+    Timeout,
+    /// The status finished without success.
+    #[error(transparent)]
+    Status(#[from] StatusError),
 }
 
 /// Outcome of a status. Used by the ophyd-style `add_callback` API.
@@ -322,19 +335,19 @@ impl Status {
         cb(&end.outcome());
     }
 
-    /// Sync wait — blocks (via bsrs runtime) until completion.
-    pub fn wait(&self, timeout: Option<Duration>) -> Result<(), StatusError> {
+    /// Sync wait — blocks (via bsrs runtime) until completion, or until
+    /// `timeout` runs out with the status still pending.
+    pub fn wait(&self, timeout: Option<Duration>) -> Result<(), WaitError> {
         let fut = self.clone();
-        let result = match timeout {
-            Some(d) => crate::core::runtime::block_on(async move {
-                tokio::time::timeout(d, fut)
+        crate::core::runtime::block_on(async move {
+            let outcome = match timeout {
+                Some(d) => tokio::time::timeout(d, fut)
                     .await
-                    .map_err(|_| StatusError::Timeout)
-                    .and_then(|r| r)
-            }),
-            None => crate::core::runtime::block_on(fut),
-        };
-        result
+                    .map_err(|_| WaitError::Timeout)?,
+                None => fut.await,
+            };
+            outcome.map_err(WaitError::Status)
+        })
     }
 
     /// Subscribe to progress updates as a `watch::Receiver<f64>`.

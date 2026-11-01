@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bsrs::core::status::WaitError;
 use bsrs::core::{Status, StatusError, StatusOutcome, Watcher, WatcherUpdate};
 use tokio::time::{sleep, Instant};
 
@@ -69,14 +70,15 @@ fn callback_fires_once_whether_added_before_or_after_completion() {
 }
 
 // ophyd test_exception_success_path / test_exception_fail_path /
-// test_wait_timeout: the blocking wait returns the outcome, and a wait that
-// runs out leaves the status pending.
+// test_wait_timeout / test_external_timeout: the blocking wait returns the
+// outcome, and a wait that runs out (WaitTimeoutError) leaves the status
+// pending and is not an operation that timed out (StatusTimeoutError).
 #[test]
 fn blocking_wait_returns_the_outcome_and_a_wait_timeout_changes_nothing() {
     let (status, setter) = Status::new();
     assert!(matches!(
         status.wait(Some(10 * MS)),
-        Err(StatusError::Timeout)
+        Err(WaitError::Timeout)
     ));
     assert!(!status.done_state());
     assert!(status.exception().is_none());
@@ -84,10 +86,15 @@ fn blocking_wait_returns_the_outcome_and_a_wait_timeout_changes_nothing() {
     assert!(status.wait(LONG).is_ok());
     assert!(status.exception().is_none());
 
-    let (status, setter) = Status::new();
-    setter.fail(failed("local"));
-    assert_eq!(dbg(status.exception()), dbg(Some(failed("local"))));
-    assert_eq!(dbg(status.wait(LONG)), dbg(Err::<(), _>(failed("local"))));
+    for err in [failed("local"), StatusError::Timeout] {
+        let (status, setter) = Status::new();
+        setter.fail(err.clone());
+        assert_eq!(dbg(status.exception()), dbg(Some(&err)));
+        assert_eq!(
+            dbg(status.wait(LONG)),
+            dbg(Err::<(), _>(WaitError::Status(err)))
+        );
+    }
 }
 
 // ophyd-async test_async_status_success / _propagates_exception /
@@ -378,5 +385,50 @@ fn readers_racing_completion_see_its_outcome() {
         assert_eq!(spin_poll, boom);
         assert_eq!(woken_poll, boom);
         assert_eq!(exception, dbg(Some(failed("boom"))));
+    }
+}
+
+/// A mover whose every move times out.
+struct TimingOut;
+
+impl bsrs::core::msg::NamedObj for TimingOut {
+    fn name(&self) -> &str {
+        "timing_out"
+    }
+}
+
+#[async_trait::async_trait]
+impl bsrs::core::msg::MovableObj for TimingOut {
+    async fn set_dyn(&self, _value: f64) -> Status {
+        Status::fail(StatusError::Timeout)
+    }
+}
+
+// bluesky _status_object_completed raises FailedStatus for a status that timed
+// out on its own; WaitForTimeoutError is only the group wait running out.
+#[tokio::test]
+async fn an_operation_timeout_fails_the_plan_as_a_status_failure() {
+    use bsrs::core::msg::{MovableObj, Msg};
+    use bsrs::core::plan::plan_box;
+    use bsrs::core::BsrsError;
+    use bsrs::engine::RunEngine;
+
+    for group in [Some("g".to_string()), None] {
+        let mover: Arc<dyn MovableObj> = Arc::new(TimingOut);
+        let plan = plan_box(async_stream::stream! {
+            yield Msg::Set { obj: mover, value: 1.0, group: group.clone() };
+            if let Some(group) = group {
+                yield Msg::Wait { group, error_on_timeout: true, timeout: None };
+            }
+        });
+        let result = RunEngine::new(vec![]).run_async(plan).await.unwrap();
+        assert!(
+            matches!(
+                result.exception,
+                Some(BsrsError::Status(StatusError::Timeout))
+            ),
+            "{:?}",
+            result.exception
+        );
     }
 }
