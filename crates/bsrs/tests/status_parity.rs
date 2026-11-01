@@ -303,3 +303,80 @@ async fn every_watcher_sees_every_update_up_to_the_outcome() {
         assert_eq!(dbg(status.exception()), dbg(result.as_ref().err()));
     }
 }
+
+/// Wakes by sending on a channel, so a reader can tell a wake from a lost one.
+struct ChannelWaker(std::sync::mpsc::Sender<()>);
+
+impl std::task::Wake for ChannelWaker {
+    fn wake(self: Arc<Self>) {
+        let _ = self.0.send(());
+    }
+}
+
+// ophyd add_callback (status.py:502) runs each callback exactly once and is
+// thread-safe. Readers racing `fail` must see the recorded error, never a
+// missing or "unknown" one; a racing callback must fire and a racing waiter
+// must be woken.
+#[test]
+fn readers_racing_completion_see_its_outcome() {
+    use std::pin::pin;
+    use std::sync::{mpsc, Barrier};
+    use std::task::{Context, Poll, Waker};
+
+    let boom = dbg(Err::<(), _>(failed("boom")));
+    for _ in 0..2000 {
+        let (status, setter) = Status::new();
+        let barrier = Barrier::new(5);
+        let (callback, spin_poll, woken_poll, exception) = std::thread::scope(|s| {
+            let callback = s.spawn(|| {
+                let (tx, rx) = mpsc::channel();
+                barrier.wait();
+                status.add_callback(move |o| tx.send(o.clone()).unwrap());
+                dbg(rx.recv_timeout(Duration::from_secs(5)).ok())
+            });
+            let spin_poll = s.spawn(|| {
+                let mut cx = Context::from_waker(Waker::noop());
+                let mut fut = pin!(status.clone());
+                barrier.wait();
+                loop {
+                    if let Poll::Ready(r) = fut.as_mut().poll(&mut cx) {
+                        break dbg(r);
+                    }
+                }
+            });
+            let woken_poll = s.spawn(|| {
+                let (tx, rx) = mpsc::channel();
+                let waker = Waker::from(Arc::new(ChannelWaker(tx)));
+                let mut cx = Context::from_waker(&waker);
+                let mut fut = pin!(status.clone());
+                barrier.wait();
+                if fut.as_mut().poll(&mut cx).is_pending()
+                    && rx.recv_timeout(Duration::from_secs(5)).is_err()
+                {
+                    return "waker lost".into();
+                }
+                match fut.as_mut().poll(&mut cx) {
+                    Poll::Ready(r) => dbg(r),
+                    Poll::Pending => "pending after wake".into(),
+                }
+            });
+            let exception = s.spawn(|| {
+                barrier.wait();
+                while !status.done_state() {}
+                dbg(status.exception())
+            });
+            barrier.wait();
+            setter.fail(failed("boom"));
+            (
+                callback.join().unwrap(),
+                spin_poll.join().unwrap(),
+                woken_poll.join().unwrap(),
+                exception.join().unwrap(),
+            )
+        });
+        assert_eq!(callback, dbg(Some(StatusOutcome::Failed(failed("boom")))));
+        assert_eq!(spin_poll, boom);
+        assert_eq!(woken_poll, boom);
+        assert_eq!(exception, dbg(Some(failed("boom"))));
+    }
+}

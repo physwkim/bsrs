@@ -2,18 +2,12 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
-
-const PENDING: u8 = 0;
-const SUCCESS: u8 = 1;
-const ERROR: u8 = 2;
-const CANCELLED: u8 = 3;
 
 /// Errors that a `Status` can carry.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -97,9 +91,43 @@ pub trait Watcher: Send {
 
 type StatusCallback = Box<dyn FnOnce(&StatusOutcome) + Send>;
 
+/// Where a status is: waiting, with whoever waits for it, or finished, with
+/// its outcome. One value under one lock, so no reader sees a finished status
+/// without its outcome and no waiter registers after the waiters were run.
+enum Phase {
+    Pending {
+        callbacks: Vec<StatusCallback>,
+        wakers: Vec<Waker>,
+    },
+    Done(End),
+}
+
+#[derive(Clone)]
+enum End {
+    Succeeded,
+    Failed(StatusError),
+    Cancelled,
+}
+
+impl End {
+    fn result(&self) -> Result<(), StatusError> {
+        match self {
+            End::Succeeded => Ok(()),
+            End::Failed(e) => Err(e.clone()),
+            End::Cancelled => Err(StatusError::Cancelled),
+        }
+    }
+
+    fn outcome(&self) -> StatusOutcome {
+        match self.result() {
+            Ok(()) => StatusOutcome::Success,
+            Err(e) => StatusOutcome::Failed(e),
+        }
+    }
+}
+
 struct Inner {
-    state: AtomicU8,
-    error: Mutex<Option<StatusError>>,
+    phase: Mutex<Phase>,
     progress: watch::Sender<f64>,
     /// The latest update only; back-to-back updates replace each other here.
     watcher: watch::Sender<Option<WatcherUpdate>>,
@@ -107,8 +135,6 @@ struct Inner {
     /// Its lock also covers the `watcher` store, so an observer that registers
     /// gets each update once: as the latest, or through its queue.
     observers: Mutex<Vec<mpsc::UnboundedSender<WatcherUpdate>>>,
-    callbacks: Mutex<Vec<StatusCallback>>,
-    wakers: Mutex<Vec<Waker>>,
     /// Signalled by [`Status::cancel`] (consumer side) so a producer running
     /// long work can observe the request and abort. Held here, shared by every
     /// `Status`/`StatusSetter` clone of the same operation.
@@ -120,18 +146,31 @@ struct Inner {
 }
 
 impl Inner {
-    /// Drain and run completion callbacks + wakers. Shared by the three
-    /// terminal transitions (`success`, `fail`, `cancel`) so each fires exactly
-    /// the same way. Takes `&self` — the single owner is whoever won the state
-    /// CAS, which is enforced at the call sites, not here.
-    fn fire(&self, outcome: StatusOutcome) {
-        let cbs: Vec<_> = std::mem::take(&mut *self.callbacks.lock().unwrap());
-        for cb in cbs {
+    /// The only transition: the first call finishes the status and runs its
+    /// waiters, after the lock is released; later calls change nothing.
+    fn finish(&self, end: End) {
+        let (callbacks, wakers) = {
+            let mut phase = self.phase.lock().unwrap();
+            let Phase::Pending { callbacks, wakers } = &mut *phase else {
+                return;
+            };
+            let waiters = (std::mem::take(callbacks), std::mem::take(wakers));
+            *phase = Phase::Done(end.clone());
+            waiters
+        };
+        let outcome = end.outcome();
+        for cb in callbacks {
             cb(&outcome);
         }
-        let wakers: Vec<_> = std::mem::take(&mut *self.wakers.lock().unwrap());
         for w in wakers {
             w.wake();
+        }
+    }
+
+    fn end(&self) -> Option<End> {
+        match &*self.phase.lock().unwrap() {
+            Phase::Pending { .. } => None,
+            Phase::Done(end) => Some(end.clone()),
         }
     }
 }
@@ -155,13 +194,13 @@ impl Status {
         let (tx, rx) = watch::channel(0.0_f64);
         let (wtx, wrx) = watch::channel::<Option<WatcherUpdate>>(None);
         let inner = Arc::new(Inner {
-            state: AtomicU8::new(PENDING),
-            error: Mutex::new(None),
+            phase: Mutex::new(Phase::Pending {
+                callbacks: Vec::new(),
+                wakers: Vec::new(),
+            }),
             progress: tx,
             watcher: wtx,
             observers: Mutex::new(Vec::new()),
-            callbacks: Mutex::new(Vec::new()),
-            wakers: Mutex::new(Vec::new()),
             cancel: CancellationToken::new(),
             start: Instant::now(),
         });
@@ -191,28 +230,25 @@ impl Status {
 
     /// Has the operation completed?
     pub fn done_state(&self) -> bool {
-        self.inner.state.load(Ordering::Acquire) != PENDING
+        self.inner.end().is_some()
     }
 
     /// Has the operation completed successfully?
     pub fn success(&self) -> bool {
-        self.inner.state.load(Ordering::Acquire) == SUCCESS
+        matches!(self.inner.end(), Some(End::Succeeded))
     }
 
     /// If failed or cancelled, returns the error (cancellation surfaces as
     /// [`StatusError::Cancelled`]).
     pub fn exception(&self) -> Option<StatusError> {
-        match self.inner.state.load(Ordering::Acquire) {
-            ERROR | CANCELLED => self.inner.error.lock().unwrap().clone(),
-            _ => None,
-        }
+        self.inner.end()?.result().err()
     }
 
     /// Did the operation end in cancellation? Mirrors ophyd-async
     /// `Status.cancelled` (`_status.py:91`); a cancelled status is *not*
     /// `success()`.
     pub fn cancelled(&self) -> bool {
-        self.inner.state.load(Ordering::Acquire) == CANCELLED
+        matches!(self.inner.end(), Some(End::Cancelled))
     }
 
     /// Request cancellation (consumer side). Signals the producer via the
@@ -227,16 +263,7 @@ impl Status {
     /// ophyd-async drives from `async with status:` (`_status.py:113-118`).
     pub fn cancel(&self) {
         self.inner.cancel.cancel();
-        if self
-            .inner
-            .state
-            .compare_exchange(PENDING, CANCELLED, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            *self.inner.error.lock().unwrap() = Some(StatusError::Cancelled);
-            self.inner
-                .fire(StatusOutcome::Failed(StatusError::Cancelled));
-        }
+        self.inner.finish(End::Cancelled);
     }
 
     /// Wrap this status in a [`CancelGuard`] that cancels it on scope exit —
@@ -262,19 +289,13 @@ impl Status {
     ///
     /// `success` is `null` while pending; once `done`, it's a bool.
     pub fn inspect(&self) -> serde_json::Value {
-        let state = self.inner.state.load(Ordering::Acquire);
-        let done = state != PENDING;
-        let success = match state {
-            SUCCESS => Some(true),
-            ERROR | CANCELLED => Some(false),
-            _ => None,
-        };
-        let exception = self.exception().map(|e| e.to_string());
+        let end = self.inner.end();
+        let result = end.as_ref().map(End::result);
         serde_json::json!({
-            "done": done,
-            "success": success,
-            "cancelled": state == CANCELLED,
-            "exception": exception,
+            "done": end.is_some(),
+            "success": result.as_ref().map(Result::is_ok),
+            "cancelled": matches!(end, Some(End::Cancelled)),
+            "exception": result.and_then(Result::err).map(|e| e.to_string()),
             "progress": self.progress(),
         })
     }
@@ -285,28 +306,20 @@ impl Status {
     /// A *cancelled* status counts as done — like a cancelled asyncio task in
     /// ophyd-async (`_status.py:56-60`, `if self.done: callback(self)`), so a
     /// callback registered after `cancel()` fires immediately with the stored
-    /// `Cancelled` error. `cancel()` already drained the pending callback queue,
-    /// so an enqueued callback here would never fire; only `PENDING` may enqueue.
-    /// This mirrors the `ERROR | CANCELLED` grouping in `exception()`, `inspect()`,
-    /// and the `Future::poll` impl.
+    /// `Cancelled` error. Registration and completion take the same lock, so a
+    /// callback is either queued before completion runs the queue or run here.
     pub fn add_callback<F>(&self, cb: F)
     where
         F: FnOnce(&StatusOutcome) + Send + 'static,
     {
-        match self.inner.state.load(Ordering::Acquire) {
-            SUCCESS => cb(&StatusOutcome::Success),
-            ERROR | CANCELLED => {
-                let err = self
-                    .inner
-                    .error
-                    .lock()
-                    .unwrap()
-                    .clone()
-                    .unwrap_or(StatusError::Failed("unknown".into()));
-                cb(&StatusOutcome::Failed(err));
+        let end = match &mut *self.inner.phase.lock().unwrap() {
+            Phase::Pending { callbacks, .. } => {
+                callbacks.push(Box::new(cb));
+                return;
             }
-            _ => self.inner.callbacks.lock().unwrap().push(Box::new(cb)),
-        }
+            Phase::Done(end) => end.clone(),
+        };
+        cb(&end.outcome());
     }
 
     /// Sync wait — blocks (via bsrs runtime) until completion.
@@ -373,27 +386,12 @@ impl Status {
 impl StatusSetter {
     /// Mark the status as successful and fire callbacks/wakers.
     pub fn success(self) {
-        if self
-            .inner
-            .state
-            .compare_exchange(PENDING, SUCCESS, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            self.inner.fire(StatusOutcome::Success);
-        }
+        self.inner.finish(End::Succeeded);
     }
 
     /// Mark the status as failed.
     pub fn fail(self, err: StatusError) {
-        if self
-            .inner
-            .state
-            .compare_exchange(PENDING, ERROR, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            *self.inner.error.lock().unwrap() = Some(err.clone());
-            self.inner.fire(StatusOutcome::Failed(err));
-        }
+        self.inner.finish(End::Failed(err));
     }
 
     /// Resolves when the consumer requests cancellation via [`Status::cancel`].
@@ -474,31 +472,22 @@ impl Drop for CancelGuard {
 impl Future for Status {
     type Output = Result<(), StatusError>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.inner.state.load(Ordering::Acquire) {
-            SUCCESS => Poll::Ready(Ok(())),
-            ERROR | CANCELLED => {
-                let err = self
-                    .inner
-                    .error
-                    .lock()
-                    .unwrap()
-                    .clone()
-                    .unwrap_or(StatusError::Failed("unknown".into()));
-                Poll::Ready(Err(err))
-            }
-            _ => {
-                self.inner.wakers.lock().unwrap().push(cx.waker().clone());
+        match &mut *self.inner.phase.lock().unwrap() {
+            Phase::Pending { wakers, .. } => {
+                wakers.push(cx.waker().clone());
                 Poll::Pending
             }
+            Phase::Done(end) => Poll::Ready(end.result()),
         }
     }
 }
 
 impl std::fmt::Debug for Status {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let end = self.inner.end();
         f.debug_struct("Status")
-            .field("done", &self.done_state())
-            .field("success", &self.success())
+            .field("done", &end.is_some())
+            .field("success", &matches!(end, Some(End::Succeeded)))
             .finish()
     }
 }
