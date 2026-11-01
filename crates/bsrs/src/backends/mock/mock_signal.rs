@@ -3,6 +3,7 @@
 //! state, records every `put`, lets a callback rewrite the put value, and
 //! gates put completion on a `put_proceeds` flag so tests can block puts.
 
+use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -83,6 +84,23 @@ where
         self.inner.soft.write_now(value);
     }
 
+    /// An iterator whose every `next` sets the readback to the next of
+    /// `values` and yields it (ophyd `set_mock_values`). With
+    /// `require_all_consumed`, dropping it before `values` is exhausted
+    /// panics, naming the consumed and unconsumed values; `values` must then
+    /// be finite.
+    pub fn set_values<I>(&self, values: I, require_all_consumed: bool) -> SetValues<T, I::IntoIter>
+    where
+        T: Debug,
+        I: IntoIterator<Item = T>,
+    {
+        SetValues {
+            backend: self.clone(),
+            values: values.into_iter(),
+            consumed: require_all_consumed.then(Vec::new),
+        }
+    }
+
     /// Allow (`true`) or block (`false`) puts from completing (ophyd
     /// `set_mock_put_proceeds`).
     pub fn set_put_proceeds(&self, proceeds: bool) {
@@ -137,6 +155,56 @@ where
                 return;
             }
         }
+    }
+}
+
+/// Iterator from [`MockSignalBackend::set_values`].
+pub struct SetValues<T, I>
+where
+    T: Clone + Debug + Send + Sync + Serialize + 'static,
+    I: Iterator<Item = T>,
+{
+    backend: MockSignalBackend<T>,
+    values: I,
+    /// `Some` iff all values must be consumed; kept only then, since the
+    /// values may otherwise be endless.
+    consumed: Option<Vec<T>>,
+}
+
+impl<T, I> Iterator for SetValues<T, I>
+where
+    T: Clone + Debug + Send + Sync + Serialize + 'static,
+    I: Iterator<Item = T>,
+{
+    type Item = T;
+    fn next(&mut self) -> Option<T> {
+        let value = self.values.next()?;
+        self.backend.set_value(value.clone());
+        if let Some(consumed) = &mut self.consumed {
+            consumed.push(value.clone());
+        }
+        Some(value)
+    }
+}
+
+impl<T, I> Drop for SetValues<T, I>
+where
+    T: Clone + Debug + Send + Sync + Serialize + 'static,
+    I: Iterator<Item = T>,
+{
+    fn drop(&mut self) {
+        let Some(consumed) = self.consumed.take() else {
+            return;
+        };
+        // A second panic while unwinding would abort the test binary.
+        if std::thread::panicking() {
+            return;
+        }
+        let rest: Vec<T> = self.values.by_ref().collect();
+        assert!(
+            rest.is_empty(),
+            "{consumed:?} were consumed but {rest:?} were not consumed"
+        );
     }
 }
 

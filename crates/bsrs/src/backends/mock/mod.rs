@@ -5,7 +5,7 @@
 #![deny(missing_docs)]
 
 pub mod mock_signal;
-pub use mock_signal::{MockPutCallback, MockSignalBackend, PutsBlockedGuard};
+pub use mock_signal::{MockPutCallback, MockSignalBackend, PutsBlockedGuard, SetValues};
 
 use crate::core::error::Result;
 use crate::core::reading::ReadingValue;

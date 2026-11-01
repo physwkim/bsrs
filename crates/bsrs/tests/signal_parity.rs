@@ -15,7 +15,7 @@ use bsrs::devices::{
     SignalConfig, SignalR, SignalRW, SignalW,
 };
 use bsrs::event_model::{make_datakey, DataKey, Dtype, SignalMetadata};
-use bsrs::protocols_async::{AsyncMovable, AsyncSubscribable, Locatable};
+use bsrs::protocols_async::{AsyncMovable, AsyncSubscribable, Locatable, SignalBackend};
 use futures::StreamExt;
 use serde::Serialize;
 use serde_json::json;
@@ -231,6 +231,33 @@ async fn reset_put_calls_forgets_earlier_puts() {
     assert_eq!(backend.put_count(), 0);
     assert!(sig.put(2.0).await.success());
     assert_eq!(backend.put_calls(), vec![Some(2.0)]);
+}
+
+// ophyd-async test_set_mock_values{,_exhausted_passes,_exhausted_fails}.
+#[tokio::test]
+async fn set_values_sets_each_value_as_it_is_taken() {
+    let backend = MockSignalBackend::with_value("first".to_string(), Dtype::String);
+    let values = || vec!["second".to_string(), "third".to_string()];
+
+    let mut it = backend.set_values(values(), false);
+    assert_eq!(backend.get_value().await.unwrap(), "first");
+    assert_eq!(it.next().as_deref(), Some("second"));
+    assert_eq!(backend.get_value().await.unwrap(), "second");
+    drop(it);
+
+    for v in backend.set_values(values(), true) {
+        assert_eq!(backend.get_value().await.unwrap(), v);
+    }
+    let endless = backend.set_values(values().into_iter().cycle(), false);
+    assert_eq!(endless.take(6).count(), 6);
+
+    let mut it = backend.set_values(values(), true);
+    it.next();
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(it))).unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<String>().map(String::as_str),
+        Some(r#"["second"] were consumed but ["third"] were not consumed"#)
+    );
 }
 
 // ophyd-async test_can_unsubscribe_from_subscribe_callback; ophyd
