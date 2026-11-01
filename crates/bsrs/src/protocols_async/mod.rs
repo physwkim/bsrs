@@ -48,7 +48,8 @@ pub trait SignalBackend<T: Clone + Send + Sync + 'static>: Send + Sync {
     /// completion carries no deadline; the caller that awaits it owns one.
     async fn put_start(&self, value: Option<T>) -> Result<PutCompletion>;
     /// Put a value to the signal, awaiting completion. `None` writes the
-    /// backend's default value (used by trigger-style `SignalX` puts).
+    /// backend's initial value: a soft signal's configured one, an EPICS
+    /// signal's value read at connect (used by trigger-style `SignalX` puts).
     /// Mirrors `ophyd_async/core/_signal_backend.py:82` `put(value: T | None)`:
     /// waiting-for-completion is implicit, and any timeout lives on the
     /// `Signal` layer (`SignalW::set` / `SignalX::trigger`), not here.
