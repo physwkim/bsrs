@@ -38,7 +38,7 @@ fn soft_signal(name: &str, kind: Kind, v: f64) -> (Arc<SignalR<f64, Soft>>, Arc<
     (sig, backend)
 }
 
-fn sig(name: &str, kind: Kind) -> Arc<dyn ReadableObj> {
+fn sig(name: &str, kind: Kind) -> Arc<SignalR<f64, Soft>> {
     soft_signal(name, kind, 0.0).0
 }
 
@@ -119,11 +119,11 @@ fn derive_kind_attribute_sets_signal_kind() {
 
 fn leaf(prefix: &str) -> StandardReadable {
     let mut sr = StandardReadable::new(prefix);
-    sr.add_readables(
+    sr.add_signal(
         sig(&format!("{prefix}-value"), Kind::Normal),
         StandardReadableFormat::HintedSignal,
     );
-    sr.add_readables(
+    sr.add_signal(
         sig(&format!("{prefix}-config"), Kind::Config),
         StandardReadableFormat::ConfigSignal,
     );
@@ -137,7 +137,7 @@ fn leaf(prefix: &str) -> StandardReadable {
 #[tokio::test]
 async fn standard_readable_child_merges_nested_read_configuration_and_hints() {
     let mut parent = StandardReadable::new("parent");
-    parent.add_readables(Arc::new(leaf("parent-sub")), StandardReadableFormat::Child);
+    parent.add_child(Arc::new(leaf("parent-sub")));
     assert_eq!(
         keys(&parent.read().await.unwrap()),
         set(&["parent-sub-value"])
@@ -160,12 +160,9 @@ async fn standard_readable_child_merges_nested_read_configuration_and_hints() {
     );
 
     let mut mid = StandardReadable::new("top-mid");
-    mid.add_readables(
-        Arc::new(leaf("top-mid-leaf")),
-        StandardReadableFormat::Child,
-    );
+    mid.add_child(Arc::new(leaf("top-mid-leaf")));
     let mut top = StandardReadable::new("top");
-    top.add_readables(Arc::new(mid), StandardReadableFormat::Child);
+    top.add_child(Arc::new(mid));
     assert_eq!(
         keys(&top.read().await.unwrap()),
         set(&["top-mid-leaf-value"])
@@ -186,22 +183,22 @@ fn standard_readable_hints_concatenate_in_registration_order() {
     );
 
     let mut first = StandardReadable::new("first");
-    first.add_readables(
+    first.add_signal(
         sig("abc", Kind::Normal),
         StandardReadableFormat::HintedSignal,
     );
     let mut second = StandardReadable::new("second");
-    second.add_readables(sig("def", Kind::Hinted), StandardReadableFormat::Child);
-    second.add_readables(
+    second.add_child(sig("def", Kind::Hinted));
+    second.add_signal(
         sig("ghi", Kind::Normal),
         StandardReadableFormat::HintedSignal,
     );
 
     let mut sr = StandardReadable::new("sr");
-    sr.add_readables(Arc::new(first), StandardReadableFormat::Child);
-    sr.add_readables(Arc::new(second), StandardReadableFormat::Child);
-    sr.add_readables(sig("jkl", Kind::Hinted), StandardReadableFormat::Child);
-    sr.add_readables(sig("quiet", Kind::Normal), StandardReadableFormat::Child);
+    sr.add_child(Arc::new(first));
+    sr.add_child(Arc::new(second));
+    sr.add_child(sig("jkl", Kind::Hinted));
+    sr.add_child(sig("quiet", Kind::Normal));
     assert_eq!(
         ReadableObj::hint_fields(&sr),
         Some(vec![
@@ -220,15 +217,15 @@ fn standard_readable_hints_concatenate_in_registration_order() {
 #[tokio::test]
 async fn standard_readable_uncached_formats_route_to_read() {
     let mut sr = StandardReadable::new("sr");
-    sr.add_readables(
+    sr.add_signal(
         sig("u", Kind::Normal),
         StandardReadableFormat::UncachedSignal,
     );
-    sr.add_readables(
+    sr.add_signal(
         sig("hu", Kind::Normal),
         StandardReadableFormat::HintedUncachedSignal,
     );
-    sr.add_readables(sig("c", Kind::Config), StandardReadableFormat::ConfigSignal);
+    sr.add_signal(sig("c", Kind::Config), StandardReadableFormat::ConfigSignal);
 
     let read = keys(&sr.read().await.unwrap());
     assert_eq!(read, set(&["u", "hu"]));
@@ -252,10 +249,10 @@ fn err_text<T>(r: Result<T>) -> String {
 async fn standard_readable_rejects_duplicate_reading_keys() {
     let mut sr = StandardReadable::new("sr");
     for name in ["a", "a", "b", "c", "c"] {
-        sr.add_readables(sig(name, Kind::Normal), StandardReadableFormat::Child);
+        sr.add_child(sig(name, Kind::Normal));
     }
     for name in ["x", "x"] {
-        sr.add_readables(
+        sr.add_signal(
             sig(name, Kind::Config),
             StandardReadableFormat::ConfigSignal,
         );
@@ -268,8 +265,8 @@ async fn standard_readable_rejects_duplicate_reading_keys() {
     assert!(err_text(sr.describe_configuration().await).contains(dup_x));
 
     let mut unnamed = StandardReadable::new("");
-    unnamed.add_readables(sig("", Kind::Normal), StandardReadableFormat::Child);
-    unnamed.add_readables(sig("", Kind::Normal), StandardReadableFormat::Child);
+    unnamed.add_child(sig("", Kind::Normal));
+    unnamed.add_child(sig("", Kind::Normal));
     assert!(err_text(unnamed.read().await).contains("Have you remembered to name the Device?"));
 }
 
@@ -281,13 +278,13 @@ async fn standard_readable_stage_holds_registered_monitors_until_unstage() {
     let (a, a_backend) = soft_signal("a", Kind::Normal, 1.0);
     let (b, b_backend) = soft_signal("b", Kind::Normal, 2.0);
     let mut inner = StandardReadable::new("inner");
-    inner.add_readables(b.clone(), StandardReadableFormat::Child);
+    inner.add_child(b.clone());
     inner.add_stageable(b);
     let inner = Arc::new(inner);
     let mut outer = StandardReadable::new("outer");
-    outer.add_readables(a.clone(), StandardReadableFormat::Child);
+    outer.add_child(a.clone());
     outer.add_stageable(a);
-    outer.add_readables(inner.clone(), StandardReadableFormat::Child);
+    outer.add_child(inner.clone());
     outer.add_stageable(inner);
 
     assert_eq!(
@@ -490,9 +487,9 @@ fn sync_facade_drives_soft_motor_and_standard_readable() {
 
     let (x, x_backend) = soft_signal("x", Kind::Normal, 1.0);
     let mut sr = StandardReadable::new("dev");
-    sr.add_readables(x.clone(), StandardReadableFormat::Child);
+    sr.add_child(x.clone());
     sr.add_stageable(x);
-    sr.add_readables(sig("c", Kind::Config), StandardReadableFormat::ConfigSignal);
+    sr.add_signal(sig("c", Kind::Config), StandardReadableFormat::ConfigSignal);
 
     sr.stage_blocking().unwrap();
     assert_eq!(x_backend.subscriber_count(), 1);
