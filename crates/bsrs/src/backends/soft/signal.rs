@@ -7,7 +7,7 @@ use crate::event_model::{make_datakey, DataKey, Dtype, DtypeNumpy, SignalMetadat
 use crate::protocols_async::{PutCompletion, ReadingValueCallback, SignalBackend};
 use async_trait::async_trait;
 use serde::Serialize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -18,20 +18,87 @@ fn now_ts() -> f64 {
         .unwrap_or_default()
 }
 
-struct Inner<T: Clone + Send + Sync + 'static> {
-    value: Mutex<T>,
-    setpoint: Mutex<T>,
+/// What a store changes, as one record: a reader never pairs a value with
+/// another write's timestamp, and a subscriber registers against exactly one
+/// stored reading.
+struct State<T> {
+    value: T,
+    setpoint: T,
     /// Wall-clock time the `value` last changed (set at construction and on
     /// every `put`/`write_now`). ophyd-async stamps the reading once at
     /// `set_value`/`put` and returns it from every `get_reading`
     /// (`_soft_signal_backend.py:147-173`); a read must NOT mint a fresh
     /// timestamp, or an unchanged value would appear to update on every read.
-    timestamp: Mutex<f64>,
+    timestamp: f64,
+    subscribers: Vec<(u64, Arc<Subscriber<T>>)>,
+    next_id: u64,
+}
+
+/// One registered callback and the readings queued for it.
+///
+/// INVARIANT: a callback receives readings in the order they were stored,
+/// starting with the reading current at its registration. Readings are
+/// queued only under the `State` lock (so queue order is store order), and
+/// only the thread that found the queue idle delivers from it (so no two
+/// deliveries to one callback run at once or overtake each other). Callbacks
+/// run with no lock held, so one may read, write or subscribe this backend.
+struct Subscriber<T> {
+    cb: ReadingValueCallback<T>,
+    mailbox: Mutex<Mailbox<T>>,
+}
+
+struct Mailbox<T> {
+    pending: VecDeque<(T, f64)>,
+    draining: bool,
+}
+
+impl<T> Subscriber<T> {
+    /// Queue a reading; `true` if the caller must now `drain`. Called with
+    /// the `State` lock held.
+    fn enqueue(&self, value: T, ts: f64) -> bool {
+        let mut mb = self.mailbox.lock().unwrap();
+        mb.pending.push_back((value, ts));
+        !std::mem::replace(&mut mb.draining, true)
+    }
+
+    /// Deliver queued readings until none remain. A write from another thread
+    /// meanwhile, or from the callback itself, is delivered by this loop.
+    fn drain(&self) {
+        // A panicking callback must not leave the mailbox claimed forever; the
+        // next store then becomes the drainer and delivers the backlog.
+        struct ReleaseOnPanic<'a, T>(&'a Mutex<Mailbox<T>>);
+        impl<T> Drop for ReleaseOnPanic<'_, T> {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    self.0.lock().unwrap_or_else(|e| e.into_inner()).draining = false;
+                }
+            }
+        }
+        let _release = ReleaseOnPanic(&self.mailbox);
+        loop {
+            let (value, ts) = {
+                let mut mb = self.mailbox.lock().unwrap();
+                match mb.pending.pop_front() {
+                    Some(reading) => reading,
+                    // Released in the same critical section that saw the
+                    // queue empty, so a concurrent enqueue either lands
+                    // before (and is popped) or claims the next drain.
+                    None => {
+                        mb.draining = false;
+                        return;
+                    }
+                }
+            };
+            (self.cb)(&value, ts, None);
+        }
+    }
+}
+
+struct Inner<T: Clone + Send + Sync + 'static> {
+    state: Mutex<State<T>>,
     /// Value written by `put(None)` — the ophyd-async `initial_value`
     /// (`_soft_signal_backend.py:164`). Fixed at construction.
     initial: T,
-    callbacks: Mutex<Vec<(u64, Arc<ReadingValueCallback<T>>)>>,
-    next_id: AtomicU64,
     units: Option<String>,
     dtype: Dtype,
     dtype_numpy: Option<DtypeNumpy>,
@@ -68,12 +135,14 @@ where
     pub fn new(initial: T, dtype: Dtype) -> Self {
         Self {
             inner: Arc::new(Inner {
-                value: Mutex::new(initial.clone()),
-                setpoint: Mutex::new(initial.clone()),
-                timestamp: Mutex::new(now_ts()),
+                state: Mutex::new(State {
+                    value: initial.clone(),
+                    setpoint: initial.clone(),
+                    timestamp: now_ts(),
+                    subscribers: Vec::new(),
+                    next_id: 0,
+                }),
                 initial,
-                callbacks: Mutex::new(Vec::new()),
-                next_id: AtomicU64::new(0),
                 units: None,
                 dtype,
                 dtype_numpy: None,
@@ -82,71 +151,90 @@ where
         }
     }
 
-    /// Set engineering units.
-    pub fn with_units(self, units: impl Into<String>) -> Self {
-        let inner = Arc::new(Inner {
-            value: Mutex::new(self.inner.value.lock().unwrap().clone()),
-            setpoint: Mutex::new(self.inner.setpoint.lock().unwrap().clone()),
-            timestamp: Mutex::new(*self.inner.timestamp.lock().unwrap()),
+    /// Copy of the stored reading and metadata, without subscribers.
+    fn rebuilt(&self) -> Inner<T> {
+        let st = self.inner.state.lock().unwrap();
+        Inner {
+            state: Mutex::new(State {
+                value: st.value.clone(),
+                setpoint: st.setpoint.clone(),
+                timestamp: st.timestamp,
+                subscribers: Vec::new(),
+                next_id: 0,
+            }),
             initial: self.inner.initial.clone(),
-            callbacks: Mutex::new(Vec::new()),
-            next_id: AtomicU64::new(0),
-            units: Some(units.into()),
+            units: self.inner.units.clone(),
             dtype: self.inner.dtype,
             dtype_numpy: self.inner.dtype_numpy.clone(),
             shape: self.inner.shape.clone(),
-        });
-        Self { inner }
+        }
+    }
+
+    /// Set engineering units.
+    pub fn with_units(self, units: impl Into<String>) -> Self {
+        let inner = Inner {
+            units: Some(units.into()),
+            ..self.rebuilt()
+        };
+        Self {
+            inner: Arc::new(inner),
+        }
     }
 
     /// Set the dtype_numpy metadata.
     pub fn with_dtype_numpy(self, np: impl Into<DtypeNumpy>) -> Self {
-        let inner = Arc::new(Inner {
-            value: Mutex::new(self.inner.value.lock().unwrap().clone()),
-            setpoint: Mutex::new(self.inner.setpoint.lock().unwrap().clone()),
-            timestamp: Mutex::new(*self.inner.timestamp.lock().unwrap()),
-            initial: self.inner.initial.clone(),
-            callbacks: Mutex::new(Vec::new()),
-            next_id: AtomicU64::new(0),
-            units: self.inner.units.clone(),
-            dtype: self.inner.dtype,
+        let inner = Inner {
             dtype_numpy: Some(np.into()),
-            shape: self.inner.shape.clone(),
-        });
-        Self { inner }
+            ..self.rebuilt()
+        };
+        Self {
+            inner: Arc::new(inner),
+        }
     }
 
     /// Read the current value synchronously, for inspect/debug paths
     /// that must not block. Returns a clone.
     pub fn current_value(&self) -> T {
-        self.inner.value.lock().unwrap().clone()
+        self.inner.state.lock().unwrap().value.clone()
     }
 
     /// Read the last setpoint synchronously.
     pub fn current_setpoint(&self) -> T {
-        self.inner.setpoint.lock().unwrap().clone()
+        self.inner.state.lock().unwrap().setpoint.clone()
     }
 
     /// Number of subscribers currently registered on this backend.
     pub fn subscriber_count(&self) -> usize {
-        self.inner.callbacks.lock().unwrap().len()
+        self.inner.state.lock().unwrap().subscribers.len()
     }
 
     /// Synchronously poke a new value (for sim drivers).
     pub fn write_now(&self, v: T) {
-        *self.inner.value.lock().unwrap() = v.clone();
+        self.store(v, false);
+    }
+
+    /// The one write path: store the reading (and the setpoint, for a put)
+    /// and deliver it. Under contention a callback being delivered to by
+    /// another thread gets this reading from that thread, after the ones
+    /// stored before it, and this call returns without waiting for it.
+    fn store(&self, value: T, put: bool) {
         let ts = now_ts();
-        *self.inner.timestamp.lock().unwrap() = ts;
-        let cbs: Vec<_> = self
-            .inner
-            .callbacks
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(_, cb)| cb.clone())
-            .collect();
-        for cb in cbs {
-            cb(&v, ts, None);
+        let mut to_drain = Vec::new();
+        {
+            let mut st = self.inner.state.lock().unwrap();
+            if put {
+                st.setpoint = value.clone();
+            }
+            st.value = value.clone();
+            st.timestamp = ts;
+            for (_, sub) in &st.subscribers {
+                if sub.enqueue(value.clone(), ts) {
+                    to_drain.push(sub.clone());
+                }
+            }
+        }
+        for sub in to_drain {
+            sub.drain();
         }
     }
 }
@@ -163,21 +251,7 @@ where
         // `None` writes the configured initial value (ophyd-async
         // `_soft_signal_backend.py:164`).
         let value = value.unwrap_or_else(|| self.inner.initial.clone());
-        *self.inner.setpoint.lock().unwrap() = value.clone();
-        *self.inner.value.lock().unwrap() = value.clone();
-        let ts = now_ts();
-        *self.inner.timestamp.lock().unwrap() = ts;
-        let cbs: Vec<_> = self
-            .inner
-            .callbacks
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(_, cb)| cb.clone())
-            .collect();
-        for cb in cbs {
-            cb(&value, ts, None);
-        }
+        self.store(value, true);
         Ok(Box::pin(std::future::ready(Ok(()))))
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
@@ -193,11 +267,13 @@ where
         ))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
-        let v = self.inner.value.lock().unwrap().clone();
         // The value's last-change time, captured at construction / `put` /
         // `write_now` — NOT a fresh read-time stamp. Mirrors ophyd-async
         // returning the stored `self.reading` (`_soft_signal_backend.py:172`).
-        let timestamp = *self.inner.timestamp.lock().unwrap();
+        let (v, timestamp) = {
+            let st = self.inner.state.lock().unwrap();
+            (st.value.clone(), st.timestamp)
+        };
         Ok(ReadingValue {
             value: serde_json::to_value(v)?,
             timestamp,
@@ -206,30 +282,47 @@ where
         })
     }
     async fn get_value(&self) -> Result<T> {
-        Ok(self.inner.value.lock().unwrap().clone())
+        Ok(self.current_value())
     }
     async fn get_setpoint(&self) -> Result<T> {
-        Ok(self.inner.setpoint.lock().unwrap().clone())
+        Ok(self.current_setpoint())
     }
     fn set_callback(&self, cb: Option<ReadingValueCallback<T>>) -> SubToken {
-        match cb {
-            None => SubToken::noop(),
-            Some(cb) => {
-                let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
-                let cb = Arc::new(cb);
-                self.inner.callbacks.lock().unwrap().push((id, cb.clone()));
-                // A new monitor starts with the current reading, as ophyd-async
-                // `SoftSignalBackend.set_callback` calls `callback(self.reading)`.
-                // Read after registering so no write between the two is missed.
-                let value = self.inner.value.lock().unwrap().clone();
-                let ts = *self.inner.timestamp.lock().unwrap();
-                cb(&value, ts, None);
-                let inner = self.inner.clone();
-                SubToken::new(move || {
-                    inner.callbacks.lock().unwrap().retain(|(i, _)| *i != id);
-                })
+        let Some(cb) = cb else {
+            return SubToken::noop();
+        };
+        let sub = Arc::new(Subscriber {
+            cb,
+            mailbox: Mutex::new(Mailbox {
+                pending: VecDeque::new(),
+                draining: false,
+            }),
+        });
+        let id = {
+            let mut st = self.inner.state.lock().unwrap();
+            // A new monitor starts with the current reading, as ophyd-async
+            // `SoftSignalBackend.set_callback` calls `callback(self.reading)`;
+            // queued with the registration, so every later store follows it.
+            sub.enqueue(st.value.clone(), st.timestamp);
+            let id = st.next_id;
+            st.next_id += 1;
+            st.subscribers.push((id, sub.clone()));
+            id
+        };
+        sub.drain();
+        let inner = self.inner.clone();
+        SubToken::new(move || {
+            let removed = {
+                let mut st = inner.state.lock().unwrap();
+                let at = st.subscribers.iter().position(|(i, _)| *i == id);
+                at.map(|at| st.subscribers.remove(at).1)
+            };
+            // No store reaches it now; drop what is still queued so no
+            // delivery starts after unsubscribe.
+            if let Some(sub) = removed {
+                sub.mailbox.lock().unwrap().pending.clear();
             }
-        }
+        })
     }
     fn source(&self, name: &str, _read: bool) -> String {
         format!("soft://{name}")
@@ -289,5 +382,112 @@ mod tests {
             r3.timestamp,
             r2.timestamp
         );
+    }
+
+    type Log = Arc<Mutex<Vec<f64>>>;
+
+    /// A callback that records each value once its call returns, and whose
+    /// call for `hold` blocks until released: `entered` fires on entry.
+    fn holding_recorder(
+        hold: f64,
+    ) -> (
+        ReadingValueCallback<f64>,
+        Log,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let (entered_tx, release_rx) = (Mutex::new(entered_tx), Mutex::new(release_rx));
+        let log: Log = Arc::default();
+        let seen = log.clone();
+        let cb: ReadingValueCallback<f64> = Box::new(move |v: &f64, _, _| {
+            if *v == hold {
+                entered_tx.lock().unwrap().send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }
+            seen.lock().unwrap().push(*v);
+        });
+        (cb, log, entered, release)
+    }
+
+    fn recorder() -> (ReadingValueCallback<f64>, Log) {
+        let log: Log = Arc::default();
+        let seen = log.clone();
+        (
+            Box::new(move |v: &f64, _, _| seen.lock().unwrap().push(*v)),
+            log,
+        )
+    }
+
+    // Boundary: a store while another thread is mid-delivery of an earlier one.
+    #[test]
+    fn a_store_during_another_delivery_reaches_each_callback_after_it() {
+        let b = SoftSignalBackend::new(0.0_f64, Dtype::Number);
+        let (slow, _, entered, release) = holding_recorder(1.0);
+        let (fast, log) = recorder();
+        let _t1 = b.set_callback(Some(slow));
+        let _t2 = b.set_callback(Some(fast));
+        let writer = {
+            let b = b.clone();
+            std::thread::spawn(move || b.write_now(1.0))
+        };
+        entered.recv().unwrap();
+        b.write_now(2.0);
+        release.send(()).unwrap();
+        writer.join().unwrap();
+        assert_eq!(*log.lock().unwrap(), [0.0, 1.0, 2.0]);
+        assert_eq!(b.current_value(), 2.0);
+    }
+
+    // Boundary: an unsubscribe while a store is queued for that callback.
+    #[test]
+    fn no_delivery_starts_after_unsubscribe() {
+        let b = SoftSignalBackend::new(0.0_f64, Dtype::Number);
+        let (slow, _, entered, release) = holding_recorder(1.0);
+        let (fast, log) = recorder();
+        let _t1 = b.set_callback(Some(slow));
+        let t2 = b.set_callback(Some(fast));
+        let writer = {
+            let b = b.clone();
+            std::thread::spawn(move || b.write_now(1.0))
+        };
+        entered.recv().unwrap();
+        drop(t2);
+        release.send(()).unwrap();
+        writer.join().unwrap();
+        assert_eq!(*log.lock().unwrap(), [0.0]);
+    }
+
+    // Boundary: a store while a new callback is getting its initial reading.
+    #[test]
+    fn a_store_during_the_initial_delivery_follows_it() {
+        let b = SoftSignalBackend::new(0.0_f64, Dtype::Number);
+        let (cb, log, entered, release) = holding_recorder(0.0);
+        let registrar = {
+            let b = b.clone();
+            std::thread::spawn(move || b.set_callback(Some(cb)))
+        };
+        entered.recv().unwrap();
+        b.write_now(2.0);
+        release.send(()).unwrap();
+        let _token = registrar.join().unwrap();
+        assert_eq!(*log.lock().unwrap(), [0.0, 2.0]);
+    }
+
+    // Boundary: a store from inside a callback, on the delivering thread.
+    #[test]
+    fn a_store_from_a_callback_is_delivered_after_it_returns() {
+        let b = SoftSignalBackend::new(0.0_f64, Dtype::Number);
+        let log: Log = Arc::default();
+        let (seen, writer) = (log.clone(), b.clone());
+        let _token = b.set_callback(Some(Box::new(move |v: &f64, _, _| {
+            if *v == 1.0 {
+                writer.write_now(2.0);
+            }
+            seen.lock().unwrap().push(*v);
+        })));
+        b.write_now(1.0);
+        assert_eq!(*log.lock().unwrap(), [0.0, 1.0, 2.0]);
     }
 }
