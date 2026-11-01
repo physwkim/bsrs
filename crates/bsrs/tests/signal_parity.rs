@@ -1,6 +1,7 @@
 //! Signal behaviour checked against ophyd / ophyd-async: soft and mock
 //! backends, the shared monitor, and the observe / wait combinators.
 
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -12,7 +13,7 @@ use bsrs::devices::{
     observe_signals_value, observe_value, wait_for_value, BackendFromPv, Readable, Signal,
     SignalConfig, SignalR, SignalRW,
 };
-use bsrs::event_model::Dtype;
+use bsrs::event_model::{make_datakey, DataKey, Dtype, SignalMetadata};
 use bsrs::protocols_async::AsyncSubscribable;
 use futures::StreamExt;
 use serde::Serialize;
@@ -119,6 +120,52 @@ async fn soft_describe_carries_units_only_when_given() {
     assert_eq!(units(plain().with_units("mm")).await.as_deref(), Some("mm"));
     assert_eq!(units(plain().with_units("")).await.as_deref(), Some(""));
     assert_eq!(units(plain()).await, None);
+}
+
+fn describe_of(source: &str) -> DataKey {
+    make_datakey(
+        source,
+        Dtype::Number,
+        vec![],
+        Some("<f8".into()),
+        SignalMetadata {
+            units: Some("mm".into()),
+            ..Default::default()
+        },
+    )
+}
+
+// ophyd-async test_mock_signal_of_soft_signal_backend_receives_metadata,
+// test_mock_signal_of_soft_signal_backend_receives_intial_value.
+#[tokio::test]
+async fn mock_over_soft_keeps_initial_and_metadata_under_a_mock_source() {
+    let backend = || {
+        SoftSignalBackend::new(10.0_f64, Dtype::Number)
+            .with_units("mm")
+            .with_dtype_numpy("<f8")
+    };
+    let mocked: SignalRW<f64, _> = Signal::new(
+        Arc::new(MockSignalBackend::new(backend())),
+        cfg("mocked_device-my_signal"),
+    );
+    let plain: SignalRW<f64, _> = Signal::new(Arc::new(backend()), cfg("soft_device-my_signal"));
+
+    assert_eq!(mocked.get().await.unwrap(), 10.0);
+    assert_eq!(plain.get().await.unwrap(), 10.0);
+    assert_eq!(
+        mocked.describe().await.unwrap(),
+        HashMap::from([(
+            "mocked_device-my_signal".to_string(),
+            describe_of("mock+soft://mocked_device-my_signal"),
+        )])
+    );
+    assert_eq!(
+        plain.describe().await.unwrap(),
+        HashMap::from([(
+            "soft_device-my_signal".to_string(),
+            describe_of("soft://soft_device-my_signal"),
+        )])
+    );
 }
 
 // ophyd-async test_when_callback_on_mock_put_returns_none_then_readback_is_the_setpoint;

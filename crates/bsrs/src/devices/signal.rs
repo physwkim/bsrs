@@ -220,10 +220,10 @@ where
     /// Describe this one signal as a `(key, DataKey)` map.
     pub async fn describe(&self) -> Result<HashMap<String, DataKey>> {
         let mut dk = self.backend.get_datakey(&self.config.source).await?;
-        // Annotate the source if the backend left it blank.
-        if dk.source.is_empty() {
-            dk.source = self.backend.source(&self.config.source, true);
-        }
+        // `source()` owns DataKey.source: a backend that builds its datakey
+        // through a wrapped one (mock over soft) formats it for the wrong
+        // scheme, while ophyd-async passes `Signal.source` to `get_datakey`.
+        dk.source = self.source();
         let mut out = HashMap::new();
         out.insert(self.config.name.clone(), dk);
         Ok(out)
