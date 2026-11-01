@@ -183,6 +183,8 @@ pub struct EpicsCaBackend<T: Clone + Send + Sync + 'static> {
     channel: tokio::sync::OnceCell<Arc<SharedChannel>>,
     /// Consulted only by `SignalBackend<String>`; ignored for other `T`.
     string_kind: CaStringKind,
+    /// `SignalBackend<String>`'s codec, fixed once the channel connects.
+    str_codec: tokio::sync::OnceCell<StrCodec>,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -194,6 +196,7 @@ impl<T: Clone + Send + Sync + 'static> EpicsCaBackend<T> {
             ctx: ca_context(),
             channel: tokio::sync::OnceCell::new(),
             string_kind: CaStringKind::Short,
+            str_codec: tokio::sync::OnceCell::new(),
             _marker: std::marker::PhantomData,
         }
     }
@@ -405,7 +408,7 @@ fn epics_to_f64(v: &EpicsValue) -> Option<f64> {
 /// Decode a numeric waveform `EpicsValue` array into `Vec<f64>`, widening every
 /// element type the way [`epics_to_f64`] does for scalars. `UCharArray` /
 /// `EnumArray` / `StringArray` are intentionally excluded: they carry the
-/// long-string and enum-choice meanings owned by the `String` / enum backends,
+/// long-string and enum-choice meanings owned by the `String` backend,
 /// not numeric waveform data. A one-element answer arrives as the scalar
 /// (`EpicsValue::from_bytes_array`).
 fn epics_to_vec_f64(v: &EpicsValue) -> Option<Vec<f64>> {
@@ -495,6 +498,51 @@ fn string_to_epics(s: &str, kind: CaStringKind) -> EpicsValue {
             bytes.push(0);
             EpicsValue::CharArray(bytes.into())
         }
+    }
+}
+
+/// What a `String` is on a channel, as ophyd-async picks its `str`
+/// converter by the channel's type: a `DBR_ENUM` is its labels, by the
+/// record's choices; anything else the text of the backend's [`CaStringKind`].
+#[derive(Clone)]
+enum StrCodec {
+    Text(CaStringKind),
+    Enum(Vec<String>),
+}
+
+impl StrCodec {
+    async fn of(ch: &SharedChannel, kind: CaStringKind) -> Result<Self> {
+        if channel_native_type(ch).await? != DbFieldType::Enum {
+            return Ok(Self::Text(kind));
+        }
+        let snap = ch
+            .get_with_metadata(DbrClass::Ctrl, CA_IO_TIMEOUT)
+            .await
+            .map_err(|e| BsrsError::Backend(format!("ca ctrl get: {e}")))?;
+        let choices = snap.enums.map(|e| enum_labels_to_strings(e.strings));
+        Ok(Self::Enum(choices.unwrap_or_default()))
+    }
+
+    fn decode(&self, v: &EpicsValue) -> Option<String> {
+        match self {
+            Self::Text(kind) => epics_to_string(v, *kind),
+            Self::Enum(choices) => epics_to_enum_label(v, choices),
+        }
+    }
+
+    fn encode(&self, s: &str) -> Result<EpicsValue> {
+        match self {
+            Self::Text(kind) => Ok(string_to_epics(s, *kind)),
+            Self::Enum(choices) => enum_label_to_index(s, choices).map(EpicsValue::Enum),
+        }
+    }
+}
+
+impl EpicsCaBackend<String> {
+    async fn codec(&self, ch: &SharedChannel) -> Result<&StrCodec> {
+        self.str_codec
+            .get_or_try_init(|| StrCodec::of(ch, self.string_kind))
+            .await
     }
 }
 
@@ -698,7 +746,8 @@ impl SignalBackend<Vec<f64>> for EpicsCaBackend<Vec<f64>> {
 #[async_trait]
 impl SignalBackend<String> for EpicsCaBackend<String> {
     async fn connect(&self, timeout: Duration) -> Result<()> {
-        self.ensure_channel(timeout).await.map(|_| ())
+        let ch = self.ensure_channel(timeout).await?;
+        self.codec(&ch).await.map(|_| ())
     }
     async fn put_start(&self, value: Option<String>) -> Result<PutCompletion> {
         let value = value.unwrap_or_default();
@@ -706,7 +755,7 @@ impl SignalBackend<String> for EpicsCaBackend<String> {
             .ensure_channel(Duration::from_secs(2))
             .await
             .map_err(|e| BsrsError::Backend(format!("{e}")))?;
-        let v = string_to_epics(&value, self.string_kind);
+        let v = self.codec(&ch).await?.encode(&value)?;
         put_callback(&ch, &v, "ca put")
     }
     async fn put(&self, value: Option<String>) -> Result<()> {
@@ -718,25 +767,33 @@ impl SignalBackend<String> for EpicsCaBackend<String> {
             .info()
             .await
             .map_err(|e| BsrsError::Backend(format!("ca info: {e}")))?;
-        let shape = match self.string_kind {
-            CaStringKind::Long if info.element_count > 1 => vec![Some(info.element_count as u64)],
-            _ => vec![],
+        let (shape, choices) = match self.codec(&ch).await? {
+            StrCodec::Text(CaStringKind::Long) if info.element_count > 1 => {
+                (vec![Some(info.element_count as u64)], None)
+            }
+            StrCodec::Text(_) => (vec![], None),
+            StrCodec::Enum(choices) => (vec![], Some(choices.clone())),
         };
         Ok(make_datakey(
             format!("ca://{source}"),
             Dtype::String,
             shape,
             Some("|S".into()),
-            SignalMetadata::default(),
+            SignalMetadata {
+                choices,
+                ..SignalMetadata::default()
+            },
         ))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
+        let codec = self.codec(&ch).await?;
         let snap = ch
             .get_with_metadata(DbrClass::Time, CA_IO_TIMEOUT)
             .await
             .map_err(|e| BsrsError::Backend(format!("ca get: {e}")))?;
-        let s = epics_to_string(&snap.value, self.string_kind)
+        let s = codec
+            .decode(&snap.value)
             .ok_or_else(|| BsrsError::Backend(format!("ca: not stringable: {:?}", snap.value)))?;
         Ok(ReadingValue {
             value: serde_json::Value::from(s),
@@ -747,11 +804,13 @@ impl SignalBackend<String> for EpicsCaBackend<String> {
     }
     async fn get_value(&self) -> Result<String> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
+        let codec = self.codec(&ch).await?;
         let (_ty, v) = ch
             .get_with_timeout(CA_IO_TIMEOUT)
             .await
             .map_err(|e| BsrsError::Backend(format!("ca get: {e}")))?;
-        epics_to_string(&v, self.string_kind)
+        codec
+            .decode(&v)
             .ok_or_else(|| BsrsError::Backend(format!("ca: not stringable: {v:?}")))
     }
     async fn get_setpoint(&self) -> Result<String> {
@@ -765,17 +824,25 @@ impl SignalBackend<String> for EpicsCaBackend<String> {
         let ctx = self.ctx.clone();
         let pv = self.pv.clone();
         let kind = self.string_kind;
+        let cached = self.str_codec.get().cloned();
         let handle = tokio::spawn(async move {
             let ch = match ctx.get_or_open(&pv, Duration::from_secs(2)).await {
                 Ok(c) => c,
                 Err(_) => return,
+            };
+            let codec = match cached {
+                Some(c) => c,
+                None => match StrCodec::of(&ch, kind).await {
+                    Ok(c) => c,
+                    Err(_) => return,
+                },
             };
             let mut sub = match ch.subscribe().await {
                 Ok(s) => s,
                 Err(_) => return,
             };
             while let Some(Ok(snap)) = sub.recv().await {
-                if let Some(s) = epics_to_string(&snap.value, kind) {
+                if let Some(s) = codec.decode(&snap.value) {
                     let ts = ts_to_f64(snap.timestamp);
                     cb(&s, ts, Some(alarm_severity(snap.alarm.severity)));
                 }
@@ -1046,182 +1113,9 @@ fn enum_labels_to_strings(labels: Vec<PvString>) -> Vec<String> {
 }
 
 /// CA backend for `DBR_ENUM` PVs (`mbbi`/`mbbo`, areaDetector `ImageMode`,
-/// `TriggerMode`, `FileWriteMode`, `DetectorState_RBV`, …). Presents the enum
-/// as its label `String`, mirroring ophyd-async `CaEnumConverter`: get and
-/// subscribe map the wire index to the choice label; put maps a label (or a
-/// decimal index string) back to the `DBR_ENUM` index. The choice list is
-/// fetched once at connect via `DbrClass::Ctrl`, cached, and surfaced in
-/// `DataKey.choices` so plans validate against the choice set.
-pub struct CaEnumBackend {
-    pv: String,
-    ctx: Arc<CaContext>,
-    channel: tokio::sync::OnceCell<Arc<SharedChannel>>,
-    choices: OnceLock<Vec<String>>,
-}
-
-impl CaEnumBackend {
-    /// Build with a PV name.
-    pub fn new(pv: impl Into<String>) -> Self {
-        Self {
-            pv: pv.into(),
-            ctx: ca_context(),
-            channel: tokio::sync::OnceCell::new(),
-            choices: OnceLock::new(),
-        }
-    }
-
-    async fn ensure_channel(&self, timeout: Duration) -> Result<Arc<SharedChannel>> {
-        self.channel
-            .get_or_try_init(|| self.ctx.get_or_open(&self.pv, timeout))
-            .await
-            .cloned()
-    }
-
-    /// Fetch the enum choice labels via a `DbrClass::Ctrl` read and cache them.
-    /// Returns the cached list on subsequent calls (no further network I/O).
-    async fn ensure_choices(&self, ch: &SharedChannel) -> Result<Vec<String>> {
-        if let Some(c) = self.choices.get() {
-            return Ok(c.clone());
-        }
-        let snap = ch
-            .get_with_metadata(DbrClass::Ctrl, CA_IO_TIMEOUT)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("ca enum ctrl get {}: {e}", self.pv)))?;
-        let choices = snap
-            .enums
-            .map(|e| enum_labels_to_strings(e.strings))
-            .unwrap_or_default();
-        // First writer wins; a concurrent fetch resolves to the same labels.
-        let _ = self.choices.set(choices);
-        Ok(self.choices.get().cloned().unwrap_or_default())
-    }
-
-    /// Read the current value and resolve it to its choice label.
-    async fn read_label(&self) -> Result<String> {
-        let ch = self.ensure_channel(Duration::from_secs(2)).await?;
-        let choices = self.ensure_choices(&ch).await?;
-        let (_ty, v) = ch
-            .get_with_timeout(CA_IO_TIMEOUT)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("ca enum get: {e}")))?;
-        epics_to_enum_label(&v, &choices)
-            .ok_or_else(|| BsrsError::Backend(format!("ca enum: not enum-decodable: {v:?}")))
-    }
-}
-
-impl crate::devices::BackendFromPv for CaEnumBackend {
-    fn from_pv(pv: &str) -> Self {
-        Self::new(pv)
-    }
-}
-
-#[async_trait]
-impl SignalBackend<String> for CaEnumBackend {
-    async fn connect(&self, timeout: Duration) -> Result<()> {
-        let ch = self.ensure_channel(timeout).await?;
-        // Warm the choice cache so describe()/get() never block on it later.
-        self.ensure_choices(&ch).await?;
-        Ok(())
-    }
-    async fn put_start(&self, value: Option<String>) -> Result<PutCompletion> {
-        let value = value.unwrap_or_default();
-        let ch = self
-            .ensure_channel(Duration::from_secs(2))
-            .await
-            .map_err(|e| BsrsError::Backend(format!("{e}")))?;
-        let choices = self.ensure_choices(&ch).await?;
-        let idx = enum_label_to_index(&value, &choices)?;
-        // Enum PVs are DBR_ENUM on the wire; put writes with native_type, so the
-        // payload must be the 2-byte index, not a 40-byte DBR_STRING.
-        put_callback(&ch, &EpicsValue::Enum(idx), "ca enum put")
-    }
-    async fn put(&self, value: Option<String>) -> Result<()> {
-        await_put(self.put_start(value).await?, "ca enum put").await
-    }
-    async fn get_datakey(&self, source: &str) -> Result<DataKey> {
-        let ch = self.ensure_channel(Duration::from_secs(2)).await?;
-        let choices = self.ensure_choices(&ch).await?;
-        Ok(make_datakey(
-            format!("ca://{source}"),
-            Dtype::String,
-            vec![],
-            Some("|S".into()),
-            SignalMetadata {
-                choices: Some(choices),
-                ..SignalMetadata::default()
-            },
-        ))
-    }
-    async fn get_reading(&self) -> Result<ReadingValue> {
-        // A Reading carries the alarm severity and server timestamp that
-        // `read_label` discards, so inline a `Time` metadata read (value +
-        // severity + timestamp) and decode the label against the cached choices
-        // rather than going through `read_label`.
-        let ch = self.ensure_channel(Duration::from_secs(2)).await?;
-        let choices = self.ensure_choices(&ch).await?;
-        let snap = ch
-            .get_with_metadata(DbrClass::Time, CA_IO_TIMEOUT)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("ca enum get: {e}")))?;
-        let label = epics_to_enum_label(&snap.value, &choices).ok_or_else(|| {
-            BsrsError::Backend(format!("ca enum: not enum-decodable: {:?}", snap.value))
-        })?;
-        Ok(ReadingValue {
-            value: serde_json::Value::from(label),
-            timestamp: ts_to_f64(snap.timestamp),
-            alarm_severity: Some(alarm_severity(snap.alarm.severity)),
-            message: None,
-        })
-    }
-    async fn get_value(&self) -> Result<String> {
-        self.read_label().await
-    }
-    async fn get_setpoint(&self) -> Result<String> {
-        self.read_label().await
-    }
-    fn set_callback(&self, cb: Option<ReadingValueCallback<String>>) -> SubToken {
-        let cb = match cb {
-            None => return SubToken::noop(),
-            Some(cb) => Arc::new(cb),
-        };
-        let ctx = self.ctx.clone();
-        let pv = self.pv.clone();
-        let cached = self.choices.get().cloned();
-        let handle = tokio::spawn(async move {
-            let ch = match ctx.get_or_open(&pv, Duration::from_secs(2)).await {
-                Ok(c) => c,
-                Err(_) => return,
-            };
-            // Resolve the choice list once (the cached value if connect warmed
-            // it, else a one-shot Ctrl read) so each update maps the wire index
-            // to its label.
-            let choices = match cached {
-                Some(c) => c,
-                None => ch
-                    .get_with_metadata(DbrClass::Ctrl, CA_IO_TIMEOUT)
-                    .await
-                    .ok()
-                    .and_then(|s| s.enums.map(|e| enum_labels_to_strings(e.strings)))
-                    .unwrap_or_default(),
-            };
-            let mut sub = match ch.subscribe().await {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            while let Some(Ok(snap)) = sub.recv().await {
-                if let Some(label) = epics_to_enum_label(&snap.value, &choices) {
-                    let ts = ts_to_f64(snap.timestamp);
-                    cb(&label, ts, Some(alarm_severity(snap.alarm.severity)));
-                }
-            }
-        });
-        let abort = handle.abort_handle();
-        SubToken::new(move || abort.abort())
-    }
-    fn source(&self, name: &str, _read: bool) -> String {
-        format!("ca://{name}")
-    }
-}
+/// `TriggerMode`, `FileWriteMode`, `DetectorState_RBV`, …) as their labels:
+/// the `String` backend, which reads any `DBR_ENUM` channel so.
+pub type CaEnumBackend = EpicsCaBackend<String>;
 
 #[cfg(test)]
 mod tests {

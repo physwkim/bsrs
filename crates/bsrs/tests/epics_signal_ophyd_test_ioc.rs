@@ -360,6 +360,27 @@ fn ca_enum_lifecycle() {
     });
 }
 
+/// An mbbo read as a plain string: its label, with its labels as the
+/// choices, as ophyd-async reads `str` off a `DBR_ENUM` as `DBR_STRING`.
+#[test]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+fn ca_string_reads_an_mbbo_as_its_label() {
+    run(async {
+        let pv = format!("{CAM}cam1:TriggerMode");
+        let b = EpicsCaBackend::<String>::new(&pv);
+        let dk = assert_lifecycle(&b, &pv, "External".to_string()).await;
+        assert_eq!(dk.dtype, Dtype::String);
+        assert!(dk.shape.is_empty());
+        let choices = ["Internal", "External"].map(String::from);
+        assert_eq!(dk.choices.as_deref(), Some(&choices[..]));
+        assert_eq!((dk.units, dk.precision, dk.limits), (None, None, None));
+        b.put(Some("0".into())).await.unwrap();
+        assert_eq!(b.get_value().await.unwrap(), "Internal");
+        b.put(Some("Bogus".into())).await.expect_err("not a label");
+        assert_eq!(b.get_value().await.unwrap(), "Internal");
+    });
+}
+
 /// An mbbo over PVA (NTEnum) as a string: a label puts and reads back, an
 /// index string puts as that index, as p4p assigns into an `enum_t`.
 #[test]
