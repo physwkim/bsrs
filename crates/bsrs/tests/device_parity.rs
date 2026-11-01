@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bsrs::backends::soft::{SoftDetector, SoftMotor, SoftSignalBackend};
-use bsrs::core::msg::ReadableObj;
+use bsrs::core::msg::{ConfigurableObj, NamedObj, ReadableObj, StageableObj};
 use bsrs::core::{
     BsrsError, ConfigureArgs, DataKey, Dtype, Kind, ReadingValue, Result, Status, StatusError,
     StatusOutcome, SubToken,
@@ -315,6 +315,94 @@ impl SignalBackend<f64> for SilentMonitor {
     fn source(&self, name: &str, _read: bool) -> String {
         format!("silent://{name}")
     }
+}
+
+const SLOW: Duration = Duration::from_millis(100);
+
+/// Every verb takes `SLOW`, so two children take `SLOW` when gathered and
+/// twice that when awaited one after the other.
+struct SlowChild(String);
+
+impl NamedObj for SlowChild {
+    fn name(&self) -> &str {
+        &self.0
+    }
+}
+
+#[async_trait::async_trait]
+impl ReadableObj for SlowChild {
+    async fn read_dyn(&self) -> Result<HashMap<String, ReadingValue>> {
+        tokio::time::sleep(SLOW).await;
+        Ok(HashMap::new())
+    }
+    async fn describe_dyn(&self) -> Result<HashMap<String, DataKey>> {
+        tokio::time::sleep(SLOW).await;
+        Ok(HashMap::new())
+    }
+    fn as_stageable(self: Arc<Self>) -> Option<Arc<dyn StageableObj>> {
+        Some(self)
+    }
+    fn as_configurable(&self) -> Option<&dyn ConfigurableObj> {
+        Some(self)
+    }
+}
+
+#[async_trait::async_trait]
+impl ConfigurableObj for SlowChild {
+    async fn read_configuration_dyn(&self) -> Result<HashMap<String, ReadingValue>> {
+        tokio::time::sleep(SLOW).await;
+        Ok(HashMap::new())
+    }
+    async fn describe_configuration_dyn(&self) -> Result<HashMap<String, DataKey>> {
+        tokio::time::sleep(SLOW).await;
+        Ok(HashMap::new())
+    }
+    async fn configure_dyn(&self, _args: ConfigureArgs) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl StageableObj for SlowChild {
+    async fn stage_dyn(&self) -> Result<()> {
+        tokio::time::sleep(SLOW).await;
+        Ok(())
+    }
+    async fn unstage_dyn(&self) -> Result<()> {
+        tokio::time::sleep(SLOW).await;
+        Ok(())
+    }
+}
+
+// ophyd-async merge_gathered_dicts and _StandardBase.stage/unstage gather the
+// children (asyncio.gather) rather than awaiting them in turn.
+#[tokio::test(start_paused = true)]
+async fn standard_readable_gathers_children_concurrently() {
+    let mut sr = StandardReadable::new("sr");
+    for name in ["s1", "s2"] {
+        sr.add_child(Arc::new(SlowChild(name.into()))).unwrap();
+    }
+    macro_rules! elapsed {
+        ($verb:expr) => {{
+            let t = tokio::time::Instant::now();
+            $verb.await.unwrap();
+            t.elapsed()
+        }};
+    }
+    assert_eq!(elapsed!(sr.read()), SLOW, "read");
+    assert_eq!(elapsed!(sr.describe()), SLOW, "describe");
+    assert_eq!(
+        elapsed!(sr.read_configuration()),
+        SLOW,
+        "read_configuration"
+    );
+    assert_eq!(
+        elapsed!(sr.describe_configuration()),
+        SLOW,
+        "describe_configuration"
+    );
+    assert_eq!(elapsed!(Stageable::stage(&sr)), SLOW, "stage");
+    assert_eq!(elapsed!(Stageable::unstage(&sr)), SLOW, "unstage");
 }
 
 // ophyd-async test_readable::test_standard_readable_{uncached,

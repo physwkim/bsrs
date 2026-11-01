@@ -21,6 +21,7 @@ use crate::devices::signal::{Readable, Signal};
 use crate::event_model::DataKey;
 use crate::protocols_async::{AsyncConfigurable, AsyncReadable, SignalBackend, Stageable};
 use async_trait::async_trait;
+use futures::future::join_all;
 use serde::Serialize;
 
 /// How a readable signal contributes to a [`StandardReadable`]'s documents,
@@ -230,16 +231,18 @@ impl StandardReadable {
 
 // -- aggregating async protocol impls ---------------------------------------
 
-/// Merge per-child maps like ophyd-async `merge_gathered_dicts`: a key
-/// produced by two children is an error, never a silent overwrite.
+/// Await per-child maps concurrently and merge them like ophyd-async
+/// `merge_gathered_dicts`: a key produced by two children is an error, never
+/// a silent overwrite. A failed child reports the first error in
+/// registration order once every child has finished.
 async fn merge_unique_keys<V, F>(parts: Vec<F>) -> Result<HashMap<String, V>>
 where
     F: Future<Output = Result<HashMap<String, V>>>,
 {
     let mut out = HashMap::new();
     let mut duplicates = BTreeSet::new();
-    for part in parts {
-        for (key, value) in part.await? {
+    for part in join_all(parts).await {
+        for (key, value) in part? {
             match out.entry(key) {
                 Entry::Occupied(e) => {
                     duplicates.insert(e.key().clone());
@@ -298,17 +301,19 @@ impl Stageable for StandardReadable {
     fn name(&self) -> &str {
         &self.name
     }
+    // Concurrent like ophyd-async `_StandardBase.stage` (`asyncio.gather`);
+    // every child finishes before the first error is returned.
     async fn stage(&self) -> Result<()> {
-        for child in &self.stageables {
-            child.stage_dyn().await?;
-        }
-        Ok(())
+        join_all(self.stageables.iter().map(|c| c.stage_dyn()))
+            .await
+            .into_iter()
+            .collect()
     }
     async fn unstage(&self) -> Result<()> {
-        for child in &self.stageables {
-            child.unstage_dyn().await?;
-        }
-        Ok(())
+        join_all(self.stageables.iter().map(|c| c.unstage_dyn()))
+            .await
+            .into_iter()
+            .collect()
     }
 }
 
