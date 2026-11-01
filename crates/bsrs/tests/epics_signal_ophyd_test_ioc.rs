@@ -528,6 +528,39 @@ fn pva_array_put_reads_back() {
     });
 }
 
+/// `put(None)` writes the value the backend's `connect` read, as
+/// ophyd-async's `initial_values`; a backend never connected writes the value
+/// it reads then.
+async fn assert_put_none_writes_the_connect_value<B: SignalBackend<f64>>(new: impl Fn() -> B) {
+    new().put(Some(0.5)).await.unwrap();
+    let b = new();
+    b.connect(CONNECT).await.unwrap();
+    b.put(Some(0.25)).await.unwrap();
+    b.put(None).await.unwrap();
+    assert_eq!(b.get_value().await.unwrap(), 0.5);
+    let unconnected = new();
+    unconnected.put(None).await.unwrap();
+    assert_eq!(unconnected.get_value().await.unwrap(), 0.5);
+}
+
+#[test]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+fn ca_put_none_writes_the_connect_value() {
+    run(async {
+        let pv = format!("{CAM}cam1:AcquirePeriod");
+        assert_put_none_writes_the_connect_value(|| EpicsCaBackend::<f64>::new(&pv)).await;
+    });
+}
+
+#[test]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+fn pva_put_none_writes_the_connect_value() {
+    run(async {
+        let pv = "ADSIM:cam1:Gain";
+        assert_put_none_writes_the_connect_value(|| EpicsPvaBackend::<f64>::new(pv)).await;
+    });
+}
+
 /// NAME is SPC_NOMOD: the server refuses the put and the field keeps its
 /// value. The record names fit a DBR_STRING's 39 characters.
 async fn assert_put_refused(b: &impl SignalBackend<String>, record: &str) {

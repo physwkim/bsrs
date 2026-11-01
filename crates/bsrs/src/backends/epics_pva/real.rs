@@ -13,7 +13,7 @@ use epics_pva_rs::pvdata::{FieldDesc, ScalarType, TypedScalarArray};
 use epics_pva_rs::{PvField, PvaError, ScalarValue};
 use futures::FutureExt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn now_ts() -> f64 {
@@ -38,6 +38,9 @@ pub fn pva_context() -> Arc<PvaClient> {
 pub struct EpicsPvaBackend<T: Clone + Send + Sync + 'static> {
     pv: String,
     client: Arc<PvaClient>,
+    /// ophyd-async's `initial_values`: what `connect` read, which
+    /// `put(None)` writes.
+    initial: Mutex<Option<T>>,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -47,8 +50,39 @@ impl<T: Clone + Send + Sync + 'static> EpicsPvaBackend<T> {
         Self {
             pv: pv.into(),
             client: pva_context(),
+            initial: Mutex::new(None),
             _marker: std::marker::PhantomData,
         }
+    }
+}
+
+impl<T: Clone + Send + Sync + 'static> EpicsPvaBackend<T>
+where
+    Self: SignalBackend<T>,
+{
+    /// `connect`: wait for the channel and read the value `put(None)`
+    /// writes, both within `timeout`, as ophyd-async's connect-time `pvget`.
+    async fn connect_reading(&self, timeout: Duration) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        pva_connect(&self.client, &self.pv, timeout).await?;
+        let v = tokio::time::timeout_at(deadline, self.get_value())
+            .await
+            .map_err(|_| {
+                BsrsError::Backend(format!("pva connect {}: no value in {timeout:?}", self.pv))
+            })??;
+        *self.initial.lock().unwrap() = Some(v);
+        Ok(())
+    }
+
+    /// `value`, or for `None` the value `connect` read, read now if no
+    /// `connect` has.
+    async fn or_initial(&self, value: Option<T>) -> Result<T> {
+        if let Some(v) = value.or_else(|| self.initial.lock().unwrap().clone()) {
+            return Ok(v);
+        }
+        let v = self.get_value().await?;
+        *self.initial.lock().unwrap() = Some(v.clone());
+        Ok(v)
     }
 }
 
@@ -504,10 +538,10 @@ fn array_datakey(source: String, value: &[f64], meta: SignalMetadata) -> DataKey
 #[async_trait]
 impl SignalBackend<f64> for EpicsPvaBackend<f64> {
     async fn connect(&self, timeout: Duration) -> Result<()> {
-        pva_connect(&self.client, &self.pv, timeout).await
+        self.connect_reading(timeout).await
     }
     async fn put_start(&self, value: Option<f64>) -> Result<PutCompletion> {
-        let f = PvField::Scalar(ScalarValue::Double(value.unwrap_or_default()));
+        let f = PvField::Scalar(ScalarValue::Double(self.or_initial(value).await?));
         put_block(&self.client, &self.pv, f).await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
@@ -606,13 +640,13 @@ impl SignalBackend<f64> for EpicsPvaBackend<f64> {
 #[async_trait]
 impl SignalBackend<Vec<f64>> for EpicsPvaBackend<Vec<f64>> {
     async fn connect(&self, timeout: Duration) -> Result<()> {
-        pva_connect(&self.client, &self.pv, timeout).await
+        self.connect_reading(timeout).await
     }
     async fn put_start(&self, value: Option<Vec<f64>>) -> Result<PutCompletion> {
         // Written as a typed Double array; an EPICS waveform record coerces to
         // its FTVL element type server-side.
-        let f =
-            PvField::ScalarArrayTyped(TypedScalarArray::Double(value.unwrap_or_default().into()));
+        let value = self.or_initial(value).await?;
+        let f = PvField::ScalarArrayTyped(TypedScalarArray::Double(value.into()));
         put_block(&self.client, &self.pv, f).await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
@@ -701,10 +735,10 @@ impl SignalBackend<Vec<f64>> for EpicsPvaBackend<Vec<f64>> {
 #[async_trait]
 impl SignalBackend<String> for EpicsPvaBackend<String> {
     async fn connect(&self, timeout: Duration) -> Result<()> {
-        pva_connect(&self.client, &self.pv, timeout).await
+        self.connect_reading(timeout).await
     }
     async fn put_start(&self, value: Option<String>) -> Result<PutCompletion> {
-        let f = PvField::Scalar(ScalarValue::String(value.unwrap_or_default().into()));
+        let f = PvField::Scalar(ScalarValue::String(self.or_initial(value).await?.into()));
         put_block(&self.client, &self.pv, f).await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
@@ -789,10 +823,10 @@ impl SignalBackend<String> for EpicsPvaBackend<String> {
 #[async_trait]
 impl SignalBackend<i64> for EpicsPvaBackend<i64> {
     async fn connect(&self, timeout: Duration) -> Result<()> {
-        pva_connect(&self.client, &self.pv, timeout).await
+        self.connect_reading(timeout).await
     }
     async fn put_start(&self, value: Option<i64>) -> Result<PutCompletion> {
-        let f = PvField::Scalar(ScalarValue::Long(value.unwrap_or_default()));
+        let f = PvField::Scalar(ScalarValue::Long(self.or_initial(value).await?));
         put_block(&self.client, &self.pv, f).await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
@@ -877,10 +911,10 @@ impl SignalBackend<i64> for EpicsPvaBackend<i64> {
 #[async_trait]
 impl SignalBackend<bool> for EpicsPvaBackend<bool> {
     async fn connect(&self, timeout: Duration) -> Result<()> {
-        pva_connect(&self.client, &self.pv, timeout).await
+        self.connect_reading(timeout).await
     }
     async fn put_start(&self, value: Option<bool>) -> Result<PutCompletion> {
-        let f = PvField::Scalar(ScalarValue::Boolean(value.unwrap_or_default()));
+        let f = PvField::Scalar(ScalarValue::Boolean(self.or_initial(value).await?));
         put_block(&self.client, &self.pv, f).await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {

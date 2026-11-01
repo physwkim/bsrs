@@ -185,6 +185,9 @@ pub struct EpicsCaBackend<T: Clone + Send + Sync + 'static> {
     string_kind: CaStringKind,
     /// `SignalBackend<String>`'s codec, fixed once the channel connects.
     str_codec: tokio::sync::OnceCell<StrCodec>,
+    /// ophyd-async's `initial_values`: what `connect` read, which
+    /// `put(None)` writes.
+    initial: Mutex<Option<T>>,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -197,6 +200,7 @@ impl<T: Clone + Send + Sync + 'static> EpicsCaBackend<T> {
             channel: tokio::sync::OnceCell::new(),
             string_kind: CaStringKind::Short,
             str_codec: tokio::sync::OnceCell::new(),
+            initial: Mutex::new(None),
             _marker: std::marker::PhantomData,
         }
     }
@@ -225,6 +229,36 @@ impl<T: Clone + Send + Sync + 'static> EpicsCaBackend<T> {
             .get_or_try_init(|| self.ctx.get_or_open(&self.pv, timeout))
             .await
             .cloned()
+    }
+}
+
+impl<T: Clone + Send + Sync + 'static> EpicsCaBackend<T>
+where
+    Self: SignalBackend<T>,
+{
+    /// `connect`: open the channel and read the value `put(None)` writes,
+    /// both within `timeout`, as ophyd-async's connect-time `caget`.
+    async fn connect_reading(&self, timeout: Duration) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        self.ensure_channel(timeout).await?;
+        let v = tokio::time::timeout_at(deadline, self.get_value())
+            .await
+            .map_err(|_| {
+                BsrsError::Backend(format!("ca connect {}: no value in {timeout:?}", self.pv))
+            })??;
+        *self.initial.lock().unwrap() = Some(v);
+        Ok(())
+    }
+
+    /// `value`, or for `None` the value `connect` read, read now if no
+    /// `connect` has.
+    async fn or_initial(&self, value: Option<T>) -> Result<T> {
+        if let Some(v) = value.or_else(|| self.initial.lock().unwrap().clone()) {
+            return Ok(v);
+        }
+        let v = self.get_value().await?;
+        *self.initial.lock().unwrap() = Some(v.clone());
+        Ok(v)
     }
 }
 
@@ -586,10 +620,10 @@ impl EpicsCaBackend<String> {
 #[async_trait]
 impl SignalBackend<f64> for EpicsCaBackend<f64> {
     async fn connect(&self, timeout: Duration) -> Result<()> {
-        self.ensure_channel(timeout).await.map(|_| ())
+        self.connect_reading(timeout).await
     }
     async fn put_start(&self, value: Option<f64>) -> Result<PutCompletion> {
-        let value = value.unwrap_or_default();
+        let value = self.or_initial(value).await?;
         let ch = self
             .ensure_channel(Duration::from_secs(2))
             .await
@@ -673,10 +707,10 @@ impl SignalBackend<f64> for EpicsCaBackend<f64> {
 #[async_trait]
 impl SignalBackend<Vec<f64>> for EpicsCaBackend<Vec<f64>> {
     async fn connect(&self, timeout: Duration) -> Result<()> {
-        self.ensure_channel(timeout).await.map(|_| ())
+        self.connect_reading(timeout).await
     }
     async fn put_start(&self, value: Option<Vec<f64>>) -> Result<PutCompletion> {
-        let value = value.unwrap_or_default();
+        let value = self.or_initial(value).await?;
         let ch = self
             .ensure_channel(Duration::from_secs(2))
             .await
@@ -762,11 +796,10 @@ impl SignalBackend<Vec<f64>> for EpicsCaBackend<Vec<f64>> {
 #[async_trait]
 impl SignalBackend<String> for EpicsCaBackend<String> {
     async fn connect(&self, timeout: Duration) -> Result<()> {
-        let ch = self.ensure_channel(timeout).await?;
-        self.codec(&ch).await.map(|_| ())
+        self.connect_reading(timeout).await
     }
     async fn put_start(&self, value: Option<String>) -> Result<PutCompletion> {
-        let value = value.unwrap_or_default();
+        let value = self.or_initial(value).await?;
         let ch = self
             .ensure_channel(Duration::from_secs(2))
             .await
@@ -863,10 +896,10 @@ impl SignalBackend<String> for EpicsCaBackend<String> {
 #[async_trait]
 impl SignalBackend<i64> for EpicsCaBackend<i64> {
     async fn connect(&self, timeout: Duration) -> Result<()> {
-        self.ensure_channel(timeout).await.map(|_| ())
+        self.connect_reading(timeout).await
     }
     async fn put_start(&self, value: Option<i64>) -> Result<PutCompletion> {
-        let value = value.unwrap_or_default();
+        let value = self.or_initial(value).await?;
         let ch = self
             .ensure_channel(Duration::from_secs(2))
             .await
@@ -968,10 +1001,10 @@ impl EpicsCaBackend<bool> {
 #[async_trait]
 impl SignalBackend<bool> for EpicsCaBackend<bool> {
     async fn connect(&self, timeout: Duration) -> Result<()> {
-        self.ensure_channel(timeout).await.map(|_| ())
+        self.connect_reading(timeout).await
     }
     async fn put_start(&self, value: Option<bool>) -> Result<PutCompletion> {
-        let value = value.unwrap_or_default();
+        let value = self.or_initial(value).await?;
         let ch = self
             .ensure_channel(Duration::from_secs(2))
             .await
