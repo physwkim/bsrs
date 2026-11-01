@@ -24,11 +24,15 @@ pub fn stop() {
     }
 }
 
-/// Stop the IOC, then start it again on the ports the clients use. Its
-/// records start over from their database values.
-pub fn restart() {
-    stop();
+/// Start the IOC again on the ports the clients use. Its records start over
+/// from their database values.
+pub fn start() {
     let booted = booted();
     let mut ioc = booted.lock();
     *ioc = Some(booted.start_again());
+}
+
+pub fn restart() {
+    stop();
+    start();
 }

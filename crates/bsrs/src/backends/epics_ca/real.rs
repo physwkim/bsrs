@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use epics_base_rs::server::snapshot::{ControlInfo, DbrClass, DisplayInfo, Snapshot};
 use epics_base_rs::types::WallTime;
 use epics_ca_rs::client::CaClient;
+use epics_ca_rs::protocol::ECA_DISCONN;
 use epics_ca_rs::{estdlib, CaError, DbFieldType, EpicsValue, PvString};
 use std::array;
 use std::collections::HashMap;
@@ -277,6 +278,31 @@ fn alarm_severity(raw: u16) -> i32 {
         -1
     } else {
         raw as i32
+    }
+}
+
+/// Feed `cb` each update of `ch`'s monitor that `decode` accepts. As in
+/// aioca's camonitor, a disconnect does not end it, for the subscription
+/// resumes on reconnect; any other error does (`_catools.py` closes it).
+async fn forward_monitor<T>(
+    ch: &SharedChannel,
+    decode: impl Fn(&EpicsValue) -> Option<T>,
+    cb: &ReadingValueCallback<T>,
+) {
+    let Ok(mut sub) = ch.subscribe().await else {
+        return;
+    };
+    loop {
+        match sub.recv().await {
+            Some(Ok(snap)) => {
+                if let Some(v) = decode(&snap.value) {
+                    let ts = ts_to_f64(snap.timestamp);
+                    cb(&v, ts, Some(alarm_severity(snap.alarm.severity)));
+                }
+            }
+            Some(Err(CaError::ServerError(ECA_DISCONN))) => {}
+            Some(Err(_)) | None => return,
+        }
     }
 }
 
@@ -645,22 +671,13 @@ impl SignalBackend<f64> for EpicsCaBackend<f64> {
     fn set_callback(&self, cb: Option<ReadingValueCallback<f64>>) -> SubToken {
         let cb = match cb {
             None => return SubToken::noop(),
-            Some(cb) => Arc::new(cb),
+            Some(cb) => cb,
         };
         // Subscribed at once, connected or not: epics-ca-rs starts it on connect.
         let ch = self.channel().clone();
         // Spawn a forwarder. Held tokio::JoinHandle is aborted on Drop (K1).
         let handle = tokio::spawn(async move {
-            let mut sub = match ch.subscribe().await {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            while let Some(Ok(snap)) = sub.recv().await {
-                if let Some(f) = epics_to_f64(&snap.value) {
-                    let ts = ts_to_f64(snap.timestamp);
-                    cb(&f, ts, Some(alarm_severity(snap.alarm.severity)));
-                }
-            }
+            forward_monitor(&ch, epics_to_f64, &cb).await;
         });
         let abort = handle.abort_handle();
         SubToken::new(move || abort.abort())
@@ -731,21 +748,12 @@ impl SignalBackend<Vec<f64>> for EpicsCaBackend<Vec<f64>> {
     fn set_callback(&self, cb: Option<ReadingValueCallback<Vec<f64>>>) -> SubToken {
         let cb = match cb {
             None => return SubToken::noop(),
-            Some(cb) => Arc::new(cb),
+            Some(cb) => cb,
         };
         // Subscribed at once, connected or not: epics-ca-rs starts it on connect.
         let ch = self.channel().clone();
         let handle = tokio::spawn(async move {
-            let mut sub = match ch.subscribe().await {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            while let Some(Ok(snap)) = sub.recv().await {
-                if let Some(v) = epics_to_vec_f64(&snap.value) {
-                    let ts = ts_to_f64(snap.timestamp);
-                    cb(&v, ts, Some(alarm_severity(snap.alarm.severity)));
-                }
-            }
+            forward_monitor(&ch, epics_to_vec_f64, &cb).await;
         });
         let abort = handle.abort_handle();
         SubToken::new(move || abort.abort())
@@ -818,7 +826,7 @@ impl SignalBackend<String> for EpicsCaBackend<String> {
     fn set_callback(&self, cb: Option<ReadingValueCallback<String>>) -> SubToken {
         let cb = match cb {
             None => return SubToken::noop(),
-            Some(cb) => Arc::new(cb),
+            Some(cb) => cb,
         };
         let ch = self.channel().clone();
         let kind = self.string_kind;
@@ -827,8 +835,9 @@ impl SignalBackend<String> for EpicsCaBackend<String> {
             let codec = match cached {
                 Some(c) => c,
                 None => {
-                    // The codec needs the channel's native type.
-                    if ch.wait_connected(Duration::from_secs(2)).await.is_err() {
+                    // The codec needs the channel's native type: wait for
+                    // it as long as the token lives, as camonitor does.
+                    if ch.wait_connected(Duration::MAX).await.is_err() {
                         return;
                     }
                     match StrCodec::of(&ch, kind).await {
@@ -837,16 +846,7 @@ impl SignalBackend<String> for EpicsCaBackend<String> {
                     }
                 }
             };
-            let mut sub = match ch.subscribe().await {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            while let Some(Ok(snap)) = sub.recv().await {
-                if let Some(s) = codec.decode(&snap.value) {
-                    let ts = ts_to_f64(snap.timestamp);
-                    cb(&s, ts, Some(alarm_severity(snap.alarm.severity)));
-                }
-            }
+            forward_monitor(&ch, |v| codec.decode(v), &cb).await;
         });
         let abort = handle.abort_handle();
         SubToken::new(move || abort.abort())
@@ -912,21 +912,12 @@ impl SignalBackend<i64> for EpicsCaBackend<i64> {
     fn set_callback(&self, cb: Option<ReadingValueCallback<i64>>) -> SubToken {
         let cb = match cb {
             None => return SubToken::noop(),
-            Some(cb) => Arc::new(cb),
+            Some(cb) => cb,
         };
         // Subscribed at once, connected or not: epics-ca-rs starts it on connect.
         let ch = self.channel().clone();
         let handle = tokio::spawn(async move {
-            let mut sub = match ch.subscribe().await {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            while let Some(Ok(snap)) = sub.recv().await {
-                if let Some(i) = epics_to_i64(&snap.value) {
-                    let ts = ts_to_f64(snap.timestamp);
-                    cb(&i, ts, Some(alarm_severity(snap.alarm.severity)));
-                }
-            }
+            forward_monitor(&ch, epics_to_i64, &cb).await;
         });
         let abort = handle.abort_handle();
         SubToken::new(move || abort.abort())
@@ -1012,21 +1003,12 @@ impl SignalBackend<bool> for EpicsCaBackend<bool> {
     fn set_callback(&self, cb: Option<ReadingValueCallback<bool>>) -> SubToken {
         let cb = match cb {
             None => return SubToken::noop(),
-            Some(cb) => Arc::new(cb),
+            Some(cb) => cb,
         };
         // Subscribed at once, connected or not: epics-ca-rs starts it on connect.
         let ch = self.channel().clone();
         let handle = tokio::spawn(async move {
-            let mut sub = match ch.subscribe().await {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            while let Some(Ok(snap)) = sub.recv().await {
-                if let Some(b) = epics_to_bool(&snap.value) {
-                    let ts = ts_to_f64(snap.timestamp);
-                    cb(&b, ts, Some(alarm_severity(snap.alarm.severity)));
-                }
-            }
+            forward_monitor(&ch, epics_to_bool, &cb).await;
         });
         let abort = handle.abort_handle();
         SubToken::new(move || abort.abort())
