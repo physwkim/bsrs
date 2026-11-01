@@ -11,6 +11,9 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// ophyd-async stamps every soft reading `alarm_severity=0` (no alarm).
+const NO_ALARM: Option<i32> = Some(0);
+
 fn now_ts() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -89,7 +92,7 @@ impl<T> Subscriber<T> {
                     }
                 }
             };
-            (self.cb)(&value, ts, None);
+            (self.cb)(&value, ts, NO_ALARM);
         }
     }
 }
@@ -277,7 +280,7 @@ where
         Ok(ReadingValue {
             value: serde_json::to_value(v)?,
             timestamp,
-            alarm_severity: None,
+            alarm_severity: NO_ALARM,
             message: None,
         })
     }

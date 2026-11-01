@@ -214,14 +214,22 @@ async fn subscribe_callback_gets_current_then_each_put_until_dropped() {
     let sig: SignalRW<f64, _> = Signal::new(soft(0.0_f64, Dtype::Number), cfg("x"));
     let seen = Arc::new(Mutex::new(Vec::new()));
     let log = seen.clone();
-    let token = sig.subscribe(Box::new(move |v, ts, _| log.lock().unwrap().push((*v, ts))));
+    let token = sig.subscribe(Box::new(move |v, ts, sev| {
+        log.lock().unwrap().push((*v, ts, sev))
+    }));
 
     sig.put(1.0).await;
     sig.put(2.0).await;
-    let values: Vec<f64> = seen.lock().unwrap().iter().map(|(v, _)| *v).collect();
-    assert_eq!(values, vec![0.0, 1.0, 2.0]);
+    let got: Vec<_> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(v, _, s)| (*v, *s))
+        .collect();
+    assert_eq!(got, [(0.0, Some(0)), (1.0, Some(0)), (2.0, Some(0))]);
     let last_ts = seen.lock().unwrap().last().unwrap().1;
-    assert_eq!(last_ts, sig.read().await.unwrap()["x"].timestamp);
+    let read = &sig.read().await.unwrap()["x"];
+    assert_eq!((read.timestamp, read.alarm_severity), (last_ts, Some(0)));
 
     drop(token);
     sig.put(3.0).await;
