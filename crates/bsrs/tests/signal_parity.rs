@@ -427,6 +427,37 @@ async fn mock_put_callback_returning_none_keeps_the_put_value() {
     assert_eq!(sig.get().await.unwrap(), 10.0);
 }
 
+// ophyd-async test_async_callback_on_mock_put,
+// test_when_async_callback_returns_{a_value_the_readback_is_set,
+// none_then_readback_is_the_setpoint}.
+#[tokio::test(start_paused = true)]
+async fn async_mock_put_callback_is_awaited_before_the_readback() {
+    let backend = Arc::new(MockSignalBackend::with_value(0_i64, Dtype::Integer));
+    let sig: Arc<SignalRW<i64, _>> = Arc::new(Signal::new(backend.clone(), cfg("m")));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let log = calls.clone();
+    backend.set_put_callback_async(move |v| {
+        log.lock().unwrap().push(v);
+        async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Some(2)
+        }
+    });
+    let put = tokio::spawn({
+        let sig = sig.clone();
+        async move { sig.put(5).await.success() }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(sig.get().await.unwrap(), 0, "callback still running");
+    assert!(put.await.unwrap());
+    assert_eq!(sig.get().await.unwrap(), 2);
+    assert_eq!(*calls.lock().unwrap(), vec![Some(5)]);
+
+    backend.set_put_callback_async(|_| async { None });
+    assert!(sig.put(7).await.success());
+    assert_eq!(sig.get().await.unwrap(), 7);
+}
+
 // ophyd-async test_reset_mock_put_calls.
 #[tokio::test]
 async fn reset_put_calls_forgets_earlier_puts() {

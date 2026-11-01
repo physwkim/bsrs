@@ -14,13 +14,18 @@ use crate::core::status::SubToken;
 use crate::event_model::{DataKey, Dtype};
 use crate::protocols_async::{PutCompletion, ReadingValueCallback, SignalBackend};
 use async_trait::async_trait;
+use futures::future::BoxFuture;
 use serde::Serialize;
+use std::future::Future;
 use tokio::sync::watch;
 
 /// Callback run on every `put`. Returns `Some(v)` to override the value written
 /// to the readback, or `None` to keep the put value. Mirrors ophyd-async
 /// `MockPutCallback` (the sync form).
 pub type MockPutCallback<T> = Box<dyn Fn(Option<T>) -> Option<T> + Send + Sync>;
+
+/// The installed put callback, sync ones wrapped as already-ready futures.
+type PutCallbackFn<T> = Arc<dyn Fn(Option<T>) -> BoxFuture<'static, Option<T>> + Send + Sync>;
 
 struct Inner<T: Clone + Send + Sync + 'static> {
     soft: SoftSignalBackend<T>,
@@ -29,7 +34,7 @@ struct Inner<T: Clone + Send + Sync + 'static> {
     /// `true` ⟹ puts complete immediately; `false` ⟹ a put writes the value
     /// but blocks (does not complete) until set back to `true`. Initially set.
     proceeds: watch::Sender<bool>,
-    put_callback: Mutex<Option<MockPutCallback<T>>>,
+    put_callback: Mutex<Option<PutCallbackFn<T>>>,
 }
 
 /// Mock signal backend for unit tests. Cheap to clone (shared inner) so a test
@@ -123,7 +128,20 @@ where
     /// Install (or clear with `None`) the put callback (ophyd
     /// `set_mock_put_callback`).
     pub fn set_put_callback(&self, cb: Option<MockPutCallback<T>>) {
-        *self.inner.put_callback.lock().unwrap() = cb;
+        *self.inner.put_callback.lock().unwrap() = cb
+            .map(|f| -> PutCallbackFn<T> { Arc::new(move |v| Box::pin(std::future::ready(f(v)))) });
+    }
+
+    /// Install an async put callback (ophyd `set_mock_put_callback` with a
+    /// coroutine function). The put awaits it before writing the readback,
+    /// so a slow callback delays the readback. Clear it with
+    /// `set_put_callback(None)`.
+    pub fn set_put_callback_async<F, Fut>(&self, cb: F)
+    where
+        F: Fn(Option<T>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Option<T>> + Send + 'static,
+    {
+        *self.inner.put_callback.lock().unwrap() = Some(Arc::new(move |v| Box::pin(cb(v))));
     }
 
     /// Snapshot of every `put` argument received, in call order (ophyd
@@ -248,9 +266,10 @@ where
         self.inner.put_log.lock().unwrap().push(value.clone());
         // Callback may rewrite the value written to the readback; `None` keeps
         // the put value (ophyd: new_value = put_mock(value) or value).
-        let overridden = {
-            let cb = self.inner.put_callback.lock().unwrap();
-            cb.as_ref().and_then(|f| f(value.clone()))
+        let cb = self.inner.put_callback.lock().unwrap().clone();
+        let overridden = match cb {
+            Some(f) => f(value.clone()).await,
+            None => None,
         };
         let new_value = overridden.or(value);
         self.inner.soft.put(new_value).await?;
