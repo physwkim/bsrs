@@ -2090,6 +2090,10 @@ impl DetectorWriter for AdHdfWriter {
     async fn close(&self) -> Result<()> {
         self.io.stop_capture().await
     }
+    /// ophyd-async `_data_logic.py`: the main NDArray dataset is always hinted.
+    fn hinted_fields(&self) -> Vec<String> {
+        vec![self.data_key_name()]
+    }
 }
 
 /// Emit state for [`AdMultipartWriter`]: the once-emitted `StreamResource`
@@ -2343,6 +2347,10 @@ impl DetectorWriter for AdMultipartWriter {
     }
     async fn close(&self) -> Result<()> {
         self.io.stop_capture().await
+    }
+    /// ophyd-async `_data_logic.py`: the main NDArray dataset is always hinted.
+    fn hinted_fields(&self) -> Vec<String> {
+        vec![self.data_key_name()]
     }
 }
 
@@ -3094,6 +3102,26 @@ mod ad_hdf_tests {
             Arc::new(FakeFrameInfo),
             StaticPathProvider::new("/data/scans/", "scan"),
         )
+    }
+
+    #[tokio::test]
+    async fn file_writers_hint_their_image_key() {
+        // ophyd-async `_data_logic.py:243`/`:299`: the main dataset is hinted.
+        for (w, label) in [
+            (
+                Box::new(writer_with(FakeAdFileIo::new("/x.h5"))) as Box<dyn DetectorWriter>,
+                "hdf",
+            ),
+            (
+                Box::new(multipart_writer_with(FakeAdFileIo::new("/x.jpg"))),
+                "multipart",
+            ),
+        ] {
+            let keys = w.open(1).await.unwrap();
+            let hinted = w.hinted_fields();
+            assert_eq!(hinted, ["det_image"], "{label}");
+            assert!(keys.contains_key(&hinted[0]), "{label}");
+        }
     }
 
     /// Fixed-content `NDAttributesFile` source (inline XML or a filename).

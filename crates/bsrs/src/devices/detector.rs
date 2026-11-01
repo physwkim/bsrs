@@ -520,18 +520,9 @@ where
     W: DetectorWriter + Send + Sync + 'static,
 {
     async fn read_dyn(&self) -> Result<HashMap<String, ReadingValue>> {
-        let mut out = HashMap::new();
-        let idx = WritesStreamAssets::get_index(self).await?;
-        out.insert(
-            format!("{}_index", self.name),
-            ReadingValue {
-                value: Value::from(idx),
-                timestamp: 0.0,
-                alarm_severity: None,
-                message: None,
-            },
-        );
-        Ok(out)
+        // ophyd-async `read` returns only readable data providers; the
+        // writer's data reaches the event through StreamDatum.
+        Ok(HashMap::new())
     }
     async fn describe_dyn(&self) -> Result<HashMap<String, DataKey>> {
         // Read cached DataKeys, never re-open the writer (DB-04).
@@ -541,7 +532,7 @@ where
         Some(self)
     }
     fn hint_fields(&self) -> Option<Vec<String>> {
-        Some(vec![format!("{}_index", self.name)])
+        Some(self.writer.hinted_fields())
     }
     fn writes_external_assets(&self) -> bool {
         true

@@ -406,6 +406,11 @@ pub trait DetectorWriter: Send + Sync {
     fn collect_stream_docs(&self, up_to: u64, descriptor: &str) -> BoxStream<'_, StreamAsset>;
     /// Close the writer.
     async fn close(&self) -> Result<()>;
+    /// The data keys of [`open`](Self::open) a plot should show (ophyd-async
+    /// `DetectorDataLogic.get_hinted_fields`); none by default.
+    fn hinted_fields(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 // -- FrameSource / FrameSink -------------------------------------------------

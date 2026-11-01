@@ -8,10 +8,12 @@ mod example_ioc;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bsrs::backends::epics_ca::EpicsCaBackend;
-use bsrs::core::msg::{ConfigurableObj, ReadableObj, StageableObj};
+use bsrs::callbacks::CapturingSink;
+use bsrs::core::msg::{ConfigurableObj, ReadableObj, StageableObj, TriggerableObj};
 use bsrs::core::status::Status;
 use bsrs::devices::TriggerInfo;
 use bsrs::event_model::{DataKey, Dtype, DtypeNumpy, StreamDatum, StreamResource};
@@ -674,6 +676,40 @@ async fn configuration_describes_the_cam_exposure_pvs() {
     }
 }
 
+/// ophyd-async `test_standard_detector.py:752` `test_read_returns_correct_values`
+/// and `test_adsim_system.py:161` (event data `{}`): every field `read`
+/// returns is one `describe` declares.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+async fn read_reports_only_described_fields() {
+    boot();
+    let _cam = CAM_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let det = hdf_det("det", dir.path(), "read").await;
+    Stageable::stage(&det).await.expect("stage");
+    trigger(&det).await.unwrap();
+    let described = ReadableObj::describe_dyn(&det).await.expect("describe");
+    let read = ReadableObj::read_dyn(&det).await.expect("read");
+    let hints = ReadableObj::hint_fields(&det).unwrap_or_default();
+    Stageable::unstage(&det).await.expect("unstage");
+    let undeclared: Vec<&String> = read
+        .keys()
+        .filter(|k| !described.contains_key(*k))
+        .collect();
+    assert!(
+        undeclared.is_empty(),
+        "read but not described: {undeclared:?}"
+    );
+    let unhinted: Vec<&String> = hints
+        .iter()
+        .filter(|k| !described.contains_key(*k))
+        .collect();
+    assert!(
+        unhinted.is_empty(),
+        "hinted but not described: {unhinted:?}"
+    );
+}
+
 /// ophyd-async `test_data_logic.py:36` `test_hdf_writer_file_not_found` and
 /// `PathInfo.create_dir_depth`: a directory the IOC cannot see fails stage;
 /// allowed to create the last two levels, the IOC makes them.
@@ -830,4 +866,117 @@ async fn roi_and_stats_setters_reach_their_records() {
     stats.force_enable_stats().await.unwrap();
     assert!(get::<bool>("SIM1:Stats1:EnableCallbacks").await);
     assert!(get::<bool>("SIM1:Stats1:ComputeStatistics").await);
+}
+
+/// ophyd-async `test_adsim_system.py:161` `test_software_triggering`, through
+/// the run engine: two triggered reads give one resource and consecutive
+/// datums carrying the events' sequence numbers, and the descriptor carries
+/// the cam configuration.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+async fn step_scan_through_the_run_engine_links_datums_to_events() {
+    boot();
+    let _cam = CAM_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let det = Arc::new(hdf_det("adsim", dir.path(), "adsim").await);
+    let h5 = dir.path().join("adsim.h5");
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let d = det.clone();
+    let plan = bsrs::core::plan::plan_box(async_stream::stream! {
+        yield Msg::OpenRun(Default::default());
+        yield Msg::Stage(d.clone() as Arc<dyn StageableObj>);
+        for _ in 0..2 {
+            yield Msg::Create { stream_name: "primary".into() };
+            yield Msg::Trigger { obj: d.clone() as Arc<dyn TriggerableObj>, group: None };
+            yield Msg::Read(d.clone() as Arc<dyn ReadableObj>);
+            yield Msg::Save;
+        }
+        yield Msg::Unstage(d.clone() as Arc<dyn StageableObj>);
+        yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+    });
+    let result = timeout(Duration::from_secs(60), re.run_async(plan))
+        .await
+        .expect("run not done within 60 s")
+        .expect("run");
+    assert_eq!(result.exit_status, "success");
+
+    use bsrs::core::Document;
+    let docs = sink.snapshot().await;
+    let descriptor = docs
+        .iter()
+        .find_map(|d| match d {
+            Document::Descriptor(d) => Some(d.clone()),
+            _ => None,
+        })
+        .expect("descriptor");
+    let image = &descriptor.data_keys["adsim_image"];
+    assert_eq!(image.source, file_uri(&h5));
+    assert_eq!(image.shape, shape(&[1, HEIGHT as u64, WIDTH as u64]));
+    let config = &descriptor.configuration["adsim"];
+    for (key, pv) in [
+        ("adsim_acquire_time", "AcquireTime"),
+        ("adsim_acquire_period", "AcquirePeriod"),
+    ] {
+        assert_eq!(
+            config.data_keys[key].source,
+            format!("ca://{CAM}{pv}_RBV"),
+            "{key}"
+        );
+        assert!(config.data.contains_key(key), "{key}");
+    }
+    let events: Vec<_> = docs
+        .iter()
+        .filter_map(|d| match d {
+            Document::Event(e) => Some(e.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(events.len(), 2);
+    // The frames reach the events through StreamDatum only (`data={}` at
+    // test_adsim_system.py:265/:281).
+    for e in &events {
+        assert!(e.data.is_empty(), "event data: {:?}", e.data);
+    }
+    // `hints={"adsim": {"fields": ["adsim"]}}` at test_adsim_system.py:241,
+    // with bsrs's `_image` data key.
+    let hints = descriptor.hints.as_ref().expect("descriptor hints");
+    assert_eq!(
+        hints["adsim"].fields.as_deref(),
+        Some(&["adsim_image".to_string()][..])
+    );
+    let resources: Vec<_> = docs
+        .iter()
+        .filter_map(|d| match d {
+            Document::StreamResource(r) => Some(r.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(resources.len(), 1);
+    assert_eq!(resources[0].uri, file_uri(&h5));
+    let datums: Vec<_> = docs
+        .iter()
+        .filter_map(|d| match d {
+            Document::StreamDatum(d) => Some(d.clone()),
+            _ => None,
+        })
+        .collect();
+    let ranges: Vec<_> = datums
+        .iter()
+        .map(|d| {
+            (
+                d.indices.start,
+                d.indices.stop,
+                d.seq_nums.start,
+                d.seq_nums.stop,
+                d.descriptor == descriptor.uid,
+            )
+        })
+        .collect();
+    assert_eq!(ranges, [(0, 1, 1, 2, true), (1, 2, 2, 3, true)]);
+    #[cfg(feature = "hdf5")]
+    assert_eq!(
+        h5_shape(&h5, "entry/data/data"),
+        vec![2, HEIGHT as usize, WIDTH as usize]
+    );
 }
