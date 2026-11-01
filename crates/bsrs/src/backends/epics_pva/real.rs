@@ -58,6 +58,23 @@ impl<T: Clone + Send + Sync + 'static> crate::devices::BackendFromPv for EpicsPv
     }
 }
 
+/// Wait up to `timeout` for `pv` to connect. `pvconnect` is bounded by the
+/// client's `OP_TIMEOUT` instead; this watcher searches until the caller's
+/// deadline, and dropping its handle stops the watch, not the channel.
+async fn pva_connect(client: &PvaClient, pv: &str, timeout: Duration) -> Result<()> {
+    let connected = Arc::new(tokio::sync::Notify::new());
+    let on_connect = connected.clone();
+    let _watch = client
+        .connect(pv)
+        .on_connect(move || on_connect.notify_one())
+        .exec()
+        .await
+        .map_err(|e| BsrsError::Backend(format!("pva connect {pv}: {e}")))?;
+    tokio::time::timeout(timeout, connected.notified())
+        .await
+        .map_err(|_| BsrsError::Backend(format!("pva connect {pv}: not connected in {timeout:?}")))
+}
+
 /// PVA put of `f` with `record[block=true]`: QSRV answers it once the record
 /// has processed (`dbProcessNotify`), as rsrv does a put-callback, so the
 /// completion is that of the move or acquisition the put starts, with no
@@ -379,14 +396,8 @@ fn pv_field_to_metadata(p: &PvField, want_units: bool, want_precision: bool) -> 
 
 #[async_trait]
 impl SignalBackend<f64> for EpicsPvaBackend<f64> {
-    async fn connect(&self, _timeout: Duration) -> Result<()> {
-        // PvaClient connects lazily; the search system handles re-tries.
-        // pvconnect is the explicit handshake.
-        self.client
-            .pvconnect(&self.pv)
-            .await
-            .map(|_| ())
-            .map_err(|e| BsrsError::Backend(format!("pva connect {}: {e}", self.pv)))
+    async fn connect(&self, timeout: Duration) -> Result<()> {
+        pva_connect(&self.client, &self.pv, timeout).await
     }
     async fn put_start(&self, value: Option<f64>) -> Result<PutCompletion> {
         let f = PvField::Scalar(ScalarValue::Double(value.unwrap_or_default()));
@@ -490,12 +501,8 @@ impl SignalBackend<f64> for EpicsPvaBackend<f64> {
 
 #[async_trait]
 impl SignalBackend<Vec<f64>> for EpicsPvaBackend<Vec<f64>> {
-    async fn connect(&self, _timeout: Duration) -> Result<()> {
-        self.client
-            .pvconnect(&self.pv)
-            .await
-            .map(|_| ())
-            .map_err(|e| BsrsError::Backend(format!("pva connect {}: {e}", self.pv)))
+    async fn connect(&self, timeout: Duration) -> Result<()> {
+        pva_connect(&self.client, &self.pv, timeout).await
     }
     async fn put_start(&self, value: Option<Vec<f64>>) -> Result<PutCompletion> {
         // Written as a typed Double array; an EPICS waveform record coerces to
@@ -597,12 +604,8 @@ impl SignalBackend<Vec<f64>> for EpicsPvaBackend<Vec<f64>> {
 
 #[async_trait]
 impl SignalBackend<String> for EpicsPvaBackend<String> {
-    async fn connect(&self, _timeout: Duration) -> Result<()> {
-        self.client
-            .pvconnect(&self.pv)
-            .await
-            .map(|_| ())
-            .map_err(|e| BsrsError::Backend(format!("pva connect {}: {e}", self.pv)))
+    async fn connect(&self, timeout: Duration) -> Result<()> {
+        pva_connect(&self.client, &self.pv, timeout).await
     }
     async fn put_start(&self, value: Option<String>) -> Result<PutCompletion> {
         let f = PvField::Scalar(ScalarValue::String(value.unwrap_or_default().into()));
@@ -687,12 +690,8 @@ impl SignalBackend<String> for EpicsPvaBackend<String> {
 
 #[async_trait]
 impl SignalBackend<i64> for EpicsPvaBackend<i64> {
-    async fn connect(&self, _timeout: Duration) -> Result<()> {
-        self.client
-            .pvconnect(&self.pv)
-            .await
-            .map(|_| ())
-            .map_err(|e| BsrsError::Backend(format!("pva connect {}: {e}", self.pv)))
+    async fn connect(&self, timeout: Duration) -> Result<()> {
+        pva_connect(&self.client, &self.pv, timeout).await
     }
     async fn put_start(&self, value: Option<i64>) -> Result<PutCompletion> {
         let f = PvField::Scalar(ScalarValue::Long(value.unwrap_or_default()));
@@ -784,12 +783,8 @@ impl SignalBackend<i64> for EpicsPvaBackend<i64> {
 
 #[async_trait]
 impl SignalBackend<bool> for EpicsPvaBackend<bool> {
-    async fn connect(&self, _timeout: Duration) -> Result<()> {
-        self.client
-            .pvconnect(&self.pv)
-            .await
-            .map(|_| ())
-            .map_err(|e| BsrsError::Backend(format!("pva connect {}: {e}", self.pv)))
+    async fn connect(&self, timeout: Duration) -> Result<()> {
+        pva_connect(&self.client, &self.pv, timeout).await
     }
     async fn put_start(&self, value: Option<bool>) -> Result<PutCompletion> {
         let f = PvField::Scalar(ScalarValue::Boolean(value.unwrap_or_default()));
