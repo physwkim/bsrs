@@ -101,6 +101,19 @@ where
         }
     }
 
+    /// Set the units `describe` reports (ophyd `set_mock_units`).
+    pub fn set_units(&self, units: impl Into<String>) {
+        let units = units.into();
+        self.inner.soft.update_metadata(|m| m.units = Some(units));
+    }
+
+    /// Set the precision `describe` reports (ophyd `set_mock_precision`).
+    pub fn set_precision(&self, precision: i64) {
+        self.inner
+            .soft
+            .update_metadata(|m| m.precision = Some(precision));
+    }
+
     /// Allow (`true`) or block (`false`) puts from completing (ophyd
     /// `set_mock_put_proceeds`).
     pub fn set_put_proceeds(&self, proceeds: bool) {

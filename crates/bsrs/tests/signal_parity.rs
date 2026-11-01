@@ -143,18 +143,31 @@ async fn default_soft_signal_reads_float_zero() {
     assert_eq!(value, &json!(0.0));
 }
 
-// ophyd-async test_soft_signal_descriptor_with_metadata (units),
-// test_soft_signal_descriptor_with_no_metadata_not_passed.
+// ophyd-async test_soft_signal_descriptor_with_metadata,
+// test_soft_signal_descriptor_with_no_metadata_not_passed, and
+// set_mock_units / set_mock_precision.
 #[tokio::test]
-async fn soft_describe_carries_units_only_when_given() {
-    async fn units(b: SoftSignalBackend<i64>) -> Option<String> {
-        let sig: SignalRW<i64, _> = Signal::new(Arc::new(b), cfg(""));
-        sig.describe().await.unwrap()[""].units.clone()
+async fn describe_carries_units_and_precision_only_when_given() {
+    async fn meta<B: SignalBackend<i64> + 'static>(b: Arc<B>) -> (Option<String>, Option<i64>) {
+        let sig: SignalRW<i64, _> = Signal::new(b, cfg(""));
+        let dk = sig.describe().await.unwrap().remove("").unwrap();
+        (dk.units, dk.precision)
     }
     let plain = || SoftSignalBackend::new(0_i64, Dtype::Integer);
-    assert_eq!(units(plain().with_units("mm")).await.as_deref(), Some("mm"));
-    assert_eq!(units(plain().with_units("")).await.as_deref(), Some(""));
-    assert_eq!(units(plain()).await, None);
+    assert_eq!(
+        meta(Arc::new(plain().with_units("mm").with_precision(0))).await,
+        (Some("mm".into()), Some(0))
+    );
+    assert_eq!(
+        meta(Arc::new(plain().with_units(""))).await,
+        (Some("".into()), None)
+    );
+    assert_eq!(meta(Arc::new(plain())).await, (None, None));
+
+    let mock = Arc::new(MockSignalBackend::new(plain()));
+    mock.set_units("mm");
+    mock.set_precision(3);
+    assert_eq!(meta(mock).await, (Some("mm".into()), Some(3)));
 }
 
 fn describe_of(source: &str) -> DataKey {
@@ -165,6 +178,7 @@ fn describe_of(source: &str) -> DataKey {
         Some("<f8".into()),
         SignalMetadata {
             units: Some("mm".into()),
+            precision: Some(2),
             ..Default::default()
         },
     )
@@ -177,6 +191,7 @@ async fn mock_over_soft_keeps_initial_and_metadata_under_a_mock_source() {
     let backend = || {
         SoftSignalBackend::new(10.0_f64, Dtype::Number)
             .with_units("mm")
+            .with_precision(2)
             .with_dtype_numpy("<f8")
     };
     let mocked: SignalRW<f64, _> = Signal::new(

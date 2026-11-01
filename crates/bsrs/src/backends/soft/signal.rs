@@ -102,7 +102,9 @@ struct Inner<T: Clone + Send + Sync + 'static> {
     /// Value written by `put(None)` — the ophyd-async `initial_value`
     /// (`_soft_signal_backend.py:164`). Fixed at construction.
     initial: T,
-    units: Option<String>,
+    /// The ophyd-async backend `metadata` dict: units and precision, which
+    /// a mock may change after construction.
+    metadata: Mutex<SignalMetadata>,
     dtype: Dtype,
     dtype_numpy: Option<DtypeNumpy>,
     shape: Vec<Option<u64>>,
@@ -146,7 +148,7 @@ where
                     next_id: 0,
                 }),
                 initial,
-                units: None,
+                metadata: Mutex::default(),
                 dtype,
                 dtype_numpy: None,
                 shape: vec![],
@@ -166,7 +168,7 @@ where
                 next_id: 0,
             }),
             initial: self.inner.initial.clone(),
-            units: self.inner.units.clone(),
+            metadata: Mutex::new(self.inner.metadata.lock().unwrap().clone()),
             dtype: self.inner.dtype,
             dtype_numpy: self.inner.dtype_numpy.clone(),
             shape: self.inner.shape.clone(),
@@ -175,13 +177,26 @@ where
 
     /// Set engineering units.
     pub fn with_units(self, units: impl Into<String>) -> Self {
-        let inner = Inner {
-            units: Some(units.into()),
-            ..self.rebuilt()
-        };
+        let inner = self.rebuilt();
+        inner.metadata.lock().unwrap().units = Some(units.into());
         Self {
             inner: Arc::new(inner),
         }
+    }
+
+    /// Set the digits after the decimal place to display.
+    pub fn with_precision(self, precision: i64) -> Self {
+        let inner = self.rebuilt();
+        inner.metadata.lock().unwrap().precision = Some(precision);
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// Change the described metadata in place, for every clone of this
+    /// backend (ophyd-async `MockSignalBackend.set_units`/`set_precision`).
+    pub(crate) fn update_metadata(&self, f: impl FnOnce(&mut SignalMetadata)) {
+        f(&mut self.inner.metadata.lock().unwrap());
     }
 
     /// Set the dtype_numpy metadata.
@@ -263,10 +278,7 @@ where
             self.inner.dtype,
             self.inner.shape.clone(),
             self.inner.dtype_numpy.clone(),
-            SignalMetadata {
-                units: self.inner.units.clone(),
-                ..Default::default()
-            },
+            self.inner.metadata.lock().unwrap().clone(),
         ))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
