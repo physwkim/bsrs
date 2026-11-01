@@ -63,7 +63,10 @@ pub trait SignalBackend<T: Clone + Send + Sync + 'static>: Send + Sync {
     async fn get_value(&self) -> Result<T>;
     /// Read current setpoint.
     async fn get_setpoint(&self) -> Result<T>;
-    /// Subscribe to value updates. RAII token cleans up on drop.
+    /// Subscribe to value updates. A new callback first receives the current
+    /// value, then every change (ophyd-async `set_callback`, which
+    /// `observe_value` relies on to yield the current value first). RAII
+    /// token cleans up on drop.
     fn set_callback(&self, cb: Option<ReadingValueCallback<T>>) -> SubToken;
     /// Source string for `DataKey.source`.
     ///
