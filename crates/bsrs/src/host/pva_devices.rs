@@ -36,8 +36,8 @@ use crate::core::reading::ReadingValue;
 use crate::core::status::Status;
 use crate::core::subscription::Subscription;
 use crate::devices::SignalCache;
-use crate::event_model::{DataKey, Dtype};
-use crate::host::motor_move::MotorChannels;
+use crate::event_model::DataKey;
+use crate::host::motor_move::{describe_pv, MotorChannels};
 use crate::protocols_async::SignalBackend;
 
 /// PVA-backed motor: setpoint + readback Signal pair.
@@ -47,7 +47,7 @@ use crate::protocols_async::SignalBackend;
 pub struct PvaMotor {
     name: String,
     channels: MotorChannels<EpicsPvaBackend<f64>>,
-    cache: Arc<SignalCache<f64, EpicsPvaBackend<f64>>>,
+    rbv_pv: String,
 }
 
 impl PvaMotor {
@@ -58,9 +58,17 @@ impl PvaMotor {
             crate::core::runtime::bsrs_runtime().block_on(connect)?;
         Ok(Arc::new(Self {
             name: name.to_string(),
-            cache: SignalCache::new(channels.readback.clone()),
             channels,
+            rbv_pv: rbv_pv.to_string(),
         }))
+    }
+
+    /// ophyd `EpicsMotor.set_current_position`: redefine the user position
+    /// as `pos` without moving the motor, past the limits if need be.
+    pub async fn set_current_position(&self, pos: f64) -> Result<()> {
+        self.channels
+            .set_current_position("pva_motor", &self.name, pos)
+            .await
     }
 }
 
@@ -79,30 +87,25 @@ impl NamedObj for PvaMotor {
 #[async_trait::async_trait]
 impl ReadableObj for PvaMotor {
     async fn read_dyn(&self) -> Result<HashMap<String, ReadingValue>> {
-        let r = self.channels.readback.get_reading().await?;
+        let r = self.channels.readback.backend.get_reading().await?;
         let mut out = HashMap::new();
         out.insert(self.name.clone(), r);
         Ok(out)
     }
     async fn describe_dyn(&self) -> Result<HashMap<String, DataKey>> {
-        let mut out = HashMap::new();
-        out.insert(
+        Ok(HashMap::from([(
             self.name.clone(),
-            DataKey {
-                source: format!("pva://{}.RBV", self.name),
-                dtype: Dtype::Number,
-                shape: vec![],
-                dtype_numpy: Some("<f8".into()),
-                external: None,
-                units: None,
-                precision: None,
-                object_name: Some(self.name.clone()),
-                dims: None,
-                limits: None,
-                choices: None,
-            },
-        );
-        Ok(out)
+            describe_pv(
+                self.channels.readback.backend.as_ref(),
+                &self.rbv_pv,
+                &self.name,
+            )
+            .await?,
+        )]))
+    }
+    /// The readback is the hinted field, as in ophyd's `EpicsMotor`.
+    fn hint_fields(&self) -> Option<Vec<String>> {
+        Some(vec![self.name.clone()])
     }
 }
 
@@ -111,28 +114,33 @@ impl MovableObj for PvaMotor {
     async fn set_dyn(&self, value: f64) -> Status {
         self.channels.set("pva_motor", &self.name, value).await
     }
+    async fn stop_on_pause(&self, success: bool) -> Result<()> {
+        StoppableObj::stop_dyn(self, success).await
+    }
 }
 
 #[async_trait::async_trait]
 impl LocatableObj for PvaMotor {
     async fn locate_dyn(&self) -> Result<DynLocation> {
         let setpoint = self.channels.setpoint.get_value().await?;
-        let readback = self.channels.readback.get_value().await?;
+        let readback = self.channels.readback.backend.get_value().await?;
         Ok(DynLocation { setpoint, readback })
     }
 }
 
 #[async_trait::async_trait]
 impl StoppableObj for PvaMotor {
-    async fn stop_dyn(&self, _success: bool) -> Result<()> {
-        Ok(())
+    /// ophyd-async `Motor.stop`: press `.STOP` while the motor moves, then
+    /// settle the move, failed unless `success`.
+    async fn stop_dyn(&self, success: bool) -> Result<()> {
+        self.channels.stop(success).await
     }
 }
 
 #[async_trait::async_trait]
 impl MonitorableObj for PvaMotor {
     async fn subscribe_dyn(&self) -> Result<Subscription> {
-        let (rx, token) = self.cache.add_listener();
+        let (rx, token) = self.channels.readback.cache.add_listener();
         Ok(Subscription::new(rx, token, self.name.clone()))
     }
 }
@@ -144,6 +152,7 @@ impl MonitorableObj for PvaMotor {
 pub struct PvaDetector {
     name: String,
     value: Arc<EpicsPvaBackend<f64>>,
+    value_pv: String,
     cache: Arc<SignalCache<f64, EpicsPvaBackend<f64>>>,
     seen: AtomicI64,
 }
@@ -159,6 +168,7 @@ impl PvaDetector {
             name: name.to_string(),
             cache: SignalCache::new(v.clone()),
             value: v,
+            value_pv: value_pv.to_string(),
             seen: AtomicI64::new(0),
         }))
     }
@@ -187,24 +197,14 @@ impl ReadableObj for PvaDetector {
         Ok(out)
     }
     async fn describe_dyn(&self) -> Result<HashMap<String, DataKey>> {
-        let mut out = HashMap::new();
-        out.insert(
+        Ok(HashMap::from([(
             self.name.clone(),
-            DataKey {
-                source: format!("pva://{}", self.name),
-                dtype: Dtype::Number,
-                shape: vec![],
-                dtype_numpy: Some("<f8".into()),
-                external: None,
-                units: None,
-                precision: None,
-                object_name: Some(self.name.clone()),
-                dims: None,
-                limits: None,
-                choices: None,
-            },
-        );
-        Ok(out)
+            describe_pv(self.value.as_ref(), &self.value_pv, &self.name).await?,
+        )]))
+    }
+    /// The value is the hinted field, as in an ophyd `EpicsSignalRO`.
+    fn hint_fields(&self) -> Option<Vec<String>> {
+        Some(vec![self.name.clone()])
     }
 }
 

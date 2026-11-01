@@ -40,6 +40,9 @@
 #![deny(missing_docs)]
 
 mod dcm;
+#[cfg(test)]
+#[path = "../../../crates/bsrs/tests/example_ioc/mod.rs"]
+mod example_ioc;
 mod table;
 
 use std::sync::Arc;

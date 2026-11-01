@@ -103,7 +103,7 @@ harness = false
 
 [[example]]
 name = "mini_beamline_scan"
-required-features = ["ca"]
+required-features = ["ca", "host"]
 
 [[example]]
 name = "qs_beamline"
