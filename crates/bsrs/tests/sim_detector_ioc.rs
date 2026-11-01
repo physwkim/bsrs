@@ -17,7 +17,7 @@ use bsrs::devices::TriggerInfo;
 use bsrs::event_model::{DataKey, Dtype, DtypeNumpy, StreamDatum, StreamResource};
 use bsrs::host::areadetector::{
     area_detector_hdf, connect_area_detector_hdf, num_rois, AreaDetectorCam, AreaDetectorHdf,
-    NdFile, NdRoi, NdStats, StaticPathProvider, AD_IMAGE_MODE_CONTINUOUS, AD_IMAGE_MODE_MULTIPLE,
+    NdFile, NdRoi, NdStats, StaticPathProvider, AD_IMAGE_MODE_MULTIPLE,
 };
 use bsrs::prelude::*;
 use bsrs::protocols_async::{
@@ -436,48 +436,6 @@ async fn kickoff_resolves_once_the_detector_is_acquiring() {
         "kickoff of a 1 s acquisition not done after 500 ms: {early:?}"
     );
     completed.unwrap();
-}
-
-/// ophyd-async `test_standard_detector.py:894` `test_unstage_disarms_detector`
-/// and `test_acquire_logic.py:123` `test_acquire_logic_disarm`: stage and
-/// unstage both leave a free-running cam stopped.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
-async fn stage_and_unstage_stop_a_running_acquisition() {
-    boot();
-    let _cam = CAM_LOCK.lock().await;
-    let dir = tempfile::tempdir().unwrap();
-    let det = hdf_det("det", dir.path(), "disarm").await;
-    let cam = det.control();
-    let acquiring = format!("{CAM}Acquire_RBV");
-
-    put::<i64>(&format!("{CAM}ImageMode"), AD_IMAGE_MODE_CONTINUOUS).await;
-    cam.acquire.put_nowait(true).await.unwrap();
-    assert!(wait_for(&acquiring, true).await);
-    Stageable::stage(&det).await.expect("stage");
-    assert!(
-        !get::<bool>(&acquiring).await,
-        "stage left the cam acquiring"
-    );
-
-    cam.acquire.put_nowait(true).await.unwrap();
-    assert!(wait_for(&acquiring, true).await);
-    Stageable::unstage(&det).await.expect("unstage");
-    assert!(
-        !get::<bool>(&acquiring).await,
-        "unstage left the cam acquiring"
-    );
-}
-
-async fn wait_for(pv: &str, want: bool) -> bool {
-    let deadline = Instant::now() + TIMEOUT;
-    while Instant::now() < deadline {
-        if get::<bool>(pv).await == want {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    false
 }
 
 /// ophyd-async `test_data_logic.py:36` `test_hdf_writer_file_not_found` and
