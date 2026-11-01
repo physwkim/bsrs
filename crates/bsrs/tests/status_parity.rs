@@ -95,6 +95,13 @@ fn blocking_wait_returns_the_outcome_and_a_wait_timeout_changes_nothing() {
             dbg(Err::<(), _>(WaitError::Status(err)))
         );
     }
+
+    // test_status_timeout, from sync code.
+    let (status, _setter) = Status::with_timeout(Some(10 * MS), Duration::ZERO);
+    assert!(matches!(
+        status.wait(LONG),
+        Err(WaitError::Status(StatusError::Timeout))
+    ));
 }
 
 // ophyd-async test_async_status_success / _propagates_exception /
@@ -435,4 +442,59 @@ async fn an_operation_timeout_fails_the_plan_as_a_status_failure() {
             result.exception
         );
     }
+}
+
+// ophyd test_status_timeout / test_status_timeout_with_settle_time /
+// test_external_timeout / test_set_finished_after_timeout /
+// test_set_exception_after_timeout: a status given a timeout fails with
+// StatusTimeoutError once timeout + settle_time pass, unless its producer
+// finished first, and a late outcome changes nothing.
+#[tokio::test(start_paused = true)]
+async fn a_status_not_finished_within_its_timeout_times_out() {
+    for (timeout, settle) in [(0, 0), (0, 1000), (200, 300)] {
+        let (timeout, settle) = (timeout * MS, settle * MS);
+        let (status, setter) = Status::with_timeout(Some(timeout), settle);
+        let t0 = Instant::now();
+        assert!(matches!(status.clone().await, Err(StatusError::Timeout)));
+        assert_eq!(t0.elapsed(), timeout + settle);
+        assert!(matches!(status.exception(), Some(StatusError::Timeout)));
+        setter.success();
+        sleep(settle + MS).await;
+        assert!(matches!(status.exception(), Some(StatusError::Timeout)));
+    }
+
+    let (status, setter) = Status::with_timeout(Some(Duration::ZERO), Duration::ZERO);
+    sleep(MS).await;
+    setter.fail(failed("LocalException"));
+    assert!(matches!(status.exception(), Some(StatusError::Timeout)));
+
+    let (status, setter) = Status::with_timeout(LONG, Duration::ZERO);
+    setter.fail(failed("TimeoutError"));
+    sleep(2 * LONG.unwrap()).await;
+    assert_eq!(dbg(status.exception()), dbg(Some(failed("TimeoutError"))));
+}
+
+// ophyd test_status_timeout_infinite_with_settle_time /
+// test_race_settle_time_and_timeout: success lands settle_time after the
+// producer reports it, callbacks run then, and the timeout counts the settling
+// in; a failure lands at once.
+#[tokio::test(start_paused = true)]
+async fn success_lands_after_the_settle_time() {
+    for timeout in [None, Some(1000 * MS)] {
+        let settle = 3000 * MS;
+        let (status, setter) = Status::with_timeout(timeout, settle);
+        let seen = record(&status);
+        let t0 = Instant::now();
+        setter.success();
+        sleep(2500 * MS).await;
+        assert!(!status.done_state());
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(status.clone().await.is_ok());
+        assert_eq!(t0.elapsed(), settle);
+        assert_eq!(dbg(&*seen.lock().unwrap()), dbg([StatusOutcome::Success]));
+    }
+
+    let (status, setter) = Status::with_timeout(None, 1000 * MS);
+    setter.fail(failed("boom"));
+    assert_eq!(dbg(status.exception()), dbg(Some(failed("boom"))));
 }

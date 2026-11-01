@@ -143,6 +143,16 @@ struct Inner {
     /// for producers that omit it. Mirrors ophyd-async's
     /// `WatchableAsyncStatus._start` (`_status.py:200`).
     start: Instant,
+    /// How long a reported success takes to land (ophyd `settle_time`).
+    settle_time: Duration,
+}
+
+/// Runs a status timer on the calling tokio runtime, or on the bsrs runtime
+/// from sync code; ophyd runs its timers on threads of their own.
+fn spawn_timer<F: Future<Output = ()> + Send + 'static>(timer: F) {
+    tokio::runtime::Handle::try_current()
+        .unwrap_or_else(|_| crate::core::runtime::runtime_handle())
+        .spawn(timer);
 }
 
 impl Inner {
@@ -191,6 +201,15 @@ pub struct StatusSetter {
 impl Status {
     /// Build a fresh pair of `(Status, setter)`.
     pub fn new() -> (Self, StatusSetter) {
+        Self::with_timeout(None, Duration::ZERO)
+    }
+
+    /// Build a `(Status, setter)` pair with ophyd `StatusBase`'s `timeout`
+    /// and `settle_time`: [`StatusSetter::success`] lands `settle_time` after
+    /// it is called (a failure lands at once), and a status not finished by
+    /// `timeout + settle_time` after this call fails with
+    /// [`StatusError::Timeout`]. An outcome reported later changes nothing.
+    pub fn with_timeout(timeout: Option<Duration>, settle_time: Duration) -> (Self, StatusSetter) {
         let (tx, rx) = watch::channel(0.0_f64);
         let (wtx, wrx) = watch::channel::<Option<WatcherUpdate>>(None);
         let inner = Arc::new(Inner {
@@ -203,15 +222,26 @@ impl Status {
             observers: Mutex::new(Vec::new()),
             cancel: CancellationToken::new(),
             start: Instant::now(),
+            settle_time,
         });
-        (
-            Status {
-                inner: inner.clone(),
-                progress_rx: rx,
-                watcher_rx: wrx,
-            },
-            StatusSetter { inner },
-        )
+        let status = Status {
+            inner: inner.clone(),
+            progress_rx: rx,
+            watcher_rx: wrx,
+        };
+        if let Some(timeout) = timeout {
+            let status = status.clone();
+            spawn_timer(async move {
+                let deadline = timeout.saturating_add(settle_time);
+                if tokio::time::timeout(deadline, status.clone())
+                    .await
+                    .is_err()
+                {
+                    status.inner.finish(Err(StatusError::Timeout));
+                }
+            });
+        }
+        (status, StatusSetter { inner })
     }
 
     /// Construct an already-done success status.
@@ -384,9 +414,18 @@ impl Status {
 }
 
 impl StatusSetter {
-    /// Mark the status as successful and fire callbacks/wakers.
+    /// Mark the status as successful and fire callbacks/wakers, after the
+    /// settle time given to [`Status::with_timeout`], if any.
     pub fn success(self) {
-        self.inner.finish(Ok(()));
+        let inner = self.inner;
+        if inner.settle_time.is_zero() {
+            inner.finish(Ok(()));
+            return;
+        }
+        spawn_timer(async move {
+            tokio::time::sleep(inner.settle_time).await;
+            inner.finish(Ok(()));
+        });
     }
 
     /// Mark the status as failed.
