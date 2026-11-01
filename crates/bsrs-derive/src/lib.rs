@@ -28,8 +28,9 @@ extern crate proc_macro;
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
-use quote::quote;
-use syn::{parse_macro_input, Data, DeriveInput, Field, Fields, Meta};
+use quote::{format_ident, quote};
+use syn::parse::{Parse, ParseStream};
+use syn::{parse_macro_input, Data, DeriveInput, Field, Fields, Ident, LitStr, Token};
 
 /// Derive `Device` for a struct.
 #[proc_macro_derive(Device, attributes(signal, device))]
@@ -84,8 +85,13 @@ pub fn derive_device(input: TokenStream) -> TokenStream {
             continue;
         }
 
-        if let Some(template) = parse_string_attr(field, "signal") {
-            let kind_expr = parse_kind(field);
+        let signal = match field_attr::<SignalAttr>(field, "signal") {
+            Ok(v) => v,
+            Err(e) => return e.to_compile_error().into(),
+        };
+        if let Some(SignalAttr { template, kind }) = signal {
+            let kind = format_ident!("{}", kind);
+            let kind_expr = quote! { ::bsrs::core::Kind::#kind };
             field_inits.push(quote! {
                 #id: ::bsrs::devices::Signal::new(
                     ::std::sync::Arc::new(::bsrs::devices::__derive::default_backend(
@@ -119,7 +125,11 @@ pub fn derive_device(input: TokenStream) -> TokenStream {
             continue;
         }
 
-        if let Some(template) = parse_string_attr(field, "device") {
+        let device = match field_attr::<LitStr>(field, "device") {
+            Ok(v) => v,
+            Err(e) => return e.to_compile_error().into(),
+        };
+        if let Some(template) = device {
             let ty = strip_arc(&field.ty);
             field_inits.push(quote! {
                 #id: <#ty>::new(&::bsrs::devices::__derive::expand(#template, prefix)),
@@ -238,50 +248,62 @@ pub fn derive_device(input: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
-/// Extract the first string literal in `#[name(...)]` if present.
-fn parse_string_attr(field: &Field, name: &str) -> Option<String> {
-    for attr in &field.attrs {
-        if !attr.path().is_ident(name) {
-            continue;
-        }
-        if let Meta::List(ml) = &attr.meta {
-            let toks = ml.tokens.to_string();
-            if let Some(start) = toks.find('"') {
-                if let Some(end) = toks[start + 1..].find('"') {
-                    return Some(toks[start + 1..start + 1 + end].to_string());
-                }
-            }
-        }
-    }
-    None
+/// Parse the `#[name(...)]` helper attribute on `field`, if present.
+fn field_attr<T: Parse>(field: &Field, name: &str) -> syn::Result<Option<T>> {
+    field
+        .attrs
+        .iter()
+        .find(|a| a.path().is_ident(name))
+        .map(|a| a.parse_args::<T>())
+        .transpose()
 }
 
-/// Parse `kind = hinted|config|normal|omitted` out of `#[signal(...)]`.
-fn parse_kind(field: &Field) -> TokenStream2 {
-    for attr in &field.attrs {
-        if !attr.path().is_ident("signal") {
-            continue;
-        }
-        if let Meta::List(ml) = &attr.meta {
-            let toks = ml.tokens.to_string();
-            if let Some(idx) = toks.find("kind") {
-                let tail = &toks[idx + 4..]; // skip "kind"
-                let tail = tail.trim_start_matches([' ', '=', ',', '\t']);
-                let word: String = tail
-                    .chars()
-                    .take_while(|c| c.is_alphanumeric() || *c == '_')
-                    .collect();
-                return match word.as_str() {
-                    "hinted" => quote! { ::bsrs::core::Kind::Hinted },
-                    "config" => quote! { ::bsrs::core::Kind::Config },
-                    "normal" => quote! { ::bsrs::core::Kind::Normal },
-                    "omitted" => quote! { ::bsrs::core::Kind::Omitted },
-                    _ => quote! { ::bsrs::core::Kind::Normal },
-                };
+/// `#[signal([ro|rw|wo|x,] "template" [, kind = normal|config|hinted|omitted])]`.
+/// The role is documentation only (the field type carries it); the kind name
+/// is case-insensitive like ophyd's `Kind[val.lower()]`.
+struct SignalAttr {
+    template: LitStr,
+    /// `bsrs::core::Kind` variant name.
+    kind: &'static str,
+}
+
+impl Parse for SignalAttr {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        if input.peek(Ident) {
+            let role: Ident = input.parse()?;
+            if !matches!(role.to_string().as_str(), "ro" | "rw" | "wo" | "x") {
+                return Err(syn::Error::new(
+                    role.span(),
+                    "expected access role `ro`, `rw`, `wo` or `x`",
+                ));
             }
+            input.parse::<Token![,]>()?;
         }
+        let template: LitStr = input.parse()?;
+        let mut kind = "Normal";
+        if input.parse::<Option<Token![,]>>()?.is_some() && !input.is_empty() {
+            let key: Ident = input.parse()?;
+            if key != "kind" {
+                return Err(syn::Error::new(key.span(), "expected `kind = ...`"));
+            }
+            input.parse::<Token![=]>()?;
+            let value: Ident = input.parse()?;
+            kind = match value.to_string().to_ascii_lowercase().as_str() {
+                "normal" => "Normal",
+                "config" => "Config",
+                "hinted" => "Hinted",
+                "omitted" => "Omitted",
+                _ => {
+                    return Err(syn::Error::new(
+                        value.span(),
+                        "expected kind `normal`, `config`, `hinted` or `omitted`",
+                    ))
+                }
+            };
+            input.parse::<Option<Token![,]>>()?;
+        }
+        Ok(Self { template, kind })
     }
-    quote! { ::bsrs::core::Kind::Normal }
 }
 
 /// If the type is `Arc<T>`, strip to `T` (so `T::new(...)` resolves).
@@ -516,4 +538,42 @@ fn is_result_type(ty: &Type) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SignalAttr;
+    use quote::quote;
+
+    fn kind(tokens: proc_macro2::TokenStream) -> syn::Result<&'static str> {
+        syn::parse2::<SignalAttr>(tokens).map(|a| a.kind)
+    }
+
+    #[test]
+    fn signal_attr_kind_is_parsed_by_key_not_substring() {
+        assert_eq!(
+            kind(quote!(rw, "{prefix}:kind", kind = config)).unwrap(),
+            "Config"
+        );
+        assert_eq!(kind(quote!("{prefix}:VAL")).unwrap(), "Normal");
+        assert_eq!(
+            kind(quote!(ro, "{prefix}:RBV", kind = Hinted)).unwrap(),
+            "Hinted"
+        );
+        assert_eq!(
+            kind(quote!(x, "{prefix}:X", kind = OMITTED,)).unwrap(),
+            "Omitted"
+        );
+        let t = syn::parse2::<SignalAttr>(quote!(rw, "a\"b", kind = normal)).unwrap();
+        assert_eq!(t.template.value(), "a\"b");
+    }
+
+    #[test]
+    fn signal_attr_rejects_unknown_tokens() {
+        assert!(kind(quote!(rw, "t", kind = hinte)).is_err());
+        assert!(kind(quote!(rx, "t")).is_err());
+        assert!(kind(quote!(rw, "t", knd = config)).is_err());
+        assert!(kind(quote!(rw, "t", kind = config, extra)).is_err());
+        assert!(kind(quote!(rw)).is_err());
+    }
 }

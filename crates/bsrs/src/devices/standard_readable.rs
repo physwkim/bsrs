@@ -8,47 +8,115 @@
 //! holds the accumulators and implements those traits (plus the engine-facing
 //! `ReadableObj` / `ConfigurableObj` / `StageableObj` bridges) by delegation.
 
-use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
 use std::sync::Arc;
 
-use crate::core::error::Result;
+use crate::core::error::{BsrsError, Result};
 use crate::core::msg::{ConfigurableObj, NamedObj, ReadableObj, StageableObj};
 use crate::core::reading::ReadingValue;
 use crate::core::ConfigureArgs;
+use crate::devices::signal::{Readable, Signal};
 use crate::event_model::DataKey;
-use crate::protocols_async::{AsyncConfigurable, AsyncReadable, Stageable};
+use crate::protocols_async::{AsyncConfigurable, AsyncReadable, SignalBackend, Stageable};
 use async_trait::async_trait;
+use futures::future::join_all;
+use serde::Serialize;
 
-/// How a child contributes to a [`StandardReadable`]'s documents. Mirrors
-/// ophyd-async `StandardReadableFormat` (`core/_readable.py`).
+/// How a readable signal contributes to a [`StandardReadable`]'s documents,
+/// given to [`StandardReadable::add_signal`]. Mirrors the signal formats of
+/// ophyd-async `StandardReadableFormat` (`core/_readable.py`), which accept
+/// only a `SignalR`; its `CHILD` format, which takes any device, is
+/// [`StandardReadable::add_child`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StandardReadableFormat {
-    /// Auto-detect: contributes to `read` / `describe`, and to `hints` via the
-    /// child's [`ReadableObj::hint_fields`].
-    Child,
     /// Contributes to `read_configuration` / `describe_configuration` only.
     ConfigSignal,
     /// Contributes to `read` / `describe` and to `hints`.
     HintedSignal,
-    /// Contributes to `read` / `describe`. The value is read live (not cached);
-    /// until CP-08 adds the signal cache this is identical to a cached read.
+    /// Contributes to `read` / `describe`, read live even when the signal
+    /// holds a cached value.
     UncachedSignal,
-    /// Contributes to `read` / `describe` and to `hints`, uncached.
+    /// Contributes to `read` / `describe` and to `hints`, read live.
     HintedUncachedSignal,
 }
 
 /// A compositional device that merges its children's readings, configuration,
-/// staging and hints. Register children with [`add_readables`] /
-/// [`add_stageable`]; the trait impls then expose the aggregate.
+/// staging and hints. Register children with [`add_child`] / [`add_signal`];
+/// the trait impls then expose the aggregate.
 ///
-/// [`add_readables`]: StandardReadable::add_readables
-/// [`add_stageable`]: StandardReadable::add_stageable
+/// [`add_child`]: StandardReadable::add_child
+/// [`add_signal`]: StandardReadable::add_signal
 pub struct StandardReadable {
     name: String,
-    read: Vec<Arc<dyn ReadableObj>>,
-    config: Vec<Arc<dyn ReadableObj>>,
+    read: Vec<Source>,
+    config: Vec<Source>,
     stageables: Vec<Arc<dyn StageableObj>>,
     hints: Vec<String>,
+}
+
+/// The `SignalR` surface the signal formats read through, object-safe so
+/// signals of any value type and backend share one bucket.
+#[async_trait]
+trait SignalRead: Send + Sync {
+    async fn read_signal(&self, cached: Option<bool>) -> Result<HashMap<String, ReadingValue>>;
+    async fn describe_signal(&self) -> Result<HashMap<String, DataKey>>;
+}
+
+#[async_trait]
+impl<T, B, A> SignalRead for Signal<T, B, A>
+where
+    T: Clone + Send + Sync + Serialize + 'static,
+    B: SignalBackend<T>,
+    A: Readable,
+{
+    async fn read_signal(&self, cached: Option<bool>) -> Result<HashMap<String, ReadingValue>> {
+        self.read_cached(cached).await
+    }
+    async fn describe_signal(&self) -> Result<HashMap<String, DataKey>> {
+        self.describe().await
+    }
+}
+
+/// One contributor to a bucket: an entry of ophyd-async's paired
+/// `_describe_funcs` / `_read_funcs` (or `_describe_config_funcs` /
+/// `_read_config_funcs`).
+enum Source {
+    /// A `CHILD` in the `read` bucket: its own `read` / `describe`.
+    Device(Arc<dyn ReadableObj>),
+    /// A `CHILD` in the configuration bucket: its configuration view.
+    DeviceConfig(Arc<dyn ReadableObj>),
+    /// A signal format: the signal's `read(cached)` / `describe`; the
+    /// `Uncached*` formats pass `Some(false)` (ophyd-async `_UncachedRead`).
+    Signal {
+        signal: Arc<dyn SignalRead>,
+        cached: Option<bool>,
+    },
+}
+
+impl Source {
+    async fn read(&self) -> Result<HashMap<String, ReadingValue>> {
+        match self {
+            Self::Device(d) => d.read_dyn().await,
+            Self::DeviceConfig(d) => match d.as_configurable() {
+                Some(cfg) => cfg.read_configuration_dyn().await,
+                None => Ok(HashMap::new()),
+            },
+            Self::Signal { signal, cached } => signal.read_signal(*cached).await,
+        }
+    }
+
+    async fn describe(&self) -> Result<HashMap<String, DataKey>> {
+        match self {
+            Self::Device(d) => d.describe_dyn().await,
+            Self::DeviceConfig(d) => match d.as_configurable() {
+                Some(cfg) => cfg.describe_configuration_dyn().await,
+                None => Ok(HashMap::new()),
+            },
+            Self::Signal { signal, .. } => signal.describe_signal().await,
+        }
+    }
 }
 
 impl StandardReadable {
@@ -63,42 +131,96 @@ impl StandardReadable {
         }
     }
 
-    /// Register a readable child, routing it to the buckets implied by
-    /// `format`. A child is always read via its [`ReadableObj`] surface; the
-    /// format decides whether its reading lands in `read` or in
-    /// `read_configuration`, and whether its fields become hints.
-    ///
-    /// For [`Child`](StandardReadableFormat::Child), hints are auto-detected
-    /// from the child's [`ReadableObj::hint_fields`]. For the explicit
-    /// `Hinted*` formats, the child's declared hint fields are used if present,
-    /// otherwise the child's own name (a signal reads as `{name: value}`).
-    pub fn add_readables(&mut self, child: Arc<dyn ReadableObj>, format: StandardReadableFormat) {
-        use StandardReadableFormat::*;
-        match format {
-            ConfigSignal => self.config.push(child),
-            UncachedSignal => self.read.push(child),
-            Child => {
-                if let Some(fields) = child.hint_fields() {
-                    self.hints.extend(fields);
-                }
-                self.read.push(child);
-            }
-            HintedSignal | HintedUncachedSignal => {
-                match child.hint_fields() {
-                    Some(fields) => self.hints.extend(fields),
-                    None => self.hints.push(child.name().to_string()),
-                }
-                self.read.push(child);
-            }
+    /// Register any readable device the way ophyd-async's `CHILD` format
+    /// does: its reading goes to `read`, its configuration view (if
+    /// [`ReadableObj::as_configurable`] has one) to `read_configuration`, its
+    /// [`ReadableObj::as_stageable`] view (if any) to `stage` / `unstage`, and
+    /// its [`ReadableObj::hint_fields`] to `hints`. A hint field already
+    /// registered is an error and leaves `self` unchanged.
+    pub fn add_child(&mut self, child: Arc<dyn ReadableObj>) -> Result<()> {
+        self.add_hints(child.hint_fields().unwrap_or_default())?;
+        if let Some(stageable) = child.clone().as_stageable() {
+            self.stageables.push(stageable);
         }
+        if child.as_configurable().is_some() {
+            self.config.push(Source::DeviceConfig(child.clone()));
+        }
+        self.read.push(Source::Device(child));
+        Ok(())
     }
 
-    /// Register a child that is staged/unstaged together with this device.
-    /// (`StandardReadableFormat::CHILD` auto-stages a `Stageable` child in
-    /// ophyd-async; Rust trait objects can't be probed for capability, so
-    /// staging is registered explicitly.)
-    pub fn add_stageable(&mut self, child: Arc<dyn StageableObj>) {
-        self.stageables.push(child);
+    /// Register a readable signal under one of the signal formats. Only a
+    /// signal with a readable access role is accepted, which is ophyd-async's
+    /// `assert_device_is_signalr` check made at compile time. The `Hinted*`
+    /// formats hint the signal's name, or nothing when it is unnamed, and
+    /// `HintedSignal` also stages the signal. A hint already registered is an
+    /// error and leaves `self` unchanged.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use bsrs::backends::soft::SoftSignalBackend;
+    /// # use bsrs::core::{Dtype, Kind};
+    /// # use bsrs::devices::{Signal, SignalConfig, SignalR, StandardReadable, StandardReadableFormat};
+    /// let backend = Arc::new(SoftSignalBackend::new(0.1, Dtype::Number));
+    /// let config = SignalConfig { source: "exp".into(), kind: Kind::Config, name: "exp".into() };
+    /// let exposure: Arc<SignalR<f64, SoftSignalBackend<f64>>> = Arc::new(Signal::new(backend, config));
+    /// let mut sr = StandardReadable::new("sr");
+    /// sr.add_signal(exposure, StandardReadableFormat::ConfigSignal).unwrap();
+    /// ```
+    ///
+    /// A device that is not a signal is rejected:
+    ///
+    /// ```compile_fail,E0308
+    /// # use std::sync::Arc;
+    /// # use bsrs::devices::{StandardReadable, StandardReadableFormat};
+    /// let mut sr = StandardReadable::new("sr");
+    /// let child = Arc::new(StandardReadable::new("child"));
+    /// sr.add_signal(child, StandardReadableFormat::ConfigSignal).unwrap();
+    /// ```
+    pub fn add_signal<T, B, A>(
+        &mut self,
+        signal: Arc<Signal<T, B, A>>,
+        format: StandardReadableFormat,
+    ) -> Result<()>
+    where
+        T: Clone + Send + Sync + Serialize + 'static,
+        B: SignalBackend<T> + 'static,
+        A: Readable,
+    {
+        use StandardReadableFormat::*;
+        let hint = (!signal.name().is_empty()).then(|| signal.name().to_string());
+        let source = |cached| Source::Signal {
+            signal: signal.clone(),
+            cached,
+        };
+        match format {
+            ConfigSignal => self.config.push(source(None)),
+            HintedSignal => {
+                self.add_hints(hint)?;
+                self.read.push(source(None));
+                self.stageables.push(signal.clone());
+            }
+            UncachedSignal => self.read.push(source(Some(false))),
+            HintedUncachedSignal => {
+                self.add_hints(hint)?;
+                self.read.push(source(Some(false)));
+            }
+        }
+        Ok(())
+    }
+
+    /// Append hint fields, rejecting one already registered as ophyd-async's
+    /// `hints` property does for a sequence-valued key; nothing is appended
+    /// on error.
+    fn add_hints(&mut self, fields: impl IntoIterator<Item = String>) -> Result<()> {
+        let fields: Vec<String> = fields.into_iter().collect();
+        if let Some(f) = fields.iter().find(|f| self.hints.contains(f)) {
+            return Err(BsrsError::Other(format!(
+                "Hint fields {f} overrides existing hint"
+            )));
+        }
+        self.hints.extend(fields);
+        Ok(())
     }
 
     /// Stable name.
@@ -109,24 +231,49 @@ impl StandardReadable {
 
 // -- aggregating async protocol impls ---------------------------------------
 
+/// Await per-child maps concurrently and merge them like ophyd-async
+/// `merge_gathered_dicts`: a key produced by two children is an error, never
+/// a silent overwrite. A failed child reports the first error in
+/// registration order once every child has finished.
+async fn merge_unique_keys<V, F>(parts: Vec<F>) -> Result<HashMap<String, V>>
+where
+    F: Future<Output = Result<HashMap<String, V>>>,
+{
+    let mut out = HashMap::new();
+    let mut duplicates = BTreeSet::new();
+    for part in join_all(parts).await {
+        for (key, value) in part? {
+            match out.entry(key) {
+                Entry::Occupied(e) => {
+                    duplicates.insert(e.key().clone());
+                }
+                Entry::Vacant(e) => {
+                    e.insert(value);
+                }
+            }
+        }
+    }
+    if duplicates.is_empty() {
+        return Ok(out);
+    }
+    let keys = duplicates.into_iter().collect::<Vec<_>>().join(", ");
+    Err(BsrsError::Other(if keys.is_empty() {
+        "Have you remembered to name the Device?".to_string()
+    } else {
+        format!("Duplicate keys found while merging dictionaries: {keys}")
+    }))
+}
+
 #[async_trait]
 impl AsyncReadable for StandardReadable {
     fn name(&self) -> &str {
         &self.name
     }
     async fn read(&self) -> Result<HashMap<String, ReadingValue>> {
-        let mut out = HashMap::new();
-        for child in &self.read {
-            out.extend(child.read_dyn().await?);
-        }
-        Ok(out)
+        merge_unique_keys(self.read.iter().map(|s| s.read()).collect()).await
     }
     async fn describe(&self) -> Result<HashMap<String, DataKey>> {
-        let mut out = HashMap::new();
-        for child in &self.read {
-            out.extend(child.describe_dyn().await?);
-        }
-        Ok(out)
+        merge_unique_keys(self.read.iter().map(|s| s.describe()).collect()).await
     }
 }
 
@@ -136,18 +283,10 @@ impl AsyncConfigurable for StandardReadable {
         &self.name
     }
     async fn read_configuration(&self) -> Result<HashMap<String, ReadingValue>> {
-        let mut out = HashMap::new();
-        for child in &self.config {
-            out.extend(child.read_dyn().await?);
-        }
-        Ok(out)
+        merge_unique_keys(self.config.iter().map(|s| s.read()).collect()).await
     }
     async fn describe_configuration(&self) -> Result<HashMap<String, DataKey>> {
-        let mut out = HashMap::new();
-        for child in &self.config {
-            out.extend(child.describe_dyn().await?);
-        }
-        Ok(out)
+        merge_unique_keys(self.config.iter().map(|s| s.describe()).collect()).await
     }
     async fn configure(&self, _args: ConfigureArgs) -> Result<()> {
         // ophyd-async `StandardReadable` is Configurable only for
@@ -162,17 +301,19 @@ impl Stageable for StandardReadable {
     fn name(&self) -> &str {
         &self.name
     }
+    // Concurrent like ophyd-async `_StandardBase.stage` (`asyncio.gather`);
+    // every child finishes before the first error is returned.
     async fn stage(&self) -> Result<()> {
-        for child in &self.stageables {
-            child.stage_dyn().await?;
-        }
-        Ok(())
+        join_all(self.stageables.iter().map(|c| c.stage_dyn()))
+            .await
+            .into_iter()
+            .collect()
     }
     async fn unstage(&self) -> Result<()> {
-        for child in &self.stageables {
-            child.unstage_dyn().await?;
-        }
-        Ok(())
+        join_all(self.stageables.iter().map(|c| c.unstage_dyn()))
+            .await
+            .into_iter()
+            .collect()
     }
 }
 
@@ -245,11 +386,11 @@ mod tests {
     use super::*;
     use crate::backends::soft::SoftSignalBackend;
     use crate::core::Kind;
-    use crate::devices::{Signal, SignalConfig};
+    use crate::devices::{Signal, SignalConfig, SignalR};
     use crate::event_model::Dtype;
 
-    fn sig(name: &str, kind: Kind, v: f64) -> Arc<dyn ReadableObj> {
-        Arc::new(Signal::<f64, SoftSignalBackend<f64>>::new(
+    fn sig(name: &str, kind: Kind, v: f64) -> Arc<SignalR<f64, SoftSignalBackend<f64>>> {
+        Arc::new(Signal::new(
             Arc::new(SoftSignalBackend::new(v, Dtype::Number)),
             SignalConfig {
                 source: name.into(),
@@ -260,27 +401,25 @@ mod tests {
     }
 
     // Boundary: each format routes to its bucket, and hints come from both
-    // CHILD auto-detection (Kind::Hinted) and explicit HintedSignal (name
-    // fallback when the child declares no hint fields).
+    // CHILD auto-detection (Kind::Hinted) and explicit HintedSignal (the
+    // signal name, whatever its kind).
     #[tokio::test]
     async fn aggregates_read_config_and_hints() {
         let mut sr = StandardReadable::new("dev");
         // CHILD + Kind::Hinted → read bucket + auto hint "temp".
-        sr.add_readables(
-            sig("temp", Kind::Hinted, 1.0),
-            StandardReadableFormat::Child,
-        );
-        // HintedSignal + Kind::Normal → read bucket + explicit hint "x"
-        // (name fallback, since a Normal signal declares no hint fields).
-        sr.add_readables(
+        sr.add_child(sig("temp", Kind::Hinted, 1.0)).unwrap();
+        // HintedSignal + Kind::Normal → read bucket + explicit hint "x".
+        sr.add_signal(
             sig("x", Kind::Normal, 2.0),
             StandardReadableFormat::HintedSignal,
-        );
+        )
+        .unwrap();
         // ConfigSignal → configuration bucket only.
-        sr.add_readables(
+        sr.add_signal(
             sig("exposure", Kind::Config, 0.1),
             StandardReadableFormat::ConfigSignal,
-        );
+        )
+        .unwrap();
 
         let read = AsyncReadable::read(&sr).await.unwrap();
         assert_eq!(read.len(), 2);
