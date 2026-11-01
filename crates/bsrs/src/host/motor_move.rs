@@ -1,6 +1,6 @@
 //! The moves of the CA and PVA motors: their channels, their deadline, their
-//! stop and the [`Status`] a move returns; and the data key of a host
-//! device's PV.
+//! stop and the [`Status`] a move returns, with its watcher updates; and the
+//! data key of a host device's PV.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,8 +8,8 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use crate::core::error::{BsrsError, Result};
-use crate::core::status::{Status, StatusError};
-use crate::devices::BackendFromPv;
+use crate::core::status::{Status, StatusError, WatcherUpdate};
+use crate::devices::{BackendFromPv, SignalCache};
 use crate::event_model::{DataKey, LimitsRange};
 use crate::protocols_async::{PutCompletion, SignalBackend};
 
@@ -39,6 +39,29 @@ impl Halt {
     pub(crate) fn stop(&self, success: bool) {
         self.0.send_replace(success);
     }
+}
+
+/// A readback PV and the one monitor of it that its subscribers and the
+/// watchers of its moves share.
+pub(crate) struct Readback<B> {
+    pub(crate) backend: Arc<B>,
+    pub(crate) cache: Arc<SignalCache<f64, B>>,
+}
+
+impl<B: SignalBackend<f64>> Readback<B> {
+    pub(crate) fn new(backend: Arc<B>) -> Self {
+        let cache = SignalCache::new(backend.clone());
+        Self { backend, cache }
+    }
+}
+
+/// What [`move_status`] moves and reports on.
+pub(crate) struct Axis<'a, B> {
+    /// The device name the watcher updates carry.
+    pub(crate) name: &'a str,
+    pub(crate) setpoint: &'a B,
+    pub(crate) readback: &'a Readback<B>,
+    pub(crate) halt: &'a Halt,
 }
 
 /// A motor record's `.STOP` or `.SET`, written as 0 or 1.
@@ -145,7 +168,7 @@ impl<B: MotorBackend> StopButton<B> {
 /// its moves and stop use, connected, and the [`Halt`] of its moves.
 pub(crate) struct MotorChannels<B: MotorBackend> {
     pub(crate) setpoint: Arc<B>,
-    pub(crate) readback: Arc<B>,
+    pub(crate) readback: Readback<B>,
     /// `None` when the setpoint's record has no `.VELO`/`.ACCL` (not a
     /// motor record); its moves then have no deadline.
     timing: Option<MoveTiming<B>>,
@@ -217,7 +240,7 @@ impl<B: MotorBackend> MotorChannels<B> {
         };
         Ok(Self {
             setpoint,
-            readback,
+            readback: Readback::new(readback),
             timing,
             button,
             set_use,
@@ -244,7 +267,13 @@ impl<B: MotorBackend> MotorChannels<B> {
                 Err(_) => Err(format!("{label}: timed out after {:.3}s", d.as_secs_f64())),
             }
         };
-        move_status(self.setpoint.as_ref(), target, &what, &self.halt, finish).await
+        let axis = Axis {
+            name,
+            setpoint: self.setpoint.as_ref(),
+            readback: &self.readback,
+            halt: &self.halt,
+        };
+        move_status(axis, target, &what, finish).await
     }
 
     /// ophyd `EpicsMotor.set_current_position`: `.SET` to Set, `pos` to the
@@ -297,7 +326,7 @@ impl<B: MotorBackend> MotorChannels<B> {
             return Ok(None);
         };
         let read = tokio::try_join!(
-            self.readback.get_value(),
+            self.readback.backend.get_value(),
             timing.velo.get_value(),
             timing.accl.get_value(),
         );
@@ -316,20 +345,25 @@ impl<B: MotorBackend> MotorChannels<B> {
     }
 }
 
-/// Send `value` to `setpoint`, then return a pending [`Status`] that `finish`
-/// settles from the put's completion. The engine's `Set` handler awaits
-/// `set_dyn` before it moves on to the next message, so a `set_dyn` that
-/// awaited the move itself would serialize a multi-axis `mv`; bluesky's
+/// Send `value` to the axis's setpoint, then return a pending [`Status`] that
+/// `finish` settles from the put's completion. The engine's `Set` handler
+/// awaits `set_dyn` before it moves on to the next message, so a `set_dyn`
+/// that awaited the move itself would serialize a multi-axis `mv`; bluesky's
 /// `set()` returns its status immediately and the motion completes it. Only
 /// the wait is spawned: a spawned send lets `set(a); set(b)` reach the IOC as
 /// b, a, and the IOC then finishes at `a`. A `value` outside the setpoint's
 /// control limits fails the status with nothing sent. A [`Halt::stop`] once
 /// this is called settles the status; halting the motion is the caller's.
+///
+/// Until it settles, the status carries a [`WatcherUpdate`] for each readback
+/// its monitor delivers, the first being where the axis stands, as
+/// ophyd-async's `StandardMovable.set` yields them from `observe_value`;
+/// `initial`, `unit` and `precision` are read from the readback before the
+/// put, and there is no `fraction`.
 pub(crate) async fn move_status<B, F, Fut>(
-    setpoint: &B,
+    axis: Axis<'_, B>,
     value: f64,
     what: &str,
-    halt: &Halt,
     finish: F,
 ) -> Status
 where
@@ -338,23 +372,49 @@ where
     Fut: std::future::Future<Output = std::result::Result<(), String>> + Send + 'static,
 {
     let (status, setter) = Status::new();
-    let mut halted = halt.0.subscribe();
-    let started = match within_limits(setpoint, value).await {
-        Ok(()) => setpoint
+    let mut halted = axis.halt.0.subscribe();
+    let started = async {
+        let (initial, key) = tokio::try_join!(
+            axis.readback.backend.get_value(),
+            axis.readback.backend.get_datakey(""),
+        )
+        .map_err(|e| e.to_string())?;
+        within_limits(axis.setpoint, value).await?;
+        let (readings, monitor) = axis.readback.cache.add_listener();
+        let done = axis
+            .setpoint
             .put_start(Some(value))
             .await
-            .map_err(|e| e.to_string()),
-        Err(e) => Err(e),
-    };
+            .map_err(|e| e.to_string())?;
+        let update = WatcherUpdate {
+            name: Some(axis.name.to_string()),
+            unit: key.units,
+            precision: key.precision.and_then(|p| i32::try_from(p).ok()),
+            ..WatcherUpdate::new(initial, initial, value)
+        };
+        Ok::<_, String>((done, readings, monitor, update))
+    }
+    .await;
     match started {
-        Ok(done) => {
+        Ok((done, mut readings, monitor, update)) => {
             let mv = finish(done);
             let stopped = format!("{what}: stopped");
             tokio::spawn(async move {
-                let end = tokio::select! {
-                    end = mv => end,
-                    Ok(()) = halted.changed() => {
-                        if *halted.borrow() { Ok(()) } else { Err(stopped) }
+                let _monitor = monitor;
+                tokio::pin!(mv);
+                let end = loop {
+                    tokio::select! {
+                        biased;
+                        Ok(()) = halted.changed() => {
+                            break if *halted.borrow() { Ok(()) } else { Err(stopped) };
+                        }
+                        Ok(()) = readings.changed() => {
+                            let current = readings.borrow_and_update().value.as_f64();
+                            if let Some(current) = current {
+                                setter.update_watcher(WatcherUpdate { current, ..update.clone() });
+                            }
+                        }
+                        end = &mut mv => break end,
                     }
                 };
                 match end {
@@ -443,18 +503,35 @@ mod tests {
         assert!(check_range(r(Some(-1.0), None).as_ref(), -2.0).is_err());
     }
 
+    async fn put_done(done: PutCompletion) -> std::result::Result<(), String> {
+        done.await.map_err(|e| e.to_string())
+    }
+
+    fn mock(value: f64) -> MockSignalBackend<f64> {
+        MockSignalBackend::with_value(value, Dtype::Number)
+    }
+
+    fn axis<'a, B>(setpoint: &'a B, readback: &'a Readback<B>, halt: &'a Halt) -> Axis<'a, B> {
+        Axis {
+            name: "motor",
+            setpoint,
+            readback,
+            halt,
+        }
+    }
+
     #[tokio::test]
     async fn move_status_sends_puts_in_call_order() {
-        let sp = MockSignalBackend::with_value(0.0_f64, Dtype::Number);
+        let sp = mock(0.0);
+        let rb = Readback::new(Arc::new(mock(0.0)));
         let blocked = sp.mock_puts_blocked();
-        let finish = |done: PutCompletion| async move { done.await.map_err(|e| e.to_string()) };
 
         // No yield between the two calls: the puts must already be sent when
         // `move_status` returns, not left to spawned tasks.
         let halt = Halt::new();
-        let a = move_status(&sp, 1.0, "t", &halt, finish).await;
+        let a = move_status(axis(&sp, &rb, &halt), 1.0, "t", put_done).await;
         assert_eq!(sp.put_calls(), vec![Some(1.0)]);
-        let b = move_status(&sp, 2.0, "t", &halt, finish).await;
+        let b = move_status(axis(&sp, &rb, &halt), 2.0, "t", put_done).await;
         assert_eq!(sp.put_calls(), vec![Some(1.0), Some(2.0)]);
         assert!(!a.done_state() && !b.done_state());
 
@@ -469,9 +546,9 @@ mod tests {
 
     #[tokio::test]
     async fn halt_settles_only_the_move_in_flight() {
-        let sp = MockSignalBackend::with_value(0.0_f64, Dtype::Number);
+        let sp = mock(0.0);
+        let rb = Readback::new(Arc::new(mock(0.0)));
         let _blocked = sp.mock_puts_blocked();
-        let finish = |done: PutCompletion| async move { done.await.map_err(|e| e.to_string()) };
         let halt = Halt::new();
         let settled = |st: Status| async move {
             tokio::time::timeout(Duration::from_secs(1), st)
@@ -479,15 +556,80 @@ mod tests {
                 .expect("the stop settles the move")
         };
 
-        let st = move_status(&sp, 1.0, "t", &halt, finish).await;
+        let st = move_status(axis(&sp, &rb, &halt), 1.0, "t", put_done).await;
         halt.stop(false);
         let err = settled(st).await.expect_err("stop(false) fails the move");
         assert!(err.to_string().contains("t: stopped"), "{err}");
 
-        let st = move_status(&sp, 2.0, "t", &halt, finish).await;
+        let st = move_status(axis(&sp, &rb, &halt), 2.0, "t", put_done).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!st.done_state(), "an earlier stop settled a later move");
         halt.stop(true);
         settled(st).await.expect("stop(true) completes the move");
+    }
+
+    /// The next watcher update of `rx` within a second.
+    async fn next_update(rx: &mut watch::Receiver<Option<WatcherUpdate>>) -> WatcherUpdate {
+        tokio::time::timeout(Duration::from_secs(1), rx.changed())
+            .await
+            .expect("a watcher update")
+            .unwrap();
+        rx.borrow_and_update().clone().unwrap()
+    }
+
+    /// ophyd-async `test_motor_moving_well`: the move reports where it
+    /// stands, then each readback, with the name, the readback's units and
+    /// the time elapsed, while the put is pending.
+    #[tokio::test]
+    async fn a_move_reports_each_readback_until_it_settles() {
+        let sp = mock(0.0);
+        let rb_mock = MockSignalBackend::new(
+            crate::backends::soft::SoftSignalBackend::new(0.0, Dtype::Number).with_units("mm"),
+        );
+        let rb = Readback::new(Arc::new(rb_mock.clone()));
+        // A CA or PVA monitor delivers the current value as it opens; the
+        // soft backend does not, so give the cache one through a listener.
+        let (_rx, _listener) = rb.cache.add_listener();
+        rb_mock.set_value(0.0);
+        let halt = Halt::new();
+        let blocked = sp.mock_puts_blocked();
+
+        let st = move_status(axis(&sp, &rb, &halt), 0.55, "t", put_done).await;
+        let mut rx = st.watch_updates();
+        let expected = |current| WatcherUpdate {
+            name: Some("motor".into()),
+            unit: Some("mm".into()),
+            ..WatcherUpdate::new(current, 0.0, 0.55)
+        };
+        let first = next_update(&mut rx).await;
+        assert!(first.time_elapsed.unwrap() < 0.2, "{first:?}");
+        assert_eq!(
+            WatcherUpdate {
+                time_elapsed: None,
+                ..first
+            },
+            expected(0.0)
+        );
+        assert_eq!(sp.put_calls(), vec![Some(0.55)]);
+        assert!(!st.done_state());
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        rb_mock.set_value(0.1);
+        let next = next_update(&mut rx).await;
+        let elapsed = next.time_elapsed.unwrap();
+        assert!((0.2..0.4).contains(&elapsed), "{next:?}");
+        assert_eq!(
+            WatcherUpdate {
+                time_elapsed: None,
+                ..next
+            },
+            expected(0.1)
+        );
+
+        drop(blocked);
+        tokio::time::timeout(Duration::from_secs(1), st)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

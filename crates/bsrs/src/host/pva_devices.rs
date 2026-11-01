@@ -48,7 +48,6 @@ pub struct PvaMotor {
     name: String,
     channels: MotorChannels<EpicsPvaBackend<f64>>,
     rbv_pv: String,
-    cache: Arc<SignalCache<f64, EpicsPvaBackend<f64>>>,
 }
 
 impl PvaMotor {
@@ -59,7 +58,6 @@ impl PvaMotor {
             crate::core::runtime::bsrs_runtime().block_on(connect)?;
         Ok(Arc::new(Self {
             name: name.to_string(),
-            cache: SignalCache::new(channels.readback.clone()),
             channels,
             rbv_pv: rbv_pv.to_string(),
         }))
@@ -89,7 +87,7 @@ impl NamedObj for PvaMotor {
 #[async_trait::async_trait]
 impl ReadableObj for PvaMotor {
     async fn read_dyn(&self) -> Result<HashMap<String, ReadingValue>> {
-        let r = self.channels.readback.get_reading().await?;
+        let r = self.channels.readback.backend.get_reading().await?;
         let mut out = HashMap::new();
         out.insert(self.name.clone(), r);
         Ok(out)
@@ -97,7 +95,12 @@ impl ReadableObj for PvaMotor {
     async fn describe_dyn(&self) -> Result<HashMap<String, DataKey>> {
         Ok(HashMap::from([(
             self.name.clone(),
-            describe_pv(self.channels.readback.as_ref(), &self.rbv_pv, &self.name).await?,
+            describe_pv(
+                self.channels.readback.backend.as_ref(),
+                &self.rbv_pv,
+                &self.name,
+            )
+            .await?,
         )]))
     }
     /// The readback is the hinted field, as in ophyd's `EpicsMotor`.
@@ -120,7 +123,7 @@ impl MovableObj for PvaMotor {
 impl LocatableObj for PvaMotor {
     async fn locate_dyn(&self) -> Result<DynLocation> {
         let setpoint = self.channels.setpoint.get_value().await?;
-        let readback = self.channels.readback.get_value().await?;
+        let readback = self.channels.readback.backend.get_value().await?;
         Ok(DynLocation { setpoint, readback })
     }
 }
@@ -137,7 +140,7 @@ impl StoppableObj for PvaMotor {
 #[async_trait::async_trait]
 impl MonitorableObj for PvaMotor {
     async fn subscribe_dyn(&self) -> Result<Subscription> {
-        let (rx, token) = self.cache.add_listener();
+        let (rx, token) = self.channels.readback.cache.add_listener();
         Ok(Subscription::new(rx, token, self.name.clone()))
     }
 }

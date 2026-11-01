@@ -16,8 +16,8 @@ use bsrs::backends::epics_ca::EpicsCaBackend;
 use bsrs::core::msg::{LocatableObj, MonitorableObj, MovableObj, ReadableObj, StoppableObj};
 use bsrs::core::runtime::bsrs_runtime;
 use bsrs::core::subscription::Subscription;
-use bsrs::core::Status;
-use bsrs::event_model::LimitsRange;
+use bsrs::core::{Status, Watcher, WatcherUpdate};
+use bsrs::event_model::{DataKey, LimitsRange};
 use bsrs::host::ca_devices::{CaDetector, CaMotor};
 use bsrs::host::pva_devices::{PvaDetector, PvaMotor};
 use bsrs::protocols_async::SignalBackend;
@@ -80,6 +80,48 @@ async fn readback_until(sub: &Subscription, pred: impl Fn(f64) -> bool) {
     .unwrap();
 }
 
+/// Every watcher update of `st` until it settles, as ophyd-async's
+/// `StatusWatcher` collects them.
+fn watched(st: &Status) -> tokio::task::JoinHandle<Vec<WatcherUpdate>> {
+    struct Collect(Vec<WatcherUpdate>);
+    impl Watcher for Collect {
+        fn watch(&mut self, update: &WatcherUpdate) {
+            self.0.push(update.clone());
+        }
+    }
+    let st = st.clone();
+    tokio::spawn(async move {
+        let mut c = Collect(Vec::new());
+        st.observe_watcher(&mut c).await;
+        c.0
+    })
+}
+
+/// ophyd-async `test_motor_moving_well` and ophyd `test_watchers`: the
+/// first update is where the move started, every update names the motor
+/// with its readback's units and precision, and they follow the readback
+/// from `start` towards `target` with the time elapsed.
+fn assert_watched(updates: &[WatcherUpdate], name: &str, key: &DataKey, start: f64, target: f64) {
+    assert!(updates.len() > 1, "{updates:?}");
+    let first = &updates[0];
+    assert!((first.current - start).abs() <= MRES + 1e-9, "{first:?}");
+    assert!(first.time_elapsed.unwrap() < 0.2, "{first:?}");
+    let precision = key.precision.map(|p| i32::try_from(p).unwrap());
+    for u in updates {
+        assert_eq!(u.name.as_deref(), Some(name), "{u:?}");
+        assert_eq!(u.unit, key.units, "{u:?}");
+        assert_eq!(u.precision, precision, "{u:?}");
+        assert_eq!((u.initial, u.target), (start, target), "{u:?}");
+    }
+    for w in updates.windows(2) {
+        assert!(
+            (target - w[1].current).abs() <= (target - w[0].current).abs() + MRES,
+            "away from {target}: {w:?}"
+        );
+        assert!(w[1].time_elapsed >= w[0].time_elapsed, "{w:?}");
+    }
+}
+
 /// Wait until `.DMOV` reads done, from its monitor.
 async fn done_moving(record: &str) {
     let dmov = CaDetector::connect_async("dmov", &field(record, "DMOV"))
@@ -89,10 +131,12 @@ async fn done_moving(record: &str) {
     readback_until(&sub, |v| v == 1.0).await;
 }
 
-/// test_epicsmotor.py `test_move`, `test_read_in_motor_callback`; ophyd-async
-/// `test_motor_moving_well`: the status is pending while the motor travels,
-/// settles once it is done, and the readback passes through the travel to
-/// land within MRES of the target. A move to where it stands settles at once.
+/// test_epicsmotor.py `test_move`, `test_read_in_motor_callback`,
+/// `test_watchers`; ophyd-async `test_motor_moving_well`: the status is
+/// pending while the motor travels, its watchers follow the readback, it
+/// settles once the motor is done, and the readback passes through the travel
+/// to land within MRES of the target. A move to where it stands settles at
+/// once.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
 async fn a_move_settles_once_the_motor_is_done() {
@@ -116,14 +160,19 @@ async fn a_move_settles_once_the_motor_is_done() {
         seen
     });
 
+    let key = m.describe_dyn().await.unwrap().remove("x1").unwrap();
+    assert_eq!(key.precision, Some(4));
+
     let started = Instant::now();
     let st = m.set_dyn(target).await;
+    let updates = watched(&st);
     assert!(!st.done_state(), "settled before the motor moved");
     tokio::time::timeout(Duration::from_secs(20), st)
         .await
         .expect("within the deadline")
         .expect("the move succeeds");
     let took = started.elapsed();
+    assert_watched(&updates.await.unwrap(), "x1", &key, start, target);
 
     // 1.5 s of travel at VELO 1.
     assert!(took >= Duration::from_millis(1_400), "{took:?}");
@@ -401,9 +450,10 @@ async fn a_held_move_times_out_on_the_records_velocity_and_acceleration() {
     assert!(took < Duration::from_secs(13), "{took:?}");
 }
 
-/// test_epicsmotor.py `test_move` and `motor.stop()` over PVA: the
-/// `block=true` put settles once the motor is done, and `stop` halts the
-/// motor and fails its move.
+/// test_epicsmotor.py `test_move`, `test_watchers` and `motor.stop()` over
+/// PVA: the `block=true` put settles once the motor is done, its watchers
+/// following the readback meanwhile, and `stop` halts the motor and fails its
+/// move.
 #[test]
 #[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
 fn a_pva_move_settles_once_done_and_stop_halts_it() {
@@ -412,14 +462,18 @@ fn a_pva_move_settles_once_done_and_stop_halts_it() {
     bsrs_runtime().block_on(async {
         let start = m.locate_dyn().await.unwrap().readback;
         let target = inward(start, 1.0);
+        let key = m.describe_dyn().await.unwrap().remove("sim_mtr1").unwrap();
+        assert_eq!(key.precision, Some(4));
         let started = Instant::now();
         let st = m.set_dyn(target).await;
+        let updates = watched(&st);
         assert!(!st.done_state(), "settled before the motor moved");
         tokio::time::timeout(Duration::from_secs(20), st)
             .await
             .expect("within the deadline")
             .expect("the move succeeds");
         assert!(started.elapsed() >= Duration::from_millis(900));
+        assert_watched(&updates.await.unwrap(), "sim_mtr1", &key, start, target);
         let rb = m.locate_dyn().await.unwrap().readback;
         assert!((rb - target).abs() <= MRES + 1e-9, "{rb}");
 

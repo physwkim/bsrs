@@ -16,6 +16,7 @@ use std::time::Duration;
 use bsrs::backends::epics_ca::EpicsCaBackend;
 use bsrs::callbacks::CapturingSink;
 use bsrs::core::msg::{LocatableObj, MovableObj, ReadableObj, StoppableObj};
+use bsrs::core::{Watcher, WatcherUpdate};
 use bsrs::event_model::PerObjectHint;
 use bsrs::host::ca_devices::{CaDetector, CaMotor, CaPositioner};
 use bsrs::prelude::*;
@@ -170,6 +171,23 @@ fn inward(from: f64, d: f64) -> f64 {
     }
 }
 
+/// Every watcher update of `st` until it settles, as ophyd-async's
+/// `StatusWatcher` collects them.
+fn watched(st: &Status) -> tokio::task::JoinHandle<Vec<WatcherUpdate>> {
+    struct Collect(Vec<WatcherUpdate>);
+    impl Watcher for Collect {
+        fn watch(&mut self, update: &WatcherUpdate) {
+            self.0.push(update.clone());
+        }
+    }
+    let st = st.clone();
+    tokio::spawn(async move {
+        let mut c = Collect(Vec::new());
+        st.observe_watcher(&mut c).await;
+        c.0
+    })
+}
+
 async fn slit_positioner() -> Arc<CaPositioner> {
     CaPositioner::connect_async(
         "slit",
@@ -185,7 +203,8 @@ async fn slit_positioner() -> Arc<CaPositioner> {
 /// test_pvpositioner.py `test_put_complete_setpoint_readback_done`: a
 /// positioner over VAL, RBV and MOVN (done at 0) refuses a target past the
 /// setpoint's high limit (`check_value`), and a move settles once the put
-/// completes and MOVN reads done, with the readback at the target.
+/// completes and MOVN reads done, with the readback at the target; its
+/// watchers follow the readback meanwhile.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
 async fn a_positioner_refuses_a_target_past_the_limit_and_settles_on_done() {
@@ -200,13 +219,29 @@ async fn a_positioner_refuses_a_target_past_the_limit_and_settles_on_done() {
     assert!(res.is_err(), "a move past HLM {hlm} succeeded");
     assert_eq!(p.locate_dyn().await.unwrap().setpoint, before);
 
-    let target = inward(p.locate_dyn().await.unwrap().readback, 1.0);
+    let start = p.locate_dyn().await.unwrap().readback;
+    let target = inward(start, 1.0);
+    let key = p.describe_dyn().await.unwrap().remove("slit").unwrap();
     let st = p.set_dyn(target).await;
+    let updates = watched(&st);
     assert!(!st.done_state(), "settled before the motor moved");
     tokio::time::timeout(Duration::from_secs(25), st)
         .await
         .expect("within ophyd's 25 s")
         .expect("the move succeeds");
+    // ophyd `MoveStatus` watchers: the positioner's name, where the move
+    // started and is going, and its readback as the motor travels.
+    let updates = updates.await.unwrap();
+    assert!(updates.len() > 1, "{updates:?}");
+    assert!(
+        (updates[0].current - start).abs() <= MRES + 1e-9,
+        "{updates:?}"
+    );
+    for u in &updates {
+        assert_eq!(u.name.as_deref(), Some("slit"), "{u:?}");
+        assert_eq!(u.unit, key.units, "{u:?}");
+        assert_eq!((u.initial, u.target), (start, target), "{u:?}");
+    }
     let movn = ca_f64("mini:slit:mtr.MOVN")
         .await
         .get_value()
