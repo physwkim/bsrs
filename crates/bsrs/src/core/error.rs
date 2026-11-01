@@ -9,6 +9,23 @@ pub enum BsrsError {
     /// Operation timed out.
     #[error("timeout after {0:?}")]
     Timeout(std::time::Duration),
+    /// [`wait_for_value`](crate::devices::wait_for_value) timed out; the
+    /// message is ophyd-async `wait_for_value`'s `TimeoutError` text.
+    #[error(
+        "{name} didn't match {matcher} in {}s, last value {last}",
+        .timeout.as_secs_f64()
+    )]
+    ValueTimeout {
+        /// Subscription key (the signal name).
+        name: String,
+        /// The predicate's fn name, or `<closure>`.
+        matcher: String,
+        /// The timeout that elapsed.
+        timeout: std::time::Duration,
+        /// The last value the subscription delivered (boxed to keep
+        /// `BsrsError` small).
+        last: Box<serde_json::Value>,
+    },
     /// Cancellation was requested.
     #[error("cancelled")]
     Cancelled,

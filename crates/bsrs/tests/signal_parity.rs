@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use bsrs::backends::mock::{MockBackend, MockSignalBackend};
 use bsrs::backends::soft::SoftSignalBackend;
-use bsrs::core::{BsrsError, Kind, ReadingValue};
+use bsrs::core::{Kind, ReadingValue};
 use bsrs::devices::{
     observe_signals_value, observe_value, wait_for_value, BackendFromPv, Readable, Signal,
     SignalConfig, SignalR, SignalRW,
@@ -211,6 +211,10 @@ async fn subscribe_callback_gets_current_then_each_put_until_dropped() {
     );
 }
 
+fn less_than_42(r: &ReadingValue) -> bool {
+    r.value.as_f64().is_some_and(|v| v < 42.0)
+}
+
 // ophyd-async test_wait_for_value_with_value, test_wait_for_value_with_function;
 // the combinator's own timeout and wake-up are pinned in devices::observe.
 #[tokio::test(start_paused = true)]
@@ -224,13 +228,22 @@ async fn wait_for_value_on_a_signal_sees_its_current_value_and_mock_sets() {
     let current = wait_for_value(&mut sub, |r| r.value == json!(45.8), timeout).await;
     assert_eq!(current.unwrap().value, json!(45.8));
 
-    let below_42 = |r: &ReadingValue| r.value.as_f64().is_some_and(|v| v < 42.0);
-    let err = wait_for_value(&mut sub, below_42, timeout)
+    let err = wait_for_value(&mut sub, less_than_42, timeout)
         .await
         .unwrap_err();
-    assert!(matches!(err, BsrsError::Timeout(_)), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        "signal didn't match less_than_42 in 0.1s, last value 45.8"
+    );
+    let err = wait_for_value(&mut sub, |r| r.value == json!("blah"), timeout)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "signal didn't match <closure> in 0.1s, last value 45.8"
+    );
 
-    let waiter = tokio::spawn(async move { wait_for_value(&mut sub, below_42, None).await });
+    let waiter = tokio::spawn(async move { wait_for_value(&mut sub, less_than_42, None).await });
     tokio::task::yield_now().await;
     assert!(!waiter.is_finished());
     backend.set_value(41.0);
