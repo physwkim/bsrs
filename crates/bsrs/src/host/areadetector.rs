@@ -54,6 +54,8 @@ use tokio::sync::watch;
 const PUT_TIMEOUT: Duration = Duration::from_secs(10);
 const WARMUP_IDLE_POLL: Duration = Duration::from_millis(100);
 const WARMUP_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+const ACQUIRE_TIME_RBV: &str = "AcquireTime_RBV";
+const ACQUIRE_PERIOD_RBV: &str = "AcquirePeriod_RBV";
 
 /// `DetectorState_RBV` value for the idle state. mbbi ordering from
 /// `ADBase.template`: 0=Idle, 1=Acquire, 2=Readout, 3=Correct, 4=Saving,
@@ -125,28 +127,47 @@ where
     }
 }
 
-/// Poll a bool readback until it equals `want`, bounded by `timeout`. The
-/// wait half of ophyd-async's `set_and_wait_for_value(...,
-/// wait_for_set_completion=False)` / `stop_busy_record` for busy records,
-/// whose put-callback tracks the *operation*, not the value change.
-async fn wait_for_bool(
-    ch: &EpicsCaBackend<bool>,
+/// Run `set`, then wait until the bool readback `rbv` has been `want`,
+/// bounded by [`PUT_TIMEOUT`]; returns what `set` returned. Port of
+/// ophyd-async `set_and_wait_for_other_value(..., wait_for_set_completion=
+/// False)`, used for busy records whose put-callback tracks the operation,
+/// not the value. The readback's monitor has delivered its current value
+/// before `set` runs, so a transition back out of `want` (a 1 ms
+/// acquisition's Acquire_RBV pulse) is still seen.
+async fn set_and_wait_for_bool<R>(
+    rbv: &EpicsCaBackend<bool>,
     want: bool,
-    timeout: Duration,
+    set: impl std::future::Future<Output = Result<R>>,
     what: &str,
-) -> Result<()> {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if SignalBackend::<bool>::get_value(ch).await? == want {
-            return Ok(());
-        }
-        if std::time::Instant::now() >= deadline {
+) -> Result<R> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let _sub = SignalBackend::<bool>::set_callback(
+        rbv,
+        Some(Box::new(move |v: &bool, _, _| {
+            let _ = tx.send(*v);
+        })),
+    );
+    let deadline = tokio::time::Instant::now() + PUT_TIMEOUT;
+    let mut last = match tokio::time::timeout_at(deadline, rx.recv()).await {
+        Ok(Some(v)) => v,
+        _ => {
             return Err(BsrsError::Backend(format!(
-                "{what}: readback did not reach {want} within {timeout:?}"
-            )));
+                "{what}: no initial value within {PUT_TIMEOUT:?}, is it connected?"
+            )))
         }
-        tokio::time::sleep(WARMUP_IDLE_POLL).await;
+    };
+    let out = set.await?;
+    while last != want {
+        last = match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(v)) => v,
+            _ => {
+                return Err(BsrsError::Backend(format!(
+                    "{what}: readback did not reach {want} within {PUT_TIMEOUT:?}"
+                )))
+            }
+        };
     }
+    Ok(out)
 }
 
 /// Cam-side handle: `ImageMode`/`NumImages`/`Acquire`/`AcquireTime`
@@ -170,6 +191,10 @@ pub struct AreaDetectorCam {
     /// `AcquirePeriod` (ao) — seconds from one exposure start to the next
     /// (exposure + dead time).
     pub acquire_period: Arc<EpicsCaBackend<f64>>,
+    /// `AcquireTime_RBV` (ai) — the exposure time the driver applied.
+    pub acquire_time_rbv: Arc<EpicsCaBackend<f64>>,
+    /// `AcquirePeriod_RBV` (ai) — the period the driver applied.
+    pub acquire_period_rbv: Arc<EpicsCaBackend<f64>>,
     /// `ArrayCounter_RBV` (longin) — total frames produced.
     pub array_counter_rbv: Arc<EpicsCaBackend<i64>>,
     /// `DetectorState_RBV` (mbbi).
@@ -182,6 +207,9 @@ pub struct AreaDetectorCam {
     /// `ColorMode_RBV`) — the shape/dtype source for the emitted `DataKey`,
     /// read from the driver as in ophyd-async's `make_writer_data_logic`.
     pub frame_info: Arc<CamFrameInfo>,
+    /// The last arm's `Acquire=1` put-callback: done when that acquisition
+    /// ends (ophyd-async `ADAcquireLogic.acquire_status`).
+    acquire_status: std::sync::Mutex<Option<Status>>,
 }
 
 /// The driver-side NDArray description: `ArraySizeX/Y/Z_RBV`, `DataType_RBV`,
@@ -299,6 +327,11 @@ impl AreaDetectorCam {
             acquire_rbv: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "Acquire_RBV"))),
             acquire_time: Arc::new(EpicsCaBackend::<f64>::new(join(&prefix, "AcquireTime"))),
             acquire_period: Arc::new(EpicsCaBackend::<f64>::new(join(&prefix, "AcquirePeriod"))),
+            acquire_time_rbv: Arc::new(EpicsCaBackend::<f64>::new(join(&prefix, ACQUIRE_TIME_RBV))),
+            acquire_period_rbv: Arc::new(EpicsCaBackend::<f64>::new(join(
+                &prefix,
+                ACQUIRE_PERIOD_RBV,
+            ))),
             array_counter_rbv: Arc::new(EpicsCaBackend::<i64>::new(join(
                 &prefix,
                 "ArrayCounter_RBV",
@@ -312,19 +345,22 @@ impl AreaDetectorCam {
                 "NDAttributesFile",
             ))),
             frame_info: Arc::new(CamFrameInfo::new(&prefix)),
+            acquire_status: std::sync::Mutex::new(None),
             prefix,
         }
     }
 
     /// Connect every channel in parallel.
     pub async fn connect(&self, timeout: Duration) -> Result<()> {
-        let (a, b, c, d, e, f, g, h, i, j) = tokio::join!(
+        let (a, b, c, d, e, f, g, h, i, j, k, l) = tokio::join!(
             SignalBackend::<i64>::connect(self.image_mode.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.num_images.as_ref(), timeout),
             SignalBackend::<bool>::connect(self.acquire.as_ref(), timeout),
             SignalBackend::<bool>::connect(self.acquire_rbv.as_ref(), timeout),
             SignalBackend::<f64>::connect(self.acquire_time.as_ref(), timeout),
             SignalBackend::<f64>::connect(self.acquire_period.as_ref(), timeout),
+            SignalBackend::<f64>::connect(self.acquire_time_rbv.as_ref(), timeout),
+            SignalBackend::<f64>::connect(self.acquire_period_rbv.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.array_counter_rbv.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.detector_state_rbv.as_ref(), timeout),
             SignalBackend::<String>::connect(self.nd_attributes_file.as_ref(), timeout),
@@ -340,7 +376,27 @@ impl AreaDetectorCam {
         h?;
         i?;
         j?;
+        k?;
+        l?;
         Ok(())
+    }
+
+    /// The descriptor `configuration` signals, as ophyd-async `AreaDetector`
+    /// registers them (`driver.acquire_time`, `driver.acquire_period`): read
+    /// from their `_RBV` PVs, which are also the `DataKey` source.
+    fn config_signals(&self) -> [(&'static str, &EpicsCaBackend<f64>, String); 2] {
+        [
+            (
+                "acquire_time",
+                self.acquire_time_rbv.as_ref(),
+                join(&self.prefix, ACQUIRE_TIME_RBV),
+            ),
+            (
+                "acquire_period",
+                self.acquire_period_rbv.as_ref(),
+                join(&self.prefix, ACQUIRE_PERIOD_RBV),
+            ),
+        ]
     }
 
     /// Poll `DetectorState_RBV` until it reports a good terminal state —
@@ -752,11 +808,10 @@ impl NdFile {
     /// `Capture_RBV=1` (ophyd-async `set_and_wait_for_value(capture, True,
     /// wait_for_set_completion=False)`).
     pub async fn start_capture(&self) -> Result<()> {
-        self.capture.put_nowait(true).await?;
-        wait_for_bool(
+        set_and_wait_for_bool(
             self.capture_rbv.as_ref(),
             true,
-            PUT_TIMEOUT,
+            self.capture.put_nowait(true),
             "NdFile::start_capture: Capture_RBV",
         )
         .await
@@ -766,11 +821,10 @@ impl NdFile {
     /// record: fire-and-forget the put, wait for `Capture_RBV=0`
     /// (ophyd-async `stop_busy_record`).
     pub async fn stop_capture(&self) -> Result<()> {
-        self.capture.put_nowait(false).await?;
-        wait_for_bool(
+        set_and_wait_for_bool(
             self.capture_rbv.as_ref(),
             false,
-            PUT_TIMEOUT,
+            self.capture.put_nowait(false),
             "NdFile::stop_capture: Capture_RBV",
         )
         .await
@@ -847,10 +901,9 @@ pub struct NdFileHdf5 {
     /// `XMLFileName` (CHAR waveform) — custom HDF5 layout XML; cleared so
     /// the default `/entry/data/data` layout applies.
     pub xml_file_name: Arc<EpicsCaBackend<String>>,
-    /// `FlushNow` (bo) — force the plugin to flush buffered frames to the
-    /// file. An `NDFileHDF5`-only record (SWMR streaming; the write index
-    /// only reflects flushed frames, so we flush before reading
-    /// `NumCaptured_RBV`) — the JPEG/TIFF plugins do not have it.
+    /// `FlushNow` (busy) — force the plugin to flush buffered frames to the
+    /// file for SWMR readers. An `NDFileHDF5`-only record; the JPEG/TIFF
+    /// plugins do not have it.
     pub flush_now: Arc<EpicsCaBackend<bool>>,
 }
 
@@ -960,8 +1013,8 @@ impl NdFileHdf5 {
         .await
     }
 
-    /// Force a flush (`FlushNow=1`) so `NumCaptured_RBV` reflects frames
-    /// actually written to the file.
+    /// Force a flush (`FlushNow=1`) so SWMR readers see the frames written
+    /// so far.
     pub async fn flush(&self) -> Result<()> {
         await_put(
             SignalBackend::<bool>::put(self.flush_now.as_ref(), Some(true)),
@@ -1335,9 +1388,9 @@ pub trait AdHdfFileIo: AdFileIo {
     /// The HDF5-specific arming puts: `NumExtraDims=0`, `LazyOpen=1`,
     /// `SWMRMode=1`, `XMLFileName=""` (ophyd-async `prepare_unbounded`).
     async fn setup_hdf_writer(&self) -> Result<()>;
-    /// Force a flush (`FlushNow=1`) so `num_captured` reflects frames written
-    /// to the file. HDF5-only: `FlushNow` exists on `NDFileHDF5` (SWMR), not
-    /// on the JPEG/TIFF file plugins.
+    /// Force a flush (`FlushNow=1`) so SWMR readers see the frames written so
+    /// far. HDF5-only: `FlushNow` exists on `NDFileHDF5`, not on the
+    /// JPEG/TIFF file plugins.
     async fn flush(&self) -> Result<()>;
 }
 
@@ -1684,7 +1737,7 @@ fn ad_stream_datum(resource_uid: String, descriptor: &str, start: u64, stop: u64
 /// Emit state for [`AdHdfWriter`]: the attribute set staged by the last
 /// `open()` (discovered from the XML sources, merged with the declared specs),
 /// the once-emitted `StreamResource` UIDs (main image + one per NDAttribute),
-/// and the frame cursor (`StreamDatum`s cover `[last_emitted, up_to)`).
+/// and the event cursor (`StreamDatum`s cover events `[last_emitted, up_to)`).
 /// `open()` is the only writer of `attrs`; `collect_stream_docs` only reads it,
 /// so the emitted datasets always match the data keys reported at `open()`.
 #[derive(Default)]
@@ -1693,9 +1746,6 @@ struct AdEmitState {
     main_resource_uid: Option<String>,
     attr_resource_uids: HashMap<String, String>,
     last_emitted: u64,
-    /// Frames per index (ophyd-async `collections_per_event`), staged by
-    /// `open(multiplier)`. `0` = not yet opened; readers clamp to 1.
-    multiplier: u64,
     /// Frame shape discovered at `open()`, for the main resource's
     /// `chunk_shape` parameter.
     frame_shape: Vec<u64>,
@@ -1821,17 +1871,6 @@ fn stream_datakey_dtype(multiplier: u64, shape_len: usize) -> Dtype {
 #[async_trait::async_trait]
 impl DetectorWriter for AdHdfWriter {
     async fn open(&self, multiplier: u32) -> Result<HashMap<String, DataKey>> {
-        // The frames-per-index multiplier shapes the DataKeys and divides the
-        // frame count into indices. >1 is rejected until the fly-mode index
-        // observation (`observe_indices_written`, raw frame counts) also
-        // scales by it — shipping one path divided and the other raw would
-        // complete a fly scan at the wrong frame count.
-        if multiplier > 1 {
-            return Err(BsrsError::Plan(format!(
-                "AdHdfWriter::open(multiplier={multiplier}): multiplier > 1 is \
-                 not supported yet"
-            )));
-        }
         let multiplier = u64::from(multiplier.max(1));
         // Frames per HDF chunk — read before the setup puts, then let the
         // plugin derive the rest of the chunking from the frame
@@ -1872,7 +1911,6 @@ impl DetectorWriter for AdHdfWriter {
             st.main_resource_uid = None;
             st.attr_resource_uids.clear();
             st.last_emitted = 0;
-            st.multiplier = multiplier;
             st.frame_shape = shape.clone();
             st.frames_per_chunk = frames_per_chunk;
         }
@@ -1927,20 +1965,10 @@ impl DetectorWriter for AdHdfWriter {
         Ok(out)
     }
     fn observe_indices_written(&self) -> watch::Receiver<u64> {
-        // Raw frame counts — equal to indices while `open` rejects
-        // multiplier > 1.
         self.io.observe_num_captured()
     }
     async fn indices_written(&self) -> u64 {
-        // Flush first so the count reflects frames actually on disk (SWMR),
-        // mirroring ophyd-async setting flush_signal before reading the count.
-        // Best-effort: a plugin without SWMR flush support just yields the
-        // unflushed count.
-        let _ = self.io.flush().await;
-        let frames = self.io.num_captured().await.unwrap_or(0);
-        // Frames -> indices (ophyd-async `collections_written //
-        // collections_per_event`).
-        frames / self.emit.lock().await.multiplier.max(1)
+        self.io.num_captured().await.unwrap_or(0)
     }
     fn collect_stream_docs(&self, up_to: u64, descriptor: &str) -> BoxStream<'_, StreamAsset> {
         let descriptor = descriptor.to_string();
@@ -1949,6 +1977,11 @@ impl DetectorWriter for AdHdfWriter {
         // flatten to a stream. `stream::once(..).flat_map(stream::iter)` gives a
         // `BoxStream` without pulling in a generator macro.
         let fut = async move {
+            // ophyd-async `make_stream_docs`: flush so SWMR readers see the
+            // frames these datums cover. The stream has no error channel.
+            if let Err(e) = self.io.flush().await {
+                tracing::warn!("{}: {e}", self.name);
+            }
             let mut docs: Vec<StreamAsset> = Vec::new();
             let mut st = self.emit.lock().await;
             // The attribute set staged by the last open().
@@ -2000,7 +2033,7 @@ impl DetectorWriter for AdHdfWriter {
                 }
             }
             // One StreamDatum per dataset (main + each attribute) for the new
-            // frames, all covering the same index range in the same event.
+            // events, all covering the same index range.
             if up_to > st.last_emitted {
                 let start = st.last_emitted;
                 st.last_emitted = up_to;
@@ -2037,16 +2070,18 @@ impl DetectorWriter for AdHdfWriter {
     async fn close(&self) -> Result<()> {
         self.io.stop_capture().await
     }
+    /// ophyd-async `_data_logic.py`: the main NDArray dataset is always hinted.
+    fn hinted_fields(&self) -> Vec<String> {
+        vec![self.data_key_name()]
+    }
 }
 
 /// Emit state for [`AdMultipartWriter`]: the once-emitted `StreamResource`
-/// UID, the frame cursor, and the shape/multiplier staged by `open()`.
+/// UID, the event cursor, and the shape staged by `open()`.
 #[derive(Default)]
 struct AdMultipartEmitState {
     resource_uid: Option<String>,
     last_emitted: u64,
-    /// Frames per index; `0` = not yet opened, readers clamp to 1.
-    multiplier: u64,
     /// Frame shape discovered at `open()`, for the resource's `chunk_shape`
     /// parameter.
     frame_shape: Vec<u64>,
@@ -2160,16 +2195,6 @@ impl AdMultipartWriter {
 #[async_trait::async_trait]
 impl DetectorWriter for AdMultipartWriter {
     async fn open(&self, multiplier: u32) -> Result<HashMap<String, DataKey>> {
-        // Same guard as AdHdfWriter::open: the index observation
-        // (`observe_indices_written`) reports raw frame counts, so shipping
-        // a divided DataKey path with a raw observe path would complete a
-        // fly scan at the wrong frame count.
-        if multiplier > 1 {
-            return Err(BsrsError::Plan(format!(
-                "AdMultipartWriter::open(multiplier={multiplier}): multiplier \
-                 > 1 is not supported yet"
-            )));
-        }
         let multiplier = u64::from(multiplier.max(1));
         // Plugin callbacks on, then the file paths. ophyd-async's
         // `ADMultipartDataLogic.prepare_unbounded` does not enable callbacks
@@ -2195,7 +2220,6 @@ impl DetectorWriter for AdMultipartWriter {
             let mut st = self.emit.lock().await;
             st.resource_uid = None;
             st.last_emitted = 0;
-            st.multiplier = multiplier;
             st.frame_shape = shape.clone();
         }
         let image_shape: Vec<Option<u64>> =
@@ -2220,16 +2244,10 @@ impl DetectorWriter for AdMultipartWriter {
         Ok(out)
     }
     fn observe_indices_written(&self) -> watch::Receiver<u64> {
-        // Raw frame counts — equal to indices while `open` rejects
-        // multiplier > 1.
         self.io.observe_num_captured()
     }
     async fn indices_written(&self) -> u64 {
-        // No flush: the multipart plugins write one whole file per frame, so
-        // `NumCaptured_RBV` already reflects files on disk (ophyd-async's
-        // multipart provider passes no flush_signal).
-        let frames = self.io.num_captured().await.unwrap_or(0);
-        frames / self.emit.lock().await.multiplier.max(1)
+        self.io.num_captured().await.unwrap_or(0)
     }
     fn collect_stream_docs(&self, up_to: u64, descriptor: &str) -> BoxStream<'_, StreamAsset> {
         let descriptor = descriptor.to_string();
@@ -2293,6 +2311,10 @@ impl DetectorWriter for AdMultipartWriter {
     }
     async fn close(&self) -> Result<()> {
         self.io.stop_capture().await
+    }
+    /// ophyd-async `_data_logic.py`: the main NDArray dataset is always hinted.
+    fn hinted_fields(&self) -> Vec<String> {
+        vec![self.data_key_name()]
     }
 }
 
@@ -2383,19 +2405,23 @@ impl DetectorControl for AreaDetectorCam {
         Ok(())
     }
     async fn arm(&self) -> Status {
-        // Acquire is a busy record: its put-callback completes when the whole
-        // acquisition ends, so it becomes the returned Status — deliberately
-        // unbounded, an N-frame acquisition takes as long as it takes. Before
-        // returning, wait until Acquire_RBV confirms the driver is actually
-        // acquiring (ophyd-async `set_and_wait_for_value(acquire, True,
-        // wait_for_set_completion=False)`), so a fly scan's kickoff doesn't
-        // complete with the detector still idle.
+        // ophyd-async `ADAcquireLogic.start_acquiring`: armed once
+        // Acquire_RBV reports acquiring. Acquire is a busy record whose
+        // put-callback completes when the whole acquisition ends; that
+        // completion is stashed for `wait_for_idle`, deliberately unbounded.
         // Acquire=1 is sent here, not in the spawned task, so a later
         // disarm's Acquire=0 cannot overtake it on the wire.
-        let (status, setter) = Status::new();
-        let prefix = self.prefix.clone();
-        match SignalBackend::<bool>::put_start(self.acquire.as_ref(), Some(true)).await {
+        match set_and_wait_for_bool(
+            self.acquire_rbv.as_ref(),
+            true,
+            SignalBackend::<bool>::put_start(self.acquire.as_ref(), Some(true)),
+            "arm: Acquire_RBV",
+        )
+        .await
+        {
             Ok(done) => {
+                let (acquired, setter) = Status::new();
+                let prefix = self.prefix.clone();
                 tokio::spawn(async move {
                     match done.await {
                         Ok(()) => setter.success(),
@@ -2404,66 +2430,53 @@ impl DetectorControl for AreaDetectorCam {
                         }
                     }
                 });
+                *self.acquire_status.lock().unwrap() = Some(acquired);
+                Status::done()
             }
-            Err(e) => {
-                setter.fail(StatusError::Failed(format!("{prefix}arm: Acquire: {e}")));
-                return status;
-            }
+            Err(e) => Status::fail(StatusError::Failed(format!("{}{e}", self.prefix))),
         }
-        if let Err(e) = wait_for_bool(
-            self.acquire_rbv.as_ref(),
-            true,
-            PUT_TIMEOUT,
-            "arm: Acquire_RBV",
-        )
-        .await
-        {
-            let (failed, setter) = Status::new();
-            setter.fail(StatusError::Failed(format!("{}{e}", self.prefix)));
-            return failed;
-        }
-        status
     }
     async fn wait_for_idle(&self) -> Result<()> {
+        // ophyd-async `ADAcquireLogic.wait_for_idle`: the acquisition's end,
+        // then a good DetectorState.
+        let acquired = self.acquire_status.lock().unwrap().clone();
+        if let Some(acquired) = acquired {
+            acquired.await?;
+        }
         // Inherent `wait_for_idle(timeout)` takes priority in method resolution.
         self.wait_for_idle(WARMUP_IDLE_TIMEOUT).await
     }
     async fn disarm(&self) -> Result<()> {
         // stop_busy_record: a put-callback for Acquire=0 can deadlock on a
         // busy record, so fire-and-forget then wait for the readback.
-        self.acquire.put_nowait(false).await?;
-        wait_for_bool(
+        set_and_wait_for_bool(
             self.acquire_rbv.as_ref(),
             false,
-            PUT_TIMEOUT,
+            self.acquire.put_nowait(false),
             "disarm: Acquire_RBV",
         )
         .await
     }
-    // Slow-changing acquisition parameters for the owning detector's
-    // descriptor `configuration` — ophyd-async `AreaDetector` registers
-    // `driver.acquire_time` / `driver.acquire_period` as CONFIG_SIGNALs.
     async fn read_configuration(&self, name: &str) -> Result<HashMap<String, ReadingValue>> {
-        let (time, period) = tokio::join!(
-            SignalBackend::<f64>::get_reading(self.acquire_time.as_ref()),
-            SignalBackend::<f64>::get_reading(self.acquire_period.as_ref()),
-        );
-        Ok(HashMap::from([
-            (format!("{name}_acquire_time"), time?),
-            (format!("{name}_acquire_period"), period?),
-        ]))
+        futures::future::try_join_all(self.config_signals().map(|(key, sig, _)| async move {
+            Ok::<_, BsrsError>((
+                format!("{name}_{key}"),
+                SignalBackend::<f64>::get_reading(sig).await?,
+            ))
+        }))
+        .await
+        .map(HashMap::from_iter)
     }
     async fn describe_configuration(&self, name: &str) -> Result<HashMap<String, DataKey>> {
-        let time_source = SignalBackend::<f64>::source(self.acquire_time.as_ref(), name, true);
-        let period_source = SignalBackend::<f64>::source(self.acquire_period.as_ref(), name, true);
-        let (time, period) = tokio::join!(
-            SignalBackend::<f64>::get_datakey(self.acquire_time.as_ref(), &time_source),
-            SignalBackend::<f64>::get_datakey(self.acquire_period.as_ref(), &period_source),
-        );
-        Ok(HashMap::from([
-            (format!("{name}_acquire_time"), time?),
-            (format!("{name}_acquire_period"), period?),
-        ]))
+        // `get_datakey` takes the bare PV and adds the `ca://` scheme itself.
+        futures::future::try_join_all(self.config_signals().map(|(key, sig, pv)| async move {
+            Ok::<_, BsrsError>((
+                format!("{name}_{key}"),
+                SignalBackend::<f64>::get_datakey(sig, &pv).await?,
+            ))
+        }))
+        .await
+        .map(HashMap::from_iter)
     }
 }
 
@@ -2923,7 +2936,7 @@ mod tests {
 #[cfg(test)]
 mod ad_hdf_tests {
     use super::*;
-    use crate::protocols_async::{Stageable, WritesStreamAssets};
+    use crate::protocols_async::{Preparable, Stageable, WritesStreamAssets};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     /// What [`AdFileIo::configure`] received: `(directory, filename,
@@ -3053,6 +3066,26 @@ mod ad_hdf_tests {
             Arc::new(FakeFrameInfo),
             StaticPathProvider::new("/data/scans/", "scan"),
         )
+    }
+
+    #[tokio::test]
+    async fn file_writers_hint_their_image_key() {
+        // ophyd-async `_data_logic.py:243`/`:299`: the main dataset is hinted.
+        for (w, label) in [
+            (
+                Box::new(writer_with(FakeAdFileIo::new("/x.h5"))) as Box<dyn DetectorWriter>,
+                "hdf",
+            ),
+            (
+                Box::new(multipart_writer_with(FakeAdFileIo::new("/x.jpg"))),
+                "multipart",
+            ),
+        ] {
+            let keys = w.open(1).await.unwrap();
+            let hinted = w.hinted_fields();
+            assert_eq!(hinted, ["det_image"], "{label}");
+            assert!(keys.contains_key(&hinted[0]), "{label}");
+        }
     }
 
     /// Fixed-content `NDAttributesFile` source (inline XML or a filename).
@@ -3286,11 +3319,29 @@ mod ad_hdf_tests {
     }
 
     #[tokio::test]
-    async fn open_rejects_multiplier_above_one() {
+    async fn open_leads_every_key_with_the_multiplier_and_counts_frames() {
+        // ophyd-async `make_datakeys(collections_per_event)` shapes, a
+        // `collections_written_signal` of frames, and datums of events
+        // (`make_stream_docs`, `_data_providers.py:138-155`).
         let io = FakeAdFileIo::new("/x.h5");
-        let w = writer_with(io);
-        let err = w.open(2).await.unwrap_err().to_string();
-        assert!(err.contains("multiplier=2"), "{err}");
+        let w =
+            writer_with(io.clone()).with_ndattributes(vec![NdAttributeDataset::new("temp", "<f8")]);
+        let keys = w.open(2).await.unwrap();
+        assert_eq!(keys["det_image"].shape, [Some(2), Some(20), Some(10)]);
+        assert_eq!(keys["temp"].shape, [Some(2)]);
+        assert_eq!(keys["temp"].dtype, Dtype::Array);
+        io.set_captured(4);
+        assert_eq!(w.indices_written().await, 4);
+        assert_eq!(*w.observe_indices_written().borrow(), 4);
+        let docs: Vec<StreamAsset> = w.collect_stream_docs(2, "d").collect().await;
+        let ranges: Vec<(u64, u64)> = docs
+            .iter()
+            .filter_map(|a| match a {
+                StreamAsset::Datum(d) => Some((d.indices.start, d.indices.stop)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ranges, [(0, 2), (0, 2)]);
     }
 
     #[test]
@@ -3480,19 +3531,17 @@ mod ad_hdf_tests {
     }
 
     #[tokio::test]
-    async fn indices_written_flushes_before_reading_count() {
-        // Parity with ophyd-async make_stream_docs: flush before reading the
-        // frame count so it reflects frames actually on disk (SWMR).
+    async fn only_collect_stream_docs_flushes() {
+        // ophyd-async flushes in make_stream_docs (`_data_providers.py:142`)
+        // and reads the count without one in get_index (`_detector.py:779`).
         let io = FakeAdFileIo::new("/x.h5");
         let w = writer_with(io.clone());
+        w.open(1).await.unwrap();
         io.set_captured(4);
-        let n = w.indices_written().await;
-        assert_eq!(n, 4);
-        assert_eq!(
-            io.flushes.load(Ordering::SeqCst),
-            1,
-            "indices_written must flush exactly once before reading the count"
-        );
+        assert_eq!(w.indices_written().await, 4);
+        assert_eq!(io.flushes.load(Ordering::SeqCst), 0, "indices_written");
+        let _: Vec<StreamAsset> = w.collect_stream_docs(4, "d").collect().await;
+        assert_eq!(io.flushes.load(Ordering::SeqCst), 1, "collect_stream_docs");
     }
 
     #[tokio::test]
@@ -3527,9 +3576,7 @@ mod ad_hdf_tests {
         let det = StandardDetector::new("det", cam, writer);
         det.writer().open(1).await.unwrap();
         io.set_captured(2);
-        let up_to = WritesStreamAssets::get_index(&det).await.unwrap();
-        assert_eq!(up_to, 2);
-        let docs: Vec<StreamAsset> = det.collect_asset_docs(up_to, "descZ").collect().await;
+        let docs: Vec<StreamAsset> = det.collect_asset_docs(2, "descZ").collect().await;
         assert_eq!(docs.len(), 2);
         assert!(matches!(docs[0], StreamAsset::Resource(_)));
         match &docs[1] {
@@ -3570,8 +3617,12 @@ mod ad_hdf_tests {
             .expect("connect");
         // Prime array dims so the HDF plugin can open the file.
         det.control().warmup().await.expect("warmup");
-        // Stage opens (configures + starts capture) the writer.
         Stageable::stage(&det).await.expect("stage");
+        // Prepare opens (configures + starts capture) the writer.
+        Preparable::<TriggerInfo>::prepare(&det, TriggerInfo::default())
+            .await
+            .await
+            .expect("prepare");
         // One internal-trigger acquisition.
         det.control().arm().await.await.expect("acquire");
         // Fully-qualified: the inherent `wait_for_idle(timeout)` shadows the
@@ -3635,14 +3686,14 @@ mod ad_hdf_tests {
     }
 
     #[tokio::test]
-    async fn multipart_open_rejects_multiplier_above_one() {
+    async fn multipart_open_leads_the_key_with_the_multiplier_and_counts_frames() {
         let io = FakeAdFileIo::new("");
-        let w = multipart_writer_with(io);
-        let err = w.open(2).await.unwrap_err();
-        assert!(
-            err.to_string().contains("multiplier > 1"),
-            "unexpected error: {err}"
-        );
+        let w = multipart_writer_with(io.clone());
+        let keys = w.open(2).await.unwrap();
+        assert_eq!(keys["det_image"].shape, [Some(2), Some(20), Some(10)]);
+        io.set_captured(4);
+        assert_eq!(w.indices_written().await, 4);
+        assert_eq!(*w.observe_indices_written().borrow(), 4);
     }
 
     /// The one `StreamResource` points at the directory with the frame-number

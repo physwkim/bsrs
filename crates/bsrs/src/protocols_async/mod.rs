@@ -63,7 +63,10 @@ pub trait SignalBackend<T: Clone + Send + Sync + 'static>: Send + Sync {
     async fn get_value(&self) -> Result<T>;
     /// Read current setpoint.
     async fn get_setpoint(&self) -> Result<T>;
-    /// Subscribe to value updates. RAII token cleans up on drop.
+    /// Subscribe to value updates. A new callback first receives the current
+    /// value, then every change (ophyd-async `set_callback`, which
+    /// `observe_value` relies on to yield the current value first). RAII
+    /// token cleans up on drop.
     fn set_callback(&self, cb: Option<ReadingValueCallback<T>>) -> SubToken;
     /// Source string for `DataKey.source`.
     ///
@@ -236,9 +239,10 @@ pub trait DetectorControl: Send + Sync {
     fn deadtime(&self, exposure: Option<Duration>) -> Duration;
     /// Configure trigger info (number, type, livetime, multiplier, ...).
     async fn prepare(&self, info: TriggerInfo) -> Result<()>;
-    /// Arm; status resolves when armed.
+    /// Arm; status resolves when armed (for an internal trigger, once
+    /// acquiring), not when the acquisition ends.
     async fn arm(&self) -> Status;
-    /// Wait for the detector to return to idle.
+    /// Wait for the armed acquisition to end and the detector to be idle.
     async fn wait_for_idle(&self) -> Result<()>;
     /// Disarm.
     async fn disarm(&self) -> Result<()>;
@@ -291,9 +295,9 @@ pub struct TriggerInfo {
     /// Collections published per emitted bluesky event — lets a fast detector
     /// zip several collections against a slower detector's single collection.
     pub collections_per_event: u32,
-    /// Maximum time to wait for one exposure (guards `complete()` loops).
-    /// `None` = derive from `livetime + deadtime` plus an implementation
-    /// default.
+    /// Maximum time to wait for each update of the written index. `None` =
+    /// `livetime + deadtime` + 10 s, see
+    /// [`effective_exposure_timeout`](Self::effective_exposure_timeout).
     pub exposure_timeout: Option<Duration>,
 }
 
@@ -311,7 +315,21 @@ impl Default for TriggerInfo {
     }
 }
 
+/// ophyd-async `DEFAULT_TIMEOUT`, the margin of the default
+/// `TriggerInfo.exposure_timeout`.
+const EXPOSURE_TIMEOUT_MARGIN: Duration = Duration::from_secs(10);
+
 impl TriggerInfo {
+    /// ophyd-async `TriggerInfo.exposure_timeout`: `exposure_timeout`, or
+    /// `livetime + deadtime` + 10 s.
+    pub fn effective_exposure_timeout(&self) -> Duration {
+        self.exposure_timeout.unwrap_or_else(|| {
+            self.livetime.unwrap_or_default()
+                + self.deadtime.unwrap_or_default()
+                + EXPOSURE_TIMEOUT_MARGIN
+        })
+    }
+
     /// Total collections taken: `number_of_events * collections_per_event`.
     /// Fly-scan kickoff watches the write index up to this count.
     pub fn number_of_collections(&self) -> u32 {
@@ -379,18 +397,27 @@ impl FlyMotorInfo {
 /// Sealed: detector writer half (open / observe / collect_stream_docs / close).
 #[async_trait]
 pub trait DetectorWriter: Send + Sync {
-    /// Open the writer; returns the `data_keys` that the writer will produce.
+    /// Open the writer for `multiplier` collections per event
+    /// ([`TriggerInfo::collections_per_event`]), which leads each returned
+    /// `DataKey`'s shape (ophyd-async `make_datakeys`).
     async fn open(&self, multiplier: u32) -> Result<HashMap<String, DataKey>>;
-    /// Observe the per-frame index counter.
+    /// Observe the collections (frames) written; the detector divides by the
+    /// multiplier for its event index (ophyd-async
+    /// `collections_written_signal`).
     fn observe_indices_written(&self) -> watch::Receiver<u64>;
-    /// Read the current index synchronously (atomic load).
+    /// The collections (frames) written now.
     async fn indices_written(&self) -> u64;
-    /// Yield asset documents for frames up to `up_to`, stamping each
+    /// Yield asset documents for events up to `up_to`, stamping each
     /// `StreamDatum` with `descriptor` (the EventDescriptor UID; empty when
     /// the caller has no descriptor context).
     fn collect_stream_docs(&self, up_to: u64, descriptor: &str) -> BoxStream<'_, StreamAsset>;
     /// Close the writer.
     async fn close(&self) -> Result<()>;
+    /// The data keys of [`open`](Self::open) a plot should show (ophyd-async
+    /// `DetectorDataLogic.get_hinted_fields`); none by default.
+    fn hinted_fields(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 // -- FrameSource / FrameSink -------------------------------------------------
@@ -466,6 +493,29 @@ mod tests {
         assert_eq!(info.trigger, DetectorTrigger::Internal);
         assert_eq!(info.number_of_collections(), 1);
         assert_eq!(info.number_of_exposures(), 1);
+    }
+
+    #[test]
+    fn trigger_info_exposure_timeout_defaults_to_exposure_plus_ten_seconds() {
+        // ophyd-async _detector.py:101 default_factory.
+        let info = TriggerInfo {
+            livetime: Some(Duration::from_millis(1500)),
+            deadtime: Some(Duration::from_millis(500)),
+            ..Default::default()
+        };
+        assert_eq!(info.effective_exposure_timeout(), Duration::from_secs(12));
+        assert_eq!(
+            TriggerInfo::default().effective_exposure_timeout(),
+            Duration::from_secs(10)
+        );
+        let given = TriggerInfo {
+            exposure_timeout: Some(Duration::from_millis(100)),
+            ..info
+        };
+        assert_eq!(
+            given.effective_exposure_timeout(),
+            Duration::from_millis(100)
+        );
     }
 
     // FlyMotorInfo boundaries: velocity is signed by move direction, and the
