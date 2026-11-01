@@ -494,7 +494,8 @@ async fn rgb1_frames_get_a_colour_dimension() {
 }
 
 /// The polled Acquire_RBV wait in `arm` must not miss an acquisition shorter
-/// than its poll; ophyd-async `test_acquire_logic.py:97` waits on a monitor.
+/// than its poll; ophyd-async `ADAcquireLogic.start_acquiring`
+/// (`_acquire_logic.py:25`) waits on a monitor.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
 async fn trigger_completes_short_exposures() {
