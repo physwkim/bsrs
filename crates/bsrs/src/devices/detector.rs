@@ -32,11 +32,11 @@ where
     name: String,
     control: C,
     writer: W,
-    // TriggerInfo stored by Preparable::prepare(); kickoff() reads it to
-    // configure the hardware and compute the absolute target index.
-    // Defaults to TriggerInfo::default() so a bare kickoff() without an
-    // explicit prepare() still acquires one frame (internal trigger).
-    cached_trigger_info: std::sync::Mutex<TriggerInfo>,
+    // ophyd-async `_prepare_ctx`: the TriggerInfo of the last prepare since
+    // stage; `None` after stage. kickoff() reads it to configure the hardware
+    // and compute the absolute target index; a bare kickoff() without one
+    // acquires `TriggerInfo::default()` (one internally triggered frame).
+    prepared: std::sync::Mutex<Option<TriggerInfo>>,
     // Absolute writer index that complete() waits for. Set in kickoff()
     // from the current writer baseline + number_of_collections().
     cached_target: AtomicU64,
@@ -57,7 +57,7 @@ where
             name: name.into(),
             control,
             writer,
-            cached_trigger_info: std::sync::Mutex::new(TriggerInfo::default()),
+            prepared: std::sync::Mutex::new(None),
             cached_target: AtomicU64::new(0),
             opened: std::sync::Mutex::new(None),
         }
@@ -131,6 +131,9 @@ where
         // the next acquisition. Mirrors ophyd-async `StandardDetector.stage()`
         // calling `_disarm_and_stop(on_unstage=False)`.
         self.control.disarm().await?;
+        // ophyd-async `stage` drops `_prepare_ctx`: a prepare belongs to the
+        // scan it was made for.
+        *self.prepared.lock().unwrap() = None;
         // Ready the writer for this scan with multiplier=1 by default; plans
         // can call configure() to change this. Cache the DataKeys the writer
         // reports so describe() is a pure read and never re-opens the writer
@@ -183,7 +186,7 @@ where
         &self.name
     }
     async fn kickoff(&self) -> Status {
-        let info = self.cached_trigger_info.lock().unwrap().clone();
+        let info = self.prepared.lock().unwrap().clone().unwrap_or_default();
         if let Err(e) = self.control.prepare(info.clone()).await {
             return Status::fail(crate::core::status::StatusError::Failed(format!(
                 "prepare: {e}"
@@ -236,7 +239,7 @@ where
         &self.name
     }
     async fn prepare(&self, info: TriggerInfo) -> crate::core::status::Status {
-        *self.cached_trigger_info.lock().unwrap() = info;
+        *self.prepared.lock().unwrap() = Some(info);
         crate::core::status::Status::done()
     }
 }
@@ -633,7 +636,8 @@ mod tests {
             ControlledWriter { rx },
         ));
 
-        // Prepare for 3 frames, then stage and kickoff.
+        // Stage, prepare for 3 frames, then kickoff.
+        Stageable::stage(&*det).await.unwrap();
         Preparable::<TriggerInfo>::prepare(
             &*det,
             TriggerInfo {
@@ -642,7 +646,6 @@ mod tests {
             },
         )
         .await;
-        Stageable::stage(&*det).await.unwrap();
         let _kickoff = Flyable::kickoff(&*det).await;
 
         // complete() must block — no frames yet.

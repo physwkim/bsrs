@@ -441,6 +441,46 @@ async fn kickoff_resolves_once_the_detector_is_acquiring() {
     completed.unwrap();
 }
 
+/// ophyd-async `test_standard_detector.py:574` `test_stage_resets_state`: a
+/// fresh stage forgets the previous scan's prepare, so a bare kickoff takes
+/// one frame.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+async fn stage_forgets_the_previous_prepare() {
+    boot();
+    let _cam = CAM_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let det = hdf_det("det", dir.path(), "restage").await;
+    Stageable::stage(&det).await.expect("stage");
+    let info = TriggerInfo {
+        number_of_events: 3,
+        ..TriggerInfo::default()
+    };
+    finish(Preparable::prepare(&det, info).await, "prepare")
+        .await
+        .unwrap();
+    finish(Flyable::kickoff(&det).await, "kickoff")
+        .await
+        .unwrap();
+    finish(Flyable::complete(&det).await, "complete")
+        .await
+        .unwrap();
+    Stageable::unstage(&det).await.expect("unstage");
+
+    Stageable::stage(&det).await.expect("restage");
+    finish(Flyable::kickoff(&det).await, "kickoff")
+        .await
+        .unwrap();
+    finish(Flyable::complete(&det).await, "complete")
+        .await
+        .unwrap();
+    let num_images = get::<i64>(&format!("{CAM}NumImages")).await;
+    let n = index(&det).await;
+    Stageable::unstage(&det).await.expect("unstage");
+    assert_eq!(num_images, 1);
+    assert_eq!(n, 1);
+}
+
 /// ophyd-async `test_standard_detector.py:625`
 /// `test_config_signals_in_describe_configuration` and
 /// `test_adsim_system.py:209`/`:217`: the exposure time and period are the
