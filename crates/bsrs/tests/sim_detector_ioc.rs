@@ -425,16 +425,19 @@ async fn kickoff_resolves_once_the_detector_is_acquiring() {
     finish(Preparable::prepare(&det, info).await, "prepare")
         .await
         .unwrap();
-    let kickoff = Flyable::kickoff(&det).await;
-    let early = timeout(Duration::from_millis(500), kickoff).await;
+    // The call and its status: kickoff reads the index without a flush.
+    let early = timeout(Duration::from_millis(500), async {
+        Flyable::kickoff(&det).await.await
+    })
+    .await;
     let acquiring = get::<bool>(&format!("{CAM}Acquire_RBV")).await;
     let completed = finish(Flyable::complete(&det).await, "complete").await;
     Stageable::unstage(&det).await.expect("unstage");
-    assert!(acquiring, "the 1 s acquisition ended within 500 ms");
     assert!(
         matches!(early, Ok(Ok(()))),
         "kickoff of a 1 s acquisition not done after 500 ms: {early:?}"
     );
+    assert!(acquiring, "the 1 s acquisition ended within 500 ms");
     completed.unwrap();
 }
 

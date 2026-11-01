@@ -868,10 +868,9 @@ pub struct NdFileHdf5 {
     /// `XMLFileName` (CHAR waveform) — custom HDF5 layout XML; cleared so
     /// the default `/entry/data/data` layout applies.
     pub xml_file_name: Arc<EpicsCaBackend<String>>,
-    /// `FlushNow` (bo) — force the plugin to flush buffered frames to the
-    /// file. An `NDFileHDF5`-only record (SWMR streaming; the write index
-    /// only reflects flushed frames, so we flush before reading
-    /// `NumCaptured_RBV`) — the JPEG/TIFF plugins do not have it.
+    /// `FlushNow` (busy) — force the plugin to flush buffered frames to the
+    /// file for SWMR readers. An `NDFileHDF5`-only record; the JPEG/TIFF
+    /// plugins do not have it.
     pub flush_now: Arc<EpicsCaBackend<bool>>,
 }
 
@@ -981,8 +980,8 @@ impl NdFileHdf5 {
         .await
     }
 
-    /// Force a flush (`FlushNow=1`) so `NumCaptured_RBV` reflects frames
-    /// actually written to the file.
+    /// Force a flush (`FlushNow=1`) so SWMR readers see the frames written
+    /// so far.
     pub async fn flush(&self) -> Result<()> {
         await_put(
             SignalBackend::<bool>::put(self.flush_now.as_ref(), Some(true)),
@@ -1356,9 +1355,9 @@ pub trait AdHdfFileIo: AdFileIo {
     /// The HDF5-specific arming puts: `NumExtraDims=0`, `LazyOpen=1`,
     /// `SWMRMode=1`, `XMLFileName=""` (ophyd-async `prepare_unbounded`).
     async fn setup_hdf_writer(&self) -> Result<()>;
-    /// Force a flush (`FlushNow=1`) so `num_captured` reflects frames written
-    /// to the file. HDF5-only: `FlushNow` exists on `NDFileHDF5` (SWMR), not
-    /// on the JPEG/TIFF file plugins.
+    /// Force a flush (`FlushNow=1`) so SWMR readers see the frames written so
+    /// far. HDF5-only: `FlushNow` exists on `NDFileHDF5`, not on the
+    /// JPEG/TIFF file plugins.
     async fn flush(&self) -> Result<()>;
 }
 
@@ -1953,11 +1952,6 @@ impl DetectorWriter for AdHdfWriter {
         self.io.observe_num_captured()
     }
     async fn indices_written(&self) -> u64 {
-        // Flush first so the count reflects frames actually on disk (SWMR),
-        // mirroring ophyd-async setting flush_signal before reading the count.
-        // Best-effort: a plugin without SWMR flush support just yields the
-        // unflushed count.
-        let _ = self.io.flush().await;
         let frames = self.io.num_captured().await.unwrap_or(0);
         // Frames -> indices (ophyd-async `collections_written //
         // collections_per_event`).
@@ -1970,6 +1964,11 @@ impl DetectorWriter for AdHdfWriter {
         // flatten to a stream. `stream::once(..).flat_map(stream::iter)` gives a
         // `BoxStream` without pulling in a generator macro.
         let fut = async move {
+            // ophyd-async `make_stream_docs`: flush so SWMR readers see the
+            // frames these datums cover. The stream has no error channel.
+            if let Err(e) = self.io.flush().await {
+                tracing::warn!("{}: {e}", self.name);
+            }
             let mut docs: Vec<StreamAsset> = Vec::new();
             let mut st = self.emit.lock().await;
             // The attribute set staged by the last open().
@@ -2246,9 +2245,6 @@ impl DetectorWriter for AdMultipartWriter {
         self.io.observe_num_captured()
     }
     async fn indices_written(&self) -> u64 {
-        // No flush: the multipart plugins write one whole file per frame, so
-        // `NumCaptured_RBV` already reflects files on disk (ophyd-async's
-        // multipart provider passes no flush_signal).
         let frames = self.io.num_captured().await.unwrap_or(0);
         frames / self.emit.lock().await.multiplier.max(1)
     }
@@ -3496,19 +3492,17 @@ mod ad_hdf_tests {
     }
 
     #[tokio::test]
-    async fn indices_written_flushes_before_reading_count() {
-        // Parity with ophyd-async make_stream_docs: flush before reading the
-        // frame count so it reflects frames actually on disk (SWMR).
+    async fn only_collect_stream_docs_flushes() {
+        // ophyd-async flushes in make_stream_docs (`_data_providers.py:142`)
+        // and reads the count without one in get_index (`_detector.py:779`).
         let io = FakeAdFileIo::new("/x.h5");
         let w = writer_with(io.clone());
+        w.open(1).await.unwrap();
         io.set_captured(4);
-        let n = w.indices_written().await;
-        assert_eq!(n, 4);
-        assert_eq!(
-            io.flushes.load(Ordering::SeqCst),
-            1,
-            "indices_written must flush exactly once before reading the count"
-        );
+        assert_eq!(w.indices_written().await, 4);
+        assert_eq!(io.flushes.load(Ordering::SeqCst), 0, "indices_written");
+        let _: Vec<StreamAsset> = w.collect_stream_docs(4, "d").collect().await;
+        assert_eq!(io.flushes.load(Ordering::SeqCst), 1, "collect_stream_docs");
     }
 
     #[tokio::test]
