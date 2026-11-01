@@ -134,25 +134,26 @@ impl StandardReadable {
     /// does: its reading goes to `read`, its configuration view (if
     /// [`ReadableObj::as_configurable`] has one) to `read_configuration`, its
     /// [`ReadableObj::as_stageable`] view (if any) to `stage` / `unstage`, and
-    /// its [`ReadableObj::hint_fields`] to `hints`.
-    pub fn add_child(&mut self, child: Arc<dyn ReadableObj>) {
+    /// its [`ReadableObj::hint_fields`] to `hints`. A hint field already
+    /// registered is an error and leaves `self` unchanged.
+    pub fn add_child(&mut self, child: Arc<dyn ReadableObj>) -> Result<()> {
+        self.add_hints(child.hint_fields().unwrap_or_default())?;
         if let Some(stageable) = child.clone().as_stageable() {
             self.stageables.push(stageable);
-        }
-        if let Some(fields) = child.hint_fields() {
-            self.hints.extend(fields);
         }
         if child.as_configurable().is_some() {
             self.config.push(Source::DeviceConfig(child.clone()));
         }
         self.read.push(Source::Device(child));
+        Ok(())
     }
 
     /// Register a readable signal under one of the signal formats. Only a
     /// signal with a readable access role is accepted, which is ophyd-async's
     /// `assert_device_is_signalr` check made at compile time. The `Hinted*`
     /// formats hint the signal's name, or nothing when it is unnamed, and
-    /// `HintedSignal` also stages the signal.
+    /// `HintedSignal` also stages the signal. A hint already registered is an
+    /// error and leaves `self` unchanged.
     ///
     /// ```
     /// # use std::sync::Arc;
@@ -163,7 +164,7 @@ impl StandardReadable {
     /// let config = SignalConfig { source: "exp".into(), kind: Kind::Config, name: "exp".into() };
     /// let exposure: Arc<SignalR<f64, SoftSignalBackend<f64>>> = Arc::new(Signal::new(backend, config));
     /// let mut sr = StandardReadable::new("sr");
-    /// sr.add_signal(exposure, StandardReadableFormat::ConfigSignal);
+    /// sr.add_signal(exposure, StandardReadableFormat::ConfigSignal).unwrap();
     /// ```
     ///
     /// A device that is not a signal is rejected:
@@ -173,13 +174,14 @@ impl StandardReadable {
     /// # use bsrs::devices::{StandardReadable, StandardReadableFormat};
     /// let mut sr = StandardReadable::new("sr");
     /// let child = Arc::new(StandardReadable::new("child"));
-    /// sr.add_signal(child, StandardReadableFormat::ConfigSignal);
+    /// sr.add_signal(child, StandardReadableFormat::ConfigSignal).unwrap();
     /// ```
     pub fn add_signal<T, B, A>(
         &mut self,
         signal: Arc<Signal<T, B, A>>,
         format: StandardReadableFormat,
-    ) where
+    ) -> Result<()>
+    where
         T: Clone + Send + Sync + Serialize + 'static,
         B: SignalBackend<T> + 'static,
         A: Readable,
@@ -193,16 +195,31 @@ impl StandardReadable {
         match format {
             ConfigSignal => self.config.push(source(None)),
             HintedSignal => {
+                self.add_hints(hint)?;
                 self.read.push(source(None));
                 self.stageables.push(signal.clone());
-                self.hints.extend(hint);
             }
             UncachedSignal => self.read.push(source(Some(false))),
             HintedUncachedSignal => {
+                self.add_hints(hint)?;
                 self.read.push(source(Some(false)));
-                self.hints.extend(hint);
             }
         }
+        Ok(())
+    }
+
+    /// Append hint fields, rejecting one already registered as ophyd-async's
+    /// `hints` property does for a sequence-valued key; nothing is appended
+    /// on error.
+    fn add_hints(&mut self, fields: impl IntoIterator<Item = String>) -> Result<()> {
+        let fields: Vec<String> = fields.into_iter().collect();
+        if let Some(f) = fields.iter().find(|f| self.hints.contains(f)) {
+            return Err(BsrsError::Other(format!(
+                "Hint fields {f} overrides existing hint"
+            )));
+        }
+        self.hints.extend(fields);
+        Ok(())
     }
 
     /// Stable name.
@@ -385,17 +402,19 @@ mod tests {
     async fn aggregates_read_config_and_hints() {
         let mut sr = StandardReadable::new("dev");
         // CHILD + Kind::Hinted → read bucket + auto hint "temp".
-        sr.add_child(sig("temp", Kind::Hinted, 1.0));
+        sr.add_child(sig("temp", Kind::Hinted, 1.0)).unwrap();
         // HintedSignal + Kind::Normal → read bucket + explicit hint "x".
         sr.add_signal(
             sig("x", Kind::Normal, 2.0),
             StandardReadableFormat::HintedSignal,
-        );
+        )
+        .unwrap();
         // ConfigSignal → configuration bucket only.
         sr.add_signal(
             sig("exposure", Kind::Config, 0.1),
             StandardReadableFormat::ConfigSignal,
-        );
+        )
+        .unwrap();
 
         let read = AsyncReadable::read(&sr).await.unwrap();
         assert_eq!(read.len(), 2);

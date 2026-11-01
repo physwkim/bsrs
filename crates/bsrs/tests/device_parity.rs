@@ -122,11 +122,13 @@ fn leaf(prefix: &str) -> StandardReadable {
     sr.add_signal(
         sig(&format!("{prefix}-value"), Kind::Normal),
         StandardReadableFormat::HintedSignal,
-    );
+    )
+    .unwrap();
     sr.add_signal(
         sig(&format!("{prefix}-config"), Kind::Config),
         StandardReadableFormat::ConfigSignal,
-    );
+    )
+    .unwrap();
     sr
 }
 
@@ -137,7 +139,7 @@ fn leaf(prefix: &str) -> StandardReadable {
 #[tokio::test]
 async fn standard_readable_child_merges_nested_read_configuration_and_hints() {
     let mut parent = StandardReadable::new("parent");
-    parent.add_child(Arc::new(leaf("parent-sub")));
+    parent.add_child(Arc::new(leaf("parent-sub"))).unwrap();
     assert_eq!(
         keys(&parent.read().await.unwrap()),
         set(&["parent-sub-value"])
@@ -160,9 +162,9 @@ async fn standard_readable_child_merges_nested_read_configuration_and_hints() {
     );
 
     let mut mid = StandardReadable::new("top-mid");
-    mid.add_child(Arc::new(leaf("top-mid-leaf")));
+    mid.add_child(Arc::new(leaf("top-mid-leaf"))).unwrap();
     let mut top = StandardReadable::new("top");
-    top.add_child(Arc::new(mid));
+    top.add_child(Arc::new(mid)).unwrap();
     assert_eq!(
         keys(&top.read().await.unwrap()),
         set(&["top-mid-leaf-value"])
@@ -183,22 +185,26 @@ fn standard_readable_hints_concatenate_in_registration_order() {
     );
 
     let mut first = StandardReadable::new("first");
-    first.add_signal(
-        sig("abc", Kind::Normal),
-        StandardReadableFormat::HintedSignal,
-    );
+    first
+        .add_signal(
+            sig("abc", Kind::Normal),
+            StandardReadableFormat::HintedSignal,
+        )
+        .unwrap();
     let mut second = StandardReadable::new("second");
-    second.add_child(sig("def", Kind::Hinted));
-    second.add_signal(
-        sig("ghi", Kind::Normal),
-        StandardReadableFormat::HintedSignal,
-    );
+    second.add_child(sig("def", Kind::Hinted)).unwrap();
+    second
+        .add_signal(
+            sig("ghi", Kind::Normal),
+            StandardReadableFormat::HintedSignal,
+        )
+        .unwrap();
 
     let mut sr = StandardReadable::new("sr");
-    sr.add_child(Arc::new(first));
-    sr.add_child(Arc::new(second));
-    sr.add_child(sig("jkl", Kind::Hinted));
-    sr.add_child(sig("quiet", Kind::Normal));
+    sr.add_child(Arc::new(first)).unwrap();
+    sr.add_child(Arc::new(second)).unwrap();
+    sr.add_child(sig("jkl", Kind::Hinted)).unwrap();
+    sr.add_child(sig("quiet", Kind::Normal)).unwrap();
     assert_eq!(
         ReadableObj::hint_fields(&sr),
         Some(vec![
@@ -208,6 +214,38 @@ fn standard_readable_hints_concatenate_in_registration_order() {
             "jkl".to_string()
         ])
     );
+}
+
+// ophyd-async test_readable::test_standard_readable_hints_raises_when_
+// overriding_sequence: a hint field registered twice is an error, whether it
+// comes from a CHILD or a Hinted* signal; an unnamed signal hints nothing.
+#[tokio::test]
+async fn standard_readable_rejects_a_hint_that_overrides_an_existing_one() {
+    let mut inner = StandardReadable::new("inner");
+    for name in ["f1", "f2"] {
+        inner
+            .add_signal(
+                sig(name, Kind::Normal),
+                StandardReadableFormat::HintedSignal,
+            )
+            .unwrap();
+    }
+    let mut sr = StandardReadable::new("sr");
+    sr.add_child(sig("f2", Kind::Hinted)).unwrap();
+    let overrides = "Hint fields f2 overrides existing hint";
+    assert!(err_text(sr.add_child(Arc::new(inner))).contains(overrides));
+    let hinted_uncached = StandardReadableFormat::HintedUncachedSignal;
+    assert!(err_text(sr.add_signal(sig("f2", Kind::Normal), hinted_uncached)).contains(overrides));
+    assert_eq!(ReadableObj::hint_fields(&sr), Some(vec!["f2".to_string()]));
+    assert_eq!(keys(&sr.read().await.unwrap()), set(&["f2"]));
+
+    let mut unnamed = StandardReadable::new("unnamed");
+    for _ in 0..2 {
+        unnamed
+            .add_signal(sig("", Kind::Normal), StandardReadableFormat::HintedSignal)
+            .unwrap();
+    }
+    assert_eq!(ReadableObj::hint_fields(&unnamed), None);
 }
 
 // ophyd-async test_readable add_readables_adds_to_expected_attrs and
@@ -220,12 +258,15 @@ async fn standard_readable_uncached_formats_route_to_read() {
     sr.add_signal(
         sig("u", Kind::Normal),
         StandardReadableFormat::UncachedSignal,
-    );
+    )
+    .unwrap();
     sr.add_signal(
         sig("hu", Kind::Normal),
         StandardReadableFormat::HintedUncachedSignal,
-    );
-    sr.add_signal(sig("c", Kind::Config), StandardReadableFormat::ConfigSignal);
+    )
+    .unwrap();
+    sr.add_signal(sig("c", Kind::Config), StandardReadableFormat::ConfigSignal)
+        .unwrap();
 
     let read = keys(&sr.read().await.unwrap());
     assert_eq!(read, set(&["u", "hu"]));
@@ -300,7 +341,7 @@ async fn standard_readable_uncached_formats_bypass_the_signal_cache() {
             },
         ));
         Stageable::stage(&*s).await.unwrap();
-        sr.add_signal(s, format);
+        sr.add_signal(s, format).unwrap();
         backends.push(backend);
     }
     for backend in &backends {
@@ -326,13 +367,14 @@ fn err_text<T>(r: Result<T>) -> String {
 async fn standard_readable_rejects_duplicate_reading_keys() {
     let mut sr = StandardReadable::new("sr");
     for name in ["a", "a", "b", "c", "c"] {
-        sr.add_child(sig(name, Kind::Normal));
+        sr.add_child(sig(name, Kind::Normal)).unwrap();
     }
     for name in ["x", "x"] {
         sr.add_signal(
             sig(name, Kind::Config),
             StandardReadableFormat::ConfigSignal,
-        );
+        )
+        .unwrap();
     }
     let dup = "Duplicate keys found while merging dictionaries: a, c";
     assert!(err_text(sr.read().await).contains(dup));
@@ -342,8 +384,8 @@ async fn standard_readable_rejects_duplicate_reading_keys() {
     assert!(err_text(sr.describe_configuration().await).contains(dup_x));
 
     let mut unnamed = StandardReadable::new("");
-    unnamed.add_child(sig("", Kind::Normal));
-    unnamed.add_child(sig("", Kind::Normal));
+    unnamed.add_child(sig("", Kind::Normal)).unwrap();
+    unnamed.add_child(sig("", Kind::Normal)).unwrap();
     assert!(err_text(unnamed.read().await).contains("Have you remembered to name the Device?"));
 }
 
@@ -360,13 +402,23 @@ async fn standard_readable_stages_children_and_hinted_signals_only() {
     let (u, u_backend) = soft_signal("u", Kind::Normal, 4.0);
     let (hu, hu_backend) = soft_signal("hu", Kind::Normal, 5.0);
     let mut inner = StandardReadable::new("inner");
-    inner.add_signal(b, StandardReadableFormat::HintedSignal);
+    inner
+        .add_signal(b, StandardReadableFormat::HintedSignal)
+        .unwrap();
     let mut outer = StandardReadable::new("outer");
-    outer.add_signal(a, StandardReadableFormat::HintedSignal);
-    outer.add_child(Arc::new(inner));
-    outer.add_signal(c, StandardReadableFormat::ConfigSignal);
-    outer.add_signal(u, StandardReadableFormat::UncachedSignal);
-    outer.add_signal(hu, StandardReadableFormat::HintedUncachedSignal);
+    outer
+        .add_signal(a, StandardReadableFormat::HintedSignal)
+        .unwrap();
+    outer.add_child(Arc::new(inner)).unwrap();
+    outer
+        .add_signal(c, StandardReadableFormat::ConfigSignal)
+        .unwrap();
+    outer
+        .add_signal(u, StandardReadableFormat::UncachedSignal)
+        .unwrap();
+    outer
+        .add_signal(hu, StandardReadableFormat::HintedUncachedSignal)
+        .unwrap();
 
     let backends = [&a_backend, &b_backend, &c_backend, &u_backend, &hu_backend];
     let counts = || backends.map(|b| b.subscriber_count());
@@ -561,8 +613,10 @@ fn sync_facade_drives_soft_motor_and_standard_readable() {
 
     let (x, x_backend) = soft_signal("x", Kind::Normal, 1.0);
     let mut sr = StandardReadable::new("dev");
-    sr.add_signal(x, StandardReadableFormat::HintedSignal);
-    sr.add_signal(sig("c", Kind::Config), StandardReadableFormat::ConfigSignal);
+    sr.add_signal(x, StandardReadableFormat::HintedSignal)
+        .unwrap();
+    sr.add_signal(sig("c", Kind::Config), StandardReadableFormat::ConfigSignal)
+        .unwrap();
 
     sr.stage_blocking().unwrap();
     assert_eq!(x_backend.subscriber_count(), 1);
