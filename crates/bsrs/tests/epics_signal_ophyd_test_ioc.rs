@@ -284,6 +284,7 @@ fn pva_move_timestamps() {
 
 fn assert_string_datakey(dk: &DataKey) {
     assert_eq!(dk.dtype, Dtype::String);
+    assert_eq!(dk.dtype_numpy, numpy("|S40"));
     assert!(dk.shape.is_empty(), "{:?}", dk.shape);
     assert_eq!(dk.units, None);
     assert_eq!(dk.precision, None);
@@ -322,6 +323,8 @@ fn ca_long_string_lifecycle() {
         let long = format!("bsrs_{}", "x".repeat(100));
         let dk = assert_lifecycle(&b, &pv, long).await;
         assert_eq!(dk.dtype, Dtype::String);
+        assert_eq!(dk.dtype_numpy, numpy("|S40"));
+        assert!(dk.shape.is_empty(), "{:?}", dk.shape);
     });
 }
 
@@ -335,6 +338,8 @@ fn pva_long_string_lifecycle() {
         let long = format!("bsrs_{}", "y".repeat(100));
         let dk = assert_lifecycle(&b, &pv, long).await;
         assert_eq!(dk.dtype, Dtype::String);
+        assert_eq!(dk.dtype_numpy, numpy("|S40"));
+        assert!(dk.shape.is_empty(), "{:?}", dk.shape);
     });
 }
 
@@ -348,6 +353,7 @@ fn ca_enum_lifecycle() {
         let b = CaEnumBackend::new(&pv);
         let dk = assert_lifecycle(&b, &pv, "Multiple".to_string()).await;
         assert_eq!(dk.dtype, Dtype::String);
+        assert_eq!(dk.dtype_numpy, numpy("|S40"));
         assert!(dk.shape.is_empty());
         let choices = ["Single", "Multiple", "Continuous"]
             .map(String::from)
@@ -370,6 +376,7 @@ fn ca_string_reads_an_mbbo_as_its_label() {
         let b = EpicsCaBackend::<String>::new(&pv);
         let dk = assert_lifecycle(&b, &pv, "External".to_string()).await;
         assert_eq!(dk.dtype, Dtype::String);
+        assert_eq!(dk.dtype_numpy, numpy("|S40"));
         assert!(dk.shape.is_empty());
         let choices = ["Internal", "External"].map(String::from);
         assert_eq!(dk.choices.as_deref(), Some(&choices[..]));
@@ -391,6 +398,7 @@ fn pva_enum_lifecycle() {
         let b = EpicsPvaBackend::<String>::new(pv);
         let dk = assert_lifecycle(&b, pv, "Multiple".to_string()).await;
         assert_eq!(dk.dtype, Dtype::String);
+        assert_eq!(dk.dtype_numpy, numpy("|S40"));
         assert!(dk.shape.is_empty());
         let choices = ["Single", "Multiple", "Continuous"].map(String::from);
         assert_eq!(dk.choices.as_deref(), Some(&choices[..]));
@@ -477,7 +485,8 @@ fn pva_integer_lifecycle() {
 
 /// A LONG waveform (NELM 10) written and read as `Vec<f64>`.
 /// A put reads back at its own length, one element included: the reads ask
-/// for the current element count, as aioca's and p4p's do.
+/// for the current element count, as aioca's and p4p's do, and the datakey
+/// has that length.
 async fn assert_array_put_reads_back(b: &impl SignalBackend<Vec<f64>>, pv: &str) {
     b.connect(CONNECT).await.unwrap();
     let (token, mut rx) = subscribe(b);
@@ -491,8 +500,9 @@ async fn assert_array_put_reads_back(b: &impl SignalBackend<Vec<f64>>, pv: &str)
     }
     assert_unsubscribed(token, rx).await;
     let dk = b.get_datakey(pv).await.unwrap();
+    assert_eq!(dk.dtype, Dtype::Array);
     assert_eq!(dk.dtype_numpy, numpy("<f8"));
-    assert_eq!(dk.shape.len(), 1, "{:?}", dk.shape);
+    assert_eq!(dk.shape, vec![Some(1)]);
 }
 
 #[test]
@@ -501,6 +511,11 @@ fn ca_array_put_reads_back() {
     run(async {
         let pv = format!("{CAM}cam1:Dimensions");
         assert_array_put_reads_back(&EpicsCaBackend::<Vec<f64>>::new(&pv), &pv).await;
+        // Read as a number, the waveform's datakey is a number's.
+        let dk = EpicsCaBackend::<f64>::new(&pv).get_datakey(&pv).await;
+        assert!(dk.unwrap().shape.is_empty());
+        let dk = EpicsCaBackend::<i64>::new(&pv).get_datakey(&pv).await;
+        assert!(dk.unwrap().shape.is_empty());
     });
 }
 

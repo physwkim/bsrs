@@ -463,6 +463,44 @@ fn pv_field_to_metadata(p: &PvField, datatype: Datatype) -> SignalMetadata {
     meta
 }
 
+/// A datatype ophyd-async's `make_datakey` gives shape `[]`, with its
+/// `dtype` and `dtype_numpy` there (`core/_signal_backend.py:128-195`).
+trait Primitive {
+    const DTYPE: Dtype;
+    const DTYPE_NUMPY: &'static str;
+}
+
+impl Primitive for f64 {
+    const DTYPE: Dtype = Dtype::Number;
+    const DTYPE_NUMPY: &'static str = "<f8";
+}
+
+impl Primitive for i64 {
+    const DTYPE: Dtype = Dtype::Integer;
+    const DTYPE_NUMPY: &'static str = "<i8";
+}
+
+impl Primitive for bool {
+    const DTYPE: Dtype = Dtype::Boolean;
+    const DTYPE_NUMPY: &'static str = "|b1";
+}
+
+/// Enum labels included: ophyd-async describes both as `S40`.
+impl Primitive for String {
+    const DTYPE: Dtype = Dtype::String;
+    const DTYPE_NUMPY: &'static str = "|S40";
+}
+
+fn primitive_datakey<T: Primitive>(source: String, meta: SignalMetadata) -> DataKey {
+    make_datakey(source, T::DTYPE, vec![], Some(T::DTYPE_NUMPY.into()), meta)
+}
+
+/// An `Array1D[np.float64]`'s datakey: shaped as the array read.
+fn array_datakey(source: String, value: &[f64], meta: SignalMetadata) -> DataKey {
+    let shape = vec![Some(value.len() as u64)];
+    make_datakey(source, Dtype::Array, shape, Some("<f8".into()), meta)
+}
+
 #[async_trait]
 impl SignalBackend<f64> for EpicsPvaBackend<f64> {
     async fn connect(&self, timeout: Duration) -> Result<()> {
@@ -480,11 +518,8 @@ impl SignalBackend<f64> for EpicsPvaBackend<f64> {
             .pvget(&self.pv)
             .await
             .map_err(|e| BsrsError::Backend(format!("pva get: {e}")))?;
-        Ok(make_datakey(
+        Ok(primitive_datakey::<f64>(
             format!("pva://{source}"),
-            Dtype::Number,
-            vec![],
-            Some("<f8".into()),
             pv_field_to_metadata(&f, Datatype::Float),
         ))
     }
@@ -581,23 +616,15 @@ impl SignalBackend<Vec<f64>> for EpicsPvaBackend<Vec<f64>> {
         put_block(&self.client, &self.pv, f).await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
-        // The descriptor shape needs the element count; pvget once (describe is
-        // rare). Reports the waveform's current length.
         let f = self
             .client
             .pvget(&self.pv)
             .await
             .map_err(|e| BsrsError::Backend(format!("pva get: {e}")))?;
-        let len = pv_field_to_vec_f64(&f)
-            .ok_or_else(|| BsrsError::Backend(format!("pva: not a numeric array: {f:?}")))?
-            .len();
-        Ok(make_datakey(
-            format!("pva://{source}"),
-            Dtype::Number,
-            vec![Some(len as u64)],
-            Some("<f8".into()),
-            pv_field_to_metadata(&f, Datatype::Float),
-        ))
+        let v = pv_field_to_vec_f64(&f)
+            .ok_or_else(|| BsrsError::Backend(format!("pva: not a numeric array: {f:?}")))?;
+        let meta = pv_field_to_metadata(&f, Datatype::Float);
+        Ok(array_datakey(format!("pva://{source}"), &v, meta))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
         let f = self
@@ -686,11 +713,8 @@ impl SignalBackend<String> for EpicsPvaBackend<String> {
             .pvget(&self.pv)
             .await
             .map_err(|e| BsrsError::Backend(format!("pva get: {e}")))?;
-        Ok(make_datakey(
+        Ok(primitive_datakey::<String>(
             format!("pva://{source}"),
-            Dtype::String,
-            vec![],
-            Some("|S".into()),
             pv_field_to_metadata(&f, Datatype::Str),
         ))
     }
@@ -777,11 +801,8 @@ impl SignalBackend<i64> for EpicsPvaBackend<i64> {
             .pvget(&self.pv)
             .await
             .map_err(|e| BsrsError::Backend(format!("pva get: {e}")))?;
-        Ok(make_datakey(
+        Ok(primitive_datakey::<i64>(
             format!("pva://{source}"),
-            Dtype::Integer,
-            vec![],
-            Some("<i8".into()),
             pv_field_to_metadata(&f, Datatype::Int),
         ))
     }
@@ -868,11 +889,8 @@ impl SignalBackend<bool> for EpicsPvaBackend<bool> {
             .pvget(&self.pv)
             .await
             .map_err(|e| BsrsError::Backend(format!("pva get: {e}")))?;
-        Ok(make_datakey(
+        Ok(primitive_datakey::<bool>(
             format!("pva://{source}"),
-            Dtype::Boolean,
-            vec![],
-            Some("|b1".into()),
             pv_field_to_metadata(&f, Datatype::Bool),
         ))
     }

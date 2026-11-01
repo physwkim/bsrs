@@ -17,7 +17,7 @@ use crate::core::status::SubToken;
 use crate::event_model::{make_datakey, DataKey, Dtype, Limits, LimitsRange, SignalMetadata};
 use crate::protocols_async::{PutCompletion, ReadingValueCallback, SignalBackend};
 use async_trait::async_trait;
-use epics_base_rs::server::snapshot::{ControlInfo, DbrClass, DisplayInfo};
+use epics_base_rs::server::snapshot::{ControlInfo, DbrClass, DisplayInfo, Snapshot};
 use epics_base_rs::types::WallTime;
 use epics_ca_rs::client::CaClient;
 use epics_ca_rs::{estdlib, CaError, DbFieldType, EpicsValue, PvString};
@@ -307,9 +307,54 @@ fn ctrl_limits(display: Option<&DisplayInfo>, control: Option<&ControlInfo>) -> 
     limits
 }
 
-/// Fetch DBR_CTRL metadata (units, precision, and the four limit ranges) for
-/// a numeric channel and shape it into a [`SignalMetadata`], applying
-/// ophyd-async's per-field inclusion rules (`_aioca._metadata_from_augmented_value`):
+/// A datatype ophyd-async's `make_datakey` gives shape `[]`, with its
+/// `dtype` and `dtype_numpy` there (`core/_signal_backend.py:128-195`).
+trait Primitive {
+    const DTYPE: Dtype;
+    const DTYPE_NUMPY: &'static str;
+}
+
+impl Primitive for f64 {
+    const DTYPE: Dtype = Dtype::Number;
+    const DTYPE_NUMPY: &'static str = "<f8";
+}
+
+impl Primitive for i64 {
+    const DTYPE: Dtype = Dtype::Integer;
+    const DTYPE_NUMPY: &'static str = "<i8";
+}
+
+impl Primitive for bool {
+    const DTYPE: Dtype = Dtype::Boolean;
+    const DTYPE_NUMPY: &'static str = "|b1";
+}
+
+/// Enum labels included: ophyd-async describes both as `S40`.
+impl Primitive for String {
+    const DTYPE: Dtype = Dtype::String;
+    const DTYPE_NUMPY: &'static str = "|S40";
+}
+
+fn primitive_datakey<T: Primitive>(source: String, meta: SignalMetadata) -> DataKey {
+    make_datakey(source, T::DTYPE, vec![], Some(T::DTYPE_NUMPY.into()), meta)
+}
+
+/// An `Array1D[np.float64]`'s datakey: shaped as the array read.
+fn array_datakey(source: String, value: &[f64], meta: SignalMetadata) -> DataKey {
+    let shape = vec![Some(value.len() as u64)];
+    make_datakey(source, Dtype::Array, shape, Some("<f8".into()), meta)
+}
+
+/// The DBR_CTRL read ophyd-async's `get_datakey` describes a PV from.
+async fn ctrl_get(ch: &SharedChannel) -> Result<Snapshot> {
+    ch.get_with_metadata(DbrClass::Ctrl, CA_IO_TIMEOUT)
+        .await
+        .map_err(|e| BsrsError::Backend(format!("ca ctrl get: {e}")))
+}
+
+/// Shape a DBR_CTRL read's units, precision and four limit ranges into a
+/// [`SignalMetadata`], applying ophyd-async's per-field inclusion rules
+/// (`_aioca._metadata_from_augmented_value`):
 ///   - `units`, empty included, only when the datatype is not string/bool
 ///     (`want_units`),
 ///   - `precision` only for floats — ints have no fractional digits
@@ -317,15 +362,7 @@ fn ctrl_limits(display: Option<&DisplayInfo>, control: Option<&ControlInfo>) -> 
 ///   - `limits` for any numeric, each range filtered by [`limits_range`].
 ///
 /// A field stays `None` when the server published no display/control block.
-async fn ctrl_metadata(
-    ch: &SharedChannel,
-    want_units: bool,
-    want_precision: bool,
-) -> Result<SignalMetadata> {
-    let snap = ch
-        .get_with_metadata(DbrClass::Ctrl, CA_IO_TIMEOUT)
-        .await
-        .map_err(|e| BsrsError::Backend(format!("ca ctrl get: {e}")))?;
+fn ctrl_metadata(snap: &Snapshot, want_units: bool, want_precision: bool) -> SignalMetadata {
     let mut meta = SignalMetadata::default();
     if let Some(d) = snap.display.as_ref() {
         if want_units {
@@ -339,7 +376,7 @@ async fn ctrl_metadata(
     if limits != Limits::default() {
         meta.limits = Some(limits);
     }
-    Ok(meta)
+    meta
 }
 
 /// Encode an `f64` payload as the `EpicsValue` variant that matches
@@ -568,24 +605,10 @@ impl SignalBackend<f64> for EpicsCaBackend<f64> {
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
-        let info = ch
-            .info()
-            .await
-            .map_err(|e| BsrsError::Backend(format!("ca info: {e}")))?;
         // Floats carry units, precision, and limits (mirrors ophyd-async
         // `_metadata_from_augmented_value`).
-        let meta = ctrl_metadata(&ch, true, true).await?;
-        Ok(make_datakey(
-            format!("ca://{source}"),
-            Dtype::Number,
-            if info.element_count > 1 {
-                vec![Some(info.element_count as u64)]
-            } else {
-                vec![]
-            },
-            Some("<f8".into()),
-            meta,
-        ))
+        let meta = ctrl_metadata(&ctrl_get(&ch).await?, true, true);
+        Ok(primitive_datakey::<f64>(format!("ca://{source}"), meta))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
@@ -669,20 +692,13 @@ impl SignalBackend<Vec<f64>> for EpicsCaBackend<Vec<f64>> {
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
-        let info = ch
-            .info()
-            .await
-            .map_err(|e| BsrsError::Backend(format!("ca info: {e}")))?;
-        // A waveform's `element_count` is its NELM (max capacity) → 1-D shape.
+        let snap = ctrl_get(&ch).await?;
+        let v = epics_to_vec_f64(&snap.value).ok_or_else(|| {
+            BsrsError::Backend(format!("ca: not a numeric array: {:?}", snap.value))
+        })?;
         // Float-element waveforms carry units/precision/limits like scalars.
-        let meta = ctrl_metadata(&ch, true, true).await?;
-        Ok(make_datakey(
-            format!("ca://{source}"),
-            Dtype::Number,
-            vec![Some(info.element_count as u64)],
-            Some("<f8".into()),
-            meta,
-        ))
+        let meta = ctrl_metadata(&snap, true, true);
+        Ok(array_datakey(format!("ca://{source}"), &v, meta))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
@@ -763,27 +779,15 @@ impl SignalBackend<String> for EpicsCaBackend<String> {
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
-        let info = ch
-            .info()
-            .await
-            .map_err(|e| BsrsError::Backend(format!("ca info: {e}")))?;
-        let (shape, choices) = match self.codec(&ch).await? {
-            StrCodec::Text(CaStringKind::Long) if info.element_count > 1 => {
-                (vec![Some(info.element_count as u64)], None)
-            }
-            StrCodec::Text(_) => (vec![], None),
-            StrCodec::Enum(choices) => (vec![], Some(choices.clone())),
+        let choices = match self.codec(&ch).await? {
+            StrCodec::Text(_) => None,
+            StrCodec::Enum(choices) => Some(choices.clone()),
         };
-        Ok(make_datakey(
-            format!("ca://{source}"),
-            Dtype::String,
-            shape,
-            Some("|S".into()),
-            SignalMetadata {
-                choices,
-                ..SignalMetadata::default()
-            },
-        ))
+        let meta = SignalMetadata {
+            choices,
+            ..SignalMetadata::default()
+        };
+        Ok(primitive_datakey::<String>(format!("ca://{source}"), meta))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
@@ -878,24 +882,10 @@ impl SignalBackend<i64> for EpicsCaBackend<i64> {
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
-        let info = ch
-            .info()
-            .await
-            .map_err(|e| BsrsError::Backend(format!("ca info: {e}")))?;
         // Ints carry units and limits, but no precision — there are no
         // fractional digits (ophyd-async excludes precision for `int`).
-        let meta = ctrl_metadata(&ch, true, false).await?;
-        Ok(make_datakey(
-            format!("ca://{source}"),
-            Dtype::Integer,
-            if info.element_count > 1 {
-                vec![Some(info.element_count as u64)]
-            } else {
-                vec![]
-            },
-            Some("<i8".into()),
-            meta,
-        ))
+        let meta = ctrl_metadata(&ctrl_get(&ch).await?, true, false);
+        Ok(primitive_datakey::<i64>(format!("ca://{source}"), meta))
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
@@ -996,11 +986,8 @@ impl SignalBackend<bool> for EpicsCaBackend<bool> {
         await_put(self.put_start(value).await?, "ca put").await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
-        Ok(make_datakey(
+        Ok(primitive_datakey::<bool>(
             format!("ca://{source}"),
-            Dtype::Boolean,
-            vec![],
-            Some("|b1".into()),
             SignalMetadata::default(),
         ))
     }

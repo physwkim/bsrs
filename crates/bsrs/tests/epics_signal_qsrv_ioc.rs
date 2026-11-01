@@ -252,6 +252,7 @@ fn ca_reads_a_bi_as_its_label_and_as_a_bool() {
 
         let dk = label.get_datakey("DEMO:BI").await.unwrap();
         assert_eq!(dk.dtype, Dtype::String);
+        assert_eq!(dk.dtype_numpy, Some(DtypeNumpy::Scalar("|S40".into())));
         assert!(dk.shape.is_empty());
         assert_eq!(dk.choices, Some(vec!["Off".to_string(), "On".to_string()]));
         let dk = flag.get_datakey("DEMO:BI").await.unwrap();

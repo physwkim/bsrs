@@ -11,7 +11,7 @@ use std::time::Duration;
 use bsrs::backends::epics_ca::EpicsCaBackend;
 use bsrs::backends::epics_pva::EpicsPvaBackend;
 use bsrs::core::bsrs_runtime;
-use bsrs::event_model::DtypeNumpy;
+use bsrs::event_model::{Dtype, DtypeNumpy};
 use bsrs::protocols_async::SignalBackend;
 use tokio::sync::mpsc;
 
@@ -59,6 +59,7 @@ async fn assert_waveform(b: &impl SignalBackend<Vec<f64>>, pv: &str) {
     assert!((0.5..1.5).contains(&(t2 - t1)), "{t1} then {t2}");
 
     let dk = b.get_datakey(pv).await.unwrap();
+    assert_eq!(dk.dtype, Dtype::Array);
     assert_eq!(dk.dtype_numpy, Some(DtypeNumpy::Scalar("<f8".into())));
     assert_eq!(dk.shape, vec![Some(NELM as u64)]);
 }
