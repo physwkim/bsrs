@@ -13,8 +13,8 @@ use crate::core::status::{Status, StatusError, SubToken};
 use crate::core::Kind;
 use crate::event_model::DataKey;
 use crate::protocols_async::{
-    AsyncReadable, AsyncSubscribable, ReadingValueCallback, SignalBackend, Subscription,
-    Triggerable,
+    AsyncMovable, AsyncReadable, AsyncSubscribable, Locatable, Location, ReadingValueCallback,
+    SignalBackend, Subscription, Triggerable,
 };
 use async_trait::async_trait;
 use serde::Serialize;
@@ -268,6 +268,60 @@ where
     /// `SignalRW::locate`).
     pub async fn get_setpoint(&self) -> Result<T> {
         self.backend.get_setpoint().await
+    }
+}
+
+// -- Movable / Locatable: ophyd-async `SignalW.set`, `SignalRW.locate` --------
+
+#[async_trait]
+impl<T, B, A> AsyncMovable<T> for Signal<T, B, A>
+where
+    T: Clone + Send + Sync + Serialize + 'static,
+    B: SignalBackend<T>,
+    A: Writable,
+{
+    fn name(&self) -> &str {
+        &self.config.name
+    }
+    async fn set(&self, value: T) -> Status {
+        self.put(value).await
+    }
+}
+
+#[async_trait]
+impl<T, B, A> Locatable<T> for Signal<T, B, A>
+where
+    T: Clone + Send + Sync + Serialize + 'static,
+    B: SignalBackend<T>,
+    A: Readable + Writable,
+{
+    async fn locate(&self) -> Result<Location<T>> {
+        let (setpoint, readback) =
+            futures::try_join!(self.backend.get_setpoint(), self.backend.get_value())?;
+        Ok(Location { setpoint, readback })
+    }
+}
+
+#[async_trait]
+impl<B, A> crate::core::msg::MovableObj for Signal<f64, B, A>
+where
+    B: SignalBackend<f64>,
+    A: Writable,
+{
+    async fn set_dyn(&self, value: f64) -> Status {
+        self.put(value).await
+    }
+}
+
+#[async_trait]
+impl<B, A> crate::core::msg::LocatableObj for Signal<f64, B, A>
+where
+    B: SignalBackend<f64>,
+    A: Readable + Writable,
+{
+    async fn locate_dyn(&self) -> Result<crate::core::msg::DynLocation> {
+        let Location { setpoint, readback } = Locatable::locate(self).await?;
+        Ok(crate::core::msg::DynLocation { setpoint, readback })
     }
 }
 

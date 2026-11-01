@@ -8,13 +8,14 @@ use std::time::Duration;
 
 use bsrs::backends::mock::{MockBackend, MockSignalBackend};
 use bsrs::backends::soft::SoftSignalBackend;
+use bsrs::core::msg::{LocatableObj, MovableObj};
 use bsrs::core::{Kind, ReadingValue};
 use bsrs::devices::{
     observe_signals_value, observe_value, wait_for_value, BackendFromPv, Readable, Signal,
-    SignalConfig, SignalR, SignalRW,
+    SignalConfig, SignalR, SignalRW, SignalW,
 };
 use bsrs::event_model::{make_datakey, DataKey, Dtype, SignalMetadata};
-use bsrs::protocols_async::AsyncSubscribable;
+use bsrs::protocols_async::{AsyncMovable, AsyncSubscribable, Locatable};
 use futures::StreamExt;
 use serde::Serialize;
 use serde_json::json;
@@ -49,12 +50,14 @@ where
     ));
     assert_eq!(values.next().await.unwrap().value, json!(initial));
     assert_eq!(sig.get().await.unwrap(), initial);
-    assert_eq!(sig.get_setpoint().await.unwrap(), initial);
+    let at = sig.locate().await.unwrap();
+    assert_eq!((at.setpoint, at.readback), (initial.clone(), initial));
 
-    assert!(sig.put(put.clone()).await.success());
+    assert!(sig.set(put.clone()).await.success());
     assert_eq!(values.next().await.unwrap().value, json!(put));
     assert_eq!(sig.get().await.unwrap(), put);
-    assert_eq!(sig.get_setpoint().await.unwrap(), put);
+    let at = sig.locate().await.unwrap();
+    assert_eq!((at.setpoint, at.readback), (put.clone(), put));
 
     assert_eq!(
         sig.describe().await.unwrap(),
@@ -73,6 +76,24 @@ async fn soft_signal_monitor_starts_at_initial_and_follows_puts() {
     lifecycle(String::new(), "goodbye".into(), Dtype::String).await;
     lifecycle(true, false, Dtype::Boolean).await;
     lifecycle(Vec::<f64>::new(), vec![1.0, 2.0], Dtype::Array).await;
+}
+
+// ophyd-async SignalW is Movable and SignalRW Locatable, so plans move a
+// signal like a motor (bps.mv / mvr).
+#[tokio::test]
+async fn signals_move_and_locate_through_the_plan_traits() {
+    let wo = soft(0.0_f64, Dtype::Number);
+    let w: SignalW<f64, _> = Signal::new(wo.clone(), cfg("w"));
+    assert!(MovableObj::set_dyn(&w, 2.0).await.success());
+    assert_eq!(wo.current_value(), 2.0);
+
+    let rw: Arc<dyn LocatableObj> = Arc::new(SignalRW::<f64, _>::new(
+        MockSignalBackend::with_value(1.0, Dtype::Number).into(),
+        cfg("rw"),
+    ));
+    assert!(rw.set_dyn(5.0).await.success());
+    let at = rw.locate_dyn().await.unwrap();
+    assert_eq!((at.setpoint, at.readback), (5.0, 5.0));
 }
 
 async fn source_and_initial<A: Readable>(sig: Signal<String, SoftSignalBackend<String>, A>) {
