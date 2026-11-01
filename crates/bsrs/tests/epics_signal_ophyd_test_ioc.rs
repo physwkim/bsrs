@@ -311,6 +311,20 @@ fn pva_string_lifecycle() {
     });
 }
 
+/// A CHAR waveform (NELM 256) read and written as one string longer than a
+/// DBR_STRING's 40 bytes.
+#[test]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+fn ca_long_string_lifecycle() {
+    run(async {
+        let pv = format!("{CAM}TIFF1:FileName");
+        let b = EpicsCaBackend::<String>::new_long_string(&pv);
+        let long = format!("bsrs_{}", "x".repeat(100));
+        let dk = assert_lifecycle(&b, &pv, long).await;
+        assert_eq!(dk.dtype, Dtype::String);
+    });
+}
+
 /// The same CHAR waveform over PVA, as a string.
 #[test]
 #[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]

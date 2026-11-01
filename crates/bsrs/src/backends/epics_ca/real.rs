@@ -385,13 +385,16 @@ fn bool_to_wire(t: DbFieldType, v: bool) -> EpicsValue {
     i64_to_wire(t, if v { 1 } else { 0 })
 }
 
+/// The decoders below read values off the CA wire, where a `DBR_CHAR`
+/// arrives as its unsigned carrier `UChar`/`UCharArray`
+/// (`DbFieldType::wire_carrier`), never as `Char`/`CharArray`.
 fn epics_to_f64(v: &EpicsValue) -> Option<f64> {
     match v {
         EpicsValue::Double(d) => Some(*d),
         EpicsValue::Float(f) => Some(*f as f64),
         EpicsValue::Long(l) => Some(*l as f64),
         EpicsValue::Short(s) => Some(*s as f64),
-        EpicsValue::Char(c) => Some(*c as f64),
+        EpicsValue::UChar(c) => Some(*c as f64),
         EpicsValue::Int64(i) => Some(*i as f64),
         EpicsValue::Enum(e) => Some(*e as f64),
         _ => None,
@@ -399,7 +402,7 @@ fn epics_to_f64(v: &EpicsValue) -> Option<f64> {
 }
 
 /// Decode a numeric waveform `EpicsValue` array into `Vec<f64>`, widening every
-/// element type the way [`epics_to_f64`] does for scalars. `CharArray` /
+/// element type the way [`epics_to_f64`] does for scalars. `UCharArray` /
 /// `EnumArray` / `StringArray` are intentionally excluded: they carry the
 /// long-string and enum-choice meanings owned by the `String` / enum backends,
 /// not numeric waveform data.
@@ -441,7 +444,7 @@ fn epics_to_i64(v: &EpicsValue) -> Option<i64> {
         EpicsValue::Int64(i) => Some(*i),
         EpicsValue::Long(l) => Some(*l as i64),
         EpicsValue::Short(s) => Some(*s as i64),
-        EpicsValue::Char(c) => Some(*c as i64),
+        EpicsValue::UChar(c) => Some(*c as i64),
         EpicsValue::Enum(e) => Some(*e as i64),
         EpicsValue::Float(f) => Some(*f as i64),
         EpicsValue::Double(d) => Some(*d as i64),
@@ -461,12 +464,12 @@ fn epics_to_bool(v: &EpicsValue) -> Option<bool> {
 fn epics_to_string(v: &EpicsValue, kind: CaStringKind) -> Option<String> {
     match (kind, v) {
         (CaStringKind::Short, EpicsValue::String(s)) => Some(s.as_str_lossy().into_owned()),
-        (CaStringKind::Long, EpicsValue::CharArray(bytes)) => {
+        (CaStringKind::Long, EpicsValue::UCharArray(bytes)) => {
             let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
             Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
         }
         (CaStringKind::Long, EpicsValue::String(s)) => Some(s.as_str_lossy().into_owned()),
-        (CaStringKind::Short, EpicsValue::CharArray(bytes)) => {
+        (CaStringKind::Short, EpicsValue::UCharArray(bytes)) => {
             let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
             Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
         }
@@ -1376,7 +1379,7 @@ mod tests {
         );
         // Char/Enum/String arrays carry non-numeric-waveform meanings; excluded.
         assert_eq!(
-            epics_to_vec_f64(&EpicsValue::CharArray(vec![1, 2].into())),
+            epics_to_vec_f64(&EpicsValue::UCharArray(vec![1, 2].into())),
             None
         );
         assert_eq!(
@@ -1418,6 +1421,27 @@ mod tests {
         }
     }
 
+    /// `v` as a CA read hands it back: its DBR_CHAR bytes decoded by the
+    /// carrier the wire gives them.
+    fn off_the_wire(v: &EpicsValue, count: usize) -> EpicsValue {
+        EpicsValue::from_bytes_array(DbFieldType::Char.wire_carrier(), &v.to_bytes(), count)
+            .unwrap()
+    }
+
+    /// A DBR_CHAR read is unsigned: byte 200 is 200, as `dbr_char_t` is.
+    #[test]
+    fn dbr_char_reads_decode() {
+        let byte = off_the_wire(&EpicsValue::Char(200), 1);
+        assert_eq!(epics_to_f64(&byte), Some(200.0));
+        assert_eq!(epics_to_i64(&byte), Some(200));
+        assert_eq!(epics_to_bool(&byte), Some(true));
+        let text = off_the_wire(&EpicsValue::CharArray(b"ab\0".to_vec().into()), 3);
+        assert_eq!(
+            epics_to_string(&text, CaStringKind::Short).as_deref(),
+            Some("ab")
+        );
+    }
+
     #[test]
     fn long_string_round_trips_via_char_array() {
         let path = "/data/scan42/run0001.h5";
@@ -1429,8 +1453,8 @@ mod tests {
             }
             _ => panic!("expected CharArray, got {v:?}"),
         }
-        let back =
-            epics_to_string(&v, CaStringKind::Long).expect("CharArray decodes as Long string");
+        let back = epics_to_string(&off_the_wire(&v, path.len() + 1), CaStringKind::Long)
+            .expect("a DBR_CHAR array decodes as a Long string");
         assert_eq!(back, path);
     }
 
@@ -1448,8 +1472,8 @@ mod tests {
     #[test]
     fn long_string_decode_strips_at_first_nul() {
         let bytes = b"/data/scan\0/tail/ignored".to_vec();
-        let s = epics_to_string(&EpicsValue::CharArray(bytes.into()), CaStringKind::Long)
-            .expect("CharArray");
+        let s = epics_to_string(&EpicsValue::UCharArray(bytes.into()), CaStringKind::Long)
+            .expect("UCharArray");
         assert_eq!(s, "/data/scan");
     }
 
@@ -1505,7 +1529,7 @@ mod tests {
         assert_eq!(epics_to_bool(&EpicsValue::Long(0)), Some(false));
         assert_eq!(epics_to_bool(&EpicsValue::Long(1)), Some(true));
         assert_eq!(epics_to_bool(&EpicsValue::Enum(1)), Some(true));
-        assert_eq!(epics_to_bool(&EpicsValue::Char(0)), Some(false));
+        assert_eq!(epics_to_bool(&EpicsValue::UChar(0)), Some(false));
         assert_eq!(epics_to_bool(&EpicsValue::String("x".into())), None);
     }
 
