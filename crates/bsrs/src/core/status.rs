@@ -16,14 +16,21 @@ pub enum StatusError {
     /// The operation was cancelled before completion.
     #[error("cancelled")]
     Cancelled,
-    /// The operation did not complete in time — ophyd's `StatusTimeoutError`.
-    /// A [`Status::wait`] running out is not this: see [`WaitError::Timeout`].
+    /// The status's own timeout ([`Status::with_timeout`]) ran out — ophyd's
+    /// `StatusTimeoutError`. Only that timer can build a [`TimedOut`], so a
+    /// producer reports its own timeout as `Failed`, as ophyd bans
+    /// `set_exception(StatusTimeoutError)`. A [`Status::wait`] running out is
+    /// not this: see [`WaitError::Timeout`].
     #[error("timed out")]
-    Timeout,
+    Timeout(TimedOut),
     /// The operation completed with an error message.
     #[error("{0}")]
     Failed(String),
 }
+
+/// Carried by [`StatusError::Timeout`]; built only by a status's own timer.
+#[derive(Debug, Clone)]
+pub struct TimedOut(());
 
 /// Why [`Status::wait`] returned without success.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -242,7 +249,7 @@ impl Status {
                     .await
                     .is_err()
                 {
-                    status.inner.finish(Err(StatusError::Timeout));
+                    status.inner.finish(Err(StatusError::Timeout(TimedOut(()))));
                 }
             });
         }
@@ -463,7 +470,14 @@ impl StatusSetter {
         });
     }
 
-    /// Mark the status as failed.
+    /// Mark the status as failed. The status's own timeout is not a failure
+    /// a producer can report:
+    ///
+    /// ```compile_fail
+    /// use bsrs::core::status::{Status, StatusError, TimedOut};
+    /// let (_status, setter) = Status::new();
+    /// setter.fail(StatusError::Timeout(TimedOut(())));
+    /// ```
     pub fn fail(self, err: StatusError) {
         self.inner.finish(Err(err));
     }

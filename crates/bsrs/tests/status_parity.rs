@@ -86,8 +86,8 @@ fn blocking_wait_returns_the_outcome_and_a_wait_timeout_changes_nothing() {
     assert!(status.wait(LONG).is_ok());
     assert!(status.exception().is_none());
 
-    for err in [failed("local"), StatusError::Timeout] {
-        let (status, setter) = Status::new();
+    for (timeout, err) in [(None, failed("local")), (LONG, failed("TimeoutError"))] {
+        let (status, setter) = Status::with_timeout(timeout, Duration::ZERO);
         setter.fail(err.clone());
         assert_eq!(dbg(status.exception()), dbg(Some(&err)));
         assert_eq!(
@@ -100,7 +100,7 @@ fn blocking_wait_returns_the_outcome_and_a_wait_timeout_changes_nothing() {
     let (status, _setter) = Status::with_timeout(Some(10 * MS), Duration::ZERO);
     assert!(matches!(
         status.wait(LONG),
-        Err(WaitError::Status(StatusError::Timeout))
+        Err(WaitError::Status(StatusError::Timeout(_)))
     ));
 }
 
@@ -283,7 +283,7 @@ async fn every_watcher_sees_every_update_up_to_the_outcome() {
     let cases = [
         (vec![1.0, 2.0, 3.0, 4.0, 5.0], Some(6.0), Ok(())),
         (vec![1.0, 2.0, 3.0], None, Err(failed("SetFailedError"))),
-        (vec![1.0], None, Err(StatusError::Timeout)),
+        (vec![1.0], None, Err(failed("TimeoutError"))),
         (vec![], Some(1.5), Ok(())),
     ];
     for (spaced, last, result) in cases {
@@ -411,7 +411,7 @@ impl bsrs::core::msg::NamedObj for TimingOut {
 #[async_trait::async_trait]
 impl bsrs::core::msg::MovableObj for TimingOut {
     async fn set_dyn(&self, _value: f64) -> Status {
-        Status::fail(StatusError::Timeout)
+        Status::with_timeout(Some(Duration::ZERO), Duration::ZERO).0
     }
 }
 
@@ -436,7 +436,7 @@ async fn an_operation_timeout_fails_the_plan_as_a_status_failure() {
         assert!(
             matches!(
                 result.exception,
-                Some(BsrsError::Status(StatusError::Timeout))
+                Some(BsrsError::Status(StatusError::Timeout(_)))
             ),
             "{:?}",
             result.exception
@@ -455,18 +455,18 @@ async fn a_status_not_finished_within_its_timeout_times_out() {
         let (timeout, settle) = (timeout * MS, settle * MS);
         let (status, setter) = Status::with_timeout(Some(timeout), settle);
         let t0 = Instant::now();
-        assert!(matches!(status.clone().await, Err(StatusError::Timeout)));
+        assert!(matches!(status.clone().await, Err(StatusError::Timeout(_))));
         assert_eq!(t0.elapsed(), timeout + settle);
-        assert!(matches!(status.exception(), Some(StatusError::Timeout)));
+        assert!(matches!(status.exception(), Some(StatusError::Timeout(_))));
         setter.success();
         sleep(settle + MS).await;
-        assert!(matches!(status.exception(), Some(StatusError::Timeout)));
+        assert!(matches!(status.exception(), Some(StatusError::Timeout(_))));
     }
 
     let (status, setter) = Status::with_timeout(Some(Duration::ZERO), Duration::ZERO);
     sleep(MS).await;
     setter.fail(failed("LocalException"));
-    assert!(matches!(status.exception(), Some(StatusError::Timeout)));
+    assert!(matches!(status.exception(), Some(StatusError::Timeout(_))));
 
     let (status, setter) = Status::with_timeout(LONG, Duration::ZERO);
     setter.fail(failed("TimeoutError"));
