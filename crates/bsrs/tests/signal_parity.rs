@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use bsrs::backends::mock::{MockBackend, MockSignalBackend};
 use bsrs::backends::soft::SoftSignalBackend;
-use bsrs::core::msg::{LocatableObj, MovableObj};
+use bsrs::core::msg::{LocatableObj, MovableObj, ReadableObj};
 use bsrs::core::{Kind, ReadingValue};
 use bsrs::devices::{
     observe_signals_value, observe_value, wait_for_value, BackendFromPv, Readable, Signal,
@@ -94,6 +94,20 @@ async fn signals_move_and_locate_through_the_plan_traits() {
     assert!(rw.set_dyn(5.0).await.success());
     let at = rw.locate_dyn().await.unwrap();
     assert_eq!((at.setpoint, at.readback), (5.0, 5.0));
+}
+
+// bluesky stages anything with `stage()`, and ophyd-async `SignalR.stage`
+// holds the signal's monitor; a signal handed over as a plain readable
+// (a detector, or a `StandardReadable` child) must still be stageable.
+#[tokio::test]
+async fn a_readable_signal_stages_through_its_readable_handle() {
+    let backend = soft(1.0_f64, Dtype::Number);
+    let sig: Arc<dyn ReadableObj> = Arc::new(SignalR::new(backend.clone(), cfg("x")));
+    let stageable = sig.as_stageable().expect("a readable Signal is stageable");
+    stageable.stage_dyn().await.unwrap();
+    assert_eq!(backend.subscriber_count(), 1, "stage holds the monitor");
+    stageable.unstage_dyn().await.unwrap();
+    assert_eq!(backend.subscriber_count(), 0);
 }
 
 async fn source_and_initial<A: Readable>(sig: Signal<String, SoftSignalBackend<String>, A>) {

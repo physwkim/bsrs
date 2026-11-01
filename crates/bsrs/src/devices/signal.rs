@@ -422,7 +422,7 @@ where
 impl<T, B, A> crate::core::msg::ReadableObj for Signal<T, B, A>
 where
     T: Clone + Send + Sync + Serialize + 'static,
-    B: SignalBackend<T>,
+    B: SignalBackend<T> + 'static,
     A: Readable,
 {
     async fn read_dyn(&self) -> Result<HashMap<String, ReadingValue>> {
@@ -445,6 +445,9 @@ where
             None
         }
     }
+    fn as_stageable(self: Arc<Self>) -> Option<Arc<dyn crate::core::msg::StageableObj>> {
+        Some(self)
+    }
 }
 
 // -- MonitorableObj: `Msg::Monitor(signal.into())` streams the shared monitor --
@@ -453,7 +456,7 @@ where
 impl<T, B, A> crate::core::msg::MonitorableObj for Signal<T, B, A>
 where
     T: Clone + Send + Sync + Serialize + 'static,
-    B: SignalBackend<T>,
+    B: SignalBackend<T> + 'static,
     A: Readable,
 {
     async fn subscribe_dyn(&self) -> Result<Subscription> {
