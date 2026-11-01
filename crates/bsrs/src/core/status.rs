@@ -2,6 +2,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
@@ -189,6 +190,9 @@ impl Inner {
 #[derive(Clone)]
 pub struct Status {
     inner: Arc<Inner>,
+    /// The two statuses an [`and`](Status::and) status combines. Held on the
+    /// handle, not in `Inner`, which the parts' callbacks keep alive.
+    parts: Option<Arc<(Status, Status)>>,
     progress_rx: watch::Receiver<f64>,
     watcher_rx: watch::Receiver<Option<WatcherUpdate>>,
 }
@@ -226,6 +230,7 @@ impl Status {
         });
         let status = Status {
             inner: inner.clone(),
+            parts: None,
             progress_rx: rx,
             watcher_rx: wrx,
         };
@@ -256,6 +261,36 @@ impl Status {
         let (s, setter) = Self::new();
         setter.fail(err);
         s
+    }
+
+    /// ophyd's `self & other` (`AndStatus`): succeeds once both succeed, and
+    /// fails with the first failure without waiting for the other.
+    pub fn and(&self, other: &Status) -> Status {
+        let (mut status, _setter) = Status::new();
+        let pending = Arc::new(AtomicUsize::new(2));
+        for part in [self, other] {
+            let (inner, pending) = (status.inner.clone(), pending.clone());
+            part.add_callback(move |outcome| match outcome {
+                StatusOutcome::Failed(e) => inner.finish(Err(e.clone())),
+                StatusOutcome::Success => {
+                    if pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        inner.finish(Ok(()));
+                    }
+                }
+            });
+        }
+        status.parts = Some(Arc::new((self.clone(), other.clone())));
+        status
+    }
+
+    /// Is `status` one of the statuses this [`and`](Self::and) status
+    /// combines, at any depth? ophyd `AndStatus.__contains__`.
+    pub fn contains(&self, status: &Status) -> bool {
+        self.parts.as_deref().is_some_and(|(left, right)| {
+            [left, right]
+                .into_iter()
+                .any(|p| Arc::ptr_eq(&p.inner, &status.inner) || p.contains(status))
+        })
     }
 
     /// Has the operation completed?

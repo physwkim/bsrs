@@ -498,3 +498,46 @@ async fn success_lands_after_the_settle_time() {
     setter.fail(failed("boom"));
     assert_eq!(dbg(status.exception()), dbg(Some(failed("boom"))));
 }
+
+// ophyd test_and: `a & b` contains its parts at any depth and succeeds once
+// both succeed; a failing part fails it at once, whether the other is still
+// pending or already succeeded.
+#[test]
+fn an_and_status_succeeds_with_both_parts_and_fails_with_either() {
+    let (st1, set1) = Status::new();
+    let (st2, set2) = Status::new();
+    let st3 = st1.and(&st2);
+    let st4 = st1.and(&st3);
+    let st5 = st3.and(&st4);
+    for (whole, part) in [
+        (&st3, &st1),
+        (&st4, &st1),
+        (&st5, &st1),
+        (&st4, &st2),
+        (&st5, &st2),
+    ] {
+        assert!(whole.contains(part));
+    }
+    assert!(!st3.contains(&Status::done()));
+
+    let seen = [&st1, &st2, &st3, &st4, &st5].map(record);
+    let fired = || seen.each_ref().map(|s| s.lock().unwrap().len());
+    set1.success();
+    assert_eq!(fired(), [1, 0, 0, 0, 0]);
+    set2.success();
+    assert_eq!(fired(), [1; 5]);
+    assert!([st3, st4, st5].iter().all(Status::success));
+
+    for fail_first in [true, false] {
+        let (a, set_a) = Status::new();
+        let (b, set_b) = Status::new();
+        let both = a.and(&b);
+        if !fail_first {
+            set_b.success();
+            assert!(!both.done_state());
+        }
+        set_a.fail(failed("boom"));
+        assert_eq!(dbg(both.exception()), dbg(Some(failed("boom"))));
+    }
+    assert!(Status::done().and(&Status::done()).success());
+}
