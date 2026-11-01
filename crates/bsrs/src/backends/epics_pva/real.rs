@@ -7,7 +7,7 @@ use crate::event_model::{make_datakey, DataKey, Dtype, Limits, LimitsRange, Sign
 use crate::protocols_async::{PutCompletion, ReadingValueCallback, SignalBackend};
 use async_trait::async_trait;
 use epics_pva_rs::client::PvaClient;
-use epics_pva_rs::client_native::ops_v2::PutLeaf;
+use epics_pva_rs::client_native::ops_v2::{effective_typed_put_path, PutLeaf};
 use epics_pva_rs::pv_request::{PvRequestBuilder, PvRequestExpr};
 use epics_pva_rs::pvdata::{FieldDesc, ScalarType, TypedScalarArray};
 use epics_pva_rs::{PvField, PvaError, ScalarValue};
@@ -132,39 +132,31 @@ async fn put_block(client: &PvaClient, pv: &str, f: PvField) -> Result<PutComple
     let present = op.take_present().map(|(v, _)| v);
     let (path, leaf) = put_leaf(op.introspection(), present.as_ref(), f);
     let sent = op
-        .send_fields_typed(&[(path.to_string(), PutLeaf::Typed(leaf))])
+        .send_fields_typed(&[(path, PutLeaf::Typed(leaf))])
         .await
         .map_err(put_err)?;
     Ok(async move { sent.wait().await.map_err(put_err) }.boxed())
 }
 
-/// Where a put of `f` lands in a PV of shape `intro`, as p4p assigns into
-/// the remote type (`pvxs_value.cpp:319-352`): into an `enum_t` value its
-/// `index`, a string by its place in the readback's `choices` and else as
-/// an index the leaf's own coercion parses; otherwise `value`, or the root
-/// of a PV that is no structure.
-fn put_leaf(intro: &FieldDesc, present: Option<&PvField>, f: PvField) -> (&'static str, PvField) {
-    let FieldDesc::Structure { fields, .. } = intro else {
-        return ("", f);
-    };
-    match fields.iter().find(|(n, _)| n == "value").map(|(_, d)| d) {
-        Some(FieldDesc::Structure { struct_id, .. }) if struct_id == "enum_t" => {
-            let choice = match (&f, present) {
-                (PvField::Scalar(ScalarValue::String(s)), Some(PvField::Structure(p))) => {
-                    sub_fields(&p.fields, "value")
-                        .and_then(|v| field(v, "choices"))
-                        .and_then(pv_string_array)
-                        .and_then(|c| c.iter().position(|c| *c == s.as_str_lossy()))
-                }
-                _ => None,
-            };
-            match choice {
-                Some(i) => ("value.index", PvField::Scalar(ScalarValue::Int(i as i32))),
-                None => ("value.index", f),
-            }
+/// Where a put of `f` lands in a PV of shape `intro`, and what it writes
+/// there, as p4p assigns into the remote type (`pvxs_value.cpp:319-352`).
+/// The path is pvxs `linkBuildPut`'s, which ends at an `enum_t`'s `index`;
+/// a string naming one of the readback's `choices` writes its place, and
+/// anything else is left to the leaf's own coercion.
+fn put_leaf(intro: &FieldDesc, present: Option<&PvField>, f: PvField) -> (String, PvField) {
+    let path = effective_typed_put_path(intro, "");
+    let choice = match (&f, present) {
+        (PvField::Scalar(ScalarValue::String(s)), Some(PvField::Structure(p))) => {
+            sub_fields(&p.fields, "value")
+                .and_then(|v| field(v, "choices"))
+                .and_then(pv_string_array)
+                .and_then(|c| c.iter().position(|c| *c == s.as_str_lossy()))
         }
-        Some(_) => ("value", f),
-        None => ("", f),
+        _ => None,
+    };
+    match choice {
+        Some(i) => (path, PvField::Scalar(ScalarValue::Int(i as i32))),
+        None => (path, f),
     }
 }
 
@@ -1072,6 +1064,10 @@ mod tests {
         PvField::Scalar(ScalarValue::String(s.into()))
     }
 
+    fn at(path: &str, f: PvField) -> (String, PvField) {
+        (path.to_string(), f)
+    }
+
     /// A put into an `enum_t` sets its index: a label by its place in the
     /// readback's choices, anything else as the value the index coerces.
     #[test]
@@ -1080,14 +1076,14 @@ mod tests {
         let to = |f| put_leaf(&nt(enum_t()), Some(&present), f);
         assert_eq!(
             to(string("Continuous")),
-            ("value.index", PvField::Scalar(ScalarValue::Int(2)))
+            at("value.index", PvField::Scalar(ScalarValue::Int(2)))
         );
-        assert_eq!(to(string("1")), ("value.index", string("1")));
+        assert_eq!(to(string("1")), at("value.index", string("1")));
         let on = PvField::Scalar(ScalarValue::Boolean(true));
-        assert_eq!(to(on.clone()), ("value.index", on));
+        assert_eq!(to(on.clone()), at("value.index", on));
         assert_eq!(
             put_leaf(&nt(enum_t()), None, string("Multiple")),
-            ("value.index", string("Multiple"))
+            at("value.index", string("Multiple"))
         );
     }
 
@@ -1095,9 +1091,9 @@ mod tests {
     fn put_leaf_assigns_value_or_a_bare_root() {
         let x = PvField::Scalar(ScalarValue::Double(1.5));
         let scalar = nt(FieldDesc::Scalar(ScalarType::Double));
-        assert_eq!(put_leaf(&scalar, None, x.clone()), ("value", x.clone()));
+        assert_eq!(put_leaf(&scalar, None, x.clone()), at("value", x.clone()));
         let bare = FieldDesc::Scalar(ScalarType::Double);
-        assert_eq!(put_leaf(&bare, None, x.clone()), ("", x));
+        assert_eq!(put_leaf(&bare, None, x.clone()), at("", x));
     }
 
     #[test]
