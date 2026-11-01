@@ -32,10 +32,9 @@ where
     name: String,
     control: C,
     writer: W,
-    // ophyd-async `_prepare_ctx`: the TriggerInfo of the last prepare since
-    // stage; `None` after stage. kickoff() reads it to configure the hardware
-    // and compute the absolute target index; a bare kickoff() without one
-    // acquires `TriggerInfo::default()` (one internally triggered frame).
+    // ophyd-async `_prepare_ctx`: the TriggerInfo the hardware was last
+    // prepared with since stage; `None` after stage. Only `prepare_for`
+    // writes it, after `DetectorControl::prepare` succeeded.
     prepared: std::sync::Mutex<Option<TriggerInfo>>,
     // Absolute writer index that complete() waits for. Set in kickoff()
     // from the current writer baseline + number_of_collections().
@@ -88,6 +87,39 @@ where
                 self.name
             ))
         })
+    }
+
+    /// ophyd-async `StandardDetector.prepare`: set the hardware up for `info`,
+    /// then record it as this scan's prepare.
+    async fn prepare_for(&self, info: TriggerInfo) -> Result<TriggerInfo> {
+        self.control.prepare(info.clone()).await?;
+        *self.prepared.lock().unwrap() = Some(info.clone());
+        Ok(info)
+    }
+
+    /// The prepare since stage, or an implicit `TriggerInfo::default()` one
+    /// (ophyd-async `trigger`; `kickoff` raises there instead).
+    async fn prepared_or_default(&self) -> Result<TriggerInfo> {
+        let prepared = self.prepared.lock().unwrap().clone();
+        match prepared {
+            Some(info) => Ok(info),
+            None => self.prepare_for(TriggerInfo::default()).await,
+        }
+    }
+
+    /// ophyd-async `StandardDetector.trigger`: one event of the prepare since
+    /// stage, or of an implicit `TriggerInfo()` one.
+    async fn trigger_one(&self) -> Result<()> {
+        let info = self.prepared_or_default().await?;
+        if info.number_of_events != 1 {
+            return Err(BsrsError::Plan(format!(
+                "{}: trigger() is not supported for multiple events, the detector \
+                 was prepared with number_of_events={}.",
+                self.name, info.number_of_events
+            )));
+        }
+        self.control.arm().await.await?;
+        self.control.wait_for_idle().await
     }
 
     /// Drain the writer's buffered `StreamResource`/`StreamDatum` for frames up
@@ -162,16 +194,11 @@ where
         &self.name
     }
     async fn trigger(&self) -> Status {
-        // For step scans: arm → wait_for_idle, then return done.
-        let arm = self.control.arm().await;
-        match arm.await {
-            Ok(()) => match self.control.wait_for_idle().await {
-                Ok(()) => Status::done(),
-                Err(e) => Status::fail(crate::core::status::StatusError::Failed(format!(
-                    "wait_for_idle: {e}"
-                ))),
-            },
-            Err(e) => Status::fail(e),
+        match self.trigger_one().await {
+            Ok(()) => Status::done(),
+            Err(e) => Status::fail(crate::core::status::StatusError::Failed(format!(
+                "trigger: {e}"
+            ))),
         }
     }
 }
@@ -186,12 +213,15 @@ where
         &self.name
     }
     async fn kickoff(&self) -> Status {
-        let info = self.prepared.lock().unwrap().clone().unwrap_or_default();
-        if let Err(e) = self.control.prepare(info.clone()).await {
-            return Status::fail(crate::core::status::StatusError::Failed(format!(
-                "prepare: {e}"
-            )));
-        }
+        // The hardware was set up by prepare, as in ophyd-async.
+        let info = match self.prepared_or_default().await {
+            Ok(info) => info,
+            Err(e) => {
+                return Status::fail(crate::core::status::StatusError::Failed(format!(
+                    "prepare: {e}"
+                )))
+            }
+        };
         // Capture the write baseline so complete() waits for exactly
         // number_of_collections NEW frames, not an absolute total.
         let baseline = self.writer.indices_written().await;
@@ -222,13 +252,8 @@ where
     }
 }
 
-/// Store `TriggerInfo` so the next `kickoff()` configures the hardware and
-/// waits for the correct number of frames. Mirrors Python
-/// `StandardDetector.prepare(trigger_info)` which stores `_prepare_ctx`.
-///
-/// Hardware setup (`DetectorControl::prepare`) is deferred to `kickoff()` so
-/// the trigger-info can be updated multiple times before arming without
-/// issuing redundant hardware transactions.
+/// Set the hardware up for `TriggerInfo` and keep it for the scan's
+/// `trigger`/`kickoff`, as ophyd-async `StandardDetector.prepare` does.
 #[async_trait]
 impl<C, W> Preparable<TriggerInfo> for StandardDetector<C, W>
 where
@@ -239,8 +264,12 @@ where
         &self.name
     }
     async fn prepare(&self, info: TriggerInfo) -> crate::core::status::Status {
-        *self.prepared.lock().unwrap() = Some(info);
-        crate::core::status::Status::done()
+        match self.prepare_for(info).await {
+            Ok(_) => Status::done(),
+            Err(e) => Status::fail(crate::core::status::StatusError::Failed(format!(
+                "prepare: {e}"
+            ))),
+        }
     }
 }
 

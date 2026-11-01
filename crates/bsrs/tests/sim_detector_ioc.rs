@@ -17,7 +17,7 @@ use bsrs::devices::TriggerInfo;
 use bsrs::event_model::{DataKey, Dtype, DtypeNumpy, StreamDatum, StreamResource};
 use bsrs::host::areadetector::{
     area_detector_hdf, connect_area_detector_hdf, num_rois, AreaDetectorCam, AreaDetectorHdf,
-    NdFile, NdRoi, NdStats, StaticPathProvider, AD_IMAGE_MODE_MULTIPLE,
+    NdFile, NdRoi, NdStats, StaticPathProvider, AD_IMAGE_MODE_CONTINUOUS, AD_IMAGE_MODE_MULTIPLE,
 };
 use bsrs::prelude::*;
 use bsrs::protocols_async::{
@@ -439,6 +439,76 @@ async fn kickoff_resolves_once_the_detector_is_acquiring() {
     );
     assert!(acquiring, "the 1 s acquisition ended within 500 ms");
     completed.unwrap();
+}
+
+/// ophyd-async `_detector.py:616` `trigger` prepares `TriggerInfo()` when
+/// nothing was prepared since stage, so a trigger takes exactly one frame
+/// whatever image mode the cam was left in.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+async fn trigger_takes_one_frame_after_a_continuous_acquisition() {
+    boot();
+    let _cam = CAM_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let det = hdf_det("det", dir.path(), "cont").await;
+    Stageable::stage(&det).await.expect("stage");
+    put::<i64>(&format!("{CAM}ImageMode"), AD_IMAGE_MODE_CONTINUOUS).await;
+    let triggered = timeout(Duration::from_secs(5), trigger(&det)).await;
+    DetectorControl::disarm(det.control())
+        .await
+        .expect("disarm");
+    let n = index(&det).await;
+    Stageable::unstage(&det).await.expect("unstage");
+    assert!(
+        matches!(triggered, Ok(Ok(()))),
+        "trigger left in Continuous: {triggered:?}"
+    );
+    assert_eq!(n, 1);
+}
+
+/// As above with the cam left at Multiple/3 by an earlier fly scan.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+async fn trigger_takes_one_frame_after_a_multi_image_acquisition() {
+    boot();
+    let _cam = CAM_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let det = hdf_det("det", dir.path(), "multi").await;
+    Stageable::stage(&det).await.expect("stage");
+    put::<i64>(&format!("{CAM}ImageMode"), AD_IMAGE_MODE_MULTIPLE).await;
+    put::<i64>(&format!("{CAM}NumImages"), 3).await;
+    let triggered = trigger(&det).await;
+    let n = index(&det).await;
+    Stageable::unstage(&det).await.expect("unstage");
+    triggered.unwrap();
+    assert_eq!(n, 1);
+}
+
+/// ophyd-async `test_standard_detector.py:426`
+/// `test_trigger_after_multi_event_prepare_raises`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+async fn trigger_after_a_multi_event_prepare_fails() {
+    boot();
+    let _cam = CAM_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let det = hdf_det("det", dir.path(), "multiprep").await;
+    Stageable::stage(&det).await.expect("stage");
+    let info = TriggerInfo {
+        number_of_events: 5,
+        ..TriggerInfo::default()
+    };
+    finish(Preparable::prepare(&det, info).await, "prepare")
+        .await
+        .unwrap();
+    let triggered = trigger(&det).await;
+    Stageable::unstage(&det).await.expect("unstage");
+    let err = triggered.expect_err("trigger after prepare(number_of_events=5) succeeded");
+    assert!(
+        err.contains("trigger() is not supported for multiple events")
+            && err.contains("number_of_events=5."),
+        "{err}"
+    );
 }
 
 /// ophyd-async `test_standard_detector.py:574` `test_stage_resets_state`: a
