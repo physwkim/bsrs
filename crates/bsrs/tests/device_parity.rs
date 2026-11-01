@@ -206,6 +206,40 @@ async fn standard_readable_uncached_formats_route_to_read() {
     assert_eq!(ReadableObj::hint_fields(&sr), Some(vec!["hu".to_string()]));
 }
 
+fn err_text<T>(r: Result<T>) -> String {
+    match r {
+        Ok(_) => panic!("expected an error"),
+        Err(e) => e.to_string(),
+    }
+}
+
+// ophyd-async test_utils merge_gathered_dicts duplicate / blank-key tests,
+// test_readable::test_duplicate_readable_raises_exception.
+#[tokio::test]
+async fn standard_readable_rejects_duplicate_reading_keys() {
+    let mut sr = StandardReadable::new("sr");
+    for name in ["a", "a", "b", "c", "c"] {
+        sr.add_readables(sig(name, Kind::Normal), StandardReadableFormat::Child);
+    }
+    for name in ["x", "x"] {
+        sr.add_readables(
+            sig(name, Kind::Config),
+            StandardReadableFormat::ConfigSignal,
+        );
+    }
+    let dup = "Duplicate keys found while merging dictionaries: a, c";
+    assert!(err_text(sr.read().await).contains(dup));
+    assert!(err_text(sr.describe().await).contains(dup));
+    let dup_x = "Duplicate keys found while merging dictionaries: x";
+    assert!(err_text(sr.read_configuration().await).contains(dup_x));
+    assert!(err_text(sr.describe_configuration().await).contains(dup_x));
+
+    let mut unnamed = StandardReadable::new("");
+    unnamed.add_readables(sig("", Kind::Normal), StandardReadableFormat::Child);
+    unnamed.add_readables(sig("", Kind::Normal), StandardReadableFormat::Child);
+    assert!(err_text(unnamed.read().await).contains("Have you remembered to name the Device?"));
+}
+
 // ophyd-async test_readable add_readables_adds_to_expected_attrs (stage
 // buckets); ophyd test_device::test_device_state (stage, configure({}),
 // unstage on a device with no staged children).

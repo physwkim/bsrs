@@ -8,10 +8,12 @@
 //! holds the accumulators and implements those traits (plus the engine-facing
 //! `ReadableObj` / `ConfigurableObj` / `StageableObj` bridges) by delegation.
 
-use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
 use std::sync::Arc;
 
-use crate::core::error::Result;
+use crate::core::error::{BsrsError, Result};
 use crate::core::msg::{ConfigurableObj, NamedObj, ReadableObj, StageableObj};
 use crate::core::reading::ReadingValue;
 use crate::core::ConfigureArgs;
@@ -144,24 +146,47 @@ impl StandardReadable {
 
 // -- aggregating async protocol impls ---------------------------------------
 
+/// Merge per-child maps like ophyd-async `merge_gathered_dicts`: a key
+/// produced by two children is an error, never a silent overwrite.
+async fn merge_unique_keys<V, F>(parts: Vec<F>) -> Result<HashMap<String, V>>
+where
+    F: Future<Output = Result<HashMap<String, V>>>,
+{
+    let mut out = HashMap::new();
+    let mut duplicates = BTreeSet::new();
+    for part in parts {
+        for (key, value) in part.await? {
+            match out.entry(key) {
+                Entry::Occupied(e) => {
+                    duplicates.insert(e.key().clone());
+                }
+                Entry::Vacant(e) => {
+                    e.insert(value);
+                }
+            }
+        }
+    }
+    if duplicates.is_empty() {
+        return Ok(out);
+    }
+    let keys = duplicates.into_iter().collect::<Vec<_>>().join(", ");
+    Err(BsrsError::Other(if keys.is_empty() {
+        "Have you remembered to name the Device?".to_string()
+    } else {
+        format!("Duplicate keys found while merging dictionaries: {keys}")
+    }))
+}
+
 #[async_trait]
 impl AsyncReadable for StandardReadable {
     fn name(&self) -> &str {
         &self.name
     }
     async fn read(&self) -> Result<HashMap<String, ReadingValue>> {
-        let mut out = HashMap::new();
-        for child in &self.read {
-            out.extend(child.read_dyn().await?);
-        }
-        Ok(out)
+        merge_unique_keys(self.read.iter().map(|c| c.read_dyn()).collect()).await
     }
     async fn describe(&self) -> Result<HashMap<String, DataKey>> {
-        let mut out = HashMap::new();
-        for child in &self.read {
-            out.extend(child.describe_dyn().await?);
-        }
-        Ok(out)
+        merge_unique_keys(self.read.iter().map(|c| c.describe_dyn()).collect()).await
     }
 }
 
@@ -171,18 +196,10 @@ impl AsyncConfigurable for StandardReadable {
         &self.name
     }
     async fn read_configuration(&self) -> Result<HashMap<String, ReadingValue>> {
-        let mut out = HashMap::new();
-        for source in &self.config {
-            out.extend(source.read().await?);
-        }
-        Ok(out)
+        merge_unique_keys(self.config.iter().map(|s| s.read()).collect()).await
     }
     async fn describe_configuration(&self) -> Result<HashMap<String, DataKey>> {
-        let mut out = HashMap::new();
-        for source in &self.config {
-            out.extend(source.describe().await?);
-        }
-        Ok(out)
+        merge_unique_keys(self.config.iter().map(|s| s.describe()).collect()).await
     }
     async fn configure(&self, _args: ConfigureArgs) -> Result<()> {
         // ophyd-async `StandardReadable` is Configurable only for
