@@ -381,6 +381,35 @@ fn pva_enum_lifecycle() {
     });
 }
 
+/// A bo read as a bool: its index, with no metadata, as ophyd-async's
+/// enum-bool converters read and describe it.
+async fn assert_bool_lifecycle(b: &impl SignalBackend<bool>, pv: &str) {
+    let dk = assert_lifecycle(b, pv, true).await;
+    assert_eq!(dk.dtype, Dtype::Boolean);
+    assert_eq!(dk.dtype_numpy, numpy("|b1"));
+    assert!(dk.shape.is_empty());
+    assert_eq!((dk.units, dk.precision, dk.limits), (None, None, None));
+    assert_eq!(dk.choices, None);
+}
+
+#[test]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+fn ca_bool_lifecycle() {
+    run(async {
+        let pv = format!("{CAM}cam1:ReverseX");
+        assert_bool_lifecycle(&EpicsCaBackend::<bool>::new(&pv), &pv).await;
+    });
+}
+
+#[test]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+fn pva_bool_lifecycle() {
+    run(async {
+        let pv = "ADSIM:cam1:ReverseX";
+        assert_bool_lifecycle(&EpicsPvaBackend::<bool>::new(pv), pv).await;
+    });
+}
+
 /// A bool read off a longout keeps the integer's units, as ophyd-async's
 /// metadata follows the PV's value type.
 #[test]

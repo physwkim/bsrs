@@ -213,9 +213,17 @@ fn pv_field_to_i64(p: &PvField) -> Option<i64> {
     }
 }
 
+// An `enum_t` value reads as its index, as ophyd-async's
+// `PvaEnumBoolConverter` (`bool(value["value"]["index"])`, _p4p.py:183-188).
 fn pv_field_to_bool(p: &PvField) -> Option<bool> {
     match p {
         PvField::Scalar(ScalarValue::Boolean(b)) => Some(*b),
+        PvField::Structure(s) => match field(&s.fields, "value")? {
+            PvField::Structure(e) => field(&e.fields, "index")
+                .and_then(pv_field_to_i64)
+                .map(|i| i != 0),
+            v => pv_field_to_bool(v),
+        },
         _ => pv_field_to_i64(p).map(|i| i != 0),
     }
 }
@@ -1321,6 +1329,19 @@ mod tests {
         let meta = pv_field_to_metadata(&ntscalar_with_meta(), Datatype::Int);
         assert_eq!(meta.units.as_deref(), Some("mm"));
         assert_eq!(meta.precision, None);
+    }
+
+    #[test]
+    fn bool_reads_an_enum_index_and_a_scalar() {
+        assert_eq!(
+            pv_field_to_bool(&ntenum(1, &["No", "Yes"], true)),
+            Some(true)
+        );
+        assert_eq!(
+            pv_field_to_bool(&ntenum(0, &["No", "Yes"], false)),
+            Some(false)
+        );
+        assert_eq!(pv_field_to_bool(&ntscalar_with_ts(2.0, 0, 0)), Some(true));
     }
 
     /// Read as str, an enum reports its choices and nothing numeric.

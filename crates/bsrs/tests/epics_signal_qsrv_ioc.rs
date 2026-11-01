@@ -272,14 +272,24 @@ fn ca_reads_a_bi_as_its_label_and_as_a_bool() {
 
 #[test]
 #[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
-fn pva_reads_a_bi_as_its_label() {
+fn pva_reads_a_bi_as_its_label_and_as_a_bool() {
     run(async {
-        let b = EpicsPvaBackend::<String>::new("DEMO:BI");
-        b.connect(CONNECT).await.unwrap();
-        let v = b.get_value().await.unwrap();
-        assert!(v == "Off" || v == "On", "{v}");
-        let r = b.get_reading().await.unwrap();
+        let label = EpicsPvaBackend::<String>::new("DEMO:BI");
+        let flag = EpicsPvaBackend::<bool>::new("DEMO:BI");
+        label.connect(CONNECT).await.unwrap();
+        flag.connect(CONNECT).await.unwrap();
+        let r = label.get_reading().await.unwrap();
         assert_eq!(r.alarm_severity, Some(0));
         assert!((now() - r.timestamp).abs() < 30.0, "{}", r.timestamp);
+
+        for _ in 0..3 {
+            let first = flag.get_value().await.unwrap();
+            let text = label.get_value().await.unwrap();
+            if flag.get_value().await.unwrap() == first {
+                assert_eq!(text, if first { "On" } else { "Off" });
+                return;
+            }
+        }
+        panic!("DEMO:BI toggled under every read");
     });
 }
