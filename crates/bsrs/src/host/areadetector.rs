@@ -2875,9 +2875,10 @@ mod tests {
     //   cd ~/codes/epics-rs/examples/sim-detector
     //   cargo run --bin sim_ioc --features ioc -- ioc/st.cmd
     //
-    // Then in another shell:
-    //   cargo test -p bsrs --features host \
-    //       areadetector::tests:: -- --ignored --nocapture
+    // Then in another shell (the `live-ad-ioc` nextest group runs them one
+    // at a time, as they share the cam):
+    //   cargo nextest run -p bsrs --features host --run-ignored only \
+    //       -E 'kind(lib) & test(/^host::/)'
     //
     // Retarget with env overrides (defaults are sim-detector `SIM1:` /
     // `SIM1`); for the mini-beamline:
