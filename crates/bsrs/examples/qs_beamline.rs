@@ -5,7 +5,7 @@
 //! Run with:
 //!
 //! ```bash
-//! cargo run --example qs_beamline
+//! cargo run -p bsrs --features qs --example qs_beamline
 //! ```
 //!
 //! Then in another shell, drive it with the queueserver `qserver` CLI

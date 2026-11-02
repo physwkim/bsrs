@@ -2860,7 +2860,7 @@ mod tests {
     //
     // Setup (sim-detector):
     //   cd ~/codes/epics-rs/examples/sim-detector
-    //   cargo run --bin sim_ioc --features ioc -- ioc/st.cmd
+    //   cargo run --bin sim-ioc --features ioc -- ioc/st.cmd
     //
     // Then in another shell (the `live-ad-ioc` nextest group runs them one
     // at a time, as they share the cam):

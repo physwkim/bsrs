@@ -4214,8 +4214,8 @@ mod ad_lua_smoke {
     //! Live-IOC smoke for the `ad_*` Lua factories. Marked
     //! `#[ignore]`. Requires `epics-rs/examples/sim-detector` running.
     //!
-    //!     cargo test -p bsrs-host --features ca \
-    //!         lua_env::ad_lua_smoke -- --ignored --nocapture
+    //!     cargo nextest run -p bsrs --features host --run-ignored only \
+    //!         -E 'test(/lua_env::ad_lua_smoke::/)'
     //!
     //! Note: this is `#[test]` (not `#[tokio::test]`). The Lua
     //! factories call `bsrs_runtime().block_on(...)` synchronously
