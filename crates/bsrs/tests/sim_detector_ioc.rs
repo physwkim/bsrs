@@ -183,7 +183,7 @@ async fn drain(det: &dyn WritesStreamAssets) -> (Vec<StreamResource>, Vec<Stream
     let up_to = index(det).await;
     let mut resources = Vec::new();
     let mut datums = Vec::new();
-    let mut docs = det.collect_asset_docs(up_to, "");
+    let mut docs = det.collect_asset_docs(up_to, "").expect("collect");
     while let Some(doc) = docs.next().await {
         match doc {
             StreamAsset::Resource(r) => resources.push(r),
@@ -1013,7 +1013,9 @@ async fn writers_fed_from_rois_describe_the_roi_frames() {
     let hints = ReadableObj::hint_fields(&det);
     let mut docs = Vec::new();
     if triggered.is_ok() {
-        let mut stream = det.collect_asset_docs(index(&det).await, "");
+        let mut stream = det
+            .collect_asset_docs(index(&det).await, "")
+            .expect("collect");
         while let Some(doc) = stream.next().await {
             docs.push(doc);
         }

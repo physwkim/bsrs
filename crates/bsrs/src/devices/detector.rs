@@ -422,7 +422,7 @@ where
         descriptor: &str,
     ) -> Result<Vec<crate::event_model::Document>> {
         let up_to = WritesStreamAssets::get_index(self).await?;
-        let docs = WritesStreamAssets::collect_asset_docs(self, up_to, descriptor)
+        let docs = WritesStreamAssets::collect_asset_docs(self, up_to, descriptor)?
             .map(|asset| match asset {
                 StreamAsset::Resource(r) => crate::event_model::Document::StreamResource(r),
                 StreamAsset::Datum(d) => crate::event_model::Document::StreamDatum(d),
@@ -554,11 +554,18 @@ where
         let per_event = u64::from(ctx.trigger_info.collections_per_event.max(1));
         Ok(self.min_collections_written().await / per_event)
     }
-    fn collect_asset_docs(&self, up_to: u64, descriptor: &str) -> BoxStream<'_, StreamAsset> {
+    /// ophyd-async `collect_asset_docs`. A writer keeps what it last opened
+    /// across stage; only a prepare since then makes that this scan's.
+    fn collect_asset_docs(
+        &self,
+        up_to: u64,
+        descriptor: &str,
+    ) -> Result<BoxStream<'_, StreamAsset>> {
+        self.prepare_ctx("Prepare not called")?;
         let descriptor = descriptor.to_string();
-        futures::stream::iter(self.writers())
+        Ok(futures::stream::iter(self.writers())
             .flat_map(move |w| w.collect_stream_docs(up_to, &descriptor))
-            .boxed()
+            .boxed())
     }
 }
 
@@ -1496,6 +1503,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_asset_docs_needs_a_prepare_since_stage() {
+        // ophyd-async `collect_asset_docs`: "Prepare not called". The writer
+        // still holds the last scan's open, which must not be re-emitted.
+        let (w1, _tx1) = streamable("-roi1");
+        let (det, _) = with_logics("det", vec![w1]);
+        let unprepared = |det: &StandardDetector<RecordingControl>| {
+            let err = det.collect_asset_docs(1, "d").err().expect("unprepared");
+            assert!(err.to_string().contains("det: Prepare not called"), "{err}");
+        };
+        unprepared(&det);
+        Stageable::stage(&det).await.unwrap();
+        prepare_events(&det, 1).await;
+        assert_eq!(det.collect_asset_docs(1, "d").unwrap().count().await, 1);
+        Stageable::unstage(&det).await.unwrap();
+        Stageable::stage(&det).await.unwrap();
+        unprepared(&det);
+    }
+
+    #[tokio::test]
     async fn trigger_waits_for_every_writer_and_assets_chain_in_order() {
         // ophyd-async `_wait_for_index` waits on the least index;
         // `collect_asset_docs` yields each writer's documents in turn.
@@ -1522,6 +1548,7 @@ mod tests {
         assert_eq!(idles.load(Ordering::SeqCst), 1);
         let keys: Vec<_> = det
             .collect_asset_docs(1, "d")
+            .unwrap()
             .map(|asset| match asset {
                 StreamAsset::Resource(r) => r.data_key,
                 StreamAsset::Datum(d) => d.stream_resource,

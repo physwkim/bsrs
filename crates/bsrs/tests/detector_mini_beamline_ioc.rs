@@ -283,7 +283,7 @@ async fn moving_dot_frames_are_described_from_the_driver_readbacks() {
 
     let up_to = det.get_index().await.expect("index");
     assert_eq!(up_to, 1);
-    let mut docs = det.collect_asset_docs(up_to, "");
+    let mut docs = det.collect_asset_docs(up_to, "").expect("collect");
     let mut resources = Vec::new();
     let mut datums = Vec::new();
     while let Some(doc) = docs.next().await {

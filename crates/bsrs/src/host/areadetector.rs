@@ -3727,20 +3727,22 @@ mod ad_hdf_tests {
 
     #[tokio::test]
     async fn composite_writes_stream_assets_drains_ad_writer() {
-        // The composite StandardDetector<AreaDetectorCam> builds, and its
-        // WritesStreamAssets seam — the exact one the engine's step/fly save
-        // path drains — yields the AD writer's resource + datum.
+        // The WritesStreamAssets seam — the exact one the engine's step/fly
+        // save path drains — yields the AD writer's resource + datum. The
+        // cam needs an IOC to prepare; area_detector_hdf_live drives it.
         let io = FakeAdFileIo::new("/data/scan.h5");
         let writer: Arc<dyn DetectorWriter> = Arc::new(writer_with(io.clone()));
-        let cam = AreaDetectorCam::new("13SIM1:cam1:");
         let det = StandardDetector::with_data_logics(
             "det",
-            cam,
-            vec![crate::devices::DataLogic::Unbounded(writer.clone())],
+            crate::backends::soft::SoftDetectorControl::new(Duration::ZERO),
+            vec![crate::devices::DataLogic::Unbounded(writer)],
         );
-        writer.open("det", 1).await.unwrap();
+        Preparable::<TriggerInfo>::prepare(&det, TriggerInfo::default())
+            .await
+            .await
+            .unwrap();
         io.set_captured(2);
-        let docs: Vec<StreamAsset> = det.collect_asset_docs(2, "descZ").collect().await;
+        let docs: Vec<StreamAsset> = det.collect_asset_docs(2, "descZ").unwrap().collect().await;
         assert_eq!(docs.len(), 2);
         assert!(matches!(docs[0], StreamAsset::Resource(_)));
         match &docs[1] {
@@ -3788,7 +3790,11 @@ mod ad_hdf_tests {
         Triggerable::trigger(&det).await.await.expect("trigger");
         let up_to = WritesStreamAssets::get_index(&det).await.expect("index");
         assert!(up_to >= 1, "expected >=1 frame written, got {up_to}");
-        let docs: Vec<StreamAsset> = det.collect_asset_docs(up_to, "live-desc").collect().await;
+        let docs: Vec<StreamAsset> = det
+            .collect_asset_docs(up_to, "live-desc")
+            .expect("collect")
+            .collect()
+            .await;
         let resource = docs
             .iter()
             .find_map(|a| match a {

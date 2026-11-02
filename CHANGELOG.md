@@ -156,6 +156,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `SoftDetectorWriter::new` no longer take a name; a writer collects no
   documents before `open` and leaves the key's `object_name` to the run
   engine.
+- **Breaking**: `WritesStreamAssets::collect_asset_docs` returns `Result`,
+  and `StandardDetector` fails it without a prepare since stage ("Prepare
+  not called"), as ophyd-async does, instead of re-emitting the documents
+  of the previous scan's prepare.
 - `AreaDetectorCam::arm` resolves once the cam is acquiring, and its
   configuration is described from `AcquireTime_RBV`/`AcquirePeriod_RBV`.
 - `CaMotor`, `PvaMotor` and `CaPositioner` press `.STOP` in `stop_dyn`,

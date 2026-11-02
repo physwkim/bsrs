@@ -230,8 +230,13 @@ pub trait WritesStreamAssets: Send + Sync {
     /// Yield asset documents up to `up_to`, stamping each `StreamDatum` with
     /// `descriptor` (the EventDescriptor UID linking the stream data to its
     /// schema; empty when the caller has no descriptor context, e.g. a raw
-    /// streaming tool with no open run).
-    fn collect_asset_docs(&self, up_to: u64, descriptor: &str) -> BoxStream<'_, StreamAsset>;
+    /// streaming tool with no open run). Fails unless prepared since the
+    /// last stage.
+    fn collect_asset_docs(
+        &self,
+        up_to: u64,
+        descriptor: &str,
+    ) -> Result<BoxStream<'_, StreamAsset>>;
 }
 
 /// Sealed: detector control half (`prepare`/`arm`/`wait_for_idle`/`disarm`).
