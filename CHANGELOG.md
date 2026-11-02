@@ -33,6 +33,81 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stream of optimization runs to a shared, editable sink list) and
   `OptimizationLogger` (plain-text progress tables and running statistics),
   ports of blop's `callbacks` package as `DocumentSink`s.
+- Tests ported from ophyd and ophyd-async for signals, devices, `Status`,
+  motors, the EPICS backends and detectors. Those that need a live IOC boot
+  one of the epics-rs example IOCs (ophyd-test-ioc, mini-beamline,
+  sim-detector, qsrv-ioc) and are `#[ignore]`d; run them with
+  `BSRS_EPICS_RS=<epics-rs checkout> cargo nextest run -p bsrs --run-ignored
+  only` (see `tests/example_ioc`).
+- `Status::with_timeout(timeout, settle_time)`, ophyd `StatusBase`'s
+  timeout and settle time; `Status::and`, ophyd's `AndStatus`; and
+  `Status::contains`.
+- Writable `Signal`s are `AsyncMovable`/`MovableObj` and read-write ones
+  `Locatable`/`LocatableObj`, so `mv`/`mvr` take a signal as ophyd-async's
+  `SignalW`/`SignalRW` do. `Signal::reconnect` forces a new connect.
+- `SoftSignalBackend::with_precision`, `with_getter` and `with_setter`
+  (ophyd-async soft getter, setter and poll period);
+  `MockSignalBackend::reset_put_calls`, `set_values`, `set_units`,
+  `set_precision` and `set_put_callback_async` (ophyd-async `set_mock_*`).
+- `BsrsError::ValueTimeout`, raised by `wait_for_value` with the signal,
+  matcher, timeout and last value seen, and `BsrsError::Connect`, the one
+  connect failure shared by every caller that joined it.
+- `CaMotor::set_current_position` and `PvaMotor::set_current_position`
+  (ophyd `EpicsMotor.set_current_position`).
+- `StandardDetector::events_to_kickoff` / `set_events_to_kickoff`,
+  `TriggerInfo::effective_exposure_timeout`, `DetectorWriter::hinted_fields`
+  and `AreaDetectorCam::acquire_time_rbv` / `acquire_period_rbv`.
+- `SoftMotor` implements `protocols_async::Stoppable`.
+
+### Changed
+
+- **Breaking**: `Status::wait` returns `Result<(), WaitError>`.
+  `WaitError::Timeout` is a wait that ran out with the status pending
+  (ophyd `WaitTimeoutError`); `WaitError::Status` is a status that finished
+  without success. `StatusError::Timeout` carries a `TimedOut` that only the
+  `with_timeout` timer builds, so a setter cannot record it, and the
+  RunEngine reports a timed-out status as a status failure.
+- **Breaking**: `StandardReadable::add_child(Arc<dyn ReadableObj>)` and
+  `add_signal(Arc<Signal<T, B, A>>, StandardReadableFormat)` replace
+  `add_readables` and return `Result`: a duplicate reading key or hint
+  field ("Hint fields {f} overrides existing hint") is an error, as in
+  ophyd-async. Stageable children and hinted signals are staged
+  automatically, uncached formats read live, and children are gathered
+  concurrently.
+- **Breaking**: `#[derive(Device)]` parses `#[signal]`/`#[device]` with
+  `syn`; an unknown role, key or kind is a compile error instead of
+  `Kind::Normal`.
+- `SoftSignalBackend::set_callback`, and so `Signal::subscribe` and
+  `observe_value`, delivers the current reading first, as ophyd-async does;
+  readings reach each callback in store order and carry `alarm_severity` 0.
+  `MockSignalBackend` delivers its value the same way.
+- `put(None)` on the EPICS backends writes the value read at connect, as
+  ophyd-async does, instead of `T::default()`.
+- `CaEnumBackend` is `EpicsCaBackend<String>`, which reads a DBR_ENUM as its
+  label with the choices in the datakey.
+- EPICS datakeys take dtype and shape from the datatype as ophyd-async
+  `make_datakey` does: `Vec<f64>` is `array`, a string is `|S40`, and an
+  empty EGU is reported as units `""`.
+- `StandardDetector` follows ophyd-async: `prepare` sets up the hardware and
+  opens the writer for `collections_per_event`; `trigger` prepares
+  implicitly, rejects a multi-event prepare and fails when the writer index
+  stalls past the exposure timeout; `stage` drops the last prepare;
+  `kickoff` cannot run past the prepared frames; `read` returns nothing and
+  the hints come from `DetectorWriter::hinted_fields`.
+- `AreaDetectorCam::arm` resolves once the cam is acquiring, and its
+  configuration is described from `AcquireTime_RBV`/`AcquirePeriod_RBV`.
+- `CaMotor`, `PvaMotor` and `CaPositioner` press `.STOP` in `stop_dyn`,
+  refuse moves outside their limits (ophyd-async `Motor.check_move`, ophyd
+  `PVPositioner.check_value`), post `WatcherUpdate`s while moving and hint
+  their readback. `PvaMotor` and `PvaDetector` are described from their PVs.
+- `spiral_square_pattern` visits points in bluesky's order.
+- The `mini_beamline_scan` example builds on `ca_devices` and needs the
+  `host` feature.
+
+### Removed
+
+- **Breaking**: `StandardReadable::add_readables`, `add_stageable` and
+  `StandardReadableFormat::Child`; use `add_child` / `add_signal`.
 
 ### Fixed
 
@@ -41,6 +116,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reading into the event only while bundling, so such a read is ad-hoc
   inspection that returns the value and touches no document; the engine now
   does the same.
+- `EpicsPvaBackend::connect` honours its timeout instead of the client's
+  5 s operation timeout.
+- The CA decoders read DBR_CHAR, which arrives as `UChar`/`UCharArray`, so
+  long strings read; CA reads ask for the current element count, not NELM.
+- A PVA put to an NTEnum reaches `value.index`, by label or by index, and a
+  PVA bool reads an `enum_t` index.
+- A CA PV maps to the same `CaContext` shard on every lookup, so backends on
+  one PV share its channel and its one put-callback in flight.
+- A CA call waits for the channel with its own timeout, and a CA monitor
+  survives a disconnect and resumes when the server returns.
+- `Status::observe_watcher` delivers every update to each observer; a
+  status's phase, outcome and waiters change under one lock, so a racing
+  reader no longer sees an error-less failure or misses a wake.
+- A `StandardReadable` child's configuration reaches `read_configuration`.
+- `Signal::describe` takes `DataKey.source` from `Signal::source`.
+- `AreaDetectorCam::arm` no longer misses acquisitions shorter than a poll,
+  and `AdHdfWriter` no longer stalls `kickoff` on a FlushNow put.
 
 ## [0.5.8] - 2026-09-22
 
