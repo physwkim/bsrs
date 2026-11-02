@@ -61,6 +61,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `PluginSignalDataLogic`), a `SingleDataLogic` that reads a plugin signal
   with each event after setting the new `AreaDetectorCam::wait_for_plugins`;
   and `NdStats::total`.
+- `host::areadetector::NdArrayDescription::new` (ophyd-async
+  `NDArrayDescription`) describes a writer's frame from any shape signals,
+  such as the new `NdRoi::size_y_rbv` / `size_x_rbv` for a writer fed from
+  an ROI.
 - `SoftMotor` implements `protocols_async::Stoppable`.
 - `BsrsError::Datatype`, ophyd-async's `make_converter` `TypeError`.
 
@@ -124,6 +128,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the least writer index, `kickoff` needs a writer and refuses writers that
   disagree on their index, asset documents chain the writers in order, and
   the hints join every data logic's.
+- **Breaking**: `CamFrameInfo` is replaced by `NdArrayDescription`, whose
+  fields are private; `AreaDetectorCam::frame_info` is an
+  `Arc<NdArrayDescription>`.
 - `AreaDetectorCam::arm` resolves once the cam is acquiring, and its
   configuration is described from `AcquireTime_RBV`/`AcquirePeriod_RBV`.
 - `CaMotor`, `PvaMotor` and `CaPositioner` press `.STOP` in `stop_dyn`,

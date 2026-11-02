@@ -200,67 +200,76 @@ pub struct AreaDetectorCam {
     /// `WaitForPlugins` (bo) — whether `Acquire` completes only once the
     /// plugins have processed the frames.
     pub wait_for_plugins: Arc<EpicsCaBackend<bool>>,
-    /// Frame description readbacks (`ArraySizeX/Y/Z_RBV`, `DataType_RBV`,
+    /// Frame description readbacks (`ArraySizeZ/Y/X_RBV`, `DataType_RBV`,
     /// `ColorMode_RBV`) — the shape/dtype source for the emitted `DataKey`,
-    /// read from the driver as in ophyd-async's `make_writer_data_logic`.
-    pub frame_info: Arc<CamFrameInfo>,
+    /// read from the driver as in ophyd-async's `ADWriterFactory` default.
+    pub frame_info: Arc<NdArrayDescription>,
     /// The last arm's `Acquire=1` put-callback: done when that acquisition
     /// ends (ophyd-async `ADAcquireLogic.acquire_status`).
     acquire_status: std::sync::Mutex<Option<Status>>,
 }
 
-/// The driver-side NDArray description: `ArraySizeX/Y/Z_RBV`, `DataType_RBV`,
-/// and `ColorMode_RBV`. A cheap `Arc` handle so the detector writer can
-/// discover the frame shape/dtype after the cam has been moved into a
-/// `StandardDetector`. Port of ophyd-async's `NDArrayDescription` and
-/// `get_ndarray_resource_info` (`_data_logic.py:54-91`).
-pub struct CamFrameInfo {
-    /// PV prefix (for error messages).
-    pub prefix: String,
-    /// `ArraySizeX_RBV` (longin).
-    pub size_x: Arc<EpicsCaBackend<i64>>,
-    /// `ArraySizeY_RBV` (longin).
-    pub size_y: Arc<EpicsCaBackend<i64>>,
-    /// `ArraySizeZ_RBV` (longin).
-    pub size_z: Arc<EpicsCaBackend<i64>>,
-    /// `DataType_RBV` (mbbi, `ADBaseDataType` labels).
-    pub data_type: Arc<EpicsCaBackend<String>>,
-    /// `ColorMode_RBV` (mbbi, `ADBaseColorMode` labels).
-    pub color_mode: Arc<EpicsCaBackend<String>>,
+/// ophyd-async `NDArrayDescription` (`_data_logic.py:54`): the signals a
+/// frame's shape is read from, slowest first, and the driver's
+/// `DataType_RBV` and `ColorMode_RBV`. A cheap `Arc` handle so the writer
+/// reads it after the cam has been moved into a `StandardDetector`.
+pub struct NdArrayDescription {
+    /// The driver's prefix, naming `DataType_RBV`/`ColorMode_RBV` in errors.
+    prefix: String,
+    shape: Vec<Arc<EpicsCaBackend<i64>>>,
+    data_type: Arc<EpicsCaBackend<String>>,
+    color_mode: Arc<EpicsCaBackend<String>>,
 }
 
-impl CamFrameInfo {
-    fn new(prefix: &str) -> Self {
+impl NdArrayDescription {
+    /// The driver's own frame, `ArraySizeZ/Y/X_RBV`: ophyd-async's default.
+    fn of_driver(prefix: &str) -> Self {
         Self {
             prefix: prefix.to_string(),
-            size_x: Arc::new(EpicsCaBackend::<i64>::new(join(prefix, "ArraySizeX_RBV"))),
-            size_y: Arc::new(EpicsCaBackend::<i64>::new(join(prefix, "ArraySizeY_RBV"))),
-            size_z: Arc::new(EpicsCaBackend::<i64>::new(join(prefix, "ArraySizeZ_RBV"))),
+            shape: ["ArraySizeZ_RBV", "ArraySizeY_RBV", "ArraySizeX_RBV"]
+                .into_iter()
+                .map(|s| Arc::new(EpicsCaBackend::<i64>::new(join(prefix, s))))
+                .collect(),
             data_type: Arc::new(EpicsCaBackend::<String>::new(join(prefix, "DataType_RBV"))),
             color_mode: Arc::new(EpicsCaBackend::<String>::new(join(prefix, "ColorMode_RBV"))),
         }
     }
 
+    /// `driver`'s data type and colour mode over a frame of `shape`, e.g. an
+    /// [`NdRoi`]'s `size_y_rbv` and `size_x_rbv` for a writer fed from that
+    /// ROI. Zero dims are dropped. The writer does not connect `shape`; its
+    /// owner does (`NdRoi::connect`).
+    pub fn new(driver: &AreaDetectorCam, shape: Vec<Arc<EpicsCaBackend<i64>>>) -> Self {
+        let own = &driver.frame_info;
+        Self {
+            prefix: own.prefix.clone(),
+            shape,
+            data_type: own.data_type.clone(),
+            color_mode: own.color_mode.clone(),
+        }
+    }
+
     async fn connect(&self, timeout: Duration) -> Result<()> {
-        let (a, b, c, d, e) = tokio::join!(
-            SignalBackend::<i64>::connect(self.size_x.as_ref(), timeout),
-            SignalBackend::<i64>::connect(self.size_y.as_ref(), timeout),
-            SignalBackend::<i64>::connect(self.size_z.as_ref(), timeout),
+        let shape = futures::future::try_join_all(
+            self.shape
+                .iter()
+                .map(|s| SignalBackend::<i64>::connect(s.as_ref(), timeout)),
+        );
+        let (a, b, c) = tokio::join!(
+            shape,
             SignalBackend::<String>::connect(self.data_type.as_ref(), timeout),
             SignalBackend::<String>::connect(self.color_mode.as_ref(), timeout),
         );
         a?;
         b?;
         c?;
-        d?;
-        e?;
         Ok(())
     }
 }
 
 /// Source of the frame shape + numpy dtype for the emitted `DataKey`. The
-/// detector writer reads it at `open()`; the production impl is the driver's
-/// readbacks ([`CamFrameInfo`]).
+/// detector writer reads it at `open()`; the production impl is
+/// [`NdArrayDescription`].
 #[async_trait::async_trait]
 pub trait AdFrameInfoSource: Send + Sync {
     /// Frame shape (slowest-varying first, zero dims dropped, color-mode
@@ -269,13 +278,14 @@ pub trait AdFrameInfoSource: Send + Sync {
 }
 
 /// Compose the frame shape ophyd-async's `get_ndarray_resource_info`
-/// (`_data_logic.py:61-84`) derives from the driver readbacks: dims in
-/// `[Z, Y, X]` order (slowest first, matching the row-major HDF dataset),
-/// zero dims dropped, RGB1 prepending the color dim; any other non-Mono
-/// color mode is unsupported.
-fn compose_frame_shape(sz: i64, sy: i64, sx: i64, color_mode: &str, pv: &str) -> Result<Vec<u64>> {
-    let mut shape: Vec<u64> = [sz, sy, sx]
-        .into_iter()
+/// (`_data_logic.py:61-84`) derives from the shape readbacks: `dims`
+/// slowest first (matching the row-major HDF dataset), zero dims dropped,
+/// RGB1 prepending the color dim; any other non-Mono color mode is
+/// unsupported.
+fn compose_frame_shape(dims: &[i64], color_mode: &str, pv: &str) -> Result<Vec<u64>> {
+    let mut shape: Vec<u64> = dims
+        .iter()
+        .copied()
         .filter(|&d| d > 0)
         .map(|d| d as u64)
         .collect();
@@ -292,16 +302,18 @@ fn compose_frame_shape(sz: i64, sy: i64, sx: i64, color_mode: &str, pv: &str) ->
 }
 
 #[async_trait::async_trait]
-impl AdFrameInfoSource for CamFrameInfo {
+impl AdFrameInfoSource for NdArrayDescription {
     async fn frame_info(&self) -> Result<(Vec<u64>, String)> {
-        let (sz, sy, sx, dt, cm) = tokio::join!(
-            SignalBackend::<i64>::get_value(self.size_z.as_ref()),
-            SignalBackend::<i64>::get_value(self.size_y.as_ref()),
-            SignalBackend::<i64>::get_value(self.size_x.as_ref()),
+        let (dims, dt, cm) = tokio::join!(
+            futures::future::try_join_all(
+                self.shape
+                    .iter()
+                    .map(|s| SignalBackend::<i64>::get_value(s.as_ref())),
+            ),
             SignalBackend::<String>::get_value(self.data_type.as_ref()),
             SignalBackend::<String>::get_value(self.color_mode.as_ref()),
         );
-        let shape = compose_frame_shape(sz?, sy?, sx?, &cm?, &self.prefix)?;
+        let shape = compose_frame_shape(&dims?, &cm?, &self.prefix)?;
         let dt = dt?;
         let dtype_numpy = ad_datatype_to_numpy(&dt).ok_or_else(|| {
             BsrsError::Backend(format!(
@@ -345,7 +357,7 @@ impl AreaDetectorCam {
                 &prefix,
                 "WaitForPlugins",
             ))),
-            frame_info: Arc::new(CamFrameInfo::new(&prefix)),
+            frame_info: Arc::new(NdArrayDescription::of_driver(&prefix)),
             acquire_status: std::sync::Mutex::new(None),
             prefix,
         }
@@ -1144,6 +1156,11 @@ pub struct NdRoi {
     pub size_x: Arc<EpicsCaBackend<i64>>,
     /// `SizeY` (longout).
     pub size_y: Arc<EpicsCaBackend<i64>>,
+    /// `SizeX_RBV` (longin): the output width, `SizeX` clipped to the input
+    /// frame, set as a frame passes.
+    pub size_x_rbv: Arc<EpicsCaBackend<i64>>,
+    /// `SizeY_RBV` (longin): the output height, as `size_x_rbv`.
+    pub size_y_rbv: Arc<EpicsCaBackend<i64>>,
     /// `EnableX` (bo).
     pub enable_x: Arc<EpicsCaBackend<bool>>,
     /// `EnableY` (bo).
@@ -1160,6 +1177,8 @@ impl NdRoi {
             min_y: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "MinY"))),
             size_x: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "SizeX"))),
             size_y: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "SizeY"))),
+            size_x_rbv: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "SizeX_RBV"))),
+            size_y_rbv: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "SizeY_RBV"))),
             enable_x: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "EnableX"))),
             enable_y: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "EnableY"))),
             plugin,
@@ -1169,12 +1188,14 @@ impl NdRoi {
     /// Connect plugin base + every ROI channel.
     pub async fn connect(&self, timeout: Duration) -> Result<()> {
         let p = self.plugin.connect(timeout);
-        let (a, b, c, d, e, f, g) = tokio::join!(
+        let (a, b, c, d, e, f, g, h, i) = tokio::join!(
             p,
             SignalBackend::<i64>::connect(self.min_x.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.min_y.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.size_x.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.size_y.as_ref(), timeout),
+            SignalBackend::<i64>::connect(self.size_x_rbv.as_ref(), timeout),
+            SignalBackend::<i64>::connect(self.size_y_rbv.as_ref(), timeout),
             SignalBackend::<bool>::connect(self.enable_x.as_ref(), timeout),
             SignalBackend::<bool>::connect(self.enable_y.as_ref(), timeout),
         );
@@ -1185,6 +1206,8 @@ impl NdRoi {
         e?;
         f?;
         g?;
+        h?;
+        i?;
         Ok(())
     }
 
@@ -3170,21 +3193,21 @@ mod ad_hdf_tests {
     fn compose_frame_shape_orders_zyx_and_handles_color_modes() {
         // Mono 2-D frame: Z unused (0) → [Y, X].
         assert_eq!(
-            compose_frame_shape(0, 768, 1024, AD_COLOR_MODE_MONO, "P:").unwrap(),
+            compose_frame_shape(&[0, 768, 1024], AD_COLOR_MODE_MONO, "P:").unwrap(),
             vec![768, 1024]
         );
         // 3-D mono: [Z, Y, X], slowest first.
         assert_eq!(
-            compose_frame_shape(4, 20, 10, AD_COLOR_MODE_MONO, "P:").unwrap(),
+            compose_frame_shape(&[4, 20, 10], AD_COLOR_MODE_MONO, "P:").unwrap(),
             vec![4, 20, 10]
         );
         // RGB1 prepends the color dim (ophyd-async `shape = [3, *shape]`).
         assert_eq!(
-            compose_frame_shape(0, 768, 1024, AD_COLOR_MODE_RGB1, "P:").unwrap(),
+            compose_frame_shape(&[0, 768, 1024], AD_COLOR_MODE_RGB1, "P:").unwrap(),
             vec![3, 768, 1024]
         );
         // Any other non-Mono color mode is unsupported.
-        let err = compose_frame_shape(0, 768, 1024, "Bayer", "P:")
+        let err = compose_frame_shape(&[0, 768, 1024], "Bayer", "P:")
             .unwrap_err()
             .to_string();
         assert!(err.contains("ColorMode_RBV=Bayer"), "{err}");

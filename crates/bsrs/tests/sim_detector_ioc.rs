@@ -21,14 +21,15 @@ use bsrs::devices::{
 };
 use bsrs::event_model::{DataKey, Dtype, DtypeNumpy, StreamDatum, StreamResource};
 use bsrs::host::areadetector::{
-    area_detector_hdf, connect_area_detector_hdf, num_rois, AreaDetectorCam, AreaDetectorHdf,
-    NdFile, NdRoi, NdStats, PluginSignalDataLogic, StaticPathProvider, AD_COLOR_MODE_MONO,
+    area_detector_hdf, connect_area_detector_hdf, num_rois, AdHdfWriter, AdMultipartWriter,
+    AreaDetectorCam, AreaDetectorHdf, NdArrayDescription, NdFile, NdFileHdf5, NdFileIo,
+    NdPluginFileIo, NdRoi, NdStats, PluginSignalDataLogic, StaticPathProvider, AD_COLOR_MODE_MONO,
     AD_COLOR_MODE_RGB1, AD_IMAGE_MODE_CONTINUOUS, AD_IMAGE_MODE_MULTIPLE, AD_IMAGE_MODE_SINGLE,
 };
 use bsrs::prelude::*;
 use bsrs::protocols_async::{
-    DetectorControl, Flyable, Preparable, SignalBackend, Stageable, StreamAsset, Triggerable,
-    WritesStreamAssets,
+    DetectorControl, DetectorWriter, Flyable, Preparable, SignalBackend, Stageable, StreamAsset,
+    Triggerable, WritesStreamAssets,
 };
 use futures::StreamExt;
 use serde_json::json;
@@ -907,6 +908,7 @@ async fn trigger_completes_short_exposures() {
 #[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
 async fn num_rois_enables_the_first_rois_while_staged() {
     boot();
+    let _cam = CAM_LOCK.lock().await;
     let rois: Vec<NdRoi> = (1..=4)
         .map(|i| NdRoi::new(format!("SIM1:ROI{i}:")))
         .collect();
@@ -940,6 +942,141 @@ async fn num_rois_enables_the_first_rois_while_staged() {
     }
     assert_eq!(enabled(&rois).await, [false, false, false, true]);
     rois[3].plugin.set_enabled(false).await.unwrap();
+}
+
+/// ophyd-async `test_use_cases.py:404` `test_2_rois_with_hdf`, with TIFF1 as
+/// the second writer since the IOC has one HDF plugin: a writer fed from an
+/// ROI describes the ROI's frame, and the hints and asset documents follow
+/// the writers' order.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+async fn writers_fed_from_rois_describe_the_roi_frames() {
+    boot();
+    let _cam = CAM_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cam = AreaDetectorCam::new(CAM);
+    cam.connect(TIMEOUT).await.expect("connect cam");
+    ready_cam(&cam, "").await;
+    let rois = [NdRoi::new("SIM1:ROI1:"), NdRoi::new("SIM1:ROI2:")];
+    // ROI2 asks past the frame's edge, which clips it to WIDTH - 50.
+    for (roi, [min_x, x, y]) in rois.iter().zip([[0, 40, 30], [50, 1000, 10]]) {
+        roi.connect(TIMEOUT).await.unwrap();
+        roi.plugin.set_source_port(PORT).await.unwrap();
+        roi.set_bounds(min_x, 0, x, y).await.unwrap();
+        roi.set_enabled_xy(true, true).await.unwrap();
+        roi.plugin.set_blocking(true).await.unwrap();
+        roi.plugin.set_enabled(true).await.unwrap();
+    }
+    for (prefix, port) in [(HDF, "ROI1"), (TIFF, "ROI2")] {
+        let f = file_plugin(prefix).await;
+        f.plugin.set_source_port(port).await.unwrap();
+        f.plugin.set_blocking(true).await.unwrap();
+        f.plugin.set_enabled(true).await.unwrap();
+    }
+    put::<i64>(&format!("{HDF}NumFramesChunks"), 1).await;
+    // A frame through the ROIs sets their SizeX/Y_RBV.
+    cam.warmup().await.expect("warmup");
+    let shape_of = |roi: &NdRoi| {
+        Arc::new(NdArrayDescription::new(
+            &cam,
+            vec![roi.size_y_rbv.clone(), roi.size_x_rbv.clone()],
+        ))
+    };
+    let hdf: Arc<dyn DetectorWriter> = Arc::new(AdHdfWriter::new(
+        "det_roi1",
+        Arc::new(NdFileIo::new(Arc::new(NdFileHdf5::new(HDF)))),
+        shape_of(&rois[0]),
+        provider(dir.path(), "roi1"),
+    ));
+    let tiff: Arc<dyn DetectorWriter> = Arc::new(AdMultipartWriter::tiff(
+        "det_roi2",
+        Arc::new(NdPluginFileIo::new(Arc::new(NdFile::new(TIFF)))),
+        shape_of(&rois[1]),
+        provider(dir.path(), "roi2"),
+    ));
+    let det = StandardDetector::with_data_logics(
+        "det",
+        cam,
+        vec![DataLogic::Unbounded(hdf), DataLogic::Unbounded(tiff)],
+    );
+    det.connect_writers(TIMEOUT).await.expect("connect writers");
+
+    Stageable::stage(&det).await.expect("stage");
+    let triggered = trigger(&det).await;
+    let keys = ReadableObj::describe_dyn(&det).await;
+    let hints = ReadableObj::hint_fields(&det);
+    let mut docs = Vec::new();
+    if triggered.is_ok() {
+        let mut stream = det.collect_asset_docs(index(&det).await, "");
+        while let Some(doc) = stream.next().await {
+            docs.push(doc);
+        }
+    }
+    let _ = Stageable::unstage(&det).await;
+    for (prefix, _) in [(HDF, "ROI1"), (TIFF, "ROI2")] {
+        let f = file_plugin(prefix).await;
+        f.plugin.set_source_port(PORT).await.unwrap();
+        f.plugin.set_enabled(false).await.unwrap();
+    }
+    for roi in &rois {
+        roi.plugin.set_enabled(false).await.unwrap();
+    }
+
+    triggered.unwrap();
+    let keys = keys.expect("describe");
+    assert_eq!(keys.len(), 2, "{keys:?}");
+    for (key, dims) in [
+        ("det_roi1_image", [1, 30, 40]),
+        ("det_roi2_image", [1, 10, 14]),
+    ] {
+        assert_eq!(keys[key].shape, shape(&dims), "{key}");
+        assert_eq!(numpy(&keys[key]), Some("|u1"), "{key}");
+        assert_eq!(keys[key].external.as_deref(), Some("STREAM:"), "{key}");
+    }
+    assert_eq!(
+        keys["det_roi1_image"].source,
+        file_uri(&dir.path().join("roi1.h5"))
+    );
+    assert_eq!(
+        hints,
+        Some(vec![
+            "det_roi1_image".to_string(),
+            "det_roi2_image".to_string()
+        ])
+    );
+    let order: Vec<String> = docs
+        .iter()
+        .map(|d| match d {
+            StreamAsset::Resource(r) => format!("resource {}", r.data_key),
+            StreamAsset::Datum(d) => format!("datum {}..{}", d.indices.start, d.indices.stop),
+        })
+        .collect();
+    assert_eq!(
+        order,
+        [
+            "resource det_roi1_image",
+            "datum 0..1",
+            "resource det_roi2_image",
+            "datum 0..1"
+        ]
+    );
+    for (i, chunk) in [[1, 30, 40], [1, 10, 14]].iter().enumerate() {
+        let StreamAsset::Resource(r) = &docs[2 * i] else {
+            unreachable!()
+        };
+        let StreamAsset::Datum(d) = &docs[2 * i + 1] else {
+            unreachable!()
+        };
+        assert_eq!(d.stream_resource, r.uid);
+        if i == 0 {
+            assert_eq!(r.parameters["chunk_shape"], json!(chunk));
+        }
+    }
+    #[cfg(feature = "hdf5")]
+    assert_eq!(
+        h5_shape(&dir.path().join("roi1.h5"), "entry/data/data"),
+        [1, 30, 40]
+    );
 }
 
 /// ophyd-async `test_use_cases.py:404` (ROI bounds) and `:532`
