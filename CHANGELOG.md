@@ -76,6 +76,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   implement `Deserialize`).
 - `SoftMotor` implements `protocols_async::Stoppable`.
 - `BsrsError::Datatype`, ophyd-async's `make_converter` `TypeError`.
+- `YmdPathProvider` and `AutoMaxIncrementingPathProvider` in
+  `bsrs::devices`, ophyd-async's date-named and next-free-number
+  directories; bsrs now depends on `chrono` for the local date.
+  `AutoMaxIncrementingPathProvider` always numbers one past the highest
+  existing directory, where ophyd-async can return that directory again.
 
 ### Changed
 

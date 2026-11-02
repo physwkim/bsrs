@@ -16,8 +16,9 @@ pub use detector::{DataLogic, DetectorTrigger, StandardDetector, TriggerInfo};
 pub use device::{wait_for_connection, walk_signal_sources, Device, DeviceVector};
 pub use observe::{observe_signals_value, observe_value, wait_for_value};
 pub use path_provider::{
-    AutoIncrementFilenameProvider, AutoIncrementingPathProvider, FilenameProvider, PathInfo,
-    PathProvider, StaticFilenameProvider, StaticPathProvider, UuidFilenameProvider,
+    AutoIncrementFilenameProvider, AutoIncrementingPathProvider, AutoMaxIncrementingPathProvider,
+    FilenameProvider, PathInfo, PathProvider, StaticFilenameProvider, StaticPathProvider,
+    UuidFilenameProvider, YmdPathProvider,
 };
 pub use signal::{
     Access, Execute, Read, ReadWrite, Readable, Signal, SignalConfig, SignalKind, SignalR,

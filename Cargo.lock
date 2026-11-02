@@ -771,6 +771,7 @@ dependencies = [
  "async-trait",
  "bsrs-derive",
  "bytes",
+ "chrono",
  "clap",
  "criterion",
  "epics-base-rs",

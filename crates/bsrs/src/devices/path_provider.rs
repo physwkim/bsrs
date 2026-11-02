@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use chrono::Local;
 use uuid::Uuid;
 
 use crate::core::error::{BsrsError, Result};
@@ -21,6 +22,19 @@ fn pure_path(path: PathBuf) -> PathBuf {
 /// `file://localhost{directory_path}/` (ophyd-async `generate_directory_uri`).
 fn generate_directory_uri(directory_path: &Path) -> String {
     format!("file://localhost{}/", directory_path.display())
+}
+
+/// `base_directory_uri or generate_directory_uri(base_directory_path)`,
+/// ending in `/`.
+fn base_directory_uri(uri: Option<&str>, base_directory_path: &Path) -> String {
+    let mut uri = uri.map_or_else(
+        || generate_directory_uri(base_directory_path),
+        str::to_string,
+    );
+    if !uri.ends_with('/') {
+        uri.push('/');
+    }
+    uri
 }
 
 /// Whether `uri` has a scheme, a network location and a path, as
@@ -413,19 +427,210 @@ impl PathProvider for AutoIncrementingPathProvider {
                 (None, None) => padded,
             }
         };
-        let mut base_uri = self
-            .base_directory_uri
-            .clone()
-            .unwrap_or_else(|| generate_directory_uri(&self.base_directory_path));
-        if !base_uri.ends_with('/') {
-            base_uri.push('/');
-        }
+        let base_uri = base_directory_uri(
+            self.base_directory_uri.as_deref(),
+            &self.base_directory_path,
+        );
         PathInfo::new(
             self.base_directory_path.join(&dir_name),
             filename,
             self.create_dir_depth,
             Some(format!("{base_uri}{dir_name}")),
         )
+    }
+}
+
+/// A `{year}/{month}/{day}` directory for today's local date under a base
+/// directory (ophyd-async `YMDPathProvider`). A caller's data key goes before
+/// the date, or after it with
+/// [`with_datakey_name_as_base_dir`](Self::with_datakey_name_as_base_dir).
+pub struct YmdPathProvider {
+    filename_provider: Arc<dyn FilenameProvider>,
+    base_directory_path: PathBuf,
+    base_directory_uri: Option<String>,
+    create_dir_depth: i64,
+    datakey_name_as_base_dir: bool,
+}
+
+impl YmdPathProvider {
+    /// Files named by `filename_provider` in today's directory under
+    /// `base_directory_path`; the writer may create the three date levels.
+    pub fn new(
+        filename_provider: Arc<dyn FilenameProvider>,
+        base_directory_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            filename_provider,
+            base_directory_path: pure_path(base_directory_path.into()),
+            base_directory_uri: None,
+            create_dir_depth: -3,
+            datakey_name_as_base_dir: false,
+        }
+    }
+
+    /// URI a reader resolves the base directory by; the date directories
+    /// are appended to it. An empty one derives it from the path.
+    pub fn with_base_directory_uri(mut self, base_directory_uri: impl Into<String>) -> Self {
+        self.base_directory_uri = Some(base_directory_uri.into()).filter(|uri| !uri.is_empty());
+        self
+    }
+
+    /// Missing directory levels the writer may create (see [`PathInfo::new`]).
+    pub fn with_create_dir_depth(mut self, create_dir_depth: i64) -> Self {
+        self.create_dir_depth = create_dir_depth;
+        self
+    }
+
+    /// Put the data key's directory under the date instead of above it.
+    pub fn with_datakey_name_as_base_dir(mut self, datakey_name_as_base_dir: bool) -> Self {
+        self.datakey_name_as_base_dir = datakey_name_as_base_dir;
+        self
+    }
+}
+
+impl PathProvider for YmdPathProvider {
+    fn path_info(&self, datakey_name: Option<&str>) -> Result<PathInfo> {
+        let date = Local::now().format("%Y/%m/%d").to_string();
+        let ymd_dir = match datakey_name {
+            None => PathBuf::from(date),
+            Some(key) if self.datakey_name_as_base_dir => pure_path(Path::new(&date).join(key)),
+            Some(key) => pure_path(Path::new(key).join(date)),
+        };
+        let filename = self.filename_provider.filename(datakey_name)?;
+        let base_uri = base_directory_uri(
+            self.base_directory_uri.as_deref(),
+            &self.base_directory_path,
+        );
+        PathInfo::new(
+            self.base_directory_path.join(&ymd_dir),
+            filename,
+            self.create_dir_depth,
+            Some(format!("{base_uri}{}", ymd_dir.display())),
+        )
+    }
+}
+
+fn io_error(path: &Path, err: std::io::Error) -> BsrsError {
+    BsrsError::Backend(format!("{}: {err}", path.display()))
+}
+
+/// The highest `N` of the `{N}_*` directories in `path`, `None` when there
+/// is none.
+fn highest_numbered_dir(path: &Path) -> Result<Option<u64>> {
+    let mut highest = None;
+    for entry in std::fs::read_dir(path).map_err(|e| io_error(path, e))? {
+        let entry = entry.map_err(|e| io_error(path, e))?;
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let number = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.split_once('_'))
+            .map(|(digits, _)| digits)
+            .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|digits| digits.parse::<u64>().ok());
+        highest = highest.max(number);
+    }
+    Ok(highest)
+}
+
+/// Whether `name` is a `YYYY-MM-DD` directory name.
+fn is_date_dir_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    b.len() == 10
+        && b.iter().enumerate().all(|(i, c)| match i {
+            4 | 7 => *c == b'-',
+            _ => c.is_ascii_digit(),
+        })
+}
+
+/// A `{counter}_{filename}/` directory under the base provider's directory,
+/// numbered one past the highest `{N}_` directory already there
+/// (ophyd-async `AutoMaxIncrementingPathProvider`). With
+/// [`with_dated`](Self::with_dated) it goes in today's `YYYY-MM-DD`
+/// directory, numbered past every other day's directories too.
+pub struct AutoMaxIncrementingPathProvider {
+    base_path_provider: Arc<dyn PathProvider>,
+    max_digits: usize,
+    dated: bool,
+    next_value: Mutex<u64>,
+}
+
+impl AutoMaxIncrementingPathProvider {
+    /// Numbered directories in `base_path_provider`'s directory, named after
+    /// its filename; `base_path_provider` should not increment itself.
+    pub fn new(base_path_provider: Arc<dyn PathProvider>) -> Self {
+        Self {
+            base_path_provider,
+            max_digits: 4,
+            dated: false,
+            next_value: Mutex::new(0),
+        }
+    }
+
+    /// Pad the counter to `max_digits`.
+    pub fn with_max_digits(mut self, max_digits: usize) -> Self {
+        self.max_digits = max_digits;
+        self
+    }
+
+    /// Counter value used while no numbered directory exists.
+    pub fn with_starting_value(self, starting_value: u64) -> Self {
+        *self.next_value.lock().unwrap() = starting_value;
+        self
+    }
+
+    /// Number directories inside a directory for today's date.
+    pub fn with_dated(mut self, dated: bool) -> Self {
+        self.dated = dated;
+        self
+    }
+}
+
+impl PathProvider for AutoMaxIncrementingPathProvider {
+    fn path_info(&self, _datakey_name: Option<&str>) -> Result<PathInfo> {
+        let base = self.base_path_provider.path_info(None)?;
+        let base_dir = base.directory_path();
+        let mut next_value = self.next_value.lock().unwrap();
+        let path = if self.dated {
+            for entry in std::fs::read_dir(base_dir).map_err(|e| io_error(base_dir, e))? {
+                let entry = entry.map_err(|e| io_error(base_dir, e))?;
+                if entry.file_name().to_str().is_some_and(is_date_dir_name) {
+                    if let Some(highest) = highest_numbered_dir(&entry.path())? {
+                        *next_value = (*next_value).max(highest + 1);
+                    }
+                }
+            }
+            base_dir.join(Local::now().format("%Y-%m-%d").to_string())
+        } else {
+            base_dir.to_path_buf()
+        };
+        // Upstream reuses the highest number when it equals the stored next
+        // value, which reopens an existing directory; take the one after it.
+        let value = if path.exists() {
+            highest_numbered_dir(&path)?.map_or(*next_value, |highest| highest + 1)
+        } else {
+            *next_value
+        };
+        *next_value = value + 1;
+        let filename = base.filename();
+        let full_path = pure_path(
+            path.join(format!(
+                "{value:0width$}_{}",
+                filename.trim_matches('_'),
+                width = self.max_digits
+            ))
+            .join(filename.trim_end_matches('_')),
+        );
+        let (Some(directory_path), Some(filename)) = (full_path.parent(), full_path.file_name())
+        else {
+            return Err(BsrsError::InvalidValue(format!(
+                "no file name in {}",
+                full_path.display()
+            )));
+        };
+        PathInfo::new(directory_path, filename.to_string_lossy(), 0, None)
     }
 }
 
@@ -579,6 +784,123 @@ mod tests {
         assert_eq!(
             pp.path_info(None).unwrap().directory_uri(),
             "file://localhost/data/00000/"
+        );
+    }
+
+    fn today(format: &str) -> String {
+        Local::now().format(format).to_string()
+    }
+
+    /// Creates the directory and the file, as the upstream test's `write_file`.
+    fn write_file(info: &PathInfo) {
+        std::fs::create_dir_all(info.directory_path()).unwrap();
+        std::fs::write(info.directory_path().join(info.filename()), b"").unwrap();
+    }
+
+    #[test]
+    fn auto_max_increment_path_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base: Arc<dyn PathProvider> = Arc::new(StaticPathProvider::new(
+            Arc::new(StaticFilenameProvider::new("capture")),
+            tmp.path(),
+        ));
+
+        let pp = AutoMaxIncrementingPathProvider::new(base.clone()).with_max_digits(3);
+        let info = pp.path_info(None).unwrap();
+        write_file(&info);
+        assert_eq!(info.directory_path(), tmp.path().join("000_capture"));
+        assert_eq!(info.filename(), "capture");
+        assert_eq!(info.create_dir_depth(), 0);
+        assert_eq!(
+            info.directory_uri(),
+            format!("file://localhost{}/000_capture/", tmp.path().display())
+        );
+        let info = pp.path_info(None).unwrap();
+        write_file(&info);
+        assert_eq!(info.directory_path(), tmp.path().join("001_capture"));
+
+        // A fresh provider continues past the directories already there.
+        let pp = AutoMaxIncrementingPathProvider::new(base.clone());
+        let info = pp.path_info(None).unwrap();
+        write_file(&info);
+        assert_eq!(info.directory_path(), tmp.path().join("0002_capture"));
+
+        let pp = AutoMaxIncrementingPathProvider::new(base).with_dated(true);
+        let day = tmp.path().join(today("%Y-%m-%d"));
+        let info = pp.path_info(None).unwrap();
+        write_file(&info);
+        assert_eq!(info.directory_path(), day.join("0000_capture"));
+        let info = pp.path_info(None).unwrap();
+        write_file(&info);
+        assert_eq!(info.directory_path(), day.join("0001_capture"));
+    }
+
+    /// Upstream returns `0000_capture` again here: its highest number equals
+    /// the fresh provider's next value.
+    #[test]
+    fn auto_max_increment_path_provider_never_reopens_the_highest_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("0000_capture")).unwrap();
+        let pp = AutoMaxIncrementingPathProvider::new(Arc::new(StaticPathProvider::new(
+            Arc::new(StaticFilenameProvider::new("capture")),
+            tmp.path(),
+        )));
+        assert_eq!(
+            pp.path_info(None).unwrap().directory_path(),
+            tmp.path().join("0001_capture")
+        );
+    }
+
+    #[test]
+    fn auto_max_increment_path_provider_dated_numbers_past_other_days() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("2000-01-01/0007_capture")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("2000-01-02")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("0042_capture")).unwrap();
+        let pp = AutoMaxIncrementingPathProvider::new(Arc::new(StaticPathProvider::new(
+            Arc::new(StaticFilenameProvider::new("_capture_")),
+            tmp.path(),
+        )))
+        .with_dated(true);
+        let info = pp.path_info(None).unwrap();
+        assert_eq!(
+            info.directory_path(),
+            tmp.path().join(today("%Y-%m-%d")).join("0008_capture")
+        );
+        assert_eq!(info.filename(), "_capture");
+    }
+
+    #[test]
+    fn ymd_path_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        let date = today("%Y/%m/%d");
+        let pp = YmdPathProvider::new(static_filename(), tmp.path());
+
+        let info = pp.path_info(None).unwrap();
+        assert_eq!(info.directory_path(), tmp.path().join(&date));
+        assert_eq!(info.create_dir_depth(), -3);
+        assert_eq!(
+            info.directory_uri(),
+            format!("file://localhost{}/{date}/", tmp.path().display())
+        );
+
+        let info = pp.path_info(Some("test_device")).unwrap();
+        assert_eq!(
+            info.directory_path(),
+            tmp.path().join("test_device").join(&date)
+        );
+
+        let pp = YmdPathProvider::new(static_filename(), "/data")
+            .with_base_directory_uri("http://host/data")
+            .with_datakey_name_as_base_dir(true);
+        let info = pp.path_info(Some("test_device")).unwrap();
+        assert_eq!(
+            info.directory_path(),
+            Path::new("/data").join(&date).join("test_device")
+        );
+        assert_eq!(
+            info.directory_uri(),
+            format!("http://host/data/{date}/test_device/")
         );
     }
 }
