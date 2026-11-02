@@ -57,6 +57,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `StandardDetector::events_to_kickoff` / `set_events_to_kickoff`,
   `TriggerInfo::effective_exposure_timeout`, `DetectorWriter::hinted_fields`
   and `AreaDetectorCam::acquire_time_rbv` / `acquire_period_rbv`.
+- `host::areadetector::PluginSignalDataLogic` (ophyd-async
+  `PluginSignalDataLogic`), a `SingleDataLogic` that reads a plugin signal
+  with each event after setting the new `AreaDetectorCam::wait_for_plugins`;
+  and `NdStats::total`.
 - `SoftMotor` implements `protocols_async::Stoppable`.
 - `BsrsError::Datatype`, ophyd-async's `make_converter` `TypeError`.
 

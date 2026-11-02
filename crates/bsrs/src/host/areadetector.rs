@@ -37,11 +37,13 @@ use crate::core::error::{BsrsError, Result};
 use crate::core::msg::{NamedObj, StageableObj};
 use crate::core::reading::ReadingValue;
 use crate::core::status::{Status, StatusError, SubToken};
+use crate::devices::signal::{Read, Readable, Signal};
 use crate::devices::stage_sigs::StageSigs;
 use crate::devices::StandardDetector;
 use crate::event_model::{DataKey, Dtype, StreamDatum, StreamRange, StreamResource};
 use crate::protocols_async::{
-    DetectorControl, DetectorTrigger, DetectorWriter, SignalBackend, StreamAsset, TriggerInfo,
+    DetectorControl, DetectorTrigger, DetectorWriter, SignalBackend, SingleDataLogic, StreamAsset,
+    TriggerInfo,
 };
 use futures::stream::{BoxStream, StreamExt};
 use std::collections::HashMap;
@@ -195,6 +197,9 @@ pub struct AreaDetectorCam {
     /// inline XML or a filename on the IOC host. Read at `open()` to discover
     /// NDAttribute datasets for the emitted stream documents.
     pub nd_attributes_file: Arc<EpicsCaBackend<String>>,
+    /// `WaitForPlugins` (bo) — whether `Acquire` completes only once the
+    /// plugins have processed the frames.
+    pub wait_for_plugins: Arc<EpicsCaBackend<bool>>,
     /// Frame description readbacks (`ArraySizeX/Y/Z_RBV`, `DataType_RBV`,
     /// `ColorMode_RBV`) — the shape/dtype source for the emitted `DataKey`,
     /// read from the driver as in ophyd-async's `make_writer_data_logic`.
@@ -336,6 +341,10 @@ impl AreaDetectorCam {
                 &prefix,
                 "NDAttributesFile",
             ))),
+            wait_for_plugins: Arc::new(EpicsCaBackend::<bool>::new(join(
+                &prefix,
+                "WaitForPlugins",
+            ))),
             frame_info: Arc::new(CamFrameInfo::new(&prefix)),
             acquire_status: std::sync::Mutex::new(None),
             prefix,
@@ -344,7 +353,7 @@ impl AreaDetectorCam {
 
     /// Connect every channel in parallel.
     pub async fn connect(&self, timeout: Duration) -> Result<()> {
-        let (a, b, c, d, e, f, g, h, i, j, k, l) = tokio::join!(
+        let (a, b, c, d, e, f, g, h, i, j, k, l, m) = tokio::join!(
             SignalBackend::<String>::connect(self.image_mode.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.num_images.as_ref(), timeout),
             SignalBackend::<bool>::connect(self.acquire.as_ref(), timeout),
@@ -356,6 +365,7 @@ impl AreaDetectorCam {
             SignalBackend::<i64>::connect(self.array_counter_rbv.as_ref(), timeout),
             SignalBackend::<String>::connect(self.detector_state_rbv.as_ref(), timeout),
             SignalBackend::<String>::connect(self.nd_attributes_file.as_ref(), timeout),
+            SignalBackend::<bool>::connect(self.wait_for_plugins.as_ref(), timeout),
             self.frame_info.connect(timeout),
         );
         a?;
@@ -370,6 +380,7 @@ impl AreaDetectorCam {
         j?;
         k?;
         l?;
+        m?;
         Ok(())
     }
 
@@ -1042,6 +1053,8 @@ pub struct NdStats {
     pub compute_profiles: Arc<EpicsCaBackend<bool>>,
     /// `ComputeHistogram` (bo).
     pub compute_histogram: Arc<EpicsCaBackend<bool>>,
+    /// `Total_RBV` (ai) — the sum of the last frame's pixels.
+    pub total: Arc<EpicsCaBackend<f64>>,
 }
 
 impl NdStats {
@@ -1066,6 +1079,7 @@ impl NdStats {
                 &prefix,
                 "ComputeHistogram",
             ))),
+            total: Arc::new(EpicsCaBackend::<f64>::new(join(&prefix, "Total_RBV"))),
             plugin,
         }
     }
@@ -1073,18 +1087,20 @@ impl NdStats {
     /// Connect plugin base + every stats-compute channel.
     pub async fn connect(&self, timeout: Duration) -> Result<()> {
         let p = self.plugin.connect(timeout);
-        let (a, b, c, d, e) = tokio::join!(
+        let (a, b, c, d, e, f) = tokio::join!(
             p,
             SignalBackend::<bool>::connect(self.compute_statistics.as_ref(), timeout),
             SignalBackend::<bool>::connect(self.compute_centroid.as_ref(), timeout),
             SignalBackend::<bool>::connect(self.compute_profiles.as_ref(), timeout),
             SignalBackend::<bool>::connect(self.compute_histogram.as_ref(), timeout),
+            SignalBackend::<f64>::connect(self.total.as_ref(), timeout),
         );
         a?;
         b?;
         c?;
         d?;
         e?;
+        f?;
         Ok(())
     }
 
@@ -2465,6 +2481,71 @@ impl DetectorControl for AreaDetectorCam {
         }))
         .await
         .map(HashMap::from_iter)
+    }
+}
+
+/// ophyd-async `PluginSignalDataLogic`: `signal`, a plugin's result, read
+/// with the event of a one-collection prepare, which makes the driver wait
+/// for its plugins so the signal holds the frame's result.
+pub struct PluginSignalDataLogic<T, B, A = Read>
+where
+    T: Clone + Send + Sync + serde::Serialize + 'static,
+    B: SignalBackend<T> + 'static,
+    A: Readable,
+{
+    wait_for_plugins: Arc<EpicsCaBackend<bool>>,
+    signal: Arc<Signal<T, B, A>>,
+    hinted: bool,
+}
+
+impl<T, B, A> PluginSignalDataLogic<T, B, A>
+where
+    T: Clone + Send + Sync + serde::Serialize + 'static,
+    B: SignalBackend<T> + 'static,
+    A: Readable,
+{
+    /// Read `signal` with each event of `driver`'s detector, hinted.
+    pub fn new(driver: &AreaDetectorCam, signal: Arc<Signal<T, B, A>>) -> Self {
+        Self {
+            wait_for_plugins: driver.wait_for_plugins.clone(),
+            signal,
+            hinted: true,
+        }
+    }
+
+    /// Whether `signal` is hinted.
+    pub fn hinted(mut self, hinted: bool) -> Self {
+        self.hinted = hinted;
+        self
+    }
+}
+
+#[async_trait::async_trait]
+impl<T, B, A> SingleDataLogic for PluginSignalDataLogic<T, B, A>
+where
+    T: Clone + Send + Sync + serde::Serialize + 'static,
+    B: SignalBackend<T> + 'static,
+    A: Readable,
+{
+    async fn prepare_single(&self) -> Result<()> {
+        await_put(
+            SignalBackend::<bool>::put(self.wait_for_plugins.as_ref(), Some(true)),
+            "PluginSignalDataLogic::prepare_single",
+        )
+        .await
+    }
+    async fn describe(&self) -> Result<HashMap<String, DataKey>> {
+        self.signal.describe().await
+    }
+    async fn read(&self) -> Result<HashMap<String, ReadingValue>> {
+        self.signal.read_cached(Some(false)).await
+    }
+    fn hinted_fields(&self) -> Vec<String> {
+        if self.hinted {
+            vec![self.signal.name().to_string()]
+        } else {
+            Vec::new()
+        }
     }
 }
 

@@ -1,7 +1,8 @@
 //! `StandardDetector` against the sim-detector example IOC's real
 //! areaDetector records (`SIM1:cam1:` and its commonPlugins), checking what
 //! ophyd-async's detector tests check. `cargo test` runs these against one
-//! shared IOC, so every test that drives the cam holds `CAM_LOCK`.
+//! shared IOC, so every test that drives the cam or reconfigures its plugins
+//! holds `CAM_LOCK`.
 #![cfg(all(feature = "ca", feature = "host"))]
 
 mod example_ioc;
@@ -15,12 +16,14 @@ use bsrs::backends::epics_ca::EpicsCaBackend;
 use bsrs::callbacks::CapturingSink;
 use bsrs::core::msg::{ConfigurableObj, ReadableObj, StageableObj, TriggerableObj};
 use bsrs::core::status::Status;
-use bsrs::devices::{BackendFromPv, TriggerInfo};
+use bsrs::devices::{
+    BackendFromPv, DataLogic, SignalConfig, SignalR, StandardDetector, TriggerInfo,
+};
 use bsrs::event_model::{DataKey, Dtype, DtypeNumpy, StreamDatum, StreamResource};
 use bsrs::host::areadetector::{
     area_detector_hdf, connect_area_detector_hdf, num_rois, AreaDetectorCam, AreaDetectorHdf,
-    NdFile, NdRoi, NdStats, StaticPathProvider, AD_COLOR_MODE_MONO, AD_COLOR_MODE_RGB1,
-    AD_IMAGE_MODE_CONTINUOUS, AD_IMAGE_MODE_MULTIPLE, AD_IMAGE_MODE_SINGLE,
+    NdFile, NdRoi, NdStats, PluginSignalDataLogic, StaticPathProvider, AD_COLOR_MODE_MONO,
+    AD_COLOR_MODE_RGB1, AD_IMAGE_MODE_CONTINUOUS, AD_IMAGE_MODE_MULTIPLE, AD_IMAGE_MODE_SINGLE,
 };
 use bsrs::prelude::*;
 use bsrs::protocols_async::{
@@ -946,6 +949,7 @@ async fn num_rois_enables_the_first_rois_while_staged() {
 #[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
 async fn roi_and_stats_setters_reach_their_records() {
     boot();
+    let _cam = CAM_LOCK.lock().await;
     let roi = NdRoi::new("SIM1:ROI1:");
     roi.connect(TIMEOUT).await.unwrap();
     roi.set_bounds(4, 6, 20, 10).await.unwrap();
@@ -968,6 +972,63 @@ async fn roi_and_stats_setters_reach_their_records() {
     stats.force_enable_stats().await.unwrap();
     assert!(get::<bool>("SIM1:Stats1:EnableCallbacks").await);
     assert!(get::<bool>("SIM1:Stats1:ComputeStatistics").await);
+}
+
+/// ophyd-async `test_use_cases.py:532` `test_simdetector_with_stats_signal`:
+/// a detector with no writer reads a plugin's signal, and its trigger makes
+/// the driver wait for the plugins first.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+async fn plugin_signal_is_read_after_the_driver_waits_for_plugins() {
+    boot();
+    let _cam = CAM_LOCK.lock().await;
+    let cam = AreaDetectorCam::new(CAM);
+    cam.connect(TIMEOUT).await.expect("connect cam");
+    ready_cam(&cam, "").await;
+    let stats = NdStats::new("SIM1:Stats1:");
+    stats.connect(TIMEOUT).await.unwrap();
+    stats.plugin.set_source_port(PORT).await.unwrap();
+    stats.force_enable_stats().await.unwrap();
+    let total = Arc::new(SignalR::new(
+        stats.total.clone(),
+        SignalConfig {
+            source: "SIM1:Stats1:Total_RBV".into(),
+            kind: Kind::Normal,
+            name: "det_stats_total".into(),
+        },
+    ));
+    let logic = PluginSignalDataLogic::new(&cam, total);
+    let det =
+        StandardDetector::with_data_logics("det", cam, vec![DataLogic::Single(Arc::new(logic))]);
+    let wait_for_plugins = format!("{CAM}WaitForPlugins");
+    put::<bool>(&wait_for_plugins, false).await;
+
+    Stageable::stage(&det).await.expect("stage");
+    let after_stage = get::<bool>(&wait_for_plugins).await;
+    let triggered = trigger(&det).await;
+    let after_trigger = get::<bool>(&wait_for_plugins).await;
+    let keys = ReadableObj::describe_dyn(&det).await;
+    let reading = ReadableObj::read_dyn(&det).await;
+    let want_total = get::<f64>("SIM1:Stats1:Total_RBV").await;
+    let hints = ReadableObj::hint_fields(&det);
+    let _ = Stageable::unstage(&det).await;
+    put::<bool>(&wait_for_plugins, false).await;
+    stats.plugin.set_enabled(false).await.unwrap();
+
+    assert!(!after_stage);
+    triggered.unwrap();
+    assert!(after_trigger);
+    let keys = keys.expect("describe");
+    assert_eq!(keys.len(), 1, "{keys:?}");
+    let key = &keys["det_stats_total"];
+    assert_eq!(key.dtype, Dtype::Number);
+    assert_eq!(numpy(key), Some("<f8"));
+    assert!(key.shape.is_empty());
+    assert_eq!(key.source, "ca://SIM1:Stats1:Total_RBV");
+    let reading = reading.expect("read");
+    assert_eq!(reading.len(), 1, "{reading:?}");
+    assert_eq!(reading["det_stats_total"].value, json!(want_total));
+    assert_eq!(hints, Some(vec!["det_stats_total".to_string()]));
 }
 
 /// ophyd-async `test_adsim_system.py:161` `test_software_triggering`, through
