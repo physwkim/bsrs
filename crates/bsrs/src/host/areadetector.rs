@@ -22,17 +22,15 @@
 //!
 //! ## Wire conventions
 //!
-//! - `ImageMode`/`FileWriteMode`/`DetectorState_RBV`: `mbbo`/`mbbi`
-//!   (enum). We treat the wire value as `i64` and rely on the EPICS
-//!   server's numeric coercion.
+//! - `ImageMode`/`FileWriteMode`/`DetectorState_RBV`/`DataType_RBV`/
+//!   `ColorMode_RBV`: `mbbo`/`mbbi` (enum), read and written by label as
+//!   ophyd-async's `StrictEnum`/`SubsetEnum` signals do.
 //! - `Acquire`/`EnableCallbacks`/`BlockingCallbacks`/`AutoIncrement`/
 //!   `Capture`/`Compute*`/`EnableX`/`EnableY`: `bo` (binary). We treat
 //!   these as `bool` via `EpicsCaBackend<bool>` (DBR_LONG on the wire).
-//! - `FilePath`/`FileName`/`FileTemplate`: `waveform` of `CHAR` —
-//!   constructed with `EpicsCaBackend::new_long_string` so the put
-//!   path uses DBR_CHAR rather than the 40-byte DBR_STRING.
-//! - `NDArrayPort`: `stringout` (DBR_STRING). Built with the default
-//!   `EpicsCaBackend::<String>::new` (short form).
+//! - `FilePath`/`FileName`/`FileTemplate`: `waveform` of `CHAR`, which
+//!   `EpicsCaBackend::<String>` reads and writes as a long string.
+//! - `NDArrayPort`: `stringout` (DBR_STRING).
 
 use crate::backends::epics_ca::EpicsCaBackend;
 use crate::core::error::{BsrsError, Result};
@@ -57,52 +55,46 @@ const WARMUP_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const ACQUIRE_TIME_RBV: &str = "AcquireTime_RBV";
 const ACQUIRE_PERIOD_RBV: &str = "AcquirePeriod_RBV";
 
-/// `DetectorState_RBV` value for the idle state. mbbi ordering from
-/// `ADBase.template`: 0=Idle, 1=Acquire, 2=Readout, 3=Correct, 4=Saving,
-/// 5=Aborting, 6=Error, 7=Waiting, 8=Initializing, 9=Disconnected,
-/// 10=Aborted.
-pub const AD_STATE_IDLE: i64 = 0;
+/// `DetectorState_RBV` label for the idle state (ophyd-async `ADState.IDLE`).
+pub const AD_STATE_IDLE: &str = "Idle";
 
-/// `DetectorState_RBV` value for an aborted acquisition — a "good" terminal
+/// `DetectorState_RBV` label for an aborted acquisition — a "good" terminal
 /// state alongside Idle (ophyd-async waits for `{IDLE, ABORTED}`).
-pub const AD_STATE_ABORTED: i64 = 10;
+pub const AD_STATE_ABORTED: &str = "Aborted";
 
-/// `ImageMode` value for single-frame acquisition (mbbo ordering from
-/// `ADBase.template`: 0=Single, 1=Multiple, 2=Continuous).
-pub const AD_IMAGE_MODE_SINGLE: i64 = 0;
+/// `ImageMode` label for single-frame acquisition (`ADImageMode.SINGLE`).
+pub const AD_IMAGE_MODE_SINGLE: &str = "Single";
 
-/// `ImageMode` value for a bounded burst of `NumImages` frames.
-pub const AD_IMAGE_MODE_MULTIPLE: i64 = 1;
+/// `ImageMode` label for a bounded burst of `NumImages` frames.
+pub const AD_IMAGE_MODE_MULTIPLE: &str = "Multiple";
 
-/// `ImageMode` value for unbounded acquisition until `Acquire` is cleared.
-pub const AD_IMAGE_MODE_CONTINUOUS: i64 = 2;
+/// `ImageMode` label for unbounded acquisition until `Acquire` is cleared.
+pub const AD_IMAGE_MODE_CONTINUOUS: &str = "Continuous";
 
-/// `FileWriteMode` value for streaming capture (mbbo ordering from
-/// `NDFile.template`: 0=Single, 1=Capture, 2=Stream).
-pub const AD_FILE_WRITE_MODE_STREAM: i64 = 2;
+/// `FileWriteMode` label for streaming capture (`ADFileWriteMode.STREAM`).
+pub const AD_FILE_WRITE_MODE_STREAM: &str = "Stream";
 
-/// `ColorMode_RBV` values (`NDColorMode_t` ordering from `NDArray.h`:
-/// 0=Mono, 1=Bayer, 2=RGB1, 3=RGB2, 4=RGB3, 5=YUV444, 6=YUV422, 7=YUV420).
-pub const AD_COLOR_MODE_MONO: i64 = 0;
-/// See [`AD_COLOR_MODE_MONO`].
-pub const AD_COLOR_MODE_RGB1: i64 = 2;
+/// `ColorMode_RBV` label for a monochrome frame (`ADBaseColorMode.MONO`).
+pub const AD_COLOR_MODE_MONO: &str = "Mono";
+/// `ColorMode_RBV` label for pixel-interleaved RGB (`ADBaseColorMode.RGB1`).
+pub const AD_COLOR_MODE_RGB1: &str = "RGB1";
 
-/// Map an areaDetector `DataType_RBV` (`NDDataType_t` enum ordering) to the
-/// corresponding numpy dtype string (little-endian; single-byte types carry no
-/// byte order). Returns `None` for an unknown code. Matches
-/// `np.dtype(datatype).str` in ophyd-async's `get_ndarray_resource_info`.
-pub const fn ad_datatype_to_numpy(dt: i64) -> Option<&'static str> {
+/// Map an areaDetector `DataType_RBV` label (`ADBaseDataType`) to its numpy
+/// dtype string, ophyd-async's `np.dtype(datatype.value.lower()).str`.
+/// Returns `None` for any other label, including the blank one a driver
+/// database leaves for an unsupported type.
+pub fn ad_datatype_to_numpy(dt: &str) -> Option<&'static str> {
     Some(match dt {
-        0 => "|i1", // NDInt8
-        1 => "|u1", // NDUInt8
-        2 => "<i2", // NDInt16
-        3 => "<u2", // NDUInt16
-        4 => "<i4", // NDInt32
-        5 => "<u4", // NDUInt32
-        6 => "<i8", // NDInt64
-        7 => "<u8", // NDUInt64
-        8 => "<f4", // NDFloat32
-        9 => "<f8", // NDFloat64
+        "Int8" => "|i1",
+        "UInt8" => "|u1",
+        "Int16" => "<i2",
+        "UInt16" => "<u2",
+        "Int32" => "<i4",
+        "UInt32" => "<u4",
+        "Int64" => "<i8",
+        "UInt64" => "<u8",
+        "Float32" => "<f4",
+        "Float64" => "<f8",
         _ => return None,
     })
 }
@@ -175,8 +167,8 @@ async fn set_and_wait_for_bool<R>(
 pub struct AreaDetectorCam {
     /// PV prefix, e.g. `"13SIM1:cam1:"`.
     pub prefix: String,
-    /// `ImageMode` (mbbo: 0=Single, 1=Multiple, 2=Continuous).
-    pub image_mode: Arc<EpicsCaBackend<i64>>,
+    /// `ImageMode` (mbbo: Single, Multiple, Continuous).
+    pub image_mode: Arc<EpicsCaBackend<String>>,
     /// `NumImages` (longout) — how many frames to acquire in
     /// `Multiple` mode.
     pub num_images: Arc<EpicsCaBackend<i64>>,
@@ -198,7 +190,7 @@ pub struct AreaDetectorCam {
     /// `ArrayCounter_RBV` (longin) — total frames produced.
     pub array_counter_rbv: Arc<EpicsCaBackend<i64>>,
     /// `DetectorState_RBV` (mbbi).
-    pub detector_state_rbv: Arc<EpicsCaBackend<i64>>,
+    pub detector_state_rbv: Arc<EpicsCaBackend<String>>,
     /// `NDAttributesFile` (waveform) — per-frame attribute config, either
     /// inline XML or a filename on the IOC host. Read at `open()` to discover
     /// NDAttribute datasets for the emitted stream documents.
@@ -226,10 +218,10 @@ pub struct CamFrameInfo {
     pub size_y: Arc<EpicsCaBackend<i64>>,
     /// `ArraySizeZ_RBV` (longin).
     pub size_z: Arc<EpicsCaBackend<i64>>,
-    /// `DataType_RBV` (mbbi, `NDDataType_t` ordering).
-    pub data_type: Arc<EpicsCaBackend<i64>>,
-    /// `ColorMode_RBV` (mbbi, `NDColorMode_t` ordering).
-    pub color_mode: Arc<EpicsCaBackend<i64>>,
+    /// `DataType_RBV` (mbbi, `ADBaseDataType` labels).
+    pub data_type: Arc<EpicsCaBackend<String>>,
+    /// `ColorMode_RBV` (mbbi, `ADBaseColorMode` labels).
+    pub color_mode: Arc<EpicsCaBackend<String>>,
 }
 
 impl CamFrameInfo {
@@ -239,8 +231,8 @@ impl CamFrameInfo {
             size_x: Arc::new(EpicsCaBackend::<i64>::new(join(prefix, "ArraySizeX_RBV"))),
             size_y: Arc::new(EpicsCaBackend::<i64>::new(join(prefix, "ArraySizeY_RBV"))),
             size_z: Arc::new(EpicsCaBackend::<i64>::new(join(prefix, "ArraySizeZ_RBV"))),
-            data_type: Arc::new(EpicsCaBackend::<i64>::new(join(prefix, "DataType_RBV"))),
-            color_mode: Arc::new(EpicsCaBackend::<i64>::new(join(prefix, "ColorMode_RBV"))),
+            data_type: Arc::new(EpicsCaBackend::<String>::new(join(prefix, "DataType_RBV"))),
+            color_mode: Arc::new(EpicsCaBackend::<String>::new(join(prefix, "ColorMode_RBV"))),
         }
     }
 
@@ -249,8 +241,8 @@ impl CamFrameInfo {
             SignalBackend::<i64>::connect(self.size_x.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.size_y.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.size_z.as_ref(), timeout),
-            SignalBackend::<i64>::connect(self.data_type.as_ref(), timeout),
-            SignalBackend::<i64>::connect(self.color_mode.as_ref(), timeout),
+            SignalBackend::<String>::connect(self.data_type.as_ref(), timeout),
+            SignalBackend::<String>::connect(self.color_mode.as_ref(), timeout),
         );
         a?;
         b?;
@@ -276,7 +268,7 @@ pub trait AdFrameInfoSource: Send + Sync {
 /// `[Z, Y, X]` order (slowest first, matching the row-major HDF dataset),
 /// zero dims dropped, RGB1 prepending the color dim; any other non-Mono
 /// color mode is unsupported.
-fn compose_frame_shape(sz: i64, sy: i64, sx: i64, color_mode: i64, pv: &str) -> Result<Vec<u64>> {
+fn compose_frame_shape(sz: i64, sy: i64, sx: i64, color_mode: &str, pv: &str) -> Result<Vec<u64>> {
     let mut shape: Vec<u64> = [sz, sy, sx]
         .into_iter()
         .filter(|&d| d > 0)
@@ -301,14 +293,14 @@ impl AdFrameInfoSource for CamFrameInfo {
             SignalBackend::<i64>::get_value(self.size_z.as_ref()),
             SignalBackend::<i64>::get_value(self.size_y.as_ref()),
             SignalBackend::<i64>::get_value(self.size_x.as_ref()),
-            SignalBackend::<i64>::get_value(self.data_type.as_ref()),
-            SignalBackend::<i64>::get_value(self.color_mode.as_ref()),
+            SignalBackend::<String>::get_value(self.data_type.as_ref()),
+            SignalBackend::<String>::get_value(self.color_mode.as_ref()),
         );
-        let shape = compose_frame_shape(sz?, sy?, sx?, cm?, &self.prefix)?;
+        let shape = compose_frame_shape(sz?, sy?, sx?, &cm?, &self.prefix)?;
         let dt = dt?;
-        let dtype_numpy = ad_datatype_to_numpy(dt).ok_or_else(|| {
+        let dtype_numpy = ad_datatype_to_numpy(&dt).ok_or_else(|| {
             BsrsError::Backend(format!(
-                "{}DataType_RBV={dt} is not a known NDDataType_t",
+                "{}DataType_RBV={dt:?} is not a known ADBaseDataType",
                 self.prefix
             ))
         })?;
@@ -321,7 +313,7 @@ impl AreaDetectorCam {
     pub fn new(prefix: impl Into<String>) -> Self {
         let prefix = prefix.into();
         Self {
-            image_mode: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "ImageMode"))),
+            image_mode: Arc::new(EpicsCaBackend::<String>::new(join(&prefix, "ImageMode"))),
             num_images: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "NumImages"))),
             acquire: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "Acquire"))),
             acquire_rbv: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "Acquire_RBV"))),
@@ -336,11 +328,11 @@ impl AreaDetectorCam {
                 &prefix,
                 "ArrayCounter_RBV",
             ))),
-            detector_state_rbv: Arc::new(EpicsCaBackend::<i64>::new(join(
+            detector_state_rbv: Arc::new(EpicsCaBackend::<String>::new(join(
                 &prefix,
                 "DetectorState_RBV",
             ))),
-            nd_attributes_file: Arc::new(EpicsCaBackend::<String>::new_long_string(join(
+            nd_attributes_file: Arc::new(EpicsCaBackend::<String>::new(join(
                 &prefix,
                 "NDAttributesFile",
             ))),
@@ -353,7 +345,7 @@ impl AreaDetectorCam {
     /// Connect every channel in parallel.
     pub async fn connect(&self, timeout: Duration) -> Result<()> {
         let (a, b, c, d, e, f, g, h, i, j, k, l) = tokio::join!(
-            SignalBackend::<i64>::connect(self.image_mode.as_ref(), timeout),
+            SignalBackend::<String>::connect(self.image_mode.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.num_images.as_ref(), timeout),
             SignalBackend::<bool>::connect(self.acquire.as_ref(), timeout),
             SignalBackend::<bool>::connect(self.acquire_rbv.as_ref(), timeout),
@@ -362,7 +354,7 @@ impl AreaDetectorCam {
             SignalBackend::<f64>::connect(self.acquire_time_rbv.as_ref(), timeout),
             SignalBackend::<f64>::connect(self.acquire_period_rbv.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.array_counter_rbv.as_ref(), timeout),
-            SignalBackend::<i64>::connect(self.detector_state_rbv.as_ref(), timeout),
+            SignalBackend::<String>::connect(self.detector_state_rbv.as_ref(), timeout),
             SignalBackend::<String>::connect(self.nd_attributes_file.as_ref(), timeout),
             self.frame_info.connect(timeout),
         );
@@ -405,13 +397,14 @@ impl AreaDetectorCam {
     pub async fn wait_for_idle(&self, timeout: Duration) -> Result<()> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            let state = SignalBackend::<i64>::get_value(self.detector_state_rbv.as_ref()).await?;
+            let state =
+                SignalBackend::<String>::get_value(self.detector_state_rbv.as_ref()).await?;
             if state == AD_STATE_IDLE || state == AD_STATE_ABORTED {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
                 return Err(BsrsError::Backend(format!(
-                    "{}DetectorState_RBV did not reach Idle/Aborted within {:?} (last={state})",
+                    "{}DetectorState_RBV did not reach Idle/Aborted within {:?} (last={state:?})",
                     self.prefix, timeout
                 )));
             }
@@ -425,11 +418,14 @@ impl AreaDetectorCam {
     /// `Single`+1, fires Acquire, waits for `DetectorState_RBV=Idle`,
     /// then restores the original values.
     pub async fn warmup(&self) -> Result<()> {
-        let prev_image_mode = SignalBackend::<i64>::get_value(self.image_mode.as_ref()).await?;
+        let prev_image_mode = SignalBackend::<String>::get_value(self.image_mode.as_ref()).await?;
         let prev_num_images = SignalBackend::<i64>::get_value(self.num_images.as_ref()).await?;
 
         await_put(
-            SignalBackend::<i64>::put(self.image_mode.as_ref(), Some(AD_IMAGE_MODE_SINGLE)),
+            SignalBackend::<String>::put(
+                self.image_mode.as_ref(),
+                Some(AD_IMAGE_MODE_SINGLE.to_string()),
+            ),
             "warmup: set ImageMode=Single",
         )
         .await?;
@@ -458,7 +454,7 @@ impl AreaDetectorCam {
         // Restore. Failures here are best-effort: log via Err in the
         // outer Result so callers see them.
         await_put(
-            SignalBackend::<i64>::put(self.image_mode.as_ref(), Some(prev_image_mode)),
+            SignalBackend::<String>::put(self.image_mode.as_ref(), Some(prev_image_mode)),
             "warmup: restore ImageMode",
         )
         .await?;
@@ -610,8 +606,8 @@ pub struct NdFile {
     pub file_template: Arc<EpicsCaBackend<String>>,
     /// `AutoIncrement` (bo).
     pub auto_increment: Arc<EpicsCaBackend<bool>>,
-    /// `FileWriteMode` (mbbo: 0=Single, 1=Capture, 2=Stream).
-    pub file_write_mode: Arc<EpicsCaBackend<i64>>,
+    /// `FileWriteMode` (mbbo: Single, Capture, Stream).
+    pub file_write_mode: Arc<EpicsCaBackend<String>>,
     /// `Capture` (busy) — start/stop capture in Capture/Stream mode. A
     /// put-callback for `1` completes only when capture ENDS, so
     /// start/stop watch [`capture_rbv`](Self::capture_rbv) instead.
@@ -646,18 +642,14 @@ impl NdFile {
         let prefix = prefix.into();
         let plugin = NdPlugin::new(prefix.clone());
         Self {
-            file_path: Arc::new(EpicsCaBackend::<String>::new_long_string(join(
-                &prefix, "FilePath",
-            ))),
-            file_name: Arc::new(EpicsCaBackend::<String>::new_long_string(join(
-                &prefix, "FileName",
-            ))),
-            file_template: Arc::new(EpicsCaBackend::<String>::new_long_string(join(
-                &prefix,
-                "FileTemplate",
-            ))),
+            file_path: Arc::new(EpicsCaBackend::<String>::new(join(&prefix, "FilePath"))),
+            file_name: Arc::new(EpicsCaBackend::<String>::new(join(&prefix, "FileName"))),
+            file_template: Arc::new(EpicsCaBackend::<String>::new(join(&prefix, "FileTemplate"))),
             auto_increment: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "AutoIncrement"))),
-            file_write_mode: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "FileWriteMode"))),
+            file_write_mode: Arc::new(EpicsCaBackend::<String>::new(join(
+                &prefix,
+                "FileWriteMode",
+            ))),
             capture: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "Capture"))),
             capture_rbv: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "Capture_RBV"))),
             num_capture: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "NumCapture"))),
@@ -665,7 +657,7 @@ impl NdFile {
                 &prefix,
                 "NumCaptured_RBV",
             ))),
-            full_file_name_rbv: Arc::new(EpicsCaBackend::<String>::new_long_string(join(
+            full_file_name_rbv: Arc::new(EpicsCaBackend::<String>::new(join(
                 &prefix,
                 "FullFileName_RBV",
             ))),
@@ -691,7 +683,7 @@ impl NdFile {
             SignalBackend::<String>::connect(self.file_name.as_ref(), timeout),
             SignalBackend::<String>::connect(self.file_template.as_ref(), timeout),
             SignalBackend::<bool>::connect(self.auto_increment.as_ref(), timeout),
-            SignalBackend::<i64>::connect(self.file_write_mode.as_ref(), timeout),
+            SignalBackend::<String>::connect(self.file_write_mode.as_ref(), timeout),
             SignalBackend::<bool>::connect(self.capture.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.num_capture.as_ref(), timeout),
             SignalBackend::<i64>::connect(self.num_captured_rbv.as_ref(), timeout),
@@ -747,10 +739,10 @@ impl NdFile {
         .await
     }
 
-    /// Set `FileWriteMode` (0=Single, 1=Capture, 2=Stream).
-    pub async fn set_write_mode(&self, mode: i64) -> Result<()> {
+    /// Set `FileWriteMode` by label (`Single`, `Capture`, `Stream`).
+    pub async fn set_write_mode(&self, mode: &str) -> Result<()> {
         await_put(
-            SignalBackend::<i64>::put(self.file_write_mode.as_ref(), Some(mode)),
+            SignalBackend::<String>::put(self.file_write_mode.as_ref(), Some(mode.to_string())),
             "NdFile::set_write_mode",
         )
         .await
@@ -924,10 +916,7 @@ impl NdFileHdf5 {
             lazy_open: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "LazyOpen"))),
             swmr_mode: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "SWMRMode"))),
             num_extra_dims: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "NumExtraDims"))),
-            xml_file_name: Arc::new(EpicsCaBackend::<String>::new_long_string(join(
-                &prefix,
-                "XMLFileName",
-            ))),
+            xml_file_name: Arc::new(EpicsCaBackend::<String>::new(join(&prefix, "XMLFileName"))),
             flush_now: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "FlushNow"))),
             file: NdFile::new(prefix),
         }
@@ -2325,7 +2314,7 @@ impl DetectorWriter for AdMultipartWriter {
 /// which case `prepare` leaves the corresponding record untouched.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ExposurePlan {
-    image_mode: i64,
+    image_mode: &'static str,
     num_images: i64,
     acquire_time: Option<f64>,
     acquire_period: Option<f64>,
@@ -2379,7 +2368,10 @@ impl DetectorControl for AreaDetectorCam {
         // skipped, mirroring ophyd-async's conditional sets.
         let plan = ExposurePlan::from_trigger_info(&info)?;
         await_put(
-            SignalBackend::<i64>::put(self.image_mode.as_ref(), Some(plan.image_mode)),
+            SignalBackend::<String>::put(
+                self.image_mode.as_ref(),
+                Some(plan.image_mode.to_string()),
+            ),
             "prepare: ImageMode",
         )
         .await?;
@@ -2626,12 +2618,13 @@ mod tests {
 
     #[test]
     fn ad_state_idle_matches_template() {
-        // Guard against accidental renumbering. ZRST=Idle ZRVL=0 in
-        // ADBase.template:388-389.
-        assert_eq!(AD_STATE_IDLE, 0);
-        assert_eq!(AD_IMAGE_MODE_SINGLE, 0);
-        assert_eq!(AD_IMAGE_MODE_MULTIPLE, 1);
-        assert_eq!(AD_IMAGE_MODE_CONTINUOUS, 2);
+        // The mbbi/mbbo labels in ADBase.template (DetectorState_RBV ZRST,
+        // TEST; ImageMode ZRST/ONST/TWST).
+        assert_eq!(AD_STATE_IDLE, "Idle");
+        assert_eq!(AD_STATE_ABORTED, "Aborted");
+        assert_eq!(AD_IMAGE_MODE_SINGLE, "Single");
+        assert_eq!(AD_IMAGE_MODE_MULTIPLE, "Multiple");
+        assert_eq!(AD_IMAGE_MODE_CONTINUOUS, "Continuous");
     }
 
     // ExposurePlan boundary tests — the IOC-free half of prepare().
@@ -2763,7 +2756,7 @@ mod tests {
             .await
             .expect("connect cam1");
 
-        let prev_mode = SignalBackend::<i64>::get_value(cam.image_mode.as_ref())
+        let prev_mode = SignalBackend::<String>::get_value(cam.image_mode.as_ref())
             .await
             .expect("read ImageMode");
         let prev_num = SignalBackend::<i64>::get_value(cam.num_images.as_ref())
@@ -2778,10 +2771,10 @@ mod tests {
         let c1 = SignalBackend::<i64>::get_value(cam.array_counter_rbv.as_ref())
             .await
             .expect("read ArrayCounter_RBV post");
-        let state = SignalBackend::<i64>::get_value(cam.detector_state_rbv.as_ref())
+        let state = SignalBackend::<String>::get_value(cam.detector_state_rbv.as_ref())
             .await
             .expect("read DetectorState_RBV post");
-        let restored_mode = SignalBackend::<i64>::get_value(cam.image_mode.as_ref())
+        let restored_mode = SignalBackend::<String>::get_value(cam.image_mode.as_ref())
             .await
             .expect("read ImageMode post");
         let restored_num = SignalBackend::<i64>::get_value(cam.num_images.as_ref())
@@ -2810,7 +2803,7 @@ mod tests {
     /// staging then applies it — (a) `HDF1:NDArrayPort = <port>`,
     /// (b) `HDF1:EnableCallbacks` enabled, (c) siblings' `EnableCallbacks`
     /// disabled — and unstaging restores every signal to its pre-stage value.
-    /// Also exercises the long-string `HDF1:FilePath` `CaStringKind::Long`
+    /// Also exercises the long-string `HDF1:FilePath` (CHAR waveform)
     /// get/put path.
     ///
     /// Non-destructive: FilePath, every plugin enable, and HDF1's port are
@@ -2844,7 +2837,7 @@ mod tests {
         )
         .expect("connect file plugins");
 
-        // (1) Long-string round-trip on FilePath (CaStringKind::Long),
+        // (1) Long-string round-trip on FilePath (CHAR waveform),
         // capturing and restoring the original so the IOC is untouched.
         let orig_path = SignalBackend::<String>::get_value(hdf1.file_path.as_ref())
             .await
@@ -3116,10 +3109,10 @@ mod ad_hdf_tests {
             vec![3, 768, 1024]
         );
         // Any other non-Mono color mode is unsupported.
-        let err = compose_frame_shape(0, 768, 1024, 1, "P:")
+        let err = compose_frame_shape(0, 768, 1024, "Bayer", "P:")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("ColorMode_RBV=1"), "{err}");
+        assert!(err.contains("ColorMode_RBV=Bayer"), "{err}");
     }
 
     #[test]
@@ -3346,15 +3339,25 @@ mod ad_hdf_tests {
 
     #[test]
     fn ad_datatype_maps_all_known_codes_and_rejects_unknown() {
-        // NDDataType_t 0..=9 → numpy; anything else is None.
+        // ADBaseDataType labels → numpy; the blank UNDEFINED label and any
+        // other string are None.
         let want = [
-            "|i1", "|u1", "<i2", "<u2", "<i4", "<u4", "<i8", "<u8", "<f4", "<f8",
+            ("Int8", "|i1"),
+            ("UInt8", "|u1"),
+            ("Int16", "<i2"),
+            ("UInt16", "<u2"),
+            ("Int32", "<i4"),
+            ("UInt32", "<u4"),
+            ("Int64", "<i8"),
+            ("UInt64", "<u8"),
+            ("Float32", "<f4"),
+            ("Float64", "<f8"),
         ];
-        for (code, np) in want.iter().enumerate() {
-            assert_eq!(ad_datatype_to_numpy(code as i64), Some(*np));
+        for (label, np) in want {
+            assert_eq!(ad_datatype_to_numpy(label), Some(np));
         }
-        assert_eq!(ad_datatype_to_numpy(10), None);
-        assert_eq!(ad_datatype_to_numpy(-1), None);
+        assert_eq!(ad_datatype_to_numpy(""), None);
+        assert_eq!(ad_datatype_to_numpy("int8"), None);
     }
 
     #[tokio::test]

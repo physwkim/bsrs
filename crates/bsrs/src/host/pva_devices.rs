@@ -160,7 +160,7 @@ pub struct PvaDetector {
 impl PvaDetector {
     /// Build + connect.
     pub fn connect_blocking(name: &str, value_pv: &str) -> Result<Arc<Self>> {
-        let v = Arc::new(EpicsPvaBackend::<f64>::new(value_pv));
+        let v = Arc::new(EpicsPvaBackend::<f64>::new_inferred(value_pv));
         let v_for_async = v.clone();
         crate::core::runtime::bsrs_runtime()
             .block_on(async move { v_for_async.connect(Duration::from_secs(5)).await })?;

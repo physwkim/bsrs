@@ -35,7 +35,7 @@ use tokio::sync::watch;
 /// (a `SubToken` with RAII unsubscribe) is leaked to the heap so
 /// the pump survives this fn returning.
 pub async fn ca_watch_f64(pv: &str) -> Result<watch::Receiver<f64>> {
-    let backend = Arc::new(EpicsCaBackend::<f64>::new(pv));
+    let backend = Arc::new(EpicsCaBackend::<f64>::new_inferred(pv));
     backend.connect(Duration::from_secs(5)).await?;
     let initial: f64 = backend.get_value().await.unwrap_or(0.0);
     let (tx, rx) = watch::channel(initial);

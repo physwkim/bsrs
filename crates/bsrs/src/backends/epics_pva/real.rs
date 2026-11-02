@@ -12,7 +12,6 @@ use epics_pva_rs::pv_request::{PvRequestBuilder, PvRequestExpr};
 use epics_pva_rs::pvdata::{FieldDesc, ScalarType, TypedScalarArray};
 use epics_pva_rs::{PvField, PvaError, ScalarValue};
 use futures::FutureExt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -34,44 +33,78 @@ pub fn pva_context() -> Arc<PvaClient> {
         .clone()
 }
 
-/// PVA backend for one PV. Currently scalar-Double oriented (M5 minimum).
+/// PVA backend for one PV.
 pub struct EpicsPvaBackend<T: Clone + Send + Sync + 'static> {
     pv: String,
     client: Arc<PvaClient>,
+    /// What the PV is read as: `T`'s datatype, or [`Datatype::Number`].
+    want: Datatype,
+    /// The converter the latest `connect`, or before one the first call,
+    /// made for the PV.
+    converter: Mutex<Option<Arc<PvaConverter>>>,
     /// ophyd-async's `initial_values`: what `connect` read, which
     /// `put(None)` writes.
     initial: Mutex<Option<T>>,
-    _marker: std::marker::PhantomData<T>,
 }
 
-impl<T: Clone + Send + Sync + 'static> EpicsPvaBackend<T> {
-    /// Build with a PV name.
+impl<T: PvaType> EpicsPvaBackend<T> {
+    /// Build with a PV name. `connect` refuses a PV that cannot be read as
+    /// `T`, as ophyd-async's `make_converter`: `f64` is a float NTScalar,
+    /// `i64` an integer one (or a float one at precision 0), `bool` a
+    /// two-choice NTEnum or a bool, int8, uint8, int32 or uint32 NTScalar,
+    /// `String` a string NTScalar, an NTEnum's labels or an int8 array's
+    /// text, `Vec<f64>` a double NTScalarArray.
     pub fn new(pv: impl Into<String>) -> Self {
+        Self::reading_as(pv.into(), T::DATATYPE)
+    }
+
+    fn reading_as(pv: String, want: Datatype) -> Self {
         Self {
-            pv: pv.into(),
+            pv,
             client: pva_context(),
+            want,
+            converter: Mutex::new(None),
             initial: Mutex::new(None),
-            _marker: std::marker::PhantomData,
         }
     }
-}
 
-impl<T: Clone + Send + Sync + 'static> EpicsPvaBackend<T>
-where
-    Self: SignalBackend<T>,
-{
-    /// `connect`: wait for the channel and read the value `put(None)`
-    /// writes, both within `timeout`, as ophyd-async's connect-time `pvget`.
+    /// `connect`: wait for the channel, then make the converter from a full
+    /// read whose value is the one `put(None)` writes, both within
+    /// `timeout`, as ophyd-async's connect-time `pvget` and `make_converter`.
     async fn connect_reading(&self, timeout: Duration) -> Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
         pva_connect(&self.client, &self.pv, timeout).await?;
-        let v = tokio::time::timeout_at(deadline, self.get_value())
+        let top = tokio::time::timeout_at(deadline, pvget(&self.client, &self.pv))
             .await
             .map_err(|_| {
                 BsrsError::Backend(format!("pva connect {}: no value in {timeout:?}", self.pv))
             })??;
+        let conv = make_converter(&self.pv, self.want, &top)?;
+        let v = T::decode(&conv, &top).ok_or_else(|| undecodable(&top))?;
+        *self.converter.lock().unwrap() = Some(Arc::new(conv));
         *self.initial.lock().unwrap() = Some(v);
         Ok(())
+    }
+
+    /// A full read, with the converter `connect` made, or if none has, one
+    /// made from this read.
+    async fn read(&self) -> Result<(Arc<PvaConverter>, PvField)> {
+        let top = pvget(&self.client, &self.pv).await?;
+        let cached = self.converter.lock().unwrap().clone();
+        let conv = match cached {
+            Some(conv) => conv,
+            None => {
+                let conv = Arc::new(make_converter(&self.pv, self.want, &top)?);
+                *self.converter.lock().unwrap() = Some(conv.clone());
+                conv
+            }
+        };
+        Ok((conv, top))
+    }
+
+    async fn value(&self) -> Result<T> {
+        let (conv, top) = self.read().await?;
+        T::decode(&conv, &top).ok_or_else(|| undecodable(&top))
     }
 
     /// `value`, or for `None` the value `connect` read, read now if no
@@ -80,16 +113,49 @@ where
         if let Some(v) = value.or_else(|| self.initial.lock().unwrap().clone()) {
             return Ok(v);
         }
-        let v = self.get_value().await?;
+        let v = self.value().await?;
         *self.initial.lock().unwrap() = Some(v.clone());
         Ok(v)
     }
+
+    async fn put_value(&self, value: Option<T>) -> Result<PutCompletion> {
+        let value = self.or_initial(value).await?;
+        let cached = self.converter.lock().unwrap().clone();
+        let conv = match cached {
+            Some(conv) => conv,
+            None => self.read().await?.0,
+        };
+        put_block(&self.client, &self.pv, T::encode(&conv, value)).await
+    }
 }
 
-impl<T: Clone + Send + Sync + 'static> crate::devices::BackendFromPv for EpicsPvaBackend<T> {
+impl EpicsPvaBackend<f64> {
+    /// ophyd-async's `datatype=None` read as a number: any numeric or bool
+    /// NTScalar, an NTEnum as its index, for the devices whose PV is the
+    /// user's to name (`pva_detector`).
+    pub(crate) fn new_inferred(pv: impl Into<String>) -> Self {
+        Self::reading_as(pv.into(), Datatype::Number)
+    }
+}
+
+impl<T: PvaType> crate::devices::BackendFromPv for EpicsPvaBackend<T> {
     fn from_pv(pv: &str) -> Self {
         Self::new(pv)
     }
+}
+
+/// A full read of `pv`.
+async fn pvget(client: &PvaClient, pv: &str) -> Result<PvField> {
+    client
+        .pvget(pv)
+        .await
+        .map_err(|e| BsrsError::Backend(format!("pva get: {e}")))
+}
+
+/// A read whose value is not of the type the converter was made for: the PV
+/// changed type since the connect.
+fn undecodable(top: &PvField) -> BsrsError {
+    BsrsError::Backend(format!("pva: {top:?} is not of the PV's connect-time type"))
 }
 
 /// Wait up to `timeout` for `pv` to connect. `pvconnect` is bounded by the
@@ -160,9 +226,7 @@ fn put_leaf(intro: &FieldDesc, present: Option<&PvField>, f: PvField) -> (String
     }
 }
 
-// Coerce one scalar to f64. The single source of truth for numeric→f64
-// widening, shared by the scalar `pv_field_to_f64` and the array
-// `pv_field_to_vec_f64` so both accept the same element types.
+// Coerce one scalar to f64, as Python `float()` does any numeric value.
 fn scalar_to_f64(s: &ScalarValue) -> Option<f64> {
     match s {
         ScalarValue::Double(d) => Some(*d),
@@ -193,27 +257,6 @@ fn pv_field_to_f64(p: &PvField) -> Option<f64> {
     }
 }
 
-// Decode a numeric NTScalarArray (`{ value: [...] }`) or a bare scalar array
-// into `Vec<f64>`, coercing every element through [`scalar_to_f64`] so any
-// numeric element type (Double/Float/Int/Long/…), in either the legacy
-// `ScalarArray` or the typed `ScalarArrayTyped` representation, reads
-// uniformly. Returns None if the field is not an array or any element is
-// non-numeric.
-fn pv_field_to_vec_f64(p: &PvField) -> Option<Vec<f64>> {
-    match p {
-        PvField::ScalarArray(items) => items.iter().map(scalar_to_f64).collect(),
-        PvField::ScalarArrayTyped(arr) => {
-            arr.to_scalar_values().iter().map(scalar_to_f64).collect()
-        }
-        PvField::Structure(s) => s
-            .fields
-            .iter()
-            .find(|(name, _)| name == "value")
-            .and_then(|(_, f)| pv_field_to_vec_f64(f)),
-        _ => None,
-    }
-}
-
 fn pv_field_to_i64(p: &PvField) -> Option<i64> {
     match p {
         PvField::Scalar(s) => match s {
@@ -236,21 +279,6 @@ fn pv_field_to_i64(p: &PvField) -> Option<i64> {
             .find(|(name, _)| name == "value")
             .and_then(|(_, f)| pv_field_to_i64(f)),
         _ => None,
-    }
-}
-
-// An `enum_t` value reads as its index, as ophyd-async's
-// `PvaEnumBoolConverter` (`bool(value["value"]["index"])`, _p4p.py:183-188).
-fn pv_field_to_bool(p: &PvField) -> Option<bool> {
-    match p {
-        PvField::Scalar(ScalarValue::Boolean(b)) => Some(*b),
-        PvField::Structure(s) => match field(&s.fields, "value")? {
-            PvField::Structure(e) => field(&e.fields, "index")
-                .and_then(pv_field_to_i64)
-                .map(|i| i != 0),
-            v => pv_field_to_bool(v),
-        },
-        _ => pv_field_to_i64(p).map(|i| i != 0),
     }
 }
 
@@ -293,25 +321,6 @@ fn pv_enum_to_label(fields: &[(String, PvField)]) -> Option<String> {
             .and_then(|i| choices.get(i).cloned())
             .unwrap_or_else(|| index.to_string()),
     )
-}
-
-fn pv_field_to_string(p: &PvField) -> Option<String> {
-    match p {
-        PvField::Scalar(ScalarValue::String(s)) => Some(s.as_str_lossy().into_owned()),
-        PvField::Structure(s) => {
-            // NTEnum value substructure `{ index, choices }`: decode the
-            // selected label. Checked before the NTScalar `value` recursion
-            // because an NTEnum's `value` is itself this substructure.
-            if let Some(label) = pv_enum_to_label(&s.fields) {
-                return Some(label);
-            }
-            s.fields
-                .iter()
-                .find(|(name, _)| name == "value")
-                .and_then(|(_, f)| pv_field_to_string(f))
-        }
-        _ => None,
-    }
 }
 
 // NTScalar carries an optional `timeStamp` substructure with
@@ -426,13 +435,182 @@ fn pv_limits(top: &[(String, PvField)]) -> Limits {
     limits
 }
 
-/// The type a backend reads a PV as: ophyd-async's `datatype`.
-#[derive(Clone, Copy, PartialEq)]
-enum Datatype {
+/// What a backend reads its PV as: ophyd-async's `datatype`, named as its
+/// `format_datatype` names it in a refusal. `pub` only for the sealed
+/// [`PvaType`], as is [`PvaConverter`]; neither is reachable outside.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Datatype {
     Float,
     Int,
     Bool,
     Str,
+    FloatArray,
+    /// `datatype=None`, read as a number: whatever numeric or bool scalar
+    /// the PV is, an NTEnum as its index (ophyd `EpicsSignalRO`).
+    Number,
+}
+
+impl Datatype {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Float | Self::Number => "float",
+            Self::Int => "int",
+            Self::Bool => "bool",
+            Self::Str => "str",
+            Self::FloatArray => "Array1D[np.float64]",
+        }
+    }
+}
+
+/// How a backend's values come from its PV's `value`, as [`make_converter`]
+/// picked it at connect.
+#[derive(Debug, PartialEq)]
+pub enum PvaConverter {
+    /// The scalar or array itself (`PvaConverter`, `PvaIntConverter`,
+    /// `PvaScalarBoolConverter`).
+    Value,
+    /// An NTEnum's `index` and `choices` (`PvaEnumConverter`,
+    /// `PvaEnumBoolConverter`).
+    Enum,
+    /// A `str` on an int8 array, NUL-terminated (`PvaLongStringConverter`).
+    LongStr,
+}
+
+const NT_SCALAR: &str = "epics:nt/NTScalar:1.0";
+const NT_SCALAR_ARRAY: &str = "epics:nt/NTScalarArray:1.0";
+const NT_ENUM: &str = "epics:nt/NTEnum:1.0";
+
+/// A full read's fields; none for a bare value.
+fn top_fields(top: &PvField) -> &[(String, PvField)] {
+    match top {
+        PvField::Structure(s) => &s.fields,
+        _ => &[],
+    }
+}
+
+/// The p4p type code of a `value` field: ophyd-async's `_get_specifier`.
+fn specifier(value: Option<&PvField>) -> String {
+    fn code(t: ScalarType) -> char {
+        use ScalarType::*;
+        match t {
+            Boolean => '?',
+            Byte => 'b',
+            UByte => 'B',
+            Short => 'h',
+            UShort => 'H',
+            Int => 'i',
+            UInt => 'I',
+            Long => 'l',
+            ULong => 'L',
+            Float => 'f',
+            Double => 'd',
+            String => 's',
+        }
+    }
+    match value {
+        Some(PvField::Scalar(x)) => code(x.scalar_type()).to_string(),
+        Some(PvField::ScalarArrayTyped(a)) => format!("a{}", code(a.scalar_type())),
+        // The legacy form, which no decoder makes, is typed by its elements.
+        Some(PvField::ScalarArray(items)) => match items.first() {
+            Some(x) => format!("a{}", code(x.scalar_type())),
+            None => "a".into(),
+        },
+        Some(PvField::Structure(_)) => "S".into(),
+        Some(PvField::StructureArray(_)) => "aS".into(),
+        Some(PvField::Union { .. }) => "U".into(),
+        Some(PvField::UnionArray(_)) => "aU".into(),
+        Some(PvField::Variant(_)) => "v".into(),
+        Some(PvField::VariantArray(_)) => "av".into(),
+        Some(PvField::Null) | None => String::new(),
+    }
+}
+
+/// The datatype ophyd-async infers from a PV's typeid and specifier
+/// (`_datatype_converter_from_typeid`): its name in a refusal, and the
+/// [`Datatype`] it is, if bsrs has one.
+fn inferred(typeid: &str, spec: &str) -> Option<(&'static str, Option<Datatype>)> {
+    use Datatype as D;
+    Some(match (typeid, spec) {
+        (NT_SCALAR, "?") => ("bool", Some(D::Bool)),
+        (NT_SCALAR, "b" | "B" | "h" | "H" | "i" | "I" | "l" | "L") => ("int", Some(D::Int)),
+        (NT_SCALAR, "f" | "d") => ("float", Some(D::Float)),
+        (NT_SCALAR, "s") | (NT_ENUM, "S") => ("str", Some(D::Str)),
+        (NT_SCALAR_ARRAY, "ad") => ("Array1D[np.float64]", Some(D::FloatArray)),
+        (NT_SCALAR_ARRAY, "a?") => ("Array1D[np.bool]", None),
+        (NT_SCALAR_ARRAY, "ab") => ("Array1D[np.int8]", None),
+        (NT_SCALAR_ARRAY, "aB") => ("Array1D[np.uint8]", None),
+        (NT_SCALAR_ARRAY, "ah") => ("Array1D[np.int16]", None),
+        (NT_SCALAR_ARRAY, "aH") => ("Array1D[np.uint16]", None),
+        (NT_SCALAR_ARRAY, "ai") => ("Array1D[np.int32]", None),
+        (NT_SCALAR_ARRAY, "aI") => ("Array1D[np.uint32]", None),
+        (NT_SCALAR_ARRAY, "al") => ("Array1D[np.int64]", None),
+        (NT_SCALAR_ARRAY, "aL") => ("Array1D[np.uint64]", None),
+        (NT_SCALAR_ARRAY, "af") => ("Array1D[np.float32]", None),
+        (NT_SCALAR_ARRAY, "as") => ("Sequence[str]", None),
+        ("epics:nt/NTTable:1.0", "S") => ("Table", None),
+        ("epics:nt/NTNDArray:1.0", "v" | "U") => ("ndarray", None),
+        _ => return None,
+    })
+}
+
+/// ophyd-async `make_converter`: the converter that reads `pv`, whose full
+/// read is `top`, as `want`, or the `TypeError` that refuses it.
+fn make_converter(pv: &str, want: Datatype, top: &PvField) -> Result<PvaConverter> {
+    use Datatype as D;
+    let typeid = match top {
+        PvField::Structure(s) => s.struct_id.as_str(),
+        _ => "",
+    };
+    let spec = specifier(field(top_fields(top), "value"));
+    let Some((name, inferred)) = inferred(typeid, &spec) else {
+        // ophyd-async's lookup raises a bare `KeyError` here.
+        return Err(BsrsError::Datatype(format!(
+            "{pv} has no datatype for typeid='{typeid}' specifier='{spec}'"
+        )));
+    };
+    let is_enum = typeid == NT_ENUM;
+    let conv = match want {
+        // A database bool is often a two-choice enum.
+        D::Bool if is_enum => {
+            let n = sub_fields(top_fields(top), "value")
+                .and_then(|e| field(e, "choices"))
+                .and_then(pv_string_array)
+                .map_or(0, |c| c.len());
+            if n != 2 {
+                return Err(BsrsError::Datatype(format!(
+                    "{pv} has {n} choices, can't map to bool"
+                )));
+            }
+            Some(PvaConverter::Enum)
+        }
+        D::Bool if typeid == NT_SCALAR && matches!(spec.as_str(), "?" | "b" | "B" | "i" | "I") => {
+            Some(PvaConverter::Value)
+        }
+        _ if is_enum => matches!(want, D::Str | D::Number).then_some(PvaConverter::Enum),
+        // An int on a float record whose precision shows no fraction.
+        D::Int
+            if inferred == Some(D::Float)
+                && sub_fields(top_fields(top), "display")
+                    .and_then(|d| field(d, "precision"))
+                    .and_then(pv_field_to_i64)
+                    == Some(0) =>
+        {
+            Some(PvaConverter::Value)
+        }
+        D::Number if matches!(inferred, Some(D::Float | D::Int | D::Bool)) => {
+            Some(PvaConverter::Value)
+        }
+        _ if inferred == Some(want) => Some(PvaConverter::Value),
+        D::Str if name == "Array1D[np.int8]" => Some(PvaConverter::LongStr),
+        _ => None,
+    };
+    conv.ok_or_else(|| {
+        BsrsError::Datatype(format!(
+            "{pv} with inferred datatype {name} from typeid='{typeid}' \
+             specifier='{spec}' cannot be coerced to {}",
+            want.name()
+        ))
+    })
 }
 
 // The element type of a `value` leaf: ophyd-async's specifier.
@@ -527,458 +705,245 @@ fn array_datakey(source: String, value: &[f64], meta: SignalMetadata) -> DataKey
     make_datakey(source, Dtype::Array, shape, Some("<f8".into()), meta)
 }
 
-#[async_trait]
-impl SignalBackend<f64> for EpicsPvaBackend<f64> {
-    async fn connect(&self, timeout: Duration) -> Result<()> {
-        self.connect_reading(timeout).await
+mod sealed {
+    use super::{Datatype, PvaConverter};
+    use crate::core::error::Result;
+    use crate::event_model::DataKey;
+    use epics_pva_rs::PvField;
+
+    /// A type [`EpicsPvaBackend`](super::EpicsPvaBackend) reads a PV as: its
+    /// ophyd-async datatype, and its values through the converter
+    /// [`make_converter`](super::make_converter) picked for it.
+    pub trait PvaType: Into<serde_json::Value> + Clone + Send + Sync + 'static {
+        #[doc(hidden)]
+        const DATATYPE: Datatype;
+        /// `None` when `top` is not a read of the PV `conv` was made for.
+        #[doc(hidden)]
+        fn decode(conv: &PvaConverter, top: &PvField) -> Option<Self>;
+        #[doc(hidden)]
+        fn encode(conv: &PvaConverter, v: Self) -> PvField;
+        /// ophyd-async `get_datakey` from a full read `top`.
+        #[doc(hidden)]
+        fn datakey(source: String, conv: &PvaConverter, top: &PvField) -> Result<DataKey>;
     }
-    async fn put_start(&self, value: Option<f64>) -> Result<PutCompletion> {
-        let f = PvField::Scalar(ScalarValue::Double(self.or_initial(value).await?));
-        put_block(&self.client, &self.pv, f).await
+}
+use sealed::PvaType;
+
+/// An NTEnum's `value.index`.
+fn enum_index(top: &PvField) -> Option<i64> {
+    sub_fields(top_fields(top), "value")
+        .and_then(|e| field(e, "index"))
+        .and_then(pv_field_to_i64)
+}
+
+/// An int8 array's text, its trailing NULs stripped, as
+/// `PvaLongStringConverter` reads it.
+fn long_string(chars: &[i8]) -> String {
+    let bytes: Vec<u8> = chars.iter().map(|c| *c as u8).collect();
+    let end = bytes.iter().rposition(|b| *b != 0).map_or(0, |i| i + 1);
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+impl PvaType for f64 {
+    const DATATYPE: Datatype = Datatype::Float;
+    fn decode(conv: &PvaConverter, top: &PvField) -> Option<Self> {
+        match (conv, field(top_fields(top), "value")?) {
+            (PvaConverter::Enum, _) => enum_index(top).map(|i| i as f64),
+            (_, PvField::Scalar(ScalarValue::Boolean(b))) => Some(f64::from(u8::from(*b))),
+            (_, PvField::Scalar(s)) => scalar_to_f64(s),
+            _ => None,
+        }
     }
-    async fn get_datakey(&self, source: &str) -> Result<DataKey> {
-        // pvget the full NTScalar (display/control/valueAlarm carry units,
-        // precision, and limits) — describe is rare; mirrors CA ctrl_metadata.
-        let f = self
-            .client
-            .pvget(&self.pv)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("pva get: {e}")))?;
-        Ok(primitive_datakey::<f64>(
-            format!("pva://{source}"),
-            pv_field_to_metadata(&f, Datatype::Float),
-        ))
+    fn encode(_: &PvaConverter, v: Self) -> PvField {
+        PvField::Scalar(ScalarValue::Double(v))
     }
-    async fn get_reading(&self) -> Result<ReadingValue> {
-        let f = self
-            .client
-            .pvget(&self.pv)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("pva get: {e}")))?;
-        let v = pv_field_to_f64(&f)
-            .ok_or_else(|| BsrsError::Backend(format!("pva: not numeric: {f:?}")))?;
-        Ok(ReadingValue {
-            value: serde_json::Value::from(v),
-            timestamp: pv_field_to_ts(&f).unwrap_or_else(now_ts),
-            alarm_severity: pv_field_to_alarm_severity(&f),
-            message: None,
-        })
+    fn datakey(source: String, _: &PvaConverter, top: &PvField) -> Result<DataKey> {
+        let meta = pv_field_to_metadata(top, Datatype::Float);
+        Ok(primitive_datakey::<f64>(source, meta))
     }
-    async fn get_value(&self) -> Result<f64> {
-        let f = self
-            .client
-            .pvget(&self.pv)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("pva get: {e}")))?;
-        pv_field_to_f64(&f).ok_or_else(|| BsrsError::Backend(format!("pva: not numeric: {f:?}")))
+}
+
+impl PvaType for i64 {
+    const DATATYPE: Datatype = Datatype::Int;
+    fn decode(_: &PvaConverter, top: &PvField) -> Option<Self> {
+        field(top_fields(top), "value").and_then(pv_field_to_i64)
     }
-    async fn get_setpoint(&self) -> Result<f64> {
-        SignalBackend::<f64>::get_value(self).await
+    fn encode(_: &PvaConverter, v: Self) -> PvField {
+        PvField::Scalar(ScalarValue::Long(v))
     }
-    fn set_callback(&self, cb: Option<ReadingValueCallback<f64>>) -> SubToken {
-        let cb = match cb {
-            None => return SubToken::noop(),
-            Some(cb) => Arc::new(cb),
-        };
-        let client = self.client.clone();
-        let pv = self.pv.clone();
-        // Server timestamps live in NTScalar's `timeStamp` substructure and
-        // alarm state in `alarm`. Project both explicitly (skipping the larger
-        // `display`/`control` fields) so monitor readings carry server time +
-        // alarm severity, matching ophyd-async's reading format.
-        // Servers publishing bare (non-Normative) scalars simply have no
-        // `timeStamp` to send; we detect that on first frame and emit a
-        // one-shot WARN per PV so operators can see that local-clock
-        // timestamps are being substituted (the fallback is otherwise
-        // invisible).
-        let request = PvRequestExpr::parse("field(value,alarm,timeStamp)").unwrap_or_default();
-        let warned_local_clock = Arc::new(AtomicBool::new(false));
-        let pv_for_cb = pv.clone();
-        let warned_for_cb = warned_local_clock.clone();
-        let handle = tokio::spawn(async move {
-            let res = client
-                .pvmonitor_with_request(&pv, &request, move |field: &PvField| {
-                    if let Some(f) = pv_field_to_f64(field) {
-                        let ts = match pv_field_to_ts(field) {
-                            Some(t) => t,
-                            None => {
-                                if !warned_for_cb.swap(true, Ordering::SeqCst) {
-                                    tracing::warn!(
-                                        target: "bsrs_backend_epics_pva",
-                                        "pva {}: monitor frame has no server timeStamp; \
-                                         falling back to local clock for this PV (one-shot)",
-                                        pv_for_cb,
-                                    );
-                                }
-                                now_ts()
-                            }
-                        };
-                        cb(&f, ts, pv_field_to_alarm_severity(field));
-                    }
-                })
-                .await;
-            if let Err(e) = res {
-                tracing::error!("pva monitor on {pv}: {e}");
+    fn datakey(source: String, _: &PvaConverter, top: &PvField) -> Result<DataKey> {
+        let meta = pv_field_to_metadata(top, Datatype::Int);
+        Ok(primitive_datakey::<i64>(source, meta))
+    }
+}
+
+impl PvaType for bool {
+    const DATATYPE: Datatype = Datatype::Bool;
+    fn decode(conv: &PvaConverter, top: &PvField) -> Option<Self> {
+        match conv {
+            PvaConverter::Enum => enum_index(top),
+            _ => field(top_fields(top), "value").and_then(pv_field_to_i64),
+        }
+        .map(|i| i != 0)
+    }
+    fn encode(_: &PvaConverter, v: Self) -> PvField {
+        PvField::Scalar(ScalarValue::Boolean(v))
+    }
+    fn datakey(source: String, _: &PvaConverter, top: &PvField) -> Result<DataKey> {
+        let meta = pv_field_to_metadata(top, Datatype::Bool);
+        Ok(primitive_datakey::<bool>(source, meta))
+    }
+}
+
+impl PvaType for String {
+    const DATATYPE: Datatype = Datatype::Str;
+    fn decode(conv: &PvaConverter, top: &PvField) -> Option<Self> {
+        match (conv, field(top_fields(top), "value")?) {
+            (PvaConverter::Value, PvField::Scalar(ScalarValue::String(s))) => {
+                Some(s.as_str_lossy().into_owned())
             }
-        });
-        let abort = handle.abort_handle();
-        SubToken::new(move || abort.abort())
+            (PvaConverter::Enum, PvField::Structure(e)) => pv_enum_to_label(&e.fields),
+            (PvaConverter::LongStr, PvField::ScalarArrayTyped(TypedScalarArray::Byte(a))) => {
+                Some(long_string(a))
+            }
+            _ => None,
+        }
     }
-    fn source(&self, name: &str, _read: bool) -> String {
-        format!("pva://{name}")
+    fn encode(conv: &PvaConverter, v: Self) -> PvField {
+        match conv {
+            // NUL-terminated, as `PvaLongStringConverter` writes it.
+            PvaConverter::LongStr => {
+                let mut chars: Vec<i8> = v.bytes().map(|b| b as i8).collect();
+                chars.push(0);
+                PvField::ScalarArrayTyped(TypedScalarArray::Byte(chars.into()))
+            }
+            _ => PvField::Scalar(ScalarValue::String(v.into())),
+        }
+    }
+    fn datakey(source: String, _: &PvaConverter, top: &PvField) -> Result<DataKey> {
+        let meta = pv_field_to_metadata(top, Datatype::Str);
+        Ok(primitive_datakey::<String>(source, meta))
+    }
+}
+
+impl PvaType for Vec<f64> {
+    const DATATYPE: Datatype = Datatype::FloatArray;
+    fn decode(_: &PvaConverter, top: &PvField) -> Option<Self> {
+        match field(top_fields(top), "value")? {
+            PvField::ScalarArrayTyped(TypedScalarArray::Double(a)) => Some(a.to_vec()),
+            PvField::ScalarArray(items) => items
+                .iter()
+                .map(|x| match x {
+                    ScalarValue::Double(d) => Some(*d),
+                    _ => None,
+                })
+                .collect(),
+            _ => None,
+        }
+    }
+    fn encode(_: &PvaConverter, v: Self) -> PvField {
+        PvField::ScalarArrayTyped(TypedScalarArray::Double(v.into()))
+    }
+    fn datakey(source: String, conv: &PvaConverter, top: &PvField) -> Result<DataKey> {
+        let v = Self::decode(conv, top).ok_or_else(|| undecodable(top))?;
+        let meta = pv_field_to_metadata(top, Datatype::FloatArray);
+        Ok(array_datakey(source, &v, meta))
+    }
+}
+
+/// Feed `cb` each update of `pv`'s monitor that `decode` accepts. Only
+/// `value`, `alarm` and `timeStamp` are asked for; a server that publishes
+/// no `timeStamp` is stamped by the local clock, warned of once.
+async fn forward_monitor<T>(
+    client: &PvaClient,
+    pv: &str,
+    decode: impl Fn(&PvField) -> Option<T> + Send,
+    cb: ReadingValueCallback<T>,
+) {
+    let request = PvRequestExpr::parse("field(value,alarm,timeStamp)").unwrap_or_default();
+    let mut warned = false;
+    let res = client
+        .pvmonitor_with_request(pv, &request, move |f: &PvField| {
+            let Some(v) = decode(f) else {
+                return;
+            };
+            let ts = pv_field_to_ts(f).unwrap_or_else(|| {
+                if !std::mem::replace(&mut warned, true) {
+                    tracing::warn!(
+                        target: "bsrs_backend_epics_pva",
+                        "pva {pv}: monitor frame has no server timeStamp; \
+                         falling back to local clock for this PV (one-shot)",
+                    );
+                }
+                now_ts()
+            });
+            cb(&v, ts, pv_field_to_alarm_severity(f));
+        })
+        .await;
+    if let Err(e) = res {
+        tracing::error!("pva monitor on {pv}: {e}");
     }
 }
 
 #[async_trait]
-impl SignalBackend<Vec<f64>> for EpicsPvaBackend<Vec<f64>> {
+impl<T: PvaType> SignalBackend<T> for EpicsPvaBackend<T> {
     async fn connect(&self, timeout: Duration) -> Result<()> {
         self.connect_reading(timeout).await
     }
-    async fn put_start(&self, value: Option<Vec<f64>>) -> Result<PutCompletion> {
-        // Written as a typed Double array; an EPICS waveform record coerces to
-        // its FTVL element type server-side.
-        let value = self.or_initial(value).await?;
-        let f = PvField::ScalarArrayTyped(TypedScalarArray::Double(value.into()));
-        put_block(&self.client, &self.pv, f).await
+    async fn put_start(&self, value: Option<T>) -> Result<PutCompletion> {
+        self.put_value(value).await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
-        let f = self
-            .client
-            .pvget(&self.pv)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("pva get: {e}")))?;
-        let v = pv_field_to_vec_f64(&f)
-            .ok_or_else(|| BsrsError::Backend(format!("pva: not a numeric array: {f:?}")))?;
-        let meta = pv_field_to_metadata(&f, Datatype::Float);
-        Ok(array_datakey(format!("pva://{source}"), &v, meta))
+        // The full read carries display/control/valueAlarm: units,
+        // precision and limits.
+        let (conv, top) = self.read().await?;
+        T::datakey(format!("pva://{source}"), &conv, &top)
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
-        let f = self
-            .client
-            .pvget(&self.pv)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("pva get: {e}")))?;
-        let v = pv_field_to_vec_f64(&f)
-            .ok_or_else(|| BsrsError::Backend(format!("pva: not a numeric array: {f:?}")))?;
+        let (conv, top) = self.read().await?;
+        let v = T::decode(&conv, &top).ok_or_else(|| undecodable(&top))?;
         Ok(ReadingValue {
-            value: serde_json::Value::from(v),
-            timestamp: pv_field_to_ts(&f).unwrap_or_else(now_ts),
-            alarm_severity: pv_field_to_alarm_severity(&f),
+            value: v.into(),
+            timestamp: pv_field_to_ts(&top).unwrap_or_else(now_ts),
+            alarm_severity: pv_field_to_alarm_severity(&top),
             message: None,
         })
     }
-    async fn get_value(&self) -> Result<Vec<f64>> {
-        let f = self
-            .client
-            .pvget(&self.pv)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("pva get: {e}")))?;
-        pv_field_to_vec_f64(&f)
-            .ok_or_else(|| BsrsError::Backend(format!("pva: not a numeric array: {f:?}")))
+    async fn get_value(&self) -> Result<T> {
+        self.value().await
     }
-    async fn get_setpoint(&self) -> Result<Vec<f64>> {
-        SignalBackend::<Vec<f64>>::get_value(self).await
+    async fn get_setpoint(&self) -> Result<T> {
+        self.value().await
     }
-    fn set_callback(&self, cb: Option<ReadingValueCallback<Vec<f64>>>) -> SubToken {
-        let cb = match cb {
-            None => return SubToken::noop(),
-            Some(cb) => Arc::new(cb),
+    fn set_callback(&self, cb: Option<ReadingValueCallback<T>>) -> SubToken {
+        let Some(cb) = cb else {
+            return SubToken::noop();
         };
         let client = self.client.clone();
-        let pv = self.pv.clone();
-        let request = PvRequestExpr::parse("field(value,alarm,timeStamp)").unwrap_or_default();
-        let warned_local_clock = Arc::new(AtomicBool::new(false));
-        let pv_for_cb = pv.clone();
-        let warned_for_cb = warned_local_clock.clone();
+        let cached = self.converter.lock().unwrap().clone();
+        let (pv, want) = (self.pv.clone(), self.want);
         let handle = tokio::spawn(async move {
-            let res = client
-                .pvmonitor_with_request(&pv, &request, move |field: &PvField| {
-                    if let Some(v) = pv_field_to_vec_f64(field) {
-                        let ts = match pv_field_to_ts(field) {
-                            Some(t) => t,
-                            None => {
-                                if !warned_for_cb.swap(true, Ordering::SeqCst) {
-                                    tracing::warn!(
-                                        target: "bsrs_backend_epics_pva",
-                                        "pva {}: monitor frame has no server timeStamp; \
-                                         falling back to local clock for this PV (one-shot)",
-                                        pv_for_cb,
-                                    );
-                                }
-                                now_ts()
-                            }
-                        };
-                        cb(&v, ts, pv_field_to_alarm_severity(field));
+            let conv = match cached {
+                Some(conv) => conv,
+                None => {
+                    // No connect made the converter: wait for the channel as
+                    // long as the token lives, as the monitor itself would.
+                    if pva_connect(&client, &pv, Duration::MAX).await.is_err() {
+                        return;
                     }
-                })
-                .await;
-            if let Err(e) = res {
-                tracing::error!("pva monitor on {pv}: {e}");
-            }
-        });
-        let abort = handle.abort_handle();
-        SubToken::new(move || abort.abort())
-    }
-    fn source(&self, name: &str, _read: bool) -> String {
-        format!("pva://{name}")
-    }
-}
-
-#[async_trait]
-impl SignalBackend<String> for EpicsPvaBackend<String> {
-    async fn connect(&self, timeout: Duration) -> Result<()> {
-        self.connect_reading(timeout).await
-    }
-    async fn put_start(&self, value: Option<String>) -> Result<PutCompletion> {
-        let f = PvField::Scalar(ScalarValue::String(self.or_initial(value).await?.into()));
-        put_block(&self.client, &self.pv, f).await
-    }
-    async fn get_datakey(&self, source: &str) -> Result<DataKey> {
-        let f = self
-            .client
-            .pvget(&self.pv)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("pva get: {e}")))?;
-        Ok(primitive_datakey::<String>(
-            format!("pva://{source}"),
-            pv_field_to_metadata(&f, Datatype::Str),
-        ))
-    }
-    async fn get_reading(&self) -> Result<ReadingValue> {
-        let f = self
-            .client
-            .pvget(&self.pv)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("pva get: {e}")))?;
-        let s = pv_field_to_string(&f)
-            .ok_or_else(|| BsrsError::Backend(format!("pva: not string: {f:?}")))?;
-        Ok(ReadingValue {
-            value: serde_json::Value::from(s),
-            timestamp: pv_field_to_ts(&f).unwrap_or_else(now_ts),
-            alarm_severity: pv_field_to_alarm_severity(&f),
-            message: None,
-        })
-    }
-    async fn get_value(&self) -> Result<String> {
-        let f = self
-            .client
-            .pvget(&self.pv)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("pva get: {e}")))?;
-        pv_field_to_string(&f).ok_or_else(|| BsrsError::Backend(format!("pva: not string: {f:?}")))
-    }
-    async fn get_setpoint(&self) -> Result<String> {
-        SignalBackend::<String>::get_value(self).await
-    }
-    fn set_callback(&self, cb: Option<ReadingValueCallback<String>>) -> SubToken {
-        let cb = match cb {
-            None => return SubToken::noop(),
-            Some(cb) => Arc::new(cb),
-        };
-        let client = self.client.clone();
-        let pv = self.pv.clone();
-        let request = PvRequestExpr::parse("field(value,alarm,timeStamp)").unwrap_or_default();
-        let warned_local_clock = Arc::new(AtomicBool::new(false));
-        let pv_for_cb = pv.clone();
-        let warned_for_cb = warned_local_clock.clone();
-        let handle = tokio::spawn(async move {
-            let res = client
-                .pvmonitor_with_request(&pv, &request, move |field: &PvField| {
-                    if let Some(s) = pv_field_to_string(field) {
-                        let ts = pv_field_to_ts(field).unwrap_or_else(|| {
-                            if !warned_for_cb.swap(true, Ordering::SeqCst) {
-                                tracing::warn!(
-                                    target: "bsrs_backend_epics_pva",
-                                    "pva {}: monitor frame has no server timeStamp; \
-                                     falling back to local clock for this PV (one-shot)",
-                                    pv_for_cb,
-                                );
-                            }
-                            now_ts()
-                        });
-                        cb(&s, ts, pv_field_to_alarm_severity(field));
+                    let made = pvget(&client, &pv)
+                        .await
+                        .and_then(|top| make_converter(&pv, want, &top));
+                    match made {
+                        Ok(conv) => Arc::new(conv),
+                        Err(e) => {
+                            tracing::warn!("pva monitor {pv}: {e}");
+                            return;
+                        }
                     }
-                })
-                .await;
-            if let Err(e) = res {
-                tracing::error!("pva monitor on {pv}: {e}");
-            }
-        });
-        let abort = handle.abort_handle();
-        SubToken::new(move || abort.abort())
-    }
-    fn source(&self, name: &str, _read: bool) -> String {
-        format!("pva://{name}")
-    }
-}
-
-#[async_trait]
-impl SignalBackend<i64> for EpicsPvaBackend<i64> {
-    async fn connect(&self, timeout: Duration) -> Result<()> {
-        self.connect_reading(timeout).await
-    }
-    async fn put_start(&self, value: Option<i64>) -> Result<PutCompletion> {
-        let f = PvField::Scalar(ScalarValue::Long(self.or_initial(value).await?));
-        put_block(&self.client, &self.pv, f).await
-    }
-    async fn get_datakey(&self, source: &str) -> Result<DataKey> {
-        let f = self
-            .client
-            .pvget(&self.pv)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("pva get: {e}")))?;
-        Ok(primitive_datakey::<i64>(
-            format!("pva://{source}"),
-            pv_field_to_metadata(&f, Datatype::Int),
-        ))
-    }
-    async fn get_reading(&self) -> Result<ReadingValue> {
-        let f = self
-            .client
-            .pvget(&self.pv)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("pva get: {e}")))?;
-        let i = pv_field_to_i64(&f)
-            .ok_or_else(|| BsrsError::Backend(format!("pva: not int: {f:?}")))?;
-        Ok(ReadingValue {
-            value: serde_json::Value::from(i),
-            timestamp: pv_field_to_ts(&f).unwrap_or_else(now_ts),
-            alarm_severity: pv_field_to_alarm_severity(&f),
-            message: None,
-        })
-    }
-    async fn get_value(&self) -> Result<i64> {
-        let f = self
-            .client
-            .pvget(&self.pv)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("pva get: {e}")))?;
-        pv_field_to_i64(&f).ok_or_else(|| BsrsError::Backend(format!("pva: not int: {f:?}")))
-    }
-    async fn get_setpoint(&self) -> Result<i64> {
-        SignalBackend::<i64>::get_value(self).await
-    }
-    fn set_callback(&self, cb: Option<ReadingValueCallback<i64>>) -> SubToken {
-        let cb = match cb {
-            None => return SubToken::noop(),
-            Some(cb) => Arc::new(cb),
-        };
-        let client = self.client.clone();
-        let pv = self.pv.clone();
-        let request = PvRequestExpr::parse("field(value,alarm,timeStamp)").unwrap_or_default();
-        let warned_local_clock = Arc::new(AtomicBool::new(false));
-        let pv_for_cb = pv.clone();
-        let warned_for_cb = warned_local_clock.clone();
-        let handle = tokio::spawn(async move {
-            let res = client
-                .pvmonitor_with_request(&pv, &request, move |field: &PvField| {
-                    if let Some(i) = pv_field_to_i64(field) {
-                        let ts = pv_field_to_ts(field).unwrap_or_else(|| {
-                            if !warned_for_cb.swap(true, Ordering::SeqCst) {
-                                tracing::warn!(
-                                    target: "bsrs_backend_epics_pva",
-                                    "pva {}: monitor frame has no server timeStamp; \
-                                     falling back to local clock for this PV (one-shot)",
-                                    pv_for_cb,
-                                );
-                            }
-                            now_ts()
-                        });
-                        cb(&i, ts, pv_field_to_alarm_severity(field));
-                    }
-                })
-                .await;
-            if let Err(e) = res {
-                tracing::error!("pva monitor on {pv}: {e}");
-            }
-        });
-        let abort = handle.abort_handle();
-        SubToken::new(move || abort.abort())
-    }
-    fn source(&self, name: &str, _read: bool) -> String {
-        format!("pva://{name}")
-    }
-}
-
-#[async_trait]
-impl SignalBackend<bool> for EpicsPvaBackend<bool> {
-    async fn connect(&self, timeout: Duration) -> Result<()> {
-        self.connect_reading(timeout).await
-    }
-    async fn put_start(&self, value: Option<bool>) -> Result<PutCompletion> {
-        let f = PvField::Scalar(ScalarValue::Boolean(self.or_initial(value).await?));
-        put_block(&self.client, &self.pv, f).await
-    }
-    async fn get_datakey(&self, source: &str) -> Result<DataKey> {
-        let f = self
-            .client
-            .pvget(&self.pv)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("pva get: {e}")))?;
-        Ok(primitive_datakey::<bool>(
-            format!("pva://{source}"),
-            pv_field_to_metadata(&f, Datatype::Bool),
-        ))
-    }
-    async fn get_reading(&self) -> Result<ReadingValue> {
-        let f = self
-            .client
-            .pvget(&self.pv)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("pva get: {e}")))?;
-        let b = pv_field_to_bool(&f)
-            .ok_or_else(|| BsrsError::Backend(format!("pva: not bool: {f:?}")))?;
-        Ok(ReadingValue {
-            value: serde_json::Value::from(b),
-            timestamp: pv_field_to_ts(&f).unwrap_or_else(now_ts),
-            alarm_severity: pv_field_to_alarm_severity(&f),
-            message: None,
-        })
-    }
-    async fn get_value(&self) -> Result<bool> {
-        let f = self
-            .client
-            .pvget(&self.pv)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("pva get: {e}")))?;
-        pv_field_to_bool(&f).ok_or_else(|| BsrsError::Backend(format!("pva: not bool: {f:?}")))
-    }
-    async fn get_setpoint(&self) -> Result<bool> {
-        SignalBackend::<bool>::get_value(self).await
-    }
-    fn set_callback(&self, cb: Option<ReadingValueCallback<bool>>) -> SubToken {
-        let cb = match cb {
-            None => return SubToken::noop(),
-            Some(cb) => Arc::new(cb),
-        };
-        let client = self.client.clone();
-        let pv = self.pv.clone();
-        let request = PvRequestExpr::parse("field(value,alarm,timeStamp)").unwrap_or_default();
-        let warned_local_clock = Arc::new(AtomicBool::new(false));
-        let pv_for_cb = pv.clone();
-        let warned_for_cb = warned_local_clock.clone();
-        let handle = tokio::spawn(async move {
-            let res = client
-                .pvmonitor_with_request(&pv, &request, move |field: &PvField| {
-                    if let Some(b) = pv_field_to_bool(field) {
-                        let ts = pv_field_to_ts(field).unwrap_or_else(|| {
-                            if !warned_for_cb.swap(true, Ordering::SeqCst) {
-                                tracing::warn!(
-                                    target: "bsrs_backend_epics_pva",
-                                    "pva {}: monitor frame has no server timeStamp; \
-                                     falling back to local clock for this PV (one-shot)",
-                                    pv_for_cb,
-                                );
-                            }
-                            now_ts()
-                        });
-                        cb(&b, ts, pv_field_to_alarm_severity(field));
-                    }
-                })
-                .await;
-            if let Err(e) = res {
-                tracing::error!("pva monitor on {pv}: {e}");
-            }
+                }
+            };
+            forward_monitor(&client, &pv, |f| T::decode(&conv, f), cb).await;
         });
         let abort = handle.abort_handle();
         SubToken::new(move || abort.abort())
@@ -1100,24 +1065,16 @@ mod tests {
     fn nt_enum_decodes_typed_choices_to_label() {
         // Real-wire shape: choices arrive as ScalarArrayTyped(String).
         let f = ntenum(1, &["OFF", "ON"], true);
-        assert_eq!(pv_field_to_string(&f), Some("ON".into()));
+        assert_eq!(String::decode(&PvaConverter::Enum, &f), Some("ON".into()));
     }
 
     #[test]
     fn nt_enum_out_of_range_index_falls_back_to_decimal() {
         // Legacy ScalarArray choices + index past the end → decimal fallback.
         let f = ntenum(5, &["OFF"], false);
-        assert_eq!(pv_field_to_string(&f), Some("5".into()));
-        // A plain NTScalar string is unaffected by the new enum arm.
-        let mut nt = PvStructure::new("epics:nt/NTScalar:1.0");
-        nt.fields.push((
-            "value".into(),
-            PvField::Scalar(ScalarValue::String("hi".into())),
-        ));
-        assert_eq!(
-            pv_field_to_string(&PvField::Structure(nt)),
-            Some("hi".into())
-        );
+        assert_eq!(String::decode(&PvaConverter::Enum, &f), Some("5".into()));
+        let f = ntscalar(ScalarValue::String("hi".into()));
+        assert_eq!(String::decode(&PvaConverter::Value, &f), Some("hi".into()));
     }
 
     // Build an NTScalar `{ value, alarm: { severity, status } }`.
@@ -1188,30 +1145,29 @@ mod tests {
 
     #[test]
     fn ntscalararray_decodes_typed_and_legacy_doubles() {
+        let decode = |f| Vec::<f64>::decode(&PvaConverter::Value, &f);
         let typed = ntscalararray_doubles(&[1.0, 2.5, -3.0], true);
-        assert_eq!(pv_field_to_vec_f64(&typed), Some(vec![1.0, 2.5, -3.0]));
+        assert_eq!(decode(typed), Some(vec![1.0, 2.5, -3.0]));
         let legacy = ntscalararray_doubles(&[4.0, 5.0], false);
-        assert_eq!(pv_field_to_vec_f64(&legacy), Some(vec![4.0, 5.0]));
+        assert_eq!(decode(legacy), Some(vec![4.0, 5.0]));
+        assert_eq!(decode(ntscalar_with_ts(1.0, 0, 0)), None);
     }
 
+    /// `Array1D[np.float64]` is a double array only, as ophyd-async infers
+    /// `Array1D[np.int32]` from an int one and coerces neither way.
     #[test]
-    fn ntscalararray_coerces_integer_elements_and_rejects_scalar() {
-        // A legacy mixed-integer array coerces element-wise to f64.
-        let mut nt = PvStructure::new("epics:nt/NTScalarArray:1.0");
-        nt.fields.push((
-            "value".into(),
-            PvField::ScalarArray(vec![
-                ScalarValue::Int(7),
-                ScalarValue::Long(8),
-                ScalarValue::Short(9),
-            ]),
-        ));
+    fn float_array_refuses_an_int_array() {
+        let mut nt = PvStructure::new(NT_SCALAR_ARRAY);
+        let ints = TypedScalarArray::Int(vec![7, 8, 9].into());
+        nt.fields
+            .push(("value".into(), PvField::ScalarArrayTyped(ints)));
+        let err = make_converter("WF", Datatype::FloatArray, &PvField::Structure(nt));
         assert_eq!(
-            pv_field_to_vec_f64(&PvField::Structure(nt)),
-            Some(vec![7.0, 8.0, 9.0])
+            err.unwrap_err().to_string(),
+            "WF with inferred datatype Array1D[np.int32] from \
+             typeid='epics:nt/NTScalarArray:1.0' specifier='ai' cannot be \
+             coerced to Array1D[np.float64]"
         );
-        // A plain scalar NTScalar is not a numeric array.
-        assert!(pv_field_to_vec_f64(&ntscalar_with_ts(1.0, 0, 0)).is_none());
     }
 
     #[test]
@@ -1381,15 +1337,128 @@ mod tests {
 
     #[test]
     fn bool_reads_an_enum_index_and_a_scalar() {
+        let enum_bool = |i| bool::decode(&PvaConverter::Enum, &ntenum(i, &["No", "Yes"], true));
+        assert_eq!((enum_bool(1), enum_bool(0)), (Some(true), Some(false)));
+        let f = ntscalar(ScalarValue::Int(2));
+        assert_eq!(bool::decode(&PvaConverter::Value, &f), Some(true));
+    }
+
+    fn ntscalar(value: ScalarValue) -> PvField {
+        let mut nt = PvStructure::new(NT_SCALAR);
+        nt.fields.push(("value".into(), PvField::Scalar(value)));
+        PvField::Structure(nt)
+    }
+
+    fn converter(want: Datatype, top: &PvField) -> Result<PvaConverter> {
+        make_converter("PV", want, top)
+    }
+
+    /// A bool is a two-choice enum, or an NTScalar whose type p4p calls bool,
+    /// int8, uint8, int32 or uint32: not int16, as ophyd-async lists them.
+    #[test]
+    fn bool_takes_two_choices_or_a_listed_integer() {
+        let two = ntenum(1, &["No", "Yes"], true);
+        assert_eq!(converter(Datatype::Bool, &two).unwrap(), PvaConverter::Enum);
+        let three = ntenum(1, &["A", "B", "C"], true);
         assert_eq!(
-            pv_field_to_bool(&ntenum(1, &["No", "Yes"], true)),
-            Some(true)
+            converter(Datatype::Bool, &three).unwrap_err().to_string(),
+            "PV has 3 choices, can't map to bool"
         );
+        let int = ntscalar(ScalarValue::Int(1));
         assert_eq!(
-            pv_field_to_bool(&ntenum(0, &["No", "Yes"], false)),
-            Some(false)
+            converter(Datatype::Bool, &int).unwrap(),
+            PvaConverter::Value
         );
-        assert_eq!(pv_field_to_bool(&ntscalar_with_ts(2.0, 0, 0)), Some(true));
+        let short = ntscalar(ScalarValue::Short(1));
+        assert_eq!(
+            converter(Datatype::Bool, &short).unwrap_err().to_string(),
+            "PV with inferred datatype int from typeid='epics:nt/NTScalar:1.0' \
+             specifier='h' cannot be coerced to bool"
+        );
+    }
+
+    /// An int reads a float record only at precision 0.
+    #[test]
+    fn int_takes_a_float_at_precision_zero() {
+        let at_precision = |p| {
+            let PvField::Structure(mut nt) = ntscalar_with_meta() else {
+                unreachable!()
+            };
+            let Some((_, PvField::Structure(display))) =
+                nt.fields.iter_mut().find(|(n, _)| n == "display")
+            else {
+                unreachable!()
+            };
+            display.fields[1].1 = PvField::Scalar(ScalarValue::Int(p));
+            converter(Datatype::Int, &PvField::Structure(nt))
+        };
+        assert_eq!(at_precision(0).unwrap(), PvaConverter::Value);
+        assert!(matches!(at_precision(3), Err(BsrsError::Datatype(_))));
+    }
+
+    /// An enum is read as its labels, or by an inferred number as its
+    /// index, and as nothing else.
+    #[test]
+    fn enum_is_read_as_str_or_an_inferred_number() {
+        let e = ntenum(2, &["A", "B", "C"], true);
+        assert_eq!(converter(Datatype::Str, &e).unwrap(), PvaConverter::Enum);
+        assert_eq!(converter(Datatype::Number, &e).unwrap(), PvaConverter::Enum);
+        assert_eq!(f64::decode(&PvaConverter::Enum, &e), Some(2.0));
+        for want in [Datatype::Int, Datatype::Float] {
+            assert!(matches!(converter(want, &e), Err(BsrsError::Datatype(_))));
+        }
+    }
+
+    /// An inferred number is any numeric or bool scalar, not a string.
+    #[test]
+    fn number_takes_any_numeric_scalar() {
+        for v in [
+            ScalarValue::Double(1.5),
+            ScalarValue::Short(3),
+            ScalarValue::Boolean(true),
+        ] {
+            let f = ntscalar(v);
+            assert_eq!(
+                converter(Datatype::Number, &f).unwrap(),
+                PvaConverter::Value
+            );
+            assert!(f64::decode(&PvaConverter::Value, &f).is_some());
+        }
+        let s = ntscalar(ScalarValue::String("x".into()));
+        assert!(matches!(
+            converter(Datatype::Number, &s),
+            Err(BsrsError::Datatype(_))
+        ));
+    }
+
+    /// A str reads a `FTVL=CHAR` waveform as its text, and writes it back
+    /// NUL-terminated.
+    #[test]
+    fn str_takes_an_int8_array_as_long_string() {
+        let mut nt = PvStructure::new(NT_SCALAR_ARRAY);
+        let chars = TypedScalarArray::Byte(vec![104, 105, 0, 0].into());
+        nt.fields
+            .push(("value".into(), PvField::ScalarArrayTyped(chars)));
+        let top = PvField::Structure(nt);
+        let conv = converter(Datatype::Str, &top).unwrap();
+        assert_eq!(conv, PvaConverter::LongStr);
+        assert_eq!(String::decode(&conv, &top), Some("hi".into()));
+        let PvField::ScalarArrayTyped(TypedScalarArray::Byte(written)) =
+            String::encode(&conv, "hi".into())
+        else {
+            unreachable!()
+        };
+        assert_eq!(&written[..], &[104, 105, 0]);
+    }
+
+    /// A PV that is no normative type has no datatype to read it as.
+    #[test]
+    fn a_bare_scalar_has_no_datatype() {
+        let bare = PvField::Scalar(ScalarValue::Double(1.0));
+        assert_eq!(
+            converter(Datatype::Float, &bare).unwrap_err().to_string(),
+            "PV has no datatype for typeid='' specifier=''"
+        );
     }
 
     /// Read as str, an enum reports its choices and nothing numeric.

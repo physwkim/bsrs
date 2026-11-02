@@ -15,11 +15,12 @@ use bsrs::backends::epics_ca::EpicsCaBackend;
 use bsrs::callbacks::CapturingSink;
 use bsrs::core::msg::{ConfigurableObj, ReadableObj, StageableObj, TriggerableObj};
 use bsrs::core::status::Status;
-use bsrs::devices::TriggerInfo;
+use bsrs::devices::{BackendFromPv, TriggerInfo};
 use bsrs::event_model::{DataKey, Dtype, DtypeNumpy, StreamDatum, StreamResource};
 use bsrs::host::areadetector::{
     area_detector_hdf, connect_area_detector_hdf, num_rois, AreaDetectorCam, AreaDetectorHdf,
-    NdFile, NdRoi, NdStats, StaticPathProvider, AD_IMAGE_MODE_CONTINUOUS, AD_IMAGE_MODE_MULTIPLE,
+    NdFile, NdRoi, NdStats, StaticPathProvider, AD_COLOR_MODE_MONO, AD_COLOR_MODE_RGB1,
+    AD_IMAGE_MODE_CONTINUOUS, AD_IMAGE_MODE_MULTIPLE, AD_IMAGE_MODE_SINGLE,
 };
 use bsrs::prelude::*;
 use bsrs::protocols_async::{
@@ -50,9 +51,9 @@ fn boot() {
 async fn channel<V>(pv: &str) -> EpicsCaBackend<V>
 where
     V: Clone + Send + Sync + 'static,
-    EpicsCaBackend<V>: SignalBackend<V>,
+    EpicsCaBackend<V>: SignalBackend<V> + BackendFromPv,
 {
-    let ch = EpicsCaBackend::<V>::new(pv);
+    let ch = EpicsCaBackend::<V>::from_pv(pv);
     ch.connect(TIMEOUT)
         .await
         .unwrap_or_else(|e| panic!("connect {pv}: {e}"));
@@ -62,7 +63,7 @@ where
 async fn put<V>(pv: &str, v: V)
 where
     V: Clone + Send + Sync + 'static,
-    EpicsCaBackend<V>: SignalBackend<V>,
+    EpicsCaBackend<V>: SignalBackend<V> + BackendFromPv,
 {
     let ch = channel::<V>(pv).await;
     timeout(TIMEOUT, SignalBackend::put(&ch, Some(v)))
@@ -74,7 +75,7 @@ where
 async fn get<V>(pv: &str) -> V
 where
     V: Clone + Send + Sync + 'static,
-    EpicsCaBackend<V>: SignalBackend<V>,
+    EpicsCaBackend<V>: SignalBackend<V> + BackendFromPv,
 {
     let ch = channel::<V>(pv).await;
     SignalBackend::get_value(&ch)
@@ -111,12 +112,8 @@ async fn ready_cam(cam: &AreaDetectorCam, feed: &str) {
             .expect("EnableCallbacks");
     }
     for (suffix, v) in [
-        ("ImageMode", 0),
         ("NumImages", 1),
         ("NumExposures", 1),
-        ("ColorMode", 0),
-        ("DataType", 1),
-        ("ArrayCallbacks", 1),
         ("BinX", 1),
         ("BinY", 1),
         ("MinX", 0),
@@ -126,6 +123,14 @@ async fn ready_cam(cam: &AreaDetectorCam, feed: &str) {
     ] {
         put::<i64>(&format!("{CAM}{suffix}"), v).await;
     }
+    for (suffix, label) in [
+        ("ImageMode", AD_IMAGE_MODE_SINGLE),
+        ("ColorMode", AD_COLOR_MODE_MONO),
+        ("DataType", "UInt8"),
+    ] {
+        put::<String>(&format!("{CAM}{suffix}"), label.into()).await;
+    }
+    put::<bool>(&format!("{CAM}ArrayCallbacks"), true).await;
     put::<f64>(&format!("{CAM}AcquireTime"), EXPOSURE).await;
     put::<f64>(&format!("{CAM}AcquirePeriod"), EXPOSURE).await;
     timeout(
@@ -283,7 +288,7 @@ async fn hdf_ndattributes_get_a_key_resource_and_datum_each() {
          </Attributes>"
     );
     assert!(xml.len() < 256);
-    let attrs_file = EpicsCaBackend::<String>::new_long_string(format!("{CAM}NDAttributesFile"));
+    let attrs_file = EpicsCaBackend::<String>::new(format!("{CAM}NDAttributesFile"));
     attrs_file.connect(TIMEOUT).await.unwrap();
     timeout(TIMEOUT, SignalBackend::put(&attrs_file, Some(xml)))
         .await
@@ -374,7 +379,7 @@ async fn fly_scan_takes_the_prepared_frames_and_continues_the_index() {
         .await
         .unwrap();
     assert_eq!(
-        get::<i64>(&format!("{CAM}ImageMode")).await,
+        get::<String>(&format!("{CAM}ImageMode")).await,
         AD_IMAGE_MODE_MULTIPLE
     );
     assert_eq!(get::<i64>(&format!("{CAM}NumImages")).await, 5);
@@ -459,7 +464,7 @@ async fn trigger_takes_one_frame_after_a_continuous_acquisition() {
     let dir = tempfile::tempdir().unwrap();
     let det = hdf_det("det", dir.path(), "cont").await;
     Stageable::stage(&det).await.expect("stage");
-    put::<i64>(&format!("{CAM}ImageMode"), AD_IMAGE_MODE_CONTINUOUS).await;
+    put::<String>(&format!("{CAM}ImageMode"), AD_IMAGE_MODE_CONTINUOUS.into()).await;
     let triggered = timeout(Duration::from_secs(5), trigger(&det)).await;
     DetectorControl::disarm(det.control())
         .await
@@ -482,7 +487,7 @@ async fn trigger_takes_one_frame_after_a_multi_image_acquisition() {
     let dir = tempfile::tempdir().unwrap();
     let det = hdf_det("det", dir.path(), "multi").await;
     Stageable::stage(&det).await.expect("stage");
-    put::<i64>(&format!("{CAM}ImageMode"), AD_IMAGE_MODE_MULTIPLE).await;
+    put::<String>(&format!("{CAM}ImageMode"), AD_IMAGE_MODE_MULTIPLE.into()).await;
     put::<i64>(&format!("{CAM}NumImages"), 3).await;
     let triggered = trigger(&det).await;
     let n = index(&det).await;
@@ -843,7 +848,7 @@ async fn rgb1_frames_get_a_colour_dimension() {
     let _cam = CAM_LOCK.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let det = hdf_det("det", dir.path(), "rgb").await;
-    put::<i64>(&format!("{CAM}ColorMode"), 2).await;
+    put::<String>(&format!("{CAM}ColorMode"), AD_COLOR_MODE_RGB1.into()).await;
     det.control().warmup().await.expect("warmup");
     let staged = Stageable::stage(&det).await;
     let prepared = finish(
@@ -853,7 +858,7 @@ async fn rgb1_frames_get_a_colour_dimension() {
     .await;
     let keys = ReadableObj::describe_dyn(&det).await;
     let _ = Stageable::unstage(&det).await;
-    put::<i64>(&format!("{CAM}ColorMode"), 0).await;
+    put::<String>(&format!("{CAM}ColorMode"), AD_COLOR_MODE_MONO.into()).await;
     staged.expect("stage");
     prepared.unwrap();
     assert_eq!(
@@ -959,7 +964,7 @@ async fn roi_and_stats_setters_reach_their_records() {
     let stats = NdStats::new("SIM1:Stats1:");
     stats.connect(TIMEOUT).await.unwrap();
     stats.plugin.set_enabled(false).await.unwrap();
-    put::<i64>("SIM1:Stats1:ComputeStatistics", 0).await;
+    put::<bool>("SIM1:Stats1:ComputeStatistics", false).await;
     stats.force_enable_stats().await.unwrap();
     assert!(get::<bool>("SIM1:Stats1:EnableCallbacks").await);
     assert!(get::<bool>("SIM1:Stats1:ComputeStatistics").await);

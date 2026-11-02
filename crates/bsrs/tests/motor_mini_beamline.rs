@@ -17,6 +17,7 @@ use bsrs::backends::epics_ca::EpicsCaBackend;
 use bsrs::callbacks::CapturingSink;
 use bsrs::core::msg::{LocatableObj, MovableObj, ReadableObj, StoppableObj};
 use bsrs::core::{Watcher, WatcherUpdate};
+use bsrs::devices::BackendFromPv;
 use bsrs::event_model::PerObjectHint;
 use bsrs::host::ca_devices::{CaDetector, CaMotor, CaPositioner};
 use bsrs::prelude::*;
@@ -36,8 +37,12 @@ async fn ca_motor(name: &str, record: &str) -> Arc<CaMotor> {
         .unwrap()
 }
 
-async fn ca_f64(pv: &str) -> EpicsCaBackend<f64> {
-    let b = EpicsCaBackend::new(pv);
+async fn ca<T>(pv: &str) -> EpicsCaBackend<T>
+where
+    T: Clone + Send + Sync + 'static,
+    EpicsCaBackend<T>: SignalBackend<T> + BackendFromPv,
+{
+    let b = EpicsCaBackend::from_pv(pv);
     b.connect(Duration::from_secs(10)).await.unwrap();
     b
 }
@@ -211,7 +216,11 @@ async fn slit_positioner() -> Arc<CaPositioner> {
 async fn a_positioner_refuses_a_target_past_the_limit_and_settles_on_done() {
     example_ioc::boot(BIN, EXAMPLE);
     let p = slit_positioner().await;
-    let hlm = ca_f64("mini:slit:mtr.HLM").await.get_value().await.unwrap();
+    let hlm = ca::<f64>("mini:slit:mtr.HLM")
+        .await
+        .get_value()
+        .await
+        .unwrap();
     let before = p.locate_dyn().await.unwrap().setpoint;
 
     let res = tokio::time::timeout(Duration::from_secs(5), p.set_dyn(hlm + 1.0).await)
@@ -220,8 +229,12 @@ async fn a_positioner_refuses_a_target_past_the_limit_and_settles_on_done() {
     assert!(res.is_err(), "a move past HLM {hlm} succeeded");
     assert_eq!(p.locate_dyn().await.unwrap().setpoint, before);
 
-    let llm = ca_f64("mini:slit:mtr.LLM").await.get_value().await.unwrap();
-    let hlm_pv = ca_f64("mini:slit:mtr.HLM").await;
+    let llm = ca::<f64>("mini:slit:mtr.LLM")
+        .await
+        .get_value()
+        .await
+        .unwrap();
+    let hlm_pv = ca::<f64>("mini:slit:mtr.HLM").await;
     hlm_pv.put(Some(llm - 1.0)).await.unwrap();
     let inverted = hlm_pv.get_value().await.unwrap();
     let res = tokio::time::timeout(Duration::from_secs(5), p.set_dyn(before).await)
@@ -240,7 +253,7 @@ async fn a_positioner_refuses_a_target_past_the_limit_and_settles_on_done() {
     } else {
         ("LLM", pos + 0.2)
     };
-    let pulled = ca_f64(&format!("mini:slit:mtr.{f}")).await;
+    let pulled = ca::<f64>(&format!("mini:slit:mtr.{f}")).await;
     let limit = pulled.get_value().await.unwrap();
     pulled.put(Some(inward(pos, 0.1))).await.unwrap();
     let res = tokio::time::timeout(Duration::from_secs(25), p.set_dyn(inside).await)
@@ -272,12 +285,12 @@ async fn a_positioner_refuses_a_target_past_the_limit_and_settles_on_done() {
         assert_eq!(u.unit, key.units, "{u:?}");
         assert_eq!((u.initial, u.target), (start, target), "{u:?}");
     }
-    let movn = ca_f64("mini:slit:mtr.MOVN")
+    let movn = ca::<i64>("mini:slit:mtr.MOVN")
         .await
         .get_value()
         .await
         .unwrap();
-    assert_eq!(movn, 0.0);
+    assert_eq!(movn, 0);
     let rb = p.locate_dyn().await.unwrap().readback;
     assert!((rb - target).abs() <= MRES + 1e-9, "{rb}");
 }
@@ -309,9 +322,9 @@ async fn stop_ends_a_positioners_move() {
             .expect("stop ends the move");
         assert_eq!(res.is_ok(), success, "{res:?}");
         // The record carries on to the target; let it get there.
-        let done = ca_f64("mini:edge:mtr.DMOV").await;
+        let done = ca::<i64>("mini:edge:mtr.DMOV").await;
         tokio::time::timeout(Duration::from_secs(15), async {
-            while done.get_value().await.unwrap() != 1.0 {
+            while done.get_value().await.unwrap() != 1 {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         })

@@ -230,7 +230,7 @@ impl CaPositioner {
     ) -> Result<Arc<Self>> {
         let sp = Arc::new(EpicsCaBackend::<f64>::new(val_pv));
         let rb = Arc::new(EpicsCaBackend::<f64>::new(rbv_pv));
-        let dn = Arc::new(EpicsCaBackend::<f64>::new(done_pv));
+        let dn = Arc::new(EpicsCaBackend::<f64>::new_inferred(done_pv));
         let (sp_a, rb_a, dn_a) = (sp.clone(), rb.clone(), dn.clone());
         crate::core::runtime::bsrs_runtime().block_on(async move {
             sp_a.connect(Duration::from_secs(5)).await?;
@@ -255,7 +255,7 @@ impl CaPositioner {
     ) -> Result<Arc<Self>> {
         let sp = Arc::new(EpicsCaBackend::<f64>::new(val_pv));
         let rb = Arc::new(EpicsCaBackend::<f64>::new(rbv_pv));
-        let dn = Arc::new(EpicsCaBackend::<f64>::new(done_pv));
+        let dn = Arc::new(EpicsCaBackend::<f64>::new_inferred(done_pv));
         sp.connect(Duration::from_secs(5)).await?;
         rb.connect(Duration::from_secs(5)).await?;
         dn.connect(Duration::from_secs(5)).await?;
@@ -396,7 +396,7 @@ impl CaDetector {
 
     /// Build + connect. Blocks; see `CaMotor::connect_blocking`.
     pub fn connect_blocking(name: &str, value_pv: &str) -> Result<Arc<Self>> {
-        let v = Arc::new(EpicsCaBackend::<f64>::new(value_pv));
+        let v = Arc::new(EpicsCaBackend::<f64>::new_inferred(value_pv));
         let v_for_async = v.clone();
         crate::core::runtime::bsrs_runtime()
             .block_on(async move { v_for_async.connect(Duration::from_secs(5)).await })?;
@@ -406,7 +406,7 @@ impl CaDetector {
     /// Async equivalent of `connect_blocking` — for callers
     /// already inside a tokio runtime (qs-manager's `async fn`).
     pub async fn connect_async(name: &str, value_pv: &str) -> Result<Arc<Self>> {
-        let v = Arc::new(EpicsCaBackend::<f64>::new(value_pv));
+        let v = Arc::new(EpicsCaBackend::<f64>::new_inferred(value_pv));
         v.connect(Duration::from_secs(5)).await?;
         Ok(Self::from_connected(name, v, value_pv))
     }

@@ -58,6 +58,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `TriggerInfo::effective_exposure_timeout`, `DetectorWriter::hinted_fields`
   and `AreaDetectorCam::acquire_time_rbv` / `acquire_period_rbv`.
 - `SoftMotor` implements `protocols_async::Stoppable`.
+- `BsrsError::Datatype`, ophyd-async's `make_converter` `TypeError`.
 
 ### Changed
 
@@ -77,6 +78,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Breaking**: `#[derive(Device)]` parses `#[signal]`/`#[device]` with
   `syn`; an unknown role, key or kind is a compile error instead of
   `Kind::Normal`.
+- **Breaking**: `EpicsCaBackend::new` and `EpicsPvaBackend::new` take only
+  `f64`, `i64`, `bool`, `String` and `Vec<f64>`, and `connect` refuses with
+  `BsrsError::Datatype` a PV the type cannot read, as ophyd-async's
+  `make_converter`: `Vec<f64>` on a LONG waveform, `bool` on an enum without
+  two choices, `i64` on a float record with a nonzero PREC. Generic code
+  builds a backend with `BackendFromPv::from_pv`.
+- **Breaking**: areaDetector enum fields (`image_mode`, `detector_state_rbv`,
+  `data_type`, `color_mode`, `file_write_mode`) are `String` labels, as are
+  the `AD_STATE_*`, `AD_IMAGE_MODE_*`, `AD_COLOR_MODE_*` and
+  `AD_FILE_WRITE_MODE_*` constants; `ad_datatype_to_numpy` and
+  `NdFile::set_write_mode` take a label, and Lua `cam:state()` and
+  `cam:set_image_mode` use labels.
+- `CaDetector`, `PvaDetector`, `ca_suspender` and the `CaPositioner` done PV
+  read their PV as whatever number it is (ophyd-async `datatype=None`), an
+  enum as its index.
 - `SoftSignalBackend::set_callback`, and so `Signal::subscribe` and
   `observe_value`, delivers the current reading first, as ophyd-async does;
   readings reach each callback in store order and carry `alarm_severity` 0.
@@ -108,6 +124,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Breaking**: `StandardReadable::add_readables`, `add_stageable` and
   `StandardReadableFormat::Child`; use `add_child` / `add_signal`.
+- **Breaking**: `CaStringKind` and `EpicsCaBackend::new_long_string`;
+  `EpicsCaBackend<String>` reads a CHAR waveform as a long string, and
+  `EpicsPvaBackend<String>` an int8 array.
 
 ### Fixed
 

@@ -170,9 +170,10 @@ pub(crate) trait SwitchField: Send + Sync + Sized + 'static {
 }
 
 /// A backend for the motor record's numeric fields, with its kind of
-/// [`SwitchField`].
+/// [`SwitchField`] and of integer field (`.DMOV`, a SHORT).
 pub(crate) trait MotorBackend: SignalBackend<f64> + BackendFromPv {
     type Switch: SwitchField;
+    type Int: SignalBackend<i64> + BackendFromPv;
 }
 
 #[cfg(feature = "ca")]
@@ -195,6 +196,7 @@ impl SwitchField for crate::backends::epics_ca::EpicsCaBackend<bool> {
 #[cfg(feature = "ca")]
 impl MotorBackend for crate::backends::epics_ca::EpicsCaBackend<f64> {
     type Switch = crate::backends::epics_ca::EpicsCaBackend<bool>;
+    type Int = crate::backends::epics_ca::EpicsCaBackend<i64>;
 }
 
 /// A PVA `.STOP` or `.SET`: a put with the default pvRequest, which QSRV
@@ -232,6 +234,7 @@ impl SwitchField for PvaSwitch {
 #[cfg(feature = "pva")]
 impl MotorBackend for crate::backends::epics_pva::EpicsPvaBackend<f64> {
     type Switch = PvaSwitch;
+    type Int = crate::backends::epics_pva::EpicsPvaBackend<i64>;
 }
 
 /// The motor record's `.VELO` and `.ACCL`, read at each move for its
@@ -243,14 +246,14 @@ struct MoveTiming<B> {
 
 /// The motor record's `.DMOV` and `.STOP`.
 struct StopButton<B: MotorBackend> {
-    dmov: B,
+    dmov: B::Int,
     stop: B::Switch,
 }
 
 impl<B: MotorBackend> StopButton<B> {
     /// ophyd-async `Motor.stop`: press `.STOP` only while the motor moves.
     async fn press_if_moving(&self) -> Result<()> {
-        if self.dmov.get_value().await? == 0.0 {
+        if self.dmov.get_value().await? == 0 {
             self.stop.press().await?;
         }
         Ok(())
@@ -300,7 +303,7 @@ impl<B: MotorBackend> MotorChannels<B> {
             accl: Arc::new(B::from_pv(&format!("{record}.ACCL"))),
         };
         let button = StopButton {
-            dmov: B::from_pv(&format!("{record}.DMOV")),
+            dmov: <B::Int as BackendFromPv>::from_pv(&format!("{record}.DMOV")),
             stop: <B::Switch as SwitchField>::from_pv(&format!("{record}.STOP")),
         };
         let set_use = <B::Switch as SwitchField>::from_pv(&format!("{record}.SET"));
@@ -316,8 +319,8 @@ impl<B: MotorBackend> MotorChannels<B> {
             readback.connect(t),
             timing.velo.connect(t),
             timing.accl.connect(t),
-            button.dmov.connect(t),
-            button.stop.connect(t),
+            SignalBackend::<i64>::connect(&button.dmov, t),
+            SwitchField::connect(&button.stop, t),
             set_use.connect(t),
             limits.llm.connect(t),
             limits.hlm.connect(t),

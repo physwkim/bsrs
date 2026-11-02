@@ -1,7 +1,7 @@
 //! CA and PVA signal backends against the epics-rs `ophyd-test-ioc`
 //! example: the soft sensors `XF:31IDA-BI{Dev:N}E-I` (ai, EGU mA, PREC 3,
 //! HOPR/LOPR ±1000), the simDetector's string, long-string, enum, integer
-//! and array records under its two prefixes, and the sim motors.
+//! and LONG waveform records under its two prefixes, and the sim motors.
 //! Each test writes only records no other test here touches.
 #![cfg(all(feature = "ca", feature = "pva"))]
 
@@ -14,6 +14,7 @@ use std::time::Duration;
 use bsrs::backends::epics_ca::{CaEnumBackend, EpicsCaBackend};
 use bsrs::backends::epics_pva::EpicsPvaBackend;
 use bsrs::core::bsrs_runtime;
+use bsrs::core::error::BsrsError;
 use bsrs::core::SubToken;
 use bsrs::event_model::{DataKey, Dtype, DtypeNumpy, Limits, LimitsRange};
 use bsrs::protocols_async::SignalBackend;
@@ -319,7 +320,7 @@ fn pva_string_lifecycle() {
 fn ca_long_string_lifecycle() {
     run(async {
         let pv = format!("{CAM}TIFF1:FileName");
-        let b = EpicsCaBackend::<String>::new_long_string(&pv);
+        let b = EpicsCaBackend::<String>::new(&pv);
         let long = format!("bsrs_{}", "x".repeat(100));
         let dk = assert_lifecycle(&b, &pv, long).await;
         assert_eq!(dk.dtype, Dtype::String);
@@ -483,48 +484,39 @@ fn pva_integer_lifecycle() {
     });
 }
 
-/// A LONG waveform (NELM 10) written and read as `Vec<f64>`.
-/// A put reads back at its own length, one element included: the reads ask
-/// for the current element count, as aioca's and p4p's do, and the datakey
-/// has that length.
-async fn assert_array_put_reads_back(b: &impl SignalBackend<Vec<f64>>, pv: &str) {
-    b.connect(CONNECT).await.unwrap();
-    let (token, mut rx) = subscribe(b);
-    next(&mut rx).await;
-    for put in [vec![3.0, 4.0, 5.0], vec![7.0]] {
-        b.put(Some(put.clone())).await.unwrap();
-        next_where(&mut rx, |v| *v == put).await;
-        assert_eq!(b.get_value().await.unwrap(), put);
-        let reading = b.get_reading().await.unwrap();
-        assert_eq!(reading.value, serde_json::json!(put));
+/// A LONG waveform is no `Array1D[np.float64]`, nor a number: ophyd-async
+/// infers `Array1D[np.int32]` from it and refuses either at connect.
+async fn assert_long_waveform_refused(b: impl SignalBackend<Vec<f64>>, n: impl SignalBackend<f64>) {
+    for err in [
+        b.connect(CONNECT)
+            .await
+            .expect_err("an int array as float64s"),
+        n.connect(CONNECT)
+            .await
+            .expect_err("an int array as a float"),
+    ] {
+        assert!(matches!(err, BsrsError::Datatype(_)), "{err}");
+        assert!(err.to_string().contains("Array1D[np.int32]"), "{err}");
     }
-    assert_unsubscribed(token, rx).await;
-    let dk = b.get_datakey(pv).await.unwrap();
-    assert_eq!(dk.dtype, Dtype::Array);
-    assert_eq!(dk.dtype_numpy, numpy("<f8"));
-    assert_eq!(dk.shape, vec![Some(1)]);
 }
 
 #[test]
 #[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
-fn ca_array_put_reads_back() {
+fn ca_long_waveform_is_refused_as_floats() {
     run(async {
         let pv = format!("{CAM}cam1:Dimensions");
-        assert_array_put_reads_back(&EpicsCaBackend::<Vec<f64>>::new(&pv), &pv).await;
-        // Read as a number, the waveform's datakey is a number's.
-        let dk = EpicsCaBackend::<f64>::new(&pv).get_datakey(&pv).await;
-        assert!(dk.unwrap().shape.is_empty());
-        let dk = EpicsCaBackend::<i64>::new(&pv).get_datakey(&pv).await;
-        assert!(dk.unwrap().shape.is_empty());
+        let (b, n) = (EpicsCaBackend::new(&pv), EpicsCaBackend::new(&pv));
+        assert_long_waveform_refused(b, n).await;
     });
 }
 
 #[test]
 #[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
-fn pva_array_put_reads_back() {
+fn pva_long_waveform_is_refused_as_floats() {
     run(async {
         let pv = "ADSIM:cam1:Dimensions";
-        assert_array_put_reads_back(&EpicsPvaBackend::<Vec<f64>>::new(pv), pv).await;
+        let (b, n) = (EpicsPvaBackend::new(pv), EpicsPvaBackend::new(pv));
+        assert_long_waveform_refused(b, n).await;
     });
 }
 

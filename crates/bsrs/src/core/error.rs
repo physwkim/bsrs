@@ -43,6 +43,10 @@ pub enum BsrsError {
     /// A signal value was rejected by `check_value`.
     #[error("invalid value: {0}")]
     InvalidValue(String),
+    /// A PV cannot be read as the signal's datatype: ophyd-async
+    /// `make_converter`'s `TypeError` at connect.
+    #[error("{0}")]
+    Datatype(String),
     /// A device was used in the wrong state (e.g. read before stage).
     #[error("device state error: {0}")]
     State(String),

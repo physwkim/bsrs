@@ -17,6 +17,7 @@ use bsrs::core::msg::{LocatableObj, MonitorableObj, MovableObj, ReadableObj, Sto
 use bsrs::core::runtime::bsrs_runtime;
 use bsrs::core::subscription::Subscription;
 use bsrs::core::{Status, Watcher, WatcherUpdate};
+use bsrs::devices::BackendFromPv;
 use bsrs::event_model::{DataKey, LimitsRange};
 use bsrs::host::ca_devices::{CaDetector, CaMotor};
 use bsrs::host::pva_devices::{PvaDetector, PvaMotor};
@@ -52,9 +53,9 @@ fn pva_motor(name: &str, record: &str) -> Arc<PvaMotor> {
 async fn ca<T>(record: &str, f: &str) -> EpicsCaBackend<T>
 where
     T: Clone + Send + Sync + 'static,
-    EpicsCaBackend<T>: SignalBackend<T>,
+    EpicsCaBackend<T>: SignalBackend<T> + BackendFromPv,
 {
-    let b = EpicsCaBackend::new(field(record, f));
+    let b = EpicsCaBackend::from_pv(&field(record, f));
     b.connect(Duration::from_secs(10)).await.unwrap();
     b
 }
@@ -170,7 +171,7 @@ async fn done_moving(record: &str) {
 async fn a_move_settles_once_the_motor_is_done() {
     example_ioc::boot(BIN, BIN);
     let m = ca_motor("x1", X1).await;
-    let dmov = ca::<f64>(X1, "DMOV").await;
+    let dmov = ca::<i64>(X1, "DMOV").await;
     let start = m.locate_dyn().await.unwrap().readback;
     let target = inward(start, 1.5);
     let sub = m.subscribe_dyn().await.unwrap();
@@ -204,7 +205,7 @@ async fn a_move_settles_once_the_motor_is_done() {
 
     // 1.5 s of travel at VELO 1.
     assert!(took >= Duration::from_millis(1_400), "{took:?}");
-    assert_eq!(dmov.get_value().await.unwrap(), 1.0);
+    assert_eq!(dmov.get_value().await.unwrap(), 1);
     let at = m.locate_dyn().await.unwrap();
     assert!((at.setpoint - target).abs() < 1e-9, "{at:?}");
     assert!((at.readback - target).abs() <= MRES + 1e-9, "{at:?}");
@@ -388,8 +389,8 @@ where
     F: Fn(f64) -> Fut,
     Fut: std::future::Future<Output = bsrs::core::error::Result<()>>,
 {
-    let set = ca::<i64>(X6, "SET").await;
-    let foff = ca::<i64>(X6, "FOFF").await;
+    let set = ca::<String>(X6, "SET").await;
+    let foff = ca::<String>(X6, "FOFF").await;
     let off = ca::<f64>(X6, "OFF").await;
     let hlm = ca::<f64>(X6, "HLM").await;
     let drbv = ca::<f64>(X6, "DRBV").await;
@@ -404,8 +405,8 @@ where
         .expect("settles without motion")
         .expect("the calibration succeeds");
     assert!(started.elapsed() < Duration::from_secs(1));
-    assert_eq!(set.get_value().await.unwrap(), 0, ".SET back at Use");
-    assert_eq!(foff.get_value().await.unwrap(), 0);
+    assert_eq!(set.get_value().await.unwrap(), "Use");
+    assert_eq!(foff.get_value().await.unwrap(), "Variable");
     let at = m.locate_dyn().await.unwrap();
     assert!((at.setpoint - pos).abs() < 1e-9, "{at:?}");
     assert!((at.readback - pos).abs() <= MRES + 1e-9, "{at:?}");
@@ -451,10 +452,10 @@ where
 async fn a_held_move_times_out_on_the_records_velocity_and_acceleration() {
     example_ioc::boot(BIN, BIN);
     let m = ca_motor("fake", FAKE).await;
-    let spmg = ca::<i64>(FAKE, "SPMG").await;
+    let spmg = ca::<String>(FAKE, "SPMG").await;
     ca::<f64>(FAKE, "VELO").await.put(Some(2.0)).await.unwrap();
     let start = m.locate_dyn().await.unwrap().readback;
-    spmg.put(Some(1)).await.unwrap();
+    spmg.put(Some("Pause".into())).await.unwrap();
 
     let started = Instant::now();
     let res = tokio::time::timeout(Duration::from_secs(20), m.set_dyn(inward(start, 0.5)).await)

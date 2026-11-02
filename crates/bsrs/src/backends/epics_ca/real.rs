@@ -122,21 +122,268 @@ pub fn ca_context() -> Arc<CaContext> {
     ctx
 }
 
-/// How `SignalBackend<String>` maps to CA wire types.
-///
-/// - `Short` (default): DBR_STRING. Single 40-byte NUL-padded value;
-///   strings longer than 39 bytes are truncated. Matches `caput PV
-///   "value"`.
-/// - `Long`: DBR_CHAR waveform carrying a NUL-terminated string.
-///   Matches `caput -S PV "long/path/value"` and ophyd-async's
-///   `long_string=True`. Required for areaDetector `FilePath` /
-///   `FileName` / `FileTemplate` which are char waveforms.
+/// What a backend reads its PV as: ophyd-async's `datatype`, named as its
+/// `format_datatype` names it in a refusal. `pub` only for the sealed
+/// [`CaType`], as is [`CaConverter`]; neither is reachable outside.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CaStringKind {
-    /// DBR_STRING — 40-byte cap.
-    Short,
-    /// DBR_CHAR waveform — long-string convention.
-    Long,
+pub enum Datatype {
+    Float,
+    Int,
+    Bool,
+    Str,
+    FloatArray,
+    /// `datatype=None`, read as a number: whatever numeric or enum scalar
+    /// the PV is, an enum as its index (ophyd `EpicsSignalRO`).
+    Number,
+}
+
+impl Datatype {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Float | Self::Number => "float",
+            Self::Int => "int",
+            Self::Bool => "bool",
+            Self::Str => "str",
+            Self::FloatArray => "Array1D[np.float64]",
+        }
+    }
+}
+
+/// How a backend's values go to and from its PV, as [`make_converter`]
+/// picked it at connect.
+#[derive(Debug, PartialEq)]
+pub enum CaConverter {
+    /// The PV's own DBR type, read and written as it.
+    Native(DbFieldType),
+    /// A `str` on a `DBR_CHAR` waveform, NUL-terminated (`CaLongStrConverter`).
+    LongStr,
+    /// A `str` on a `DBR_ENUM`: its labels, by the record's choices.
+    Enum(Vec<String>),
+}
+
+impl CaConverter {
+    /// The DBR type a put is written as.
+    fn dbr(&self) -> DbFieldType {
+        match self {
+            Self::Native(t) => *t,
+            Self::LongStr => DbFieldType::Char,
+            Self::Enum(_) => DbFieldType::Enum,
+        }
+    }
+}
+
+/// ophyd-async `make_converter`: the converter that reads `pv`, of `native`
+/// type and `element_count` elements, as `want`, from its DBR_CTRL read
+/// `snap`, or the `TypeError` that refuses it.
+fn make_converter(
+    pv: &str,
+    want: Datatype,
+    native: DbFieldType,
+    element_count: u32,
+    snap: &Snapshot,
+) -> Result<CaConverter> {
+    use Datatype as D;
+    use DbFieldType as F;
+    let is_array = element_count > 1;
+    match (want, native, is_array) {
+        (D::Str, F::Char, true) => Ok(CaConverter::LongStr),
+        (D::Bool, F::Enum, false) => {
+            let n = snap.enums.as_ref().map_or(0, |e| e.strings.len());
+            if n != 2 {
+                return Err(BsrsError::Datatype(format!(
+                    "{pv} has {n} choices, can't map to bool"
+                )));
+            }
+            Ok(CaConverter::Native(native))
+        }
+        (D::Str, F::Enum, false) => Ok(CaConverter::Enum(
+            snap.enums
+                .as_ref()
+                .map(|e| enum_labels_to_strings(&e.strings))
+                .unwrap_or_default(),
+        )),
+        // An int on a float record whose precision shows no fraction.
+        (D::Int, F::Float | F::Double, false)
+            if snap.display.as_ref().is_some_and(|d| d.precision == 0) =>
+        {
+            Ok(CaConverter::Native(native))
+        }
+        (D::Bool, F::Char | F::Short, false)
+        | (D::Number, F::Short | F::Char | F::Long | F::Float | F::Double | F::Enum, false)
+        | (D::Float, F::Float | F::Double, false)
+        | (D::Int, F::Short | F::Char | F::Long, false)
+        | (D::Str, F::String, false)
+        | (D::FloatArray, F::Double, true) => Ok(CaConverter::Native(native)),
+        _ => Err(BsrsError::Datatype(format!(
+            "{pv} with inferred datatype {} cannot be coerced to {}",
+            inferred_name(native, is_array),
+            want.name()
+        ))),
+    }
+}
+
+/// The datatype ophyd-async infers for a PV (`_datatype_converter_from_dbr`),
+/// as its refusal names it.
+fn inferred_name(native: DbFieldType, is_array: bool) -> String {
+    use DbFieldType as F;
+    match (native, is_array) {
+        (F::Enum, _) => "str | SubsetEnum | StrictEnum",
+        (F::String, false) => "str",
+        (F::Short | F::Char | F::Long, false) => "int",
+        (F::Float | F::Double, false) => "float",
+        (F::String, true) => "Sequence[str]",
+        (F::Short, true) => "Array1D[np.int16]",
+        (F::Float, true) => "Array1D[np.float32]",
+        (F::Char, true) => "Array1D[np.uint8]",
+        (F::Long, true) => "Array1D[np.int32]",
+        (F::Double, true) => "Array1D[np.float64]",
+        // Not a CA wire type: `DbFieldType::from_u16` yields none of these.
+        (other, _) => return format!("{other:?}"),
+    }
+    .to_string()
+}
+
+/// The converter for reading `pv` as `want` on the connected `ch`, made from
+/// one DBR_CTRL read, which it returns too: ophyd-async's connect-time
+/// `caget(FORMAT_CTRL)`.
+async fn converter_for(
+    pv: &str,
+    want: Datatype,
+    ch: &SharedChannel,
+) -> Result<(CaConverter, Snapshot)> {
+    let snap = ctrl_get(ch).await?;
+    let info = ch
+        .info()
+        .await
+        .map_err(|e| BsrsError::Backend(format!("ca info {pv}: {e}")))?;
+    let conv = make_converter(pv, want, info.native_type, info.element_count, &snap)?;
+    Ok((conv, snap))
+}
+
+mod sealed {
+    use super::{CaConverter, Datatype, Snapshot};
+    use crate::core::error::Result;
+    use crate::event_model::DataKey;
+    use epics_ca_rs::EpicsValue;
+
+    /// A type [`EpicsCaBackend`](super::EpicsCaBackend) reads a PV as: its
+    /// ophyd-async datatype, and its values through the converter
+    /// [`make_converter`](super::make_converter) picked for it.
+    pub trait CaType: Into<serde_json::Value> + Clone + Send + Sync + 'static {
+        #[doc(hidden)]
+        const DATATYPE: Datatype;
+        /// `None` when `v` is not a value of the PV `conv` was made for.
+        #[doc(hidden)]
+        fn decode(conv: &CaConverter, v: &EpicsValue) -> Option<Self>;
+        #[doc(hidden)]
+        fn encode(conv: &CaConverter, v: Self) -> Result<EpicsValue>;
+        /// ophyd-async `get_datakey` from a DBR_CTRL read `snap`.
+        #[doc(hidden)]
+        fn datakey(source: String, conv: &CaConverter, snap: &Snapshot) -> Result<DataKey>;
+    }
+}
+use sealed::CaType;
+
+impl CaType for f64 {
+    const DATATYPE: Datatype = Datatype::Float;
+    fn decode(_: &CaConverter, v: &EpicsValue) -> Option<Self> {
+        epics_to_f64(v)
+    }
+    fn encode(conv: &CaConverter, v: Self) -> Result<EpicsValue> {
+        Ok(f64_to_wire(conv.dbr(), v))
+    }
+    fn datakey(source: String, conv: &CaConverter, snap: &Snapshot) -> Result<DataKey> {
+        // Only a float record has a precision (`DBR_CTRL_LONG` has none).
+        let float = matches!(conv.dbr(), DbFieldType::Float | DbFieldType::Double);
+        let meta = ctrl_metadata(snap, true, float);
+        Ok(primitive_datakey::<f64>(source, meta))
+    }
+}
+
+impl CaType for i64 {
+    const DATATYPE: Datatype = Datatype::Int;
+    fn decode(_: &CaConverter, v: &EpicsValue) -> Option<Self> {
+        epics_to_i64(v)
+    }
+    fn encode(conv: &CaConverter, v: Self) -> Result<EpicsValue> {
+        Ok(i64_to_wire(conv.dbr(), v))
+    }
+    fn datakey(source: String, _: &CaConverter, snap: &Snapshot) -> Result<DataKey> {
+        // Ints carry units and limits, but no precision — there are no
+        // fractional digits (ophyd-async excludes precision for `int`).
+        let meta = ctrl_metadata(snap, true, false);
+        Ok(primitive_datakey::<i64>(source, meta))
+    }
+}
+
+impl CaType for bool {
+    const DATATYPE: Datatype = Datatype::Bool;
+    fn decode(_: &CaConverter, v: &EpicsValue) -> Option<Self> {
+        epics_to_bool(v)
+    }
+    fn encode(conv: &CaConverter, v: Self) -> Result<EpicsValue> {
+        Ok(bool_to_wire(conv.dbr(), v))
+    }
+    fn datakey(source: String, _: &CaConverter, _: &Snapshot) -> Result<DataKey> {
+        Ok(primitive_datakey::<bool>(source, SignalMetadata::default()))
+    }
+}
+
+impl CaType for String {
+    const DATATYPE: Datatype = Datatype::Str;
+    fn decode(conv: &CaConverter, v: &EpicsValue) -> Option<Self> {
+        match (conv, v) {
+            (CaConverter::Native(_), EpicsValue::String(s)) => Some(s.as_str_lossy().into_owned()),
+            (CaConverter::LongStr, EpicsValue::UCharArray(bytes)) => Some(nul_terminated(bytes)),
+            // A one-element char waveform: the lone NUL of an empty string.
+            (CaConverter::LongStr, EpicsValue::UChar(c)) => Some(nul_terminated(&[*c])),
+            (CaConverter::Enum(choices), v) => epics_to_enum_label(v, choices),
+            _ => None,
+        }
+    }
+    fn encode(conv: &CaConverter, v: Self) -> Result<EpicsValue> {
+        match conv {
+            CaConverter::Native(_) => Ok(EpicsValue::String(v.as_str().into())),
+            // NUL-terminated, as `caput -S` writes it.
+            CaConverter::LongStr => {
+                let mut bytes = v.into_bytes();
+                bytes.push(0);
+                Ok(EpicsValue::CharArray(bytes.into()))
+            }
+            CaConverter::Enum(choices) => enum_label_to_index(&v, choices).map(EpicsValue::Enum),
+        }
+    }
+    fn datakey(source: String, conv: &CaConverter, _: &Snapshot) -> Result<DataKey> {
+        let choices = match conv {
+            CaConverter::Enum(choices) => Some(choices.clone()),
+            _ => None,
+        };
+        let meta = SignalMetadata {
+            choices,
+            ..SignalMetadata::default()
+        };
+        Ok(primitive_datakey::<String>(source, meta))
+    }
+}
+
+impl CaType for Vec<f64> {
+    const DATATYPE: Datatype = Datatype::FloatArray;
+    fn decode(_: &CaConverter, v: &EpicsValue) -> Option<Self> {
+        epics_to_vec_f64(v)
+    }
+    fn encode(_: &CaConverter, v: Self) -> Result<EpicsValue> {
+        Ok(EpicsValue::DoubleArray(v.into()))
+    }
+    fn datakey(source: String, conv: &CaConverter, snap: &Snapshot) -> Result<DataKey> {
+        let v = Self::decode(conv, &snap.value).ok_or_else(|| undecodable(&snap.value))?;
+        Ok(array_datakey(source, &v, ctrl_metadata(snap, true, true)))
+    }
+}
+
+/// A read whose value is not of the type the converter was made for: the PV
+/// changed type since the connect.
+fn undecodable(v: &EpicsValue) -> BsrsError {
+    BsrsError::Backend(format!("ca: {v:?} is not of the PV's connect-time type"))
 }
 
 /// CA backend for a single PV.
@@ -144,49 +391,54 @@ pub struct EpicsCaBackend<T: Clone + Send + Sync + 'static> {
     pv: String,
     ctx: Arc<CaContext>,
     channel: OnceLock<Arc<SharedChannel>>,
-    /// Consulted only by `SignalBackend<String>`; ignored for other `T`.
-    string_kind: CaStringKind,
-    /// `SignalBackend<String>`'s codec, fixed once the channel connects.
-    str_codec: tokio::sync::OnceCell<StrCodec>,
+    /// What the PV is read as: `T`'s datatype, or [`Datatype::Number`].
+    want: Datatype,
+    /// The converter the latest `connect`, or before one the first call,
+    /// made for the PV.
+    converter: Mutex<Option<Arc<CaConverter>>>,
     /// ophyd-async's `initial_values`: what `connect` read, which
     /// `put(None)` writes.
     initial: Mutex<Option<T>>,
-    _marker: std::marker::PhantomData<T>,
 }
 
-impl<T: Clone + Send + Sync + 'static> EpicsCaBackend<T> {
-    /// Build with a PV name.
+impl<T: CaType> EpicsCaBackend<T> {
+    /// Build with a PV name. `connect` refuses a PV that cannot be read as
+    /// `T`, as ophyd-async's `make_converter`: `f64` is a float record,
+    /// `i64` an integer one (or a float one at precision 0), `bool` a
+    /// two-choice enum or a char/short, `String` a string, an enum's labels
+    /// or a char waveform's text, `Vec<f64>` a double waveform.
     pub fn new(pv: impl Into<String>) -> Self {
+        Self::reading_as(pv.into(), T::DATATYPE)
+    }
+
+    fn reading_as(pv: String, want: Datatype) -> Self {
         Self {
-            pv: pv.into(),
+            pv,
             ctx: ca_context(),
             channel: OnceLock::new(),
-            string_kind: CaStringKind::Short,
-            str_codec: tokio::sync::OnceCell::new(),
+            want,
+            converter: Mutex::new(None),
             initial: Mutex::new(None),
-            _marker: std::marker::PhantomData,
         }
     }
 }
 
-impl EpicsCaBackend<String> {
-    /// Build a String backend that uses the DBR_CHAR-waveform long-string
-    /// convention. Required for areaDetector `FilePath` / `FileName` /
-    /// `FileTemplate` PVs whose record type is `waveform` of `CHAR`.
-    pub fn new_long_string(pv: impl Into<String>) -> Self {
-        let mut s = Self::new(pv);
-        s.string_kind = CaStringKind::Long;
-        s
+impl EpicsCaBackend<f64> {
+    /// ophyd-async's `datatype=None` read as a number: any numeric or enum
+    /// scalar PV, an enum as its index, for the devices whose PV is the
+    /// user's to name (`ca_value`, a suspender, a positioner's done PV).
+    pub(crate) fn new_inferred(pv: impl Into<String>) -> Self {
+        Self::reading_as(pv.into(), Datatype::Number)
     }
 }
 
-impl<T: Clone + Send + Sync + 'static> crate::devices::BackendFromPv for EpicsCaBackend<T> {
+impl<T: CaType> crate::devices::BackendFromPv for EpicsCaBackend<T> {
     fn from_pv(pv: &str) -> Self {
         Self::new(pv)
     }
 }
 
-impl<T: Clone + Send + Sync + 'static> EpicsCaBackend<T> {
+impl<T: CaType> EpicsCaBackend<T> {
     fn channel(&self) -> &Arc<SharedChannel> {
         self.channel.get_or_init(|| self.ctx.channel(&self.pv))
     }
@@ -201,24 +453,33 @@ impl<T: Clone + Send + Sync + 'static> EpicsCaBackend<T> {
             .map_err(|e| BsrsError::Backend(format!("ca connect {}: {e}", self.pv)))?;
         Ok(ch.clone())
     }
-}
 
-impl<T: Clone + Send + Sync + 'static> EpicsCaBackend<T>
-where
-    Self: SignalBackend<T>,
-{
-    /// `connect`: open the channel and read the value `put(None)` writes,
-    /// both within `timeout`, as ophyd-async's connect-time `caget`.
+    /// `connect`: open the channel, then make the converter from a DBR_CTRL
+    /// read whose value is the one `put(None)` writes, all within `timeout`,
+    /// as ophyd-async's connect-time `caget` and `make_converter`.
     async fn connect_reading(&self, timeout: Duration) -> Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
-        self.ensure_channel(timeout).await?;
-        let v = tokio::time::timeout_at(deadline, self.get_value())
-            .await
-            .map_err(|_| {
-                BsrsError::Backend(format!("ca connect {}: no value in {timeout:?}", self.pv))
-            })??;
+        let ch = self.ensure_channel(timeout).await?;
+        let (conv, snap) =
+            tokio::time::timeout_at(deadline, converter_for(&self.pv, self.want, &ch))
+                .await
+                .map_err(|_| {
+                    BsrsError::Backend(format!("ca connect {}: no value in {timeout:?}", self.pv))
+                })??;
+        let v = T::decode(&conv, &snap.value).ok_or_else(|| undecodable(&snap.value))?;
+        *self.converter.lock().unwrap() = Some(Arc::new(conv));
         *self.initial.lock().unwrap() = Some(v);
         Ok(())
+    }
+
+    /// The converter `connect` made, or one made now if none has.
+    async fn converter(&self, ch: &SharedChannel) -> Result<Arc<CaConverter>> {
+        if let Some(conv) = self.converter.lock().unwrap().clone() {
+            return Ok(conv);
+        }
+        let conv = Arc::new(converter_for(&self.pv, self.want, ch).await?.0);
+        *self.converter.lock().unwrap() = Some(conv.clone());
+        Ok(conv)
     }
 
     /// `value`, or for `None` the value `connect` read, read now if no
@@ -227,19 +488,27 @@ where
         if let Some(v) = value.or_else(|| self.initial.lock().unwrap().clone()) {
             return Ok(v);
         }
-        let v = self.get_value().await?;
+        let v = self.value().await?;
         *self.initial.lock().unwrap() = Some(v.clone());
         Ok(v)
     }
-}
 
-/// Look up the channel's `native_type` (cheap — `info()` returns
-/// already-cached snapshot state).
-async fn channel_native_type(ch: &SharedChannel) -> Result<DbFieldType> {
-    ch.info()
-        .await
-        .map(|i| i.native_type)
-        .map_err(|e| BsrsError::Backend(format!("ca info: {e}")))
+    async fn put_value(&self, value: Option<T>) -> Result<PutCompletion> {
+        let value = self.or_initial(value).await?;
+        let ch = self.ensure_channel(Duration::from_secs(2)).await?;
+        let v = T::encode(&*self.converter(&ch).await?, value)?;
+        put_callback(&ch, &v, "ca put")
+    }
+
+    async fn value(&self) -> Result<T> {
+        let ch = self.ensure_channel(Duration::from_secs(2)).await?;
+        let conv = self.converter(&ch).await?;
+        let (_ty, v) = ch
+            .get_with_timeout(CA_IO_TIMEOUT)
+            .await
+            .map_err(|e| BsrsError::Backend(format!("ca get: {e}")))?;
+        T::decode(&conv, &v).ok_or_else(|| undecodable(&v))
+    }
 }
 
 /// [`SharedChannel::put_callback`] of `v`: the request is queued on the
@@ -472,47 +741,13 @@ fn epics_to_f64(v: &EpicsValue) -> Option<f64> {
     }
 }
 
-/// Decode a numeric waveform `EpicsValue` array into `Vec<f64>`, widening every
-/// element type the way [`epics_to_f64`] does for scalars. `UCharArray` /
-/// `EnumArray` / `StringArray` are intentionally excluded: they carry the
-/// long-string and enum-choice meanings owned by the `String` backend,
-/// not numeric waveform data. A one-element answer arrives as the scalar
-/// (`EpicsValue::from_bytes_array`).
+/// Decode a `DBR_DOUBLE` waveform, the one array `Vec<f64>` is made for. A
+/// one-element answer arrives as the scalar (`EpicsValue::from_bytes_array`).
 fn epics_to_vec_f64(v: &EpicsValue) -> Option<Vec<f64>> {
     match v {
         EpicsValue::DoubleArray(a) => Some(a.to_vec()),
-        EpicsValue::FloatArray(a) => Some(a.iter().map(|x| *x as f64).collect()),
-        EpicsValue::LongArray(a) => Some(a.iter().map(|x| *x as f64).collect()),
-        EpicsValue::ShortArray(a) => Some(a.iter().map(|x| *x as f64).collect()),
-        EpicsValue::Int64Array(a) => Some(a.iter().map(|x| *x as f64).collect()),
-        EpicsValue::Double(_)
-        | EpicsValue::Float(_)
-        | EpicsValue::Long(_)
-        | EpicsValue::Short(_)
-        | EpicsValue::Int64(_) => epics_to_f64(v).map(|x| vec![x]),
+        EpicsValue::Double(d) => Some(vec![*d]),
         _ => None,
-    }
-}
-
-/// Encode a `Vec<f64>` waveform payload as the array `EpicsValue` variant that
-/// matches the channel's `native_type`, mirroring [`f64_to_wire`] for arrays
-/// (`CaChannel::put_callback` writes with `native_type`, so a width
-/// mismatch corrupts the wire payload). A `String`-native channel has no
-/// numeric-array form, so the closest `DoubleArray` is used — a `Vec<f64>`
-/// backend on a DBR_STRING PV is a misuse the type system can't forbid here.
-fn f64s_to_wire(t: DbFieldType, v: Vec<f64>) -> EpicsValue {
-    match t {
-        DbFieldType::Double | DbFieldType::String => EpicsValue::DoubleArray(v.into()),
-        DbFieldType::Float => EpicsValue::FloatArray(v.iter().map(|x| *x as f32).collect()),
-        DbFieldType::Long => EpicsValue::LongArray(v.iter().map(|x| *x as i32).collect()),
-        DbFieldType::Int64 => EpicsValue::Int64Array(v.iter().map(|x| *x as i64).collect()),
-        DbFieldType::Short => EpicsValue::ShortArray(v.iter().map(|x| *x as i16).collect()),
-        DbFieldType::Char => EpicsValue::CharArray(v.iter().map(|x| *x as u8).collect()),
-        DbFieldType::Enum => EpicsValue::EnumArray(v.iter().map(|x| *x as u16).collect()),
-        DbFieldType::UInt64 => EpicsValue::UInt64Array(v.iter().map(|x| *x as u64).collect()),
-        DbFieldType::UShort => EpicsValue::UShortArray(v.iter().map(|x| *x as u16).collect()),
-        DbFieldType::ULong => EpicsValue::ULongArray(v.iter().map(|x| *x as u32).collect()),
-        DbFieldType::UChar => EpicsValue::UCharArray(v.iter().map(|x| *x as u8).collect()),
     }
 }
 
@@ -533,391 +768,78 @@ fn epics_to_bool(v: &EpicsValue) -> Option<bool> {
     epics_to_i64(v).map(|i| i != 0)
 }
 
-/// Decode a String value out of an `EpicsValue` according to the
-/// backend's `CaStringKind`. For `Long` we also accept a stray
-/// `EpicsValue::String` (some servers reply with DBR_STRING even when
-/// the field is a char waveform of length ≤ 39) so we degrade
-/// gracefully on get.
-fn epics_to_string(v: &EpicsValue, kind: CaStringKind) -> Option<String> {
-    match (kind, v) {
-        (CaStringKind::Short, EpicsValue::String(s)) => Some(s.as_str_lossy().into_owned()),
-        (CaStringKind::Long, EpicsValue::UCharArray(bytes)) => Some(nul_terminated(bytes)),
-        // A one-element char waveform: the lone NUL of an empty string.
-        (CaStringKind::Long, EpicsValue::UChar(c)) => Some(nul_terminated(&[*c])),
-        (CaStringKind::Long, EpicsValue::String(s)) => Some(s.as_str_lossy().into_owned()),
-        (CaStringKind::Short, EpicsValue::UCharArray(bytes)) => Some(nul_terminated(bytes)),
-        _ => None,
-    }
-}
-
 fn nul_terminated(bytes: &[u8]) -> String {
     let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
-/// Build the wire `EpicsValue` for a String put according to `kind`.
-/// Long-string puts append a NUL terminator (areaDetector convention).
-fn string_to_epics(s: &str, kind: CaStringKind) -> EpicsValue {
-    match kind {
-        CaStringKind::Short => EpicsValue::String(s.into()),
-        CaStringKind::Long => {
-            let mut bytes = s.as_bytes().to_vec();
-            bytes.push(0);
-            EpicsValue::CharArray(bytes.into())
-        }
-    }
-}
-
-/// What a `String` is on a channel, as ophyd-async picks its `str`
-/// converter by the channel's type: a `DBR_ENUM` is its labels, by the
-/// record's choices; anything else the text of the backend's [`CaStringKind`].
-#[derive(Clone)]
-enum StrCodec {
-    Text(CaStringKind),
-    Enum(Vec<String>),
-}
-
-impl StrCodec {
-    async fn of(ch: &SharedChannel, kind: CaStringKind) -> Result<Self> {
-        if channel_native_type(ch).await? != DbFieldType::Enum {
-            return Ok(Self::Text(kind));
-        }
-        let snap = ch
-            .get_with_metadata(DbrClass::Ctrl, CA_IO_TIMEOUT)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("ca ctrl get: {e}")))?;
-        let choices = snap.enums.map(|e| enum_labels_to_strings(e.strings));
-        Ok(Self::Enum(choices.unwrap_or_default()))
-    }
-
-    fn decode(&self, v: &EpicsValue) -> Option<String> {
-        match self {
-            Self::Text(kind) => epics_to_string(v, *kind),
-            Self::Enum(choices) => epics_to_enum_label(v, choices),
-        }
-    }
-
-    fn encode(&self, s: &str) -> Result<EpicsValue> {
-        match self {
-            Self::Text(kind) => Ok(string_to_epics(s, *kind)),
-            Self::Enum(choices) => enum_label_to_index(s, choices).map(EpicsValue::Enum),
-        }
-    }
-}
-
-impl EpicsCaBackend<String> {
-    async fn codec(&self, ch: &SharedChannel) -> Result<&StrCodec> {
-        self.str_codec
-            .get_or_try_init(|| StrCodec::of(ch, self.string_kind))
-            .await
-    }
-}
-
 #[async_trait]
-impl SignalBackend<f64> for EpicsCaBackend<f64> {
+impl<T: CaType> SignalBackend<T> for EpicsCaBackend<T> {
     async fn connect(&self, timeout: Duration) -> Result<()> {
         self.connect_reading(timeout).await
     }
-    async fn put_start(&self, value: Option<f64>) -> Result<PutCompletion> {
-        let value = self.or_initial(value).await?;
-        let ch = self
-            .ensure_channel(Duration::from_secs(2))
-            .await
-            .map_err(|e| BsrsError::Backend(format!("{e}")))?;
-        let native = channel_native_type(&ch)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("{e}")))?;
-        let v = f64_to_wire(native, value);
-        put_callback(&ch, &v, "ca put")
+    async fn put_start(&self, value: Option<T>) -> Result<PutCompletion> {
+        self.put_value(value).await
     }
-    async fn put(&self, value: Option<f64>) -> Result<()> {
-        await_put(self.put_start(value).await?, "ca put").await
+    async fn put(&self, value: Option<T>) -> Result<()> {
+        await_put(self.put_value(value).await?, "ca put").await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
-        // Floats carry units, precision, and limits (mirrors ophyd-async
-        // `_metadata_from_augmented_value`).
-        let meta = ctrl_metadata(&ctrl_get(&ch).await?, true, true);
-        Ok(primitive_datakey::<f64>(format!("ca://{source}"), meta))
+        let conv = self.converter(&ch).await?;
+        T::datakey(format!("ca://{source}"), &conv, &ctrl_get(&ch).await?)
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
+        let conv = self.converter(&ch).await?;
         let snap = ch
             .get_with_metadata(DbrClass::Time, CA_IO_TIMEOUT)
             .await
             .map_err(|e| BsrsError::Backend(format!("ca get: {e}")))?;
-        let f = epics_to_f64(&snap.value)
-            .ok_or_else(|| BsrsError::Backend(format!("ca: not numeric: {:?}", snap.value)))?;
+        let v = T::decode(&conv, &snap.value).ok_or_else(|| undecodable(&snap.value))?;
         Ok(ReadingValue {
-            value: serde_json::Value::from(f),
+            value: v.into(),
             timestamp: ts_to_f64(snap.timestamp),
             alarm_severity: Some(alarm_severity(snap.alarm.severity)),
             message: None,
         })
     }
-    async fn get_value(&self) -> Result<f64> {
-        let ch = self.ensure_channel(Duration::from_secs(2)).await?;
-        let (_ty, v) = ch
-            .get_with_timeout(CA_IO_TIMEOUT)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("ca get: {e}")))?;
-        epics_to_f64(&v).ok_or_else(|| BsrsError::Backend(format!("ca: not numeric: {v:?}")))
+    async fn get_value(&self) -> Result<T> {
+        self.value().await
     }
-    async fn get_setpoint(&self) -> Result<f64> {
+    async fn get_setpoint(&self) -> Result<T> {
         // CA channels expose only one read path; we treat readback as the
         // best-effort setpoint as well.
-        SignalBackend::<f64>::get_value(self).await
+        self.value().await
     }
-    fn set_callback(&self, cb: Option<ReadingValueCallback<f64>>) -> SubToken {
+    fn set_callback(&self, cb: Option<ReadingValueCallback<T>>) -> SubToken {
         let cb = match cb {
             None => return SubToken::noop(),
             Some(cb) => cb,
         };
-        // Subscribed at once, connected or not: epics-ca-rs starts it on connect.
         let ch = self.channel().clone();
+        let cached = self.converter.lock().unwrap().clone();
+        let (pv, want) = (self.pv.clone(), self.want);
         // Spawn a forwarder. Held tokio::JoinHandle is aborted on Drop (K1).
         let handle = tokio::spawn(async move {
-            forward_monitor(&ch, epics_to_f64, &cb).await;
-        });
-        let abort = handle.abort_handle();
-        SubToken::new(move || abort.abort())
-    }
-    fn source(&self, name: &str, _read: bool) -> String {
-        format!("ca://{name}")
-    }
-}
-
-#[async_trait]
-impl SignalBackend<Vec<f64>> for EpicsCaBackend<Vec<f64>> {
-    async fn connect(&self, timeout: Duration) -> Result<()> {
-        self.connect_reading(timeout).await
-    }
-    async fn put_start(&self, value: Option<Vec<f64>>) -> Result<PutCompletion> {
-        let value = self.or_initial(value).await?;
-        let ch = self
-            .ensure_channel(Duration::from_secs(2))
-            .await
-            .map_err(|e| BsrsError::Backend(format!("{e}")))?;
-        let native = channel_native_type(&ch)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("{e}")))?;
-        let v = f64s_to_wire(native, value);
-        put_callback(&ch, &v, "ca put")
-    }
-    async fn put(&self, value: Option<Vec<f64>>) -> Result<()> {
-        await_put(self.put_start(value).await?, "ca put").await
-    }
-    async fn get_datakey(&self, source: &str) -> Result<DataKey> {
-        let ch = self.ensure_channel(Duration::from_secs(2)).await?;
-        let snap = ctrl_get(&ch).await?;
-        let v = epics_to_vec_f64(&snap.value).ok_or_else(|| {
-            BsrsError::Backend(format!("ca: not a numeric array: {:?}", snap.value))
-        })?;
-        // Float-element waveforms carry units/precision/limits like scalars.
-        let meta = ctrl_metadata(&snap, true, true);
-        Ok(array_datakey(format!("ca://{source}"), &v, meta))
-    }
-    async fn get_reading(&self) -> Result<ReadingValue> {
-        let ch = self.ensure_channel(Duration::from_secs(2)).await?;
-        let snap = ch
-            .get_with_metadata(DbrClass::Time, CA_IO_TIMEOUT)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("ca get: {e}")))?;
-        let v = epics_to_vec_f64(&snap.value).ok_or_else(|| {
-            BsrsError::Backend(format!("ca: not a numeric array: {:?}", snap.value))
-        })?;
-        Ok(ReadingValue {
-            value: serde_json::Value::from(v),
-            timestamp: ts_to_f64(snap.timestamp),
-            alarm_severity: Some(alarm_severity(snap.alarm.severity)),
-            message: None,
-        })
-    }
-    async fn get_value(&self) -> Result<Vec<f64>> {
-        let ch = self.ensure_channel(Duration::from_secs(2)).await?;
-        let (_ty, v) = ch
-            .get_with_timeout(CA_IO_TIMEOUT)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("ca get: {e}")))?;
-        epics_to_vec_f64(&v)
-            .ok_or_else(|| BsrsError::Backend(format!("ca: not a numeric array: {v:?}")))
-    }
-    async fn get_setpoint(&self) -> Result<Vec<f64>> {
-        SignalBackend::<Vec<f64>>::get_value(self).await
-    }
-    fn set_callback(&self, cb: Option<ReadingValueCallback<Vec<f64>>>) -> SubToken {
-        let cb = match cb {
-            None => return SubToken::noop(),
-            Some(cb) => cb,
-        };
-        // Subscribed at once, connected or not: epics-ca-rs starts it on connect.
-        let ch = self.channel().clone();
-        let handle = tokio::spawn(async move {
-            forward_monitor(&ch, epics_to_vec_f64, &cb).await;
-        });
-        let abort = handle.abort_handle();
-        SubToken::new(move || abort.abort())
-    }
-    fn source(&self, name: &str, _read: bool) -> String {
-        format!("ca://{name}")
-    }
-}
-
-#[async_trait]
-impl SignalBackend<String> for EpicsCaBackend<String> {
-    async fn connect(&self, timeout: Duration) -> Result<()> {
-        self.connect_reading(timeout).await
-    }
-    async fn put_start(&self, value: Option<String>) -> Result<PutCompletion> {
-        let value = self.or_initial(value).await?;
-        let ch = self
-            .ensure_channel(Duration::from_secs(2))
-            .await
-            .map_err(|e| BsrsError::Backend(format!("{e}")))?;
-        let v = self.codec(&ch).await?.encode(&value)?;
-        put_callback(&ch, &v, "ca put")
-    }
-    async fn put(&self, value: Option<String>) -> Result<()> {
-        await_put(self.put_start(value).await?, "ca put").await
-    }
-    async fn get_datakey(&self, source: &str) -> Result<DataKey> {
-        let ch = self.ensure_channel(Duration::from_secs(2)).await?;
-        let choices = match self.codec(&ch).await? {
-            StrCodec::Text(_) => None,
-            StrCodec::Enum(choices) => Some(choices.clone()),
-        };
-        let meta = SignalMetadata {
-            choices,
-            ..SignalMetadata::default()
-        };
-        Ok(primitive_datakey::<String>(format!("ca://{source}"), meta))
-    }
-    async fn get_reading(&self) -> Result<ReadingValue> {
-        let ch = self.ensure_channel(Duration::from_secs(2)).await?;
-        let codec = self.codec(&ch).await?;
-        let snap = ch
-            .get_with_metadata(DbrClass::Time, CA_IO_TIMEOUT)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("ca get: {e}")))?;
-        let s = codec
-            .decode(&snap.value)
-            .ok_or_else(|| BsrsError::Backend(format!("ca: not stringable: {:?}", snap.value)))?;
-        Ok(ReadingValue {
-            value: serde_json::Value::from(s),
-            timestamp: ts_to_f64(snap.timestamp),
-            alarm_severity: Some(alarm_severity(snap.alarm.severity)),
-            message: None,
-        })
-    }
-    async fn get_value(&self) -> Result<String> {
-        let ch = self.ensure_channel(Duration::from_secs(2)).await?;
-        let codec = self.codec(&ch).await?;
-        let (_ty, v) = ch
-            .get_with_timeout(CA_IO_TIMEOUT)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("ca get: {e}")))?;
-        codec
-            .decode(&v)
-            .ok_or_else(|| BsrsError::Backend(format!("ca: not stringable: {v:?}")))
-    }
-    async fn get_setpoint(&self) -> Result<String> {
-        SignalBackend::<String>::get_value(self).await
-    }
-    fn set_callback(&self, cb: Option<ReadingValueCallback<String>>) -> SubToken {
-        let cb = match cb {
-            None => return SubToken::noop(),
-            Some(cb) => cb,
-        };
-        let ch = self.channel().clone();
-        let kind = self.string_kind;
-        let cached = self.str_codec.get().cloned();
-        let handle = tokio::spawn(async move {
-            let codec = match cached {
-                Some(c) => c,
+            let conv = match cached {
+                Some(conv) => conv,
                 None => {
-                    // The codec needs the channel's native type: wait for
-                    // it as long as the token lives, as camonitor does.
+                    // No connect made the converter: wait for the channel as
+                    // long as the token lives, as camonitor does.
                     if ch.wait_connected(Duration::MAX).await.is_err() {
                         return;
                     }
-                    match StrCodec::of(&ch, kind).await {
-                        Ok(c) => c,
-                        Err(_) => return,
+                    match converter_for(&pv, want, &ch).await {
+                        Ok((conv, _)) => Arc::new(conv),
+                        Err(e) => {
+                            tracing::warn!("ca monitor {pv}: {e}");
+                            return;
+                        }
                     }
                 }
             };
-            forward_monitor(&ch, |v| codec.decode(v), &cb).await;
-        });
-        let abort = handle.abort_handle();
-        SubToken::new(move || abort.abort())
-    }
-    fn source(&self, name: &str, _read: bool) -> String {
-        format!("ca://{name}")
-    }
-}
-
-#[async_trait]
-impl SignalBackend<i64> for EpicsCaBackend<i64> {
-    async fn connect(&self, timeout: Duration) -> Result<()> {
-        self.connect_reading(timeout).await
-    }
-    async fn put_start(&self, value: Option<i64>) -> Result<PutCompletion> {
-        let value = self.or_initial(value).await?;
-        let ch = self
-            .ensure_channel(Duration::from_secs(2))
-            .await
-            .map_err(|e| BsrsError::Backend(format!("{e}")))?;
-        let native = channel_native_type(&ch)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("{e}")))?;
-        let v = i64_to_wire(native, value);
-        put_callback(&ch, &v, "ca put")
-    }
-    async fn put(&self, value: Option<i64>) -> Result<()> {
-        await_put(self.put_start(value).await?, "ca put").await
-    }
-    async fn get_datakey(&self, source: &str) -> Result<DataKey> {
-        let ch = self.ensure_channel(Duration::from_secs(2)).await?;
-        // Ints carry units and limits, but no precision — there are no
-        // fractional digits (ophyd-async excludes precision for `int`).
-        let meta = ctrl_metadata(&ctrl_get(&ch).await?, true, false);
-        Ok(primitive_datakey::<i64>(format!("ca://{source}"), meta))
-    }
-    async fn get_reading(&self) -> Result<ReadingValue> {
-        let ch = self.ensure_channel(Duration::from_secs(2)).await?;
-        let snap = ch
-            .get_with_metadata(DbrClass::Time, CA_IO_TIMEOUT)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("ca get: {e}")))?;
-        let i = epics_to_i64(&snap.value)
-            .ok_or_else(|| BsrsError::Backend(format!("ca: not int: {:?}", snap.value)))?;
-        Ok(ReadingValue {
-            value: serde_json::Value::from(i),
-            timestamp: ts_to_f64(snap.timestamp),
-            alarm_severity: Some(alarm_severity(snap.alarm.severity)),
-            message: None,
-        })
-    }
-    async fn get_value(&self) -> Result<i64> {
-        let ch = self.ensure_channel(Duration::from_secs(2)).await?;
-        let (_ty, v) = ch
-            .get_with_timeout(CA_IO_TIMEOUT)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("ca get: {e}")))?;
-        epics_to_i64(&v).ok_or_else(|| BsrsError::Backend(format!("ca: not int: {v:?}")))
-    }
-    async fn get_setpoint(&self) -> Result<i64> {
-        SignalBackend::<i64>::get_value(self).await
-    }
-    fn set_callback(&self, cb: Option<ReadingValueCallback<i64>>) -> SubToken {
-        let cb = match cb {
-            None => return SubToken::noop(),
-            Some(cb) => cb,
-        };
-        // Subscribed at once, connected or not: epics-ca-rs starts it on connect.
-        let ch = self.channel().clone();
-        let handle = tokio::spawn(async move {
-            forward_monitor(&ch, epics_to_i64, &cb).await;
+            forward_monitor(&ch, |v| T::decode(&conv, v), &cb).await;
         });
         let abort = handle.abort_handle();
         SubToken::new(move || abort.abort())
@@ -935,86 +857,10 @@ impl EpicsCaBackend<bool> {
     /// this and watch the readback instead (the ophyd-async
     /// `EpicsOptions(wait=non_zero)` convention).
     pub async fn put_nowait(&self, value: bool) -> Result<()> {
-        let ch = self
-            .ensure_channel(Duration::from_secs(2))
-            .await
-            .map_err(|e| BsrsError::Backend(format!("{e}")))?;
-        let native = channel_native_type(&ch)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("{e}")))?;
-        let v = bool_to_wire(native, value);
+        let ch = self.ensure_channel(Duration::from_secs(2)).await?;
+        let v = bool::encode(&*self.converter(&ch).await?, value)?;
         ch.put_no_callback(&v)
             .map_err(|e| BsrsError::Backend(format!("ca put_nowait: {e}")))
-    }
-}
-
-#[async_trait]
-impl SignalBackend<bool> for EpicsCaBackend<bool> {
-    async fn connect(&self, timeout: Duration) -> Result<()> {
-        self.connect_reading(timeout).await
-    }
-    async fn put_start(&self, value: Option<bool>) -> Result<PutCompletion> {
-        let value = self.or_initial(value).await?;
-        let ch = self
-            .ensure_channel(Duration::from_secs(2))
-            .await
-            .map_err(|e| BsrsError::Backend(format!("{e}")))?;
-        let native = channel_native_type(&ch)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("{e}")))?;
-        let v = bool_to_wire(native, value);
-        put_callback(&ch, &v, "ca put")
-    }
-    async fn put(&self, value: Option<bool>) -> Result<()> {
-        await_put(self.put_start(value).await?, "ca put").await
-    }
-    async fn get_datakey(&self, source: &str) -> Result<DataKey> {
-        Ok(primitive_datakey::<bool>(
-            format!("ca://{source}"),
-            SignalMetadata::default(),
-        ))
-    }
-    async fn get_reading(&self) -> Result<ReadingValue> {
-        let ch = self.ensure_channel(Duration::from_secs(2)).await?;
-        let snap = ch
-            .get_with_metadata(DbrClass::Time, CA_IO_TIMEOUT)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("ca get: {e}")))?;
-        let b = epics_to_bool(&snap.value)
-            .ok_or_else(|| BsrsError::Backend(format!("ca: not bool: {:?}", snap.value)))?;
-        Ok(ReadingValue {
-            value: serde_json::Value::from(b),
-            timestamp: ts_to_f64(snap.timestamp),
-            alarm_severity: Some(alarm_severity(snap.alarm.severity)),
-            message: None,
-        })
-    }
-    async fn get_value(&self) -> Result<bool> {
-        let ch = self.ensure_channel(Duration::from_secs(2)).await?;
-        let (_ty, v) = ch
-            .get_with_timeout(CA_IO_TIMEOUT)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("ca get: {e}")))?;
-        epics_to_bool(&v).ok_or_else(|| BsrsError::Backend(format!("ca: not bool: {v:?}")))
-    }
-    async fn get_setpoint(&self) -> Result<bool> {
-        SignalBackend::<bool>::get_value(self).await
-    }
-    fn set_callback(&self, cb: Option<ReadingValueCallback<bool>>) -> SubToken {
-        let cb = match cb {
-            None => return SubToken::noop(),
-            Some(cb) => cb,
-        };
-        // Subscribed at once, connected or not: epics-ca-rs starts it on connect.
-        let ch = self.channel().clone();
-        let handle = tokio::spawn(async move {
-            forward_monitor(&ch, epics_to_bool, &cb).await;
-        });
-        let abort = handle.abort_handle();
-        SubToken::new(move || abort.abort())
-    }
-    fn source(&self, name: &str, _read: bool) -> String {
-        format!("ca://{name}")
     }
 }
 
@@ -1062,9 +908,9 @@ fn epics_to_enum_label(v: &EpicsValue, choices: &[String]) -> Option<String> {
 
 /// EPICS enum choice labels arrive as `PvString` (raw wire bytes); bsrs
 /// models choices as UTF-8 `String`, so convert lossily at this boundary.
-fn enum_labels_to_strings(labels: Vec<PvString>) -> Vec<String> {
+fn enum_labels_to_strings(labels: &[PvString]) -> Vec<String> {
     labels
-        .into_iter()
+        .iter()
         .map(|s| s.as_str_lossy().into_owned())
         .collect()
 }
@@ -1077,6 +923,7 @@ pub type CaEnumBackend = EpicsCaBackend<String>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_base_rs::server::snapshot::EnumInfo;
 
     #[test]
     fn put_timeout_from_env_double() {
@@ -1215,34 +1062,14 @@ mod tests {
     }
 
     #[test]
-    fn epics_to_vec_f64_widens_numeric_arrays_and_rejects_non_numeric() {
+    fn epics_to_vec_f64_reads_double_waveforms_only() {
         assert_eq!(
             epics_to_vec_f64(&EpicsValue::DoubleArray(vec![1.0, 2.0].into())),
             Some(vec![1.0, 2.0])
         );
-        assert_eq!(
-            epics_to_vec_f64(&EpicsValue::FloatArray(vec![1.5, 2.5].into())),
-            Some(vec![1.5, 2.5])
-        );
+        assert_eq!(epics_to_vec_f64(&EpicsValue::Double(3.0)), Some(vec![3.0]));
         assert_eq!(
             epics_to_vec_f64(&EpicsValue::LongArray(vec![3, 4].into())),
-            Some(vec![3.0, 4.0])
-        );
-        assert_eq!(
-            epics_to_vec_f64(&EpicsValue::ShortArray(vec![5, 6].into())),
-            Some(vec![5.0, 6.0])
-        );
-        assert_eq!(
-            epics_to_vec_f64(&EpicsValue::Int64Array(vec![7, 8].into())),
-            Some(vec![7.0, 8.0])
-        );
-        // Char/Enum/String arrays carry non-numeric-waveform meanings; excluded.
-        assert_eq!(
-            epics_to_vec_f64(&EpicsValue::UCharArray(vec![1, 2].into())),
-            None
-        );
-        assert_eq!(
-            epics_to_vec_f64(&EpicsValue::StringArray(["a".into()].into_iter().collect())),
             None
         );
     }
@@ -1251,47 +1078,17 @@ mod tests {
     /// one-element answer arrives as the scalar.
     #[test]
     fn autosized_reads_decode_at_every_count() {
+        let double = CaConverter::Native(DbFieldType::Double);
         for n in [0, 1, 3] {
             let put: Vec<f64> = (0..n).map(|i| i as f64 + 0.5).collect();
-            let wire = f64s_to_wire(DbFieldType::Double, put.clone()).to_bytes();
+            let wire = Vec::<f64>::encode(&double, put.clone()).unwrap().to_bytes();
             let v = EpicsValue::from_bytes_array(DbFieldType::Double, &wire, n).unwrap();
-            assert_eq!(epics_to_vec_f64(&v), Some(put), "{n} elements");
+            assert_eq!(Vec::<f64>::decode(&double, &v), Some(put), "{n} elements");
         }
         for s in ["", "a", "/data/scan42"] {
-            let v = string_to_epics(s, CaStringKind::Long);
-            let back = epics_to_string(&off_the_wire(&v, s.len() + 1), CaStringKind::Long);
+            let v = String::encode(&CaConverter::LongStr, s.into()).unwrap();
+            let back = String::decode(&CaConverter::LongStr, &off_the_wire(&v, s.len() + 1));
             assert_eq!(back.as_deref(), Some(s), "{s:?}");
-        }
-    }
-
-    #[test]
-    fn f64s_to_wire_matches_native_array_type() {
-        match f64s_to_wire(DbFieldType::Double, vec![1.0, 2.0]) {
-            EpicsValue::DoubleArray(a) => assert_eq!(a, vec![1.0, 2.0]),
-            other => panic!("expected DoubleArray, got {other:?}"),
-        }
-        match f64s_to_wire(DbFieldType::Float, vec![1.0, 2.0]) {
-            EpicsValue::FloatArray(a) => assert_eq!(a, vec![1.0f32, 2.0]),
-            other => panic!("expected FloatArray, got {other:?}"),
-        }
-        match f64s_to_wire(DbFieldType::Long, vec![3.9, 4.1]) {
-            // f64 → i32 truncates toward zero.
-            EpicsValue::LongArray(a) => assert_eq!(a, vec![3, 4]),
-            other => panic!("expected LongArray, got {other:?}"),
-        }
-        match f64s_to_wire(DbFieldType::Short, vec![5.0]) {
-            EpicsValue::ShortArray(a) => assert_eq!(a, vec![5i16]),
-            other => panic!("expected ShortArray, got {other:?}"),
-        }
-        match f64s_to_wire(DbFieldType::Char, vec![65.0]) {
-            EpicsValue::CharArray(a) => assert_eq!(a, vec![65u8]),
-            other => panic!("expected CharArray, got {other:?}"),
-        }
-        // Unsigned 8-bit: 200 fits u8 but overflows the signed `Char` (i8),
-        // so this also pins the unsigned interpretation of the new arm.
-        match f64s_to_wire(DbFieldType::UChar, vec![200.0]) {
-            EpicsValue::UCharArray(a) => assert_eq!(a, vec![200u8]),
-            other => panic!("expected UCharArray, got {other:?}"),
         }
     }
 
@@ -1311,7 +1108,7 @@ mod tests {
         assert_eq!(epics_to_bool(&byte), Some(true));
         let text = off_the_wire(&EpicsValue::CharArray(b"ab\0".to_vec().into()), 3);
         assert_eq!(
-            epics_to_string(&text, CaStringKind::Short).as_deref(),
+            String::decode(&CaConverter::LongStr, &text).as_deref(),
             Some("ab")
         );
     }
@@ -1319,7 +1116,7 @@ mod tests {
     #[test]
     fn long_string_round_trips_via_char_array() {
         let path = "/data/scan42/run0001.h5";
-        let v = string_to_epics(path, CaStringKind::Long);
+        let v = String::encode(&CaConverter::LongStr, path.into()).unwrap();
         match &v {
             EpicsValue::CharArray(bytes) => {
                 assert_eq!(*bytes.last().unwrap(), 0);
@@ -1327,36 +1124,188 @@ mod tests {
             }
             _ => panic!("expected CharArray, got {v:?}"),
         }
-        let back = epics_to_string(&off_the_wire(&v, path.len() + 1), CaStringKind::Long)
-            .expect("a DBR_CHAR array decodes as a Long string");
+        let back = String::decode(&CaConverter::LongStr, &off_the_wire(&v, path.len() + 1))
+            .expect("a DBR_CHAR array decodes as a long string");
         assert_eq!(back, path);
     }
 
     #[test]
     fn short_string_round_trips_via_dbr_string() {
-        let v = string_to_epics("13SIM1", CaStringKind::Short);
+        let conv = CaConverter::Native(DbFieldType::String);
+        let v = String::encode(&conv, "13SIM1".into()).unwrap();
         match &v {
             EpicsValue::String(s) => assert_eq!(s, "13SIM1"),
             _ => panic!("expected String, got {v:?}"),
         }
-        let back = epics_to_string(&v, CaStringKind::Short).unwrap();
-        assert_eq!(back, "13SIM1");
+        assert_eq!(String::decode(&conv, &v).as_deref(), Some("13SIM1"));
     }
 
     #[test]
     fn long_string_decode_strips_at_first_nul() {
         let bytes = b"/data/scan\0/tail/ignored".to_vec();
-        let s = epics_to_string(&EpicsValue::UCharArray(bytes.into()), CaStringKind::Long)
+        let s = String::decode(&CaConverter::LongStr, &EpicsValue::UCharArray(bytes.into()))
             .expect("UCharArray");
         assert_eq!(s, "/data/scan");
     }
 
+    /// A DBR_CTRL read with `labels` as its enum strings and `precision` as
+    /// its display precision.
+    fn ctrl(labels: &[&str], precision: Option<i16>) -> Snapshot {
+        let mut snap = Snapshot::new(EpicsValue::Double(0.0), 0, 0, std::time::UNIX_EPOCH);
+        if !labels.is_empty() {
+            snap.enums = Some(EnumInfo::new(labels.iter().map(|s| (*s).into()).collect()));
+        }
+        snap.display = precision.map(|precision| DisplayInfo {
+            precision,
+            ..Default::default()
+        });
+        snap
+    }
+
+    fn converter(want: Datatype, native: DbFieldType, n: u32, snap: &Snapshot) -> CaConverter {
+        make_converter("P", want, native, n, snap).unwrap()
+    }
+
+    fn refusal(want: Datatype, native: DbFieldType, n: u32, snap: &Snapshot) -> String {
+        match make_converter("P", want, native, n, snap) {
+            Err(BsrsError::Datatype(msg)) => msg,
+            other => panic!("{want:?} on {native:?}[{n}]: {other:?}"),
+        }
+    }
+
     #[test]
-    fn long_string_constructor_flips_kind() {
-        let long = EpicsCaBackend::<String>::new_long_string("foo:FilePath");
-        assert_eq!(long.string_kind, CaStringKind::Long);
-        let short = EpicsCaBackend::<String>::new("bar:Port");
-        assert_eq!(short.string_kind, CaStringKind::Short);
+    fn bool_on_enum_needs_two_choices() {
+        let off_on = ctrl(&["Off", "On"], None);
+        assert_eq!(
+            converter(Datatype::Bool, DbFieldType::Enum, 1, &off_on),
+            CaConverter::Native(DbFieldType::Enum)
+        );
+        assert_eq!(
+            refusal(
+                Datatype::Bool,
+                DbFieldType::Enum,
+                1,
+                &ctrl(&["A", "B", "C"], None)
+            ),
+            "P has 3 choices, can't map to bool"
+        );
+    }
+
+    #[test]
+    fn bool_on_char_or_short_but_not_long() {
+        let none = ctrl(&[], None);
+        assert_eq!(
+            converter(Datatype::Bool, DbFieldType::Short, 1, &none),
+            CaConverter::Native(DbFieldType::Short)
+        );
+        assert_eq!(
+            converter(Datatype::Bool, DbFieldType::Char, 1, &none),
+            CaConverter::Native(DbFieldType::Char)
+        );
+        assert_eq!(
+            refusal(Datatype::Bool, DbFieldType::Long, 1, &none),
+            "P with inferred datatype int cannot be coerced to bool"
+        );
+    }
+
+    #[test]
+    fn int_on_float_needs_precision_zero() {
+        assert_eq!(
+            converter(Datatype::Int, DbFieldType::Double, 1, &ctrl(&[], Some(0))),
+            CaConverter::Native(DbFieldType::Double)
+        );
+        assert_eq!(
+            refusal(Datatype::Int, DbFieldType::Double, 1, &ctrl(&[], Some(3))),
+            "P with inferred datatype float cannot be coerced to int"
+        );
+    }
+
+    #[test]
+    fn float_on_int_record_is_refused() {
+        assert_eq!(
+            refusal(Datatype::Float, DbFieldType::Long, 1, &ctrl(&[], Some(0))),
+            "P with inferred datatype int cannot be coerced to float"
+        );
+    }
+
+    #[test]
+    fn str_on_char_waveform_is_long_string() {
+        let none = ctrl(&[], None);
+        assert_eq!(
+            converter(Datatype::Str, DbFieldType::Char, 256, &none),
+            CaConverter::LongStr
+        );
+        assert_eq!(
+            refusal(Datatype::Str, DbFieldType::Char, 1, &none),
+            "P with inferred datatype int cannot be coerced to str"
+        );
+    }
+
+    #[test]
+    fn float_array_on_double_waveform_only() {
+        let none = ctrl(&[], None);
+        assert_eq!(
+            converter(Datatype::FloatArray, DbFieldType::Double, 10, &none),
+            CaConverter::Native(DbFieldType::Double)
+        );
+        assert_eq!(
+            refusal(Datatype::FloatArray, DbFieldType::Long, 10, &none),
+            "P with inferred datatype Array1D[np.int32] cannot be coerced to Array1D[np.float64]"
+        );
+        assert_eq!(
+            refusal(Datatype::Float, DbFieldType::Double, 10, &none),
+            "P with inferred datatype Array1D[np.float64] cannot be coerced to float"
+        );
+    }
+
+    #[test]
+    fn int_on_string_is_refused() {
+        assert_eq!(
+            refusal(Datatype::Int, DbFieldType::String, 1, &ctrl(&[], None)),
+            "P with inferred datatype str cannot be coerced to int"
+        );
+    }
+
+    #[test]
+    fn enum_is_its_labels_and_no_number() {
+        let modes = ctrl(&["Single", "Multiple", "Continuous"], None);
+        assert_eq!(
+            converter(Datatype::Str, DbFieldType::Enum, 1, &modes),
+            CaConverter::Enum(image_mode_choices())
+        );
+        assert_eq!(
+            refusal(Datatype::Int, DbFieldType::Enum, 1, &modes),
+            "P with inferred datatype str | SubsetEnum | StrictEnum cannot be coerced to int"
+        );
+    }
+
+    #[test]
+    fn number_reads_any_numeric_or_enum_scalar() {
+        let modes = ctrl(&["Single", "Multiple", "Continuous"], None);
+        for native in [
+            DbFieldType::Enum,
+            DbFieldType::Short,
+            DbFieldType::Char,
+            DbFieldType::Long,
+            DbFieldType::Float,
+            DbFieldType::Double,
+        ] {
+            assert_eq!(
+                converter(Datatype::Number, native, 1, &modes),
+                CaConverter::Native(native)
+            );
+        }
+        assert_eq!(
+            f64::decode(
+                &CaConverter::Native(DbFieldType::Enum),
+                &EpicsValue::Enum(2)
+            ),
+            Some(2.0)
+        );
+        assert_eq!(
+            refusal(Datatype::Number, DbFieldType::String, 1, &modes),
+            "P with inferred datatype str cannot be coerced to float"
+        );
     }
 
     #[test]

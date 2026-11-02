@@ -10,9 +10,10 @@ use std::time::{Duration, Instant};
 
 use bsrs::backends::epics_ca::EpicsCaBackend;
 use bsrs::core::msg::StageableObj;
+use bsrs::devices::BackendFromPv;
 use bsrs::host::areadetector::{
     area_detector_hdf, connect_area_detector_hdf, select_save_plugin, AreaDetectorCam, NdFile,
-    StaticPathProvider,
+    StaticPathProvider, AD_COLOR_MODE_MONO, AD_IMAGE_MODE_SINGLE,
 };
 use bsrs::protocols_async::{
     DetectorControl, SignalBackend, Stageable, Triggerable, WritesStreamAssets,
@@ -35,9 +36,9 @@ fn boot() {
 async fn channel<V>(pv: &str) -> EpicsCaBackend<V>
 where
     V: Clone + Send + Sync + 'static,
-    EpicsCaBackend<V>: SignalBackend<V>,
+    EpicsCaBackend<V>: SignalBackend<V> + BackendFromPv,
 {
-    let ch = EpicsCaBackend::<V>::new(pv);
+    let ch = EpicsCaBackend::<V>::from_pv(pv);
     ch.connect(TIMEOUT)
         .await
         .unwrap_or_else(|e| panic!("connect {pv}: {e}"));
@@ -47,7 +48,7 @@ where
 async fn put<V>(pv: &str, v: V)
 where
     V: Clone + Send + Sync + 'static,
-    EpicsCaBackend<V>: SignalBackend<V>,
+    EpicsCaBackend<V>: SignalBackend<V> + BackendFromPv,
 {
     let ch = channel::<V>(pv).await;
     timeout(TIMEOUT, SignalBackend::put(&ch, Some(v)))
@@ -59,7 +60,7 @@ where
 async fn get<V>(pv: &str) -> V
 where
     V: Clone + Send + Sync + 'static,
-    EpicsCaBackend<V>: SignalBackend<V>,
+    EpicsCaBackend<V>: SignalBackend<V> + BackendFromPv,
 {
     let ch = channel::<V>(pv).await;
     SignalBackend::get_value(&ch)
@@ -93,12 +94,8 @@ async fn ready_cam(p: &str, cam: &AreaDetectorCam) {
         f.plugin.set_enabled(feed).await.expect("EnableCallbacks");
     }
     for (suffix, v) in [
-        ("ImageMode", 0),
         ("NumImages", 1),
         ("NumExposures", 1),
-        ("ColorMode", 0),
-        ("DataType", 1),
-        ("ArrayCallbacks", 1),
         ("BinX", 1),
         ("BinY", 1),
         ("MinX", 0),
@@ -108,6 +105,14 @@ async fn ready_cam(p: &str, cam: &AreaDetectorCam) {
     ] {
         put::<i64>(&format!("{p}cam1:{suffix}"), v).await;
     }
+    for (suffix, label) in [
+        ("ImageMode", AD_IMAGE_MODE_SINGLE),
+        ("ColorMode", AD_COLOR_MODE_MONO),
+        ("DataType", "UInt8"),
+    ] {
+        put::<String>(&format!("{p}cam1:{suffix}"), label.into()).await;
+    }
+    put::<bool>(&format!("{p}cam1:ArrayCallbacks"), true).await;
     put::<f64>(&format!("{p}cam1:AcquireTime"), 0.01).await;
     put::<f64>(&format!("{p}cam1:AcquirePeriod"), 0.01).await;
     timeout(

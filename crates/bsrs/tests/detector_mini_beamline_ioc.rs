@@ -13,9 +13,11 @@ use std::time::Duration;
 use bsrs::backends::epics_ca::EpicsCaBackend;
 use bsrs::callbacks::CapturingSink;
 use bsrs::core::msg::{MonitorableObj, ReadableObj};
+use bsrs::devices::BackendFromPv;
 use bsrs::event_model::{Dtype, DtypeNumpy};
 use bsrs::host::areadetector::{
-    area_detector_hdf, connect_area_detector_hdf, NdFile, StaticPathProvider,
+    area_detector_hdf, connect_area_detector_hdf, NdFile, StaticPathProvider, AD_COLOR_MODE_MONO,
+    AD_IMAGE_MODE_SINGLE,
 };
 use bsrs::host::ca_devices::CaDetector;
 use bsrs::prelude::*;
@@ -50,9 +52,9 @@ fn boot() {
 async fn put<V>(pv: &str, v: V)
 where
     V: Clone + Send + Sync + 'static,
-    EpicsCaBackend<V>: SignalBackend<V>,
+    EpicsCaBackend<V>: SignalBackend<V> + BackendFromPv,
 {
-    let ch = EpicsCaBackend::<V>::new(pv);
+    let ch = EpicsCaBackend::<V>::from_pv(pv);
     ch.connect(TIMEOUT)
         .await
         .unwrap_or_else(|e| panic!("connect {pv}: {e}"));
@@ -231,12 +233,8 @@ async fn moving_dot_frames_are_described_from_the_driver_readbacks() {
         f.plugin.set_enabled(feed).await.expect("EnableCallbacks");
     }
     for (suffix, v) in [
-        ("ImageMode", 0),
         ("NumImages", 1),
         ("NumExposures", 1),
-        ("ColorMode", 0),
-        ("DataType", 3),
-        ("ArrayCallbacks", 1),
         ("BinX", 2),
         ("BinY", 2),
         ("MinX", 0),
@@ -246,6 +244,14 @@ async fn moving_dot_frames_are_described_from_the_driver_readbacks() {
     ] {
         put::<i64>(&format!("mini:dot:cam1:{suffix}"), v).await;
     }
+    for (suffix, label) in [
+        ("ImageMode", AD_IMAGE_MODE_SINGLE),
+        ("ColorMode", AD_COLOR_MODE_MONO),
+        ("DataType", "UInt16"),
+    ] {
+        put::<String>(&format!("mini:dot:cam1:{suffix}"), label.into()).await;
+    }
+    put::<bool>("mini:dot:cam1:ArrayCallbacks", true).await;
     put::<f64>("mini:dot:cam1:AcquireTime", 0.01).await;
     put::<f64>("mini:dot:cam1:AcquirePeriod", 0.01).await;
     put::<i64>("mini:dot:HDF1:NumFramesChunks", 1).await;
