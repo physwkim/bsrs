@@ -1436,13 +1436,39 @@ mod tests {
         assert_eq!(reading["foo-value"].value, 42);
     }
 
+    /// Collects what `tracing` logs on this thread into a buffer, as
+    /// pytest's `caplog`.
+    #[derive(Clone, Default)]
+    struct Caplog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Caplog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn single_data_logic_is_not_prepared_for_several_collections() {
         // ophyd-async test_standard_detector.py:868: it is skipped with a
         // warning, so the prepare reads and describes nothing.
+        let caplog = Caplog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let caplog = caplog.clone();
+                move || caplog.clone()
+            })
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
         let single = Arc::new(ReadableOnly::default());
         let (det, _) = with_logics("det", vec![DataLogic::Single(single.clone())]);
         prepare_events(&det, 5).await;
+        let text = String::from_utf8(caplog.0.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("only supports a single collection"), "{text}");
         assert_eq!(single.prepares.load(Ordering::SeqCst), 0);
         assert!(ReadableObj::describe_dyn(&det).await.unwrap().is_empty());
         assert!(ReadableObj::read_dyn(&det).await.unwrap().is_empty());
