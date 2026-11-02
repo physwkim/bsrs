@@ -21,10 +21,10 @@ use bsrs::devices::{
 };
 use bsrs::event_model::{DataKey, Dtype, DtypeNumpy, StreamDatum, StreamResource};
 use bsrs::host::areadetector::{
-    area_detector_hdf, connect_area_detector_hdf, num_rois, AdHdfWriter, AdMultipartWriter,
-    AreaDetectorCam, AreaDetectorHdf, NdArrayDescription, NdFile, NdFileHdf5, NdFileIo,
-    NdPluginFileIo, NdRoi, NdStats, PluginSignalDataLogic, StaticPathProvider, AD_COLOR_MODE_MONO,
-    AD_COLOR_MODE_RGB1, AD_IMAGE_MODE_CONTINUOUS, AD_IMAGE_MODE_MULTIPLE, AD_IMAGE_MODE_SINGLE,
+    area_detector_hdf, num_rois, AdHdfWriter, AdMultipartWriter, AreaDetectorCam, AreaDetectorHdf,
+    NdArrayDescription, NdFile, NdFileHdf5, NdFileIo, NdPluginFileIo, NdRoi, NdStats,
+    PluginSignalDataLogic, StaticPathProvider, AD_COLOR_MODE_MONO, AD_COLOR_MODE_RGB1,
+    AD_IMAGE_MODE_CONTINUOUS, AD_IMAGE_MODE_MULTIPLE, AD_IMAGE_MODE_SINGLE,
 };
 use bsrs::prelude::*;
 use bsrs::protocols_async::{
@@ -153,9 +153,7 @@ fn provider(dir: &Path, filename: &str) -> StaticPathProvider {
 
 async fn hdf_det(name: &str, dir: &Path, filename: &str) -> AreaDetectorHdf {
     let det = area_detector_hdf(name, CAM, HDF, provider(dir, filename));
-    connect_area_detector_hdf(&det, TIMEOUT)
-        .await
-        .expect("connect");
+    det.connect(TIMEOUT).await.expect("connect");
     ready_cam(det.control(), HDF).await;
     put::<i64>(&format!("{HDF}NumFramesChunks"), 1).await;
     det
@@ -830,7 +828,7 @@ async fn hdf_prepare_needs_the_directory_or_leave_to_create_it() {
         HDF,
         provider(&missing, "mkdir").with_create_dir_depth(-2),
     );
-    connect_area_detector_hdf(&det, TIMEOUT).await.unwrap();
+    det.connect(TIMEOUT).await.unwrap();
     Stageable::stage(&det)
         .await
         .expect("stage with create_dir_depth -2");

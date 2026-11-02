@@ -69,9 +69,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and `StandardDetector::connect`, which connects the control (the new
   `DetectorControl::connect`), every writer and every plugin, so a plugin
   the IOC lacks fails the connect. `NdPlugin`, `NdFile`, `NdFileHdf5`,
-  `NdStats` and `NdRoi` implement `Device`, and
-  `connect_area_detector_hdf`/`connect_area_detector_multipart` call
-  `connect`.
+  `NdStats` and `NdRoi` implement `Device`.
 - `StandardDetector` implements `PreparableObj`, so a plan prepares it with
   `plans::prepare(det, json!({...}))`, the value deserialized as
   ophyd-async's `TriggerInfo` model (`TriggerInfo` and `DetectorTrigger`
@@ -177,6 +175,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Breaking**: `CaStringKind` and `EpicsCaBackend::new_long_string`;
   `EpicsCaBackend<String>` reads a CHAR waveform as a long string, and
   `EpicsPvaBackend<String>` an int8 array.
+- **Breaking**: `connect_area_detector_hdf` and
+  `connect_area_detector_multipart`; use `StandardDetector::connect`.
 
 ### Fixed
 

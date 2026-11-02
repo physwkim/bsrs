@@ -12,8 +12,8 @@ use bsrs::backends::epics_ca::EpicsCaBackend;
 use bsrs::core::msg::StageableObj;
 use bsrs::devices::BackendFromPv;
 use bsrs::host::areadetector::{
-    area_detector_hdf, connect_area_detector_hdf, select_save_plugin, AreaDetectorCam, NdFile,
-    StaticPathProvider, AD_COLOR_MODE_MONO, AD_IMAGE_MODE_SINGLE,
+    area_detector_hdf, select_save_plugin, AreaDetectorCam, NdFile, StaticPathProvider,
+    AD_COLOR_MODE_MONO, AD_IMAGE_MODE_SINGLE,
 };
 use bsrs::protocols_async::{
     DetectorControl, SignalBackend, Stageable, Triggerable, WritesStreamAssets,
@@ -149,7 +149,7 @@ async fn trigger_waits_for_the_exposure_through_either_prefix() {
             format!("{p}HDF1:"),
             StaticPathProvider::new(dir.path().to_str().unwrap(), "basic"),
         );
-        connect_area_detector_hdf(&det, TIMEOUT)
+        det.connect(TIMEOUT)
             .await
             .unwrap_or_else(|e| panic!("connect under {p}: {e}"));
         ready_cam(p, det.control()).await;

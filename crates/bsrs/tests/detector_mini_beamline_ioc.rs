@@ -16,8 +16,7 @@ use bsrs::core::msg::{MonitorableObj, ReadableObj};
 use bsrs::devices::BackendFromPv;
 use bsrs::event_model::{Dtype, DtypeNumpy};
 use bsrs::host::areadetector::{
-    area_detector_hdf, connect_area_detector_hdf, NdFile, StaticPathProvider, AD_COLOR_MODE_MONO,
-    AD_IMAGE_MODE_SINGLE,
+    area_detector_hdf, NdFile, StaticPathProvider, AD_COLOR_MODE_MONO, AD_IMAGE_MODE_SINGLE,
 };
 use bsrs::host::ca_devices::CaDetector;
 use bsrs::prelude::*;
@@ -213,9 +212,7 @@ async fn moving_dot_frames_are_described_from_the_driver_readbacks() {
         "mini:dot:HDF1:",
         StaticPathProvider::new(dir.path().to_str().unwrap(), "dot"),
     );
-    connect_area_detector_hdf(&det, TIMEOUT)
-        .await
-        .expect("connect");
+    det.connect(TIMEOUT).await.expect("connect");
     let cam = det.control();
     DetectorControl::disarm(cam).await.expect("disarm");
     for plugin in ["HDF1:", "TIFF1:", "JPEG1:"] {

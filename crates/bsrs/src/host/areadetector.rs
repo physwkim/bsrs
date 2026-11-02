@@ -2640,8 +2640,8 @@ where
 pub type AreaDetectorHdf = StandardDetector<AreaDetectorCam>;
 
 /// Build an [`AreaDetectorHdf`] from a cam prefix and an HDF-plugin prefix,
-/// writing files per `path_provider`. Call
-/// [`connect_area_detector_hdf`] before running a plan.
+/// writing files per `path_provider`. Call [`StandardDetector::connect`]
+/// before running a plan.
 pub fn area_detector_hdf(
     name: impl Into<String>,
     cam_prefix: impl Into<String>,
@@ -2665,11 +2665,6 @@ pub fn area_detector_hdf(
         cam.nd_attributes_file.clone() as Arc<dyn NdAttributeXmlSource>
     ]);
     StandardDetector::new(name, cam, writer)
-}
-
-/// Connect an [`AreaDetectorHdf`]: [`StandardDetector::connect`].
-pub async fn connect_area_detector_hdf(det: &AreaDetectorHdf, timeout: Duration) -> Result<()> {
-    det.connect(timeout).await
 }
 
 /// A `StandardDetector` composed of an areaDetector camera driver and a
@@ -2699,7 +2694,7 @@ fn area_detector_multipart(
 
 /// Build an [`AreaDetectorMultipart`] over an NDFileJPEG plugin from a cam
 /// prefix and the plugin prefix, writing files per `path_provider`. Call
-/// [`connect_area_detector_multipart`] before running a plan. The
+/// [`StandardDetector::connect`] before running a plan. The
 /// `ADWriterType.JPEG` arm of ophyd-async's `make_writer_data_logic`.
 pub fn area_detector_jpeg(
     name: impl Into<String>,
@@ -2731,14 +2726,6 @@ pub fn area_detector_tiff(
         path_provider,
         AdMultipartWriter::tiff,
     )
-}
-
-/// Connect an [`AreaDetectorMultipart`]: [`StandardDetector::connect`].
-pub async fn connect_area_detector_multipart(
-    det: &AreaDetectorMultipart,
-    timeout: Duration,
-) -> Result<()> {
-    det.connect(timeout).await
 }
 
 #[cfg(test)]
@@ -3774,9 +3761,7 @@ mod ad_hdf_tests {
             format!("{prefix}HDF1:"),
             StaticPathProvider::new(dir, "bsrs_ad_live"),
         );
-        connect_area_detector_hdf(&det, Duration::from_secs(5))
-            .await
-            .expect("connect");
+        det.connect(Duration::from_secs(5)).await.expect("connect");
         // Prime array dims so the HDF plugin can open the file.
         det.control().warmup().await.expect("warmup");
         Stageable::stage(&det).await.expect("stage");
