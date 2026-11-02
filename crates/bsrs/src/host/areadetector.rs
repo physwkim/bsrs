@@ -2881,7 +2881,7 @@ pub(crate) mod tests {
         file
     }
 
-    pub(super) fn ad_prefix() -> String {
+    pub(crate) fn ad_prefix() -> String {
         std::env::var("BSRS_AD_PREFIX").unwrap_or_else(|_| "SIM1:".to_string())
     }
 

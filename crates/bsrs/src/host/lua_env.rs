@@ -4224,15 +4224,12 @@ mod ad_lua_smoke {
 
     use super::*;
     use crate::engine::RunEngine;
-
-    fn ad_prefix() -> String {
-        std::env::var("BSRS_AD_PREFIX").unwrap_or_else(|_| "SIM1:".to_string())
-    }
+    use crate::host::areadetector::tests::{ad_prefix, lock_live_ioc};
 
     #[test]
     #[ignore]
     fn lua_ad_factories_smoke() {
-        let _ioc = crate::host::areadetector::tests::lock_live_ioc();
+        let _ioc = lock_live_ioc();
         let re = Arc::new(RunEngine::new(vec![]));
         let lua = build_lua(re).expect("build_lua");
         let prefix = ad_prefix();
