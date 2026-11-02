@@ -107,6 +107,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `StandardDetector::connect`, the areaDetector cam and plugins and the CA
   and PVA motors' setpoint and readback report it, through
   `devices::wait_for_connection` (ophyd-async `wait_for_connection`).
+  It holds a `core::NotConnected`: `Children` for a device, or `Source`
+  (`ca://PV`, `pva://PV`) for a CA or PVA signal whose PV did not answer
+  in time, the cause logged at debug. Any other child failure is logged at
+  error as an "unexpected exception", as ophyd-async does.
 - **Breaking**: `EpicsCaBackend::new` and `EpicsPvaBackend::new` take only
   `f64`, `i64`, `bool`, `String` and a `Vec` of the waveform's own element
   type, as ophyd-async's `Array1D`/`Sequence[str]` (`i16`, `f32`, `u8`,

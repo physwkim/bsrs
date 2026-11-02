@@ -10,8 +10,8 @@ use std::time::Duration;
 use bsrs::backends::soft::{SoftDetector, SoftMotor, SoftSignalBackend};
 use bsrs::core::msg::{ConfigurableObj, NamedObj, ReadableObj, StageableObj};
 use bsrs::core::{
-    BsrsError, ConfigureArgs, DataKey, Dtype, Kind, ReadingValue, Result, Status, StatusOutcome,
-    SubToken, WaitError,
+    BsrsError, ConfigureArgs, DataKey, Dtype, Kind, NotConnected, ReadingValue, Result, Status,
+    StatusOutcome, SubToken, WaitError,
 };
 use bsrs::devices::{
     BackendFromPv, Device, DeviceVector, Signal, SignalConfig, SignalR, SignalRW, SignalX,
@@ -690,12 +690,15 @@ struct SignalAndSubDevice {
 async fn connect_all_names_failed_signals_and_sub_devices_in_field_order() {
     let dev = SignalAndSubDevice::new("C");
     let err = dev.connect_all(Duration::from_secs(1)).await.unwrap_err();
-    let BsrsError::NotConnected(children) = &err else {
+    let BsrsError::NotConnected(NotConnected::Children(children)) = &err else {
         panic!("{err:?}");
     };
     let names: Vec<&str> = children.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(names, ["timeout_signal", "sub_device"]);
-    assert!(matches!(children[1].1, BsrsError::NotConnected(ref sub) if sub.len() == 2));
+    assert!(matches!(
+        children[1].1,
+        BsrsError::NotConnected(NotConnected::Children(ref sub)) if sub.len() == 2
+    ));
     assert_eq!(
         err.to_string(),
         "not connected:\n\

@@ -87,10 +87,10 @@ fn assert_demo_ai_datakey(dk: &DataKey) {
 }
 
 /// `connect` to a PV no server has fails once `timeout` has passed, not
-/// sooner or later, and names the PV.
+/// sooner or later, as ophyd-async's `NotConnectedError(source)`.
 async fn assert_missing_pv_connect_times_out<T: Clone + Send + Sync + 'static>(
     b: &impl SignalBackend<T>,
-    pv: &str,
+    source: &str,
     timeout: Duration,
 ) {
     let started = Instant::now();
@@ -101,16 +101,16 @@ async fn assert_missing_pv_connect_times_out<T: Clone + Send + Sync + 'static>(
         elapsed < timeout + Duration::from_secs(1),
         "connect({timeout:?}) took {elapsed:?}: {err}"
     );
-    assert!(err.to_string().contains(pv), "{err}");
+    assert_eq!(err.to_string(), format!("not connected: {source}"));
 }
 
 #[test]
 #[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
 fn ca_connect_to_a_missing_pv_fails_within_its_timeout() {
     run(async {
-        let pv = "BSRS:QSRV:MISSING:CA";
-        let b = EpicsCaBackend::<f64>::new(pv);
-        assert_missing_pv_connect_times_out(&b, pv, Duration::from_millis(300)).await;
+        let b = EpicsCaBackend::<f64>::new("BSRS:QSRV:MISSING:CA");
+        let source = "ca://BSRS:QSRV:MISSING:CA";
+        assert_missing_pv_connect_times_out(&b, source, Duration::from_millis(300)).await;
     });
 }
 
@@ -118,9 +118,9 @@ fn ca_connect_to_a_missing_pv_fails_within_its_timeout() {
 #[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
 fn pva_connect_to_a_missing_pv_fails_within_its_timeout() {
     run(async {
-        let pv = "BSRS:QSRV:MISSING:PVA";
-        let b = EpicsPvaBackend::<f64>::new(pv);
-        assert_missing_pv_connect_times_out(&b, pv, Duration::from_millis(300)).await;
+        let b = EpicsPvaBackend::<f64>::new("BSRS:QSRV:MISSING:PVA");
+        let source = "pva://BSRS:QSRV:MISSING:PVA";
+        assert_missing_pv_connect_times_out(&b, source, Duration::from_millis(300)).await;
     });
 }
 
@@ -129,9 +129,9 @@ fn pva_connect_to_a_missing_pv_fails_within_its_timeout() {
 #[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
 fn pva_connect_to_a_missing_pv_waits_out_a_long_timeout() {
     run(async {
-        let pv = "BSRS:QSRV:MISSING:PVA:LONG";
-        let b = EpicsPvaBackend::<f64>::new(pv);
-        assert_missing_pv_connect_times_out(&b, pv, Duration::from_secs(6)).await;
+        let b = EpicsPvaBackend::<f64>::new("BSRS:QSRV:MISSING:PVA:LONG");
+        let source = "pva://BSRS:QSRV:MISSING:PVA:LONG";
+        assert_missing_pv_connect_times_out(&b, source, Duration::from_secs(6)).await;
     });
 }
 

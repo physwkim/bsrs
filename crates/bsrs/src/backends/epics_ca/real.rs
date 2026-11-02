@@ -530,16 +530,30 @@ impl<T: CaType> EpicsCaBackend<T> {
 
     /// `connect`: open the channel, then make the converter from a DBR_CTRL
     /// read whose value is the one `put(None)` writes, all within `timeout`,
-    /// as ophyd-async's connect-time `caget` and `make_converter`.
+    /// as ophyd-async's connect-time `caget` and `make_converter`. Any CA
+    /// failure on the way is not-connected, as aioca's `CANothing` there.
     async fn connect_reading(&self, timeout: Duration) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        let ch = self.ensure_channel(timeout).await?;
-        let (conv, snap) =
-            tokio::time::timeout_at(deadline, converter_for(&self.pv, self.want, &ch))
-                .await
-                .map_err(|_| {
-                    BsrsError::Backend(format!("ca connect {}: no value in {timeout:?}", self.pv))
-                })??;
+        let ch = self.channel();
+        let read = async {
+            ch.wait_connected(timeout).await?;
+            Ok::<_, CaError>((ctrl_read(ch).await?, ch.info().await?))
+        };
+        let source = || format!("ca://{}", self.pv);
+        let (snap, info) = match tokio::time::timeout(timeout, read).await {
+            Ok(Ok(read)) => read,
+            Ok(Err(e)) => return Err(BsrsError::not_connected(source(), e)),
+            Err(_) => {
+                let why = format_args!("no value in {timeout:?}");
+                return Err(BsrsError::not_connected(source(), why));
+            }
+        };
+        let conv = make_converter(
+            &self.pv,
+            self.want,
+            info.native_type,
+            info.element_count,
+            &snap,
+        )?;
         let v = T::decode(&conv, &snap.value).ok_or_else(|| undecodable(&snap.value))?;
         *self.converter.lock().unwrap() = Some(Arc::new(conv));
         *self.initial.lock().unwrap() = Some(v);
@@ -720,9 +734,15 @@ fn array_datakey(source: String, len: usize, dtype_numpy: &str, meta: SignalMeta
 
 /// The DBR_CTRL read ophyd-async's `get_datakey` describes a PV from.
 async fn ctrl_get(ch: &SharedChannel) -> Result<Snapshot> {
-    ch.get_with_metadata(DbrClass::Ctrl, CA_IO_TIMEOUT)
+    ctrl_read(ch)
         .await
         .map_err(|e| BsrsError::Backend(format!("ca ctrl get: {e}")))
+}
+
+/// [`ctrl_get`] with the CA error kept, for `connect` to report it as
+/// not-connected.
+async fn ctrl_read(ch: &SharedChannel) -> Result<Snapshot, CaError> {
+    ch.get_with_metadata(DbrClass::Ctrl, CA_IO_TIMEOUT).await
 }
 
 /// Shape a DBR_CTRL read's units, precision and four limit ranges into a

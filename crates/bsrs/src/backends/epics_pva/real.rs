@@ -79,7 +79,8 @@ impl<T: PvaType> EpicsPvaBackend<T> {
         let top = tokio::time::timeout_at(deadline, pvget(&self.client, &self.pv))
             .await
             .map_err(|_| {
-                BsrsError::Backend(format!("pva connect {}: no value in {timeout:?}", self.pv))
+                let why = format_args!("no value in {timeout:?}");
+                BsrsError::not_connected(format!("pva://{}", self.pv), why)
             })??;
         let conv = make_converter(&self.pv, self.want, &top)?;
         let v = T::decode(&conv, &top).ok_or_else(|| undecodable(&top))?;
@@ -163,7 +164,8 @@ fn undecodable(top: &PvField) -> BsrsError {
 
 /// Wait up to `timeout` for `pv` to connect. `pvconnect` is bounded by the
 /// client's `OP_TIMEOUT` instead; this watcher searches until the caller's
-/// deadline, and dropping its handle stops the watch, not the channel.
+/// deadline, and dropping its handle stops the watch, not the channel. Only
+/// the timeout is not-connected, as p4p's `TimeoutError` at connect.
 async fn pva_connect(client: &PvaClient, pv: &str, timeout: Duration) -> Result<()> {
     let connected = Arc::new(tokio::sync::Notify::new());
     let on_connect = connected.clone();
@@ -175,7 +177,10 @@ async fn pva_connect(client: &PvaClient, pv: &str, timeout: Duration) -> Result<
         .map_err(|e| BsrsError::Backend(format!("pva connect {pv}: {e}")))?;
     tokio::time::timeout(timeout, connected.notified())
         .await
-        .map_err(|_| BsrsError::Backend(format!("pva connect {pv}: not connected in {timeout:?}")))
+        .map_err(|_| {
+            let why = format_args!("no channel in {timeout:?}");
+            BsrsError::not_connected(format!("pva://{pv}"), why)
+        })
 }
 
 /// PVA put of `f` with `record[block=true]`: QSRV answers it once the record

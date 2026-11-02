@@ -14,7 +14,7 @@ pub mod status;
 pub mod subscription;
 pub mod suspender;
 
-pub use error::{BsrsError, Interrupt, Result};
+pub use error::{BsrsError, Interrupt, NotConnected, Result};
 pub use ext::{
     FlyableExt, LocatableExt, MonitorableExt, MovableExt, ReadableExt, StageableExt, StoppableExt,
     TriggerableExt,
