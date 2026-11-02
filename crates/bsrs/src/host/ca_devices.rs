@@ -38,7 +38,9 @@ use crate::core::status::Status;
 use crate::core::subscription::Subscription;
 use crate::devices::SignalCache;
 use crate::event_model::DataKey;
-use crate::host::motor_move::{move_status, MotorChannels};
+use crate::host::motor_move::{
+    describe_pv, move_status, Axis, ControlRule, Halt, Limits, MotorChannels, Readback,
+};
 // `SignalBackend` is the trait that provides connect/put/get on the
 // CA backend; pulled in via the `bsrs-protocols-async` dep that
 // the `ca` feature toggles on.
@@ -52,7 +54,6 @@ pub struct CaMotor {
     name: String,
     channels: MotorChannels<EpicsCaBackend<f64>>,
     rbv_pv: String,
-    cache: Arc<SignalCache<f64, EpicsCaBackend<f64>>>,
 }
 
 impl CaMotor {
@@ -75,10 +76,17 @@ impl CaMotor {
             MotorChannels::connect("ca_motor", name, val_pv, rbv_pv).await?;
         Ok(Arc::new(Self {
             name: name.to_string(),
-            cache: SignalCache::new(channels.readback.clone()),
             channels,
             rbv_pv: rbv_pv.to_string(),
         }))
+    }
+
+    /// ophyd `EpicsMotor.set_current_position`: redefine the user position
+    /// as `pos` without moving the motor, past the limits if need be.
+    pub async fn set_current_position(&self, pos: f64) -> Result<()> {
+        self.channels
+            .set_current_position("ca_motor", &self.name, pos)
+            .await
     }
 }
 
@@ -97,7 +105,7 @@ impl NamedObj for CaMotor {
 #[async_trait::async_trait]
 impl ReadableObj for CaMotor {
     async fn read_dyn(&self) -> Result<HashMap<String, ReadingValue>> {
-        let r = self.channels.readback.get_reading().await?;
+        let r = self.channels.readback.backend.get_reading().await?;
         let mut out = HashMap::new();
         out.insert(self.name.clone(), r);
         Ok(out)
@@ -105,8 +113,17 @@ impl ReadableObj for CaMotor {
     async fn describe_dyn(&self) -> Result<HashMap<String, DataKey>> {
         Ok(HashMap::from([(
             self.name.clone(),
-            describe_pv(self.channels.readback.as_ref(), &self.rbv_pv, &self.name).await?,
+            describe_pv(
+                self.channels.readback.backend.as_ref(),
+                &self.rbv_pv,
+                &self.name,
+            )
+            .await?,
         )]))
+    }
+    /// The readback is the hinted field, as in ophyd's `EpicsMotor`.
+    fn hint_fields(&self) -> Option<Vec<String>> {
+        Some(vec![self.name.clone()])
     }
 }
 
@@ -115,28 +132,33 @@ impl MovableObj for CaMotor {
     async fn set_dyn(&self, value: f64) -> Status {
         self.channels.set("ca_motor", &self.name, value).await
     }
+    async fn stop_on_pause(&self, success: bool) -> Result<()> {
+        StoppableObj::stop_dyn(self, success).await
+    }
 }
 
 #[async_trait::async_trait]
 impl LocatableObj for CaMotor {
     async fn locate_dyn(&self) -> Result<DynLocation> {
         let setpoint = self.channels.setpoint.get_value().await?;
-        let readback = self.channels.readback.get_value().await?;
+        let readback = self.channels.readback.backend.get_value().await?;
         Ok(DynLocation { setpoint, readback })
     }
 }
 
 #[async_trait::async_trait]
 impl StoppableObj for CaMotor {
-    async fn stop_dyn(&self, _success: bool) -> Result<()> {
-        Ok(())
+    /// ophyd-async `Motor.stop`: press `.STOP` while the motor moves, then
+    /// settle the move, failed unless `success`.
+    async fn stop_dyn(&self, success: bool) -> Result<()> {
+        self.channels.stop(success).await
     }
 }
 
 #[async_trait::async_trait]
 impl MonitorableObj for CaMotor {
     async fn subscribe_dyn(&self) -> Result<Subscription> {
-        let (rx, token) = self.cache.add_listener();
+        let (rx, token) = self.channels.readback.cache.add_listener();
         Ok(Subscription::new(rx, token, self.name.clone()))
     }
 }
@@ -161,13 +183,13 @@ impl MonitorableObj for CaMotor {
 pub struct CaPositioner {
     name: String,
     setpoint: Arc<EpicsCaBackend<f64>>,
-    readback: Arc<EpicsCaBackend<f64>>,
-    /// Monitor fan-out over `readback` (CP-08 / K2).
-    cache: Arc<SignalCache<f64, EpicsCaBackend<f64>>>,
+    /// With its monitor fan-out (CP-08 / K2).
+    readback: Readback<EpicsCaBackend<f64>>,
     done: Arc<EpicsCaBackend<f64>>,
     done_pv: String,
     rbv_pv: String,
     done_value: f64,
+    halt: Halt,
 }
 
 /// The three channels of a [`CaPositioner`], already connected.
@@ -188,12 +210,12 @@ impl CaPositioner {
         Arc::new(Self {
             name: name.to_string(),
             setpoint: ch.setpoint,
-            cache: SignalCache::new(ch.readback.clone()),
-            readback: ch.readback,
+            readback: Readback::new(ch.readback),
             done: ch.done,
             done_pv: done_pv.to_string(),
             rbv_pv: rbv_pv.to_string(),
             done_value,
+            halt: Halt::new(),
         })
     }
 
@@ -208,7 +230,7 @@ impl CaPositioner {
     ) -> Result<Arc<Self>> {
         let sp = Arc::new(EpicsCaBackend::<f64>::new(val_pv));
         let rb = Arc::new(EpicsCaBackend::<f64>::new(rbv_pv));
-        let dn = Arc::new(EpicsCaBackend::<f64>::new(done_pv));
+        let dn = Arc::new(EpicsCaBackend::<f64>::new_inferred(done_pv));
         let (sp_a, rb_a, dn_a) = (sp.clone(), rb.clone(), dn.clone());
         crate::core::runtime::bsrs_runtime().block_on(async move {
             sp_a.connect(Duration::from_secs(5)).await?;
@@ -233,7 +255,7 @@ impl CaPositioner {
     ) -> Result<Arc<Self>> {
         let sp = Arc::new(EpicsCaBackend::<f64>::new(val_pv));
         let rb = Arc::new(EpicsCaBackend::<f64>::new(rbv_pv));
-        let dn = Arc::new(EpicsCaBackend::<f64>::new(done_pv));
+        let dn = Arc::new(EpicsCaBackend::<f64>::new_inferred(done_pv));
         sp.connect(Duration::from_secs(5)).await?;
         rb.connect(Duration::from_secs(5)).await?;
         dn.connect(Duration::from_secs(5)).await?;
@@ -263,7 +285,7 @@ impl NamedObj for CaPositioner {
 #[async_trait::async_trait]
 impl ReadableObj for CaPositioner {
     async fn read_dyn(&self) -> Result<HashMap<String, ReadingValue>> {
-        let r = self.readback.get_reading().await?;
+        let r = self.readback.backend.get_reading().await?;
         let mut out = HashMap::new();
         out.insert(self.name.clone(), r);
         Ok(out)
@@ -271,8 +293,12 @@ impl ReadableObj for CaPositioner {
     async fn describe_dyn(&self) -> Result<HashMap<String, DataKey>> {
         Ok(HashMap::from([(
             self.name.clone(),
-            describe_pv(self.readback.as_ref(), &self.rbv_pv, &self.name).await?,
+            describe_pv(self.readback.backend.as_ref(), &self.rbv_pv, &self.name).await?,
         )]))
+    }
+    /// The readback is the hinted field, as in ophyd's `PVPositioner`.
+    fn hint_fields(&self) -> Option<Vec<String>> {
+        Some(vec![self.name.clone()])
     }
 }
 
@@ -300,7 +326,18 @@ impl MovableObj for CaPositioner {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         };
-        move_status(self.setpoint.as_ref(), value, "ca_positioner set", finish).await
+        let what = "ca_positioner set";
+        let axis = Axis {
+            name: &self.name,
+            setpoint: self.setpoint.as_ref(),
+            readback: &self.readback,
+            limits: Limits::Control(ControlRule::Positioner),
+            halt: &self.halt,
+        };
+        move_status(axis, value, what, finish).await
+    }
+    async fn stop_on_pause(&self, success: bool) -> Result<()> {
+        StoppableObj::stop_dyn(self, success).await
     }
 }
 
@@ -308,14 +345,18 @@ impl MovableObj for CaPositioner {
 impl LocatableObj for CaPositioner {
     async fn locate_dyn(&self) -> Result<DynLocation> {
         let setpoint = self.setpoint.get_value().await?;
-        let readback = self.readback.get_value().await?;
+        let readback = self.readback.backend.get_value().await?;
         Ok(DynLocation { setpoint, readback })
     }
 }
 
 #[async_trait::async_trait]
 impl StoppableObj for CaPositioner {
-    async fn stop_dyn(&self, _success: bool) -> Result<()> {
+    /// ophyd `PositionerBase.stop`: settle the move, failed unless
+    /// `success`. With no stop PV the motion carries on, as for a
+    /// `PVPositioner` without `stop_signal`.
+    async fn stop_dyn(&self, success: bool) -> Result<()> {
+        self.halt.stop(success);
         Ok(())
     }
 }
@@ -323,7 +364,7 @@ impl StoppableObj for CaPositioner {
 #[async_trait::async_trait]
 impl MonitorableObj for CaPositioner {
     async fn subscribe_dyn(&self) -> Result<Subscription> {
-        let (rx, token) = self.cache.add_listener();
+        let (rx, token) = self.readback.cache.add_listener();
         Ok(Subscription::new(rx, token, self.name.clone()))
     }
 }
@@ -355,7 +396,7 @@ impl CaDetector {
 
     /// Build + connect. Blocks; see `CaMotor::connect_blocking`.
     pub fn connect_blocking(name: &str, value_pv: &str) -> Result<Arc<Self>> {
-        let v = Arc::new(EpicsCaBackend::<f64>::new(value_pv));
+        let v = Arc::new(EpicsCaBackend::<f64>::new_inferred(value_pv));
         let v_for_async = v.clone();
         crate::core::runtime::bsrs_runtime()
             .block_on(async move { v_for_async.connect(Duration::from_secs(5)).await })?;
@@ -365,7 +406,7 @@ impl CaDetector {
     /// Async equivalent of `connect_blocking` — for callers
     /// already inside a tokio runtime (qs-manager's `async fn`).
     pub async fn connect_async(name: &str, value_pv: &str) -> Result<Arc<Self>> {
-        let v = Arc::new(EpicsCaBackend::<f64>::new(value_pv));
+        let v = Arc::new(EpicsCaBackend::<f64>::new_inferred(value_pv));
         v.connect(Duration::from_secs(5)).await?;
         Ok(Self::from_connected(name, v, value_pv))
     }
@@ -399,6 +440,10 @@ impl ReadableObj for CaDetector {
             describe_pv(self.value.as_ref(), &self.value_pv, &self.name).await?,
         )]))
     }
+    /// The value is the hinted field, as in an ophyd `EpicsSignalRO`.
+    fn hint_fields(&self) -> Option<Vec<String>> {
+        Some(vec![self.name.clone()])
+    }
 }
 
 #[async_trait::async_trait]
@@ -407,20 +452,6 @@ impl MonitorableObj for CaDetector {
         let (rx, token) = self.cache.add_listener();
         Ok(Subscription::new(rx, token, self.name.clone()))
     }
-}
-
-/// The data key of one `f64` PV as `object_name` reports it: the backend's
-/// `get_datakey` reads DBR_CTRL for `units`, `precision` and the limit
-/// ranges — what ophyd's `EpicsSignal.describe()` carries — and sources it
-/// as `ca://<pv>`.
-async fn describe_pv(
-    backend: &EpicsCaBackend<f64>,
-    pv: &str,
-    object_name: &str,
-) -> Result<DataKey> {
-    let mut key = backend.get_datakey(pv).await?;
-    key.object_name = Some(object_name.to_string());
-    Ok(key)
 }
 
 /// Bootstrap the CA backend's global client. Must be called from a

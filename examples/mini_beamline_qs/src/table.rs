@@ -70,6 +70,13 @@ impl ReadableObj for Table {
         out.extend(dy?);
         Ok(out)
     }
+
+    /// ophyd `Device.hints`: both axes' readbacks.
+    fn hint_fields(&self) -> Option<Vec<String>> {
+        let mut fields = self.x.hint_fields().unwrap_or_default();
+        fields.extend(self.y.hint_fields().unwrap_or_default());
+        Some(fields)
+    }
 }
 
 #[bsrs::lua_methods]
@@ -96,5 +103,29 @@ impl Table {
             "x": lx.readback,
             "y": ly.readback,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs BSRS_EPICS_RS; see crates/bsrs/tests/example_ioc"]
+    async fn hints_both_axes() {
+        crate::example_ioc::boot("mini-ioc", "mini-beamline");
+        let table = Table::connect(
+            "table",
+            "mini:dot:mtrx.VAL",
+            "mini:dot:mtrx.RBV",
+            "mini:dot:mtry.VAL",
+            "mini:dot:mtry.RBV",
+        )
+        .await
+        .unwrap();
+        let fields = vec!["table_x".to_string(), "table_y".to_string()];
+        assert_eq!(table.hint_fields(), Some(fields.clone()));
+        let keys = table.describe_dyn().await.unwrap();
+        assert!(fields.iter().all(|f| keys.contains_key(f)));
     }
 }

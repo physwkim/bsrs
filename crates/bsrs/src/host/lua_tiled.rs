@@ -2,7 +2,7 @@
 //! Tiled HTTP catalog from bsrs REPL plans. Behind the `tiled`
 //! Cargo feature.
 //!
-//! Backed by the `tiled-rs` crate (https://github.com/physwkim/tiled-rs).
+//! Backed by the `tiled-rs` crate (<https://github.com/physwkim/tiled-rs>).
 //!
 //! ## Lua API
 //!

@@ -12,7 +12,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::core::error::Result;
+use crate::core::error::{BsrsError, NotConnected, Result};
 
 /// Object-safe device interface: a stable name plus connect-all.
 ///
@@ -166,18 +166,43 @@ impl<D: Device> DeviceVector<D> {
         self.children.iter().map(|(k, v)| (k.to_string(), v))
     }
 
-    /// Connect every child concurrently.
+    /// Connect every child concurrently; a failure names every child that
+    /// failed by its key.
     pub async fn connect_all(&self, timeout: Duration) -> Result<()> {
-        let futs: Vec<_> = self
-            .children
-            .values()
-            .map(|d| d.connect_all_boxed(timeout))
-            .collect();
-        for r in futures::future::join_all(futs).await {
-            r?;
-        }
-        Ok(())
+        wait_for_connection(
+            self.children
+                .iter()
+                .map(|(k, d)| (k.to_string(), d.connect_all_boxed(timeout))),
+        )
+        .await
     }
+}
+
+/// Run every named connect concurrently, then fail with
+/// [`BsrsError::NotConnected`] naming each one that failed, in the order
+/// given: ophyd-async `wait_for_connection`. A failure that is not itself a
+/// not-connected one is logged at error, as ophyd-async logs an "unexpected
+/// exception".
+pub async fn wait_for_connection<N, F>(connects: impl IntoIterator<Item = (N, F)>) -> Result<()>
+where
+    N: Into<String>,
+    F: Future<Output = Result<()>>,
+{
+    let (names, futs): (Vec<N>, Vec<F>) = connects.into_iter().unzip();
+    let failed: Vec<(String, BsrsError)> = names
+        .into_iter()
+        .zip(futures::future::join_all(futs).await)
+        .filter_map(|(name, r)| r.err().map(|e| (name.into(), e)))
+        .collect();
+    if failed.is_empty() {
+        return Ok(());
+    }
+    for (name, err) in &failed {
+        if err.as_not_connected().is_none() {
+            tracing::error!("device `{name}` raised unexpected exception: {err}");
+        }
+    }
+    Err(BsrsError::NotConnected(NotConnected::Children(failed)))
 }
 
 #[cfg(test)]
@@ -237,5 +262,85 @@ mod tests {
         v.connect_all(Duration::from_millis(10)).await.unwrap();
         assert!(v[1].connected.load(Ordering::SeqCst));
         assert!(v[2].connected.load(Ordering::SeqCst));
+    }
+
+    /// Collects what `tracing` logs on this thread into a buffer, as
+    /// pytest's `caplog`.
+    #[derive(Clone, Default)]
+    struct Caplog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Caplog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // ophyd-async test_utils::test_error_handling_value_errors: an unexpected
+    // child failure is logged at error once, by the device that has the
+    // child; a not-connected one, shared signal or nested device, only at
+    // debug where the signal gave up.
+    #[tokio::test]
+    async fn wait_for_connection_logs_only_unexpected_failures() {
+        use futures::FutureExt;
+        let caplog = Caplog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let caplog = caplog.clone();
+                move || caplog.clone()
+            })
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let shared = |e| Err(BsrsError::Connect(Arc::new(e)));
+        let sub_device = wait_for_connection([
+            (
+                "value_error_signal",
+                async { shared(BsrsError::InvalidValue("Some ValueError text".into())) }.boxed(),
+            ),
+            (
+                "timeout_signal",
+                async {
+                    let source = "ca://A_NON_EXISTENT_SIGNAL".to_string();
+                    shared(BsrsError::not_connected(source, "no value in 10ms"))
+                }
+                .boxed(),
+            ),
+        ]);
+        let err = wait_for_connection([
+            ("sub_device", sub_device.boxed()),
+            ("working_signal", async { Ok(()) }.boxed()),
+        ])
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "not connected:\n\
+             sub_device:\n    \
+             value_error_signal: invalid value: Some ValueError text\n    \
+             timeout_signal: not connected: ca://A_NON_EXISTENT_SIGNAL"
+        );
+        let text = String::from_utf8(caplog.0.lock().unwrap().clone()).unwrap();
+        let logged = |level: &str| -> Vec<String> {
+            text.lines()
+                .filter_map(|l| l.split_once(&format!(" {level} ")))
+                .map(|(_, rest)| rest.split_once(": ").unwrap().1.to_string())
+                .collect()
+        };
+        assert_eq!(
+            logged("ERROR"),
+            ["device `value_error_signal` raised unexpected exception: \
+              invalid value: Some ValueError text"],
+            "{text}"
+        );
+        assert_eq!(
+            logged("DEBUG"),
+            ["signal ca://A_NON_EXISTENT_SIGNAL not connected: no value in 10ms"],
+            "{text}"
+        );
     }
 }

@@ -210,7 +210,11 @@ pub fn spiral(
 /// outward-traveling square spiral over a `x_num × y_num` rectilinear grid
 /// centered on `(x_center, y_center)`. Returns the points in spiral order.
 ///
-/// Mirrors bluesky's `spiral_square_pattern` for the *centered* layout.
+/// A port of `bluesky.plan_patterns.spiral_square_pattern`, kept verbatim
+/// for point order: each ring is walked down its right side, then left along
+/// the bottom, up the left side and right along the top, skipping the cells
+/// outside the grid. A count of 1 on an axis gives it no step, where bluesky
+/// divides by zero.
 pub fn spiral_square_pattern(
     x_center: f64,
     y_center: f64,
@@ -222,66 +226,61 @@ pub fn spiral_square_pattern(
     if x_num == 0 || y_num == 0 {
         return Vec::new();
     }
-    let dx = if x_num > 1 {
-        x_range / (x_num as f64 - 1.0)
-    } else {
-        0.0
+    let step = |range: f64, num: usize| {
+        if num > 1 {
+            range / (num as f64 - 1.0)
+        } else {
+            0.0
+        }
     };
-    let dy = if y_num > 1 {
-        y_range / (y_num as f64 - 1.0)
-    } else {
-        0.0
-    };
-    let x0 = x_center - x_range / 2.0;
-    let y0 = y_center - y_range / 2.0;
-
-    // Generate the rectilinear grid in spiral order using a visited-mask walk.
+    let (x_delta, y_delta) = (step(x_range, x_num), step(y_range, y_num));
+    // The start point's offset from the center, in steps, for an even count.
+    let x_offset = if x_num.is_multiple_of(2) { 0.5 } else { 0.0 };
+    let y_offset = if y_num.is_multiple_of(2) { -0.5 } else { 0.0 };
+    let (x_half, y_half) = (x_num as f64 / 2.0, y_num as f64 / 2.0);
     let total = x_num * y_num;
-    let mut visited = vec![vec![false; x_num]; y_num];
-    // Start at the center of the index grid; when even, pick the lower-right
-    // of the four center cells (matches bluesky's pixel-centered convention).
-    let mut ix = x_num / 2;
-    let mut iy = y_num / 2;
-    if x_num.is_multiple_of(2) {
-        ix = ix.saturating_sub(1);
-    }
-    if y_num.is_multiple_of(2) {
-        iy = iy.saturating_sub(1);
-    }
+    let x_at = |n: f64| x_center - x_delta * x_offset + x_delta * n;
+    let y_at = |n: f64| y_center - y_delta * y_offset + y_delta * n;
 
-    // Spiral move sequence: right, up, left, down, repeating with growing legs.
     let mut out = Vec::with_capacity(total);
-    out.push((x0 + ix as f64 * dx, y0 + iy as f64 * dy));
-    visited[iy][ix] = true;
-
-    let dirs = [(1isize, 0isize), (0, 1), (-1, 0), (0, -1)];
-    let mut leg = 1usize;
-    let mut d = 0usize;
-    while out.len() < total {
-        for _ in 0..2 {
-            let (dxi, dyi) = dirs[d];
-            for _ in 0..leg {
-                let nx = ix as isize + dxi;
-                let ny = iy as isize + dyi;
-                if nx < 0 || ny < 0 || nx >= x_num as isize || ny >= y_num as isize {
-                    // step off-grid; just track index but don't emit
-                    ix = (nx.max(0) as usize).min(x_num - 1);
-                    iy = (ny.max(0) as usize).min(y_num - 1);
-                    continue;
-                }
-                ix = nx as usize;
-                iy = ny as usize;
-                if !visited[iy][ix] {
-                    visited[iy][ix] = true;
-                    out.push((x0 + ix as f64 * dx, y0 + iy as f64 * dy));
-                    if out.len() >= total {
-                        return out;
-                    }
+    out.push((x_center - x_delta * x_offset, y_center - y_delta * y_offset));
+    let num_ring = x_num.max(y_num) as i64;
+    for i_ring in 2..=num_ring {
+        let edge = (i_ring - 1) as f64;
+        let down = || (-i_ring + 1..=i_ring - 2).rev().map(|n| n as f64);
+        let up = || (-i_ring + 2..i_ring).map(|n| n as f64);
+        // Right side, top to bottom.
+        if (edge - x_offset).abs() <= x_half && out.len() < total {
+            for n in down() {
+                if (n - y_offset).abs() < y_half && out.len() < total {
+                    out.push((x_at(edge), y_at(n)));
                 }
             }
-            d = (d + 1) % 4;
         }
-        leg += 1;
+        // Bottom side, right to left.
+        if (-edge - y_offset).abs() < y_half && out.len() < total {
+            for n in down() {
+                if (n - x_offset).abs() < x_half && out.len() < total {
+                    out.push((x_at(n), y_at(-edge)));
+                }
+            }
+        }
+        // Left side, bottom to top.
+        if (-edge - x_offset).abs() < x_half && out.len() < total {
+            for n in up() {
+                if (n - y_offset).abs() < y_half && out.len() < total {
+                    out.push((x_at(-edge), y_at(n)));
+                }
+            }
+        }
+        // Top side, left to right.
+        if (edge - y_offset).abs() < y_half && out.len() < total {
+            for n in up() {
+                if (n - x_offset).abs() < x_half && out.len() < total {
+                    out.push((x_at(n), y_at(edge)));
+                }
+            }
+        }
     }
     out
 }
@@ -580,5 +579,98 @@ mod tests {
             (-1.841405851583, -0.341903435224),
         ];
         assert_points_eq(&pts, &expected, "fermat dr_y+tilt");
+    }
+
+    // Each parity of `x_num`/`y_num` starts the spiral at a different offset
+    // from the center and clips different sides.
+    #[test]
+    fn spiral_square_matches_bluesky() {
+        const T: f64 = 2.0 / 3.0;
+        let even = [
+            (-T, T),
+            (T, T),
+            (T, -T),
+            (-T, -T),
+            (-2.0, -T),
+            (-2.0, T),
+            (-2.0, 2.0),
+            (-T, 2.0),
+            (T, 2.0),
+            (2.0, 2.0),
+            (2.0, T),
+            (2.0, -T),
+            (2.0, -2.0),
+            (T, -2.0),
+            (-T, -2.0),
+            (-2.0, -2.0),
+        ];
+        let pts = spiral_square_pattern(0.0, 0.0, 4.0, 4.0, 4, 4);
+        assert_points_eq(&pts, &even, "4x4");
+        let odd = [
+            (1.0, 2.0),
+            (2.0, 2.0),
+            (2.0, 1.0),
+            (1.0, 1.0),
+            (0.0, 1.0),
+            (0.0, 2.0),
+            (0.0, 3.0),
+            (1.0, 3.0),
+            (2.0, 3.0),
+            (3.0, 3.0),
+            (3.0, 2.0),
+            (3.0, 1.0),
+            (-1.0, 1.0),
+            (-1.0, 2.0),
+            (-1.0, 3.0),
+        ];
+        let pts = spiral_square_pattern(1.0, 2.0, 4.0, 2.0, 5, 3);
+        assert_points_eq(&pts, &odd, "5x3");
+        let even_x = [
+            (-0.5, 0.0),
+            (0.5, 0.0),
+            (0.5, -1.0),
+            (-0.5, -1.0),
+            (-1.5, -1.0),
+            (-1.5, 0.0),
+            (-1.5, 1.0),
+            (-0.5, 1.0),
+            (0.5, 1.0),
+            (1.5, 1.0),
+            (1.5, 0.0),
+            (1.5, -1.0),
+            (1.5, -2.0),
+            (0.5, -2.0),
+            (-0.5, -2.0),
+            (-1.5, -2.0),
+            (-1.5, 2.0),
+            (-0.5, 2.0),
+            (0.5, 2.0),
+            (1.5, 2.0),
+        ];
+        let pts = spiral_square_pattern(0.0, 0.0, 3.0, 4.0, 4, 5);
+        assert_points_eq(&pts, &even_x, "4x5");
+        let (a, b) = (1.7999999999999998, 2.9999999999999996);
+        let even_y = [
+            (0.0, 0.6),
+            (1.0, 0.6),
+            (1.0, -0.6),
+            (0.0, -0.6),
+            (-1.0, -0.6),
+            (-1.0, 0.6),
+            (-1.0, a),
+            (0.0, a),
+            (1.0, a),
+            (1.0, -a),
+            (0.0, -a),
+            (-1.0, -a),
+            (-1.0, 3.0),
+            (0.0, 3.0),
+            (1.0, 3.0),
+            (1.0, -b),
+            (0.0, -b),
+            (-1.0, -b),
+        ];
+        let pts = spiral_square_pattern(0.0, 0.0, 2.0, 6.0, 3, 6);
+        assert_points_eq(&pts, &even_y, "3x6");
     }
 }

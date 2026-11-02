@@ -2,7 +2,7 @@
 //! registers composite `Dcm` + `Table` devices alongside the plain
 //! per-axis CA motors of the epics-rs mini-beamline IOC.
 //!
-//! Demonstrates the `bsrs-host` library API: how a beamline author
+//! Demonstrates the `bsrs::host` library API: how a beamline author
 //! writes their own ophyd-style hierarchical devices in Rust and stands
 //! up a queue server that exposes them through both the JSON-RPC queue
 //! path *and* the daemon-side Lua REPL.
@@ -40,6 +40,9 @@
 #![deny(missing_docs)]
 
 mod dcm;
+#[cfg(test)]
+#[path = "../../../crates/bsrs/tests/example_ioc/mod.rs"]
+mod example_ioc;
 mod table;
 
 use std::sync::Arc;

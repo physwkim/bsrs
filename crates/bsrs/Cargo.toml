@@ -59,6 +59,7 @@ tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 bsrs-derive.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 # optional integrations / backends
 omq = { workspace = true, optional = true }
@@ -91,6 +92,7 @@ futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile = "3"
+tracing-subscriber.workspace = true
 criterion = { version = "0.5", features = ["async_tokio"] }
 
 [[bench]]
@@ -103,7 +105,7 @@ harness = false
 
 [[example]]
 name = "mini_beamline_scan"
-required-features = ["ca"]
+required-features = ["ca", "host"]
 
 [[example]]
 name = "qs_beamline"

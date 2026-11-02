@@ -74,7 +74,9 @@ pub fn observe_signals_value(
 /// Wait until `sub`'s value satisfies `predicate`, returning the matching
 /// reading. The current value is checked first, then each subsequent change.
 ///
-/// Returns [`BsrsError::Timeout`] if `timeout` elapses before a match, or
+/// Returns [`BsrsError::ValueTimeout`] if `timeout` elapses before a match,
+/// carrying the last value seen and the predicate's name (its fn name, or
+/// `<closure>`) as ophyd-async's `TimeoutError` does, or
 /// [`BsrsError::Backend`] if the channel closes first. With `timeout = None`
 /// it waits indefinitely.
 pub async fn wait_for_value<F>(
@@ -85,30 +87,53 @@ pub async fn wait_for_value<F>(
 where
     F: FnMut(&ReadingValue) -> bool,
 {
+    // The current value is observed first (mirrors observe_value), before the
+    // timer starts, so a timeout always has a last value to report.
+    let mut last = sub.rx_mut().borrow_and_update().clone();
+    if predicate(&last) {
+        return Ok(last);
+    }
     let fut = async {
-        // The current value is observed first (mirrors observe_value).
-        {
-            let cur = sub.rx_mut().borrow_and_update();
-            if predicate(&cur) {
-                return Ok(cur.clone());
-            }
-        }
         loop {
             sub.rx_mut()
                 .changed()
                 .await
                 .map_err(|_| BsrsError::Backend("subscription channel closed".into()))?;
-            let v = sub.rx_mut().borrow_and_update().clone();
-            if predicate(&v) {
-                return Ok(v);
+            last = sub.rx_mut().borrow_and_update().clone();
+            if predicate(&last) {
+                return Ok(last.clone());
             }
         }
     };
     match timeout {
-        Some(d) => tokio::time::timeout(d, fut)
-            .await
-            .map_err(|_| BsrsError::Timeout(d))?,
+        Some(d) => match tokio::time::timeout(d, fut).await {
+            Ok(r) => r,
+            Err(_) => Err(BsrsError::ValueTimeout {
+                name: sub.key().to_string(),
+                matcher: matcher_name::<F>(),
+                timeout: d,
+                last: Box::new(last.value),
+            }),
+        },
         None => fut.await,
+    }
+}
+
+/// ophyd-async names the matcher by `__name__`, else `<TypeName>`: a fn item
+/// gives its name, a closure (Python's `<lambda>`) `<closure>`, and any other
+/// nameless callable (a fn pointer) `<its type>`.
+fn matcher_name<F>() -> String {
+    let ty = std::any::type_name::<F>();
+    if ty.ends_with("{{closure}}") {
+        return "<closure>".into();
+    }
+    // A fn item's type name is its path, plus generic args if it has any.
+    let path = ty.trim_start_matches("&mut ").trim_start_matches('&');
+    let path = path.split('<').next().unwrap_or(path);
+    let ident = |seg: &str| !seg.is_empty() && seg.chars().all(|c| c.is_alphanumeric() || c == '_');
+    match path.rsplit_once("::") {
+        Some((_, name)) if path.split("::").all(ident) => name.to_string(),
+        _ => format!("<{ty}>"),
     }
 }
 
@@ -158,19 +183,47 @@ mod tests {
         assert_eq!(got.value, json!(3.0));
     }
 
-    #[tokio::test]
-    async fn wait_for_value_times_out() {
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_value_times_out_with_the_last_value_seen() {
         let (tx, rx) = watch::channel(reading(0.0));
         let mut sub = Subscription::new(rx, SubToken::noop(), "x");
-        let r = wait_for_value(
-            &mut sub,
-            |r| r.value == json!(9.0),
-            Some(Duration::from_millis(50)),
-        )
-        .await;
-        assert!(matches!(r, Err(BsrsError::Timeout(_))));
-        // Keep the sender alive so the failure is a timeout, not a closed channel.
-        let _ = tx;
+        let h = tokio::spawn(async move {
+            wait_for_value(
+                &mut sub,
+                |r| r.value == json!(9.0),
+                Some(Duration::from_millis(50)),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        // The sender stays alive, so the failure is a timeout, not a close.
+        tx.send(reading(1.0)).unwrap();
+        match h.await.unwrap() {
+            Err(BsrsError::ValueTimeout {
+                name,
+                matcher,
+                timeout,
+                last,
+            }) => assert_eq!(
+                (name.as_str(), matcher.as_str(), timeout, *last),
+                ("x", "<closure>", Duration::from_millis(50), json!(1.0))
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn matcher_name_is_the_fn_name_or_the_nameless_type() {
+        fn is_nine(r: &ReadingValue) -> bool {
+            r.value == json!(9.0)
+        }
+        fn name_of<F: FnMut(&ReadingValue) -> bool>(_: F) -> String {
+            matcher_name::<F>()
+        }
+        assert_eq!(name_of(is_nine), "is_nine");
+        assert_eq!(name_of(|_: &ReadingValue| true), "<closure>");
+        let ptr: fn(&ReadingValue) -> bool = is_nine;
+        assert!(name_of(ptr).starts_with("<fn("), "{}", name_of(ptr));
     }
 
     #[tokio::test]

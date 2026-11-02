@@ -11,12 +11,12 @@
 //! worker's progress.
 //!
 //! `RE:subscribe` and `msg.subscribe` solve this with thread-aware
-//! routing in [`make_lua_subscriber_cb`]: same-thread callbacks fire
+//! routing in `make_lua_subscriber_cb`: same-thread callbacks fire
 //! synchronously (reentrant lock OK); other-thread callbacks push
 //! into a per-subscriber buffer that is replayed on the REPL thread
 //! at the next opportunity: before the subscriber's next same-thread
 //! delivery, and after `RE:run`'s `block_on` returns (see
-//! [`drain_lua_subscriber_buffers`]). A subscriber therefore sees its
+//! `drain_lua_subscriber_buffers`). A subscriber therefore sees its
 //! documents in emission order; worker-emitted docs are only delayed
 //! until the REPL thread next emits or the run ends.
 //!
@@ -3897,7 +3897,7 @@ impl UserData for LuaAdCam {
         m.add_method("state", |_, this, ()| {
             ad_block(
                 "ad_cam:state",
-                SignalBackend::<i64>::get_value(this.0.detector_state_rbv.as_ref()),
+                SignalBackend::<String>::get_value(this.0.detector_state_rbv.as_ref()),
             )
         });
         m.add_method("array_counter", |_, this, ()| {
@@ -3906,10 +3906,10 @@ impl UserData for LuaAdCam {
                 SignalBackend::<i64>::get_value(this.0.array_counter_rbv.as_ref()),
             )
         });
-        m.add_method("set_image_mode", |_, this, n: i64| {
+        m.add_method("set_image_mode", |_, this, mode: String| {
             ad_block(
                 "ad_cam:set_image_mode",
-                SignalBackend::<i64>::put(this.0.image_mode.as_ref(), Some(n)),
+                SignalBackend::<String>::put(this.0.image_mode.as_ref(), Some(mode)),
             )
         });
         m.add_method("set_num_images", |_, this, n: i64| {
@@ -4214,8 +4214,8 @@ mod ad_lua_smoke {
     //! Live-IOC smoke for the `ad_*` Lua factories. Marked
     //! `#[ignore]`. Requires `epics-rs/examples/sim-detector` running.
     //!
-    //!     cargo test -p bsrs-host --features ca \
-    //!         lua_env::ad_lua_smoke -- --ignored --nocapture
+    //!     cargo nextest run -p bsrs --features host --run-ignored only \
+    //!         -E 'test(/lua_env::ad_lua_smoke::/)'
     //!
     //! Note: this is `#[test]` (not `#[tokio::test]`). The Lua
     //! factories call `bsrs_runtime().block_on(...)` synchronously
@@ -4224,19 +4224,17 @@ mod ad_lua_smoke {
 
     use super::*;
     use crate::engine::RunEngine;
-
-    fn ad_prefix() -> String {
-        std::env::var("BSRS_AD_PREFIX").unwrap_or_else(|_| "SIM1:".to_string())
-    }
+    use crate::host::areadetector::tests::{ad_prefix, lock_live_ioc};
 
     #[test]
     #[ignore]
     fn lua_ad_factories_smoke() {
+        let _ioc = lock_live_ioc();
         let re = Arc::new(RunEngine::new(vec![]));
         let lua = build_lua(re).expect("build_lua");
         let prefix = ad_prefix();
 
-        // `cam:state()` must produce a numeric DetectorState_RBV.
+        // `cam:state()` must produce the DetectorState_RBV label.
         // `cam:warmup()` must complete without raising. Final
         // counter must be strictly greater than the pre-warmup
         // counter — proves the round-trip Lua → Rust → CA → IOC
@@ -4249,7 +4247,7 @@ local c0 = cam:array_counter()
 cam:warmup()
 local s1 = cam:state()
 local c1 = cam:array_counter()
-assert(s1 == 0, "post-warmup state should be Idle, got " .. tostring(s1))
+assert(s1 == "Idle", "post-warmup state should be Idle, got " .. tostring(s1))
 assert(c1 > c0, "warmup did not increment counter: " .. c0 .. " -> " .. c1)
 return {{ s0 = s0, s1 = s1, c0 = c0, c1 = c1 }}
 "#

@@ -219,7 +219,7 @@ impl JsonlCheckpointStore {
     /// passed straight to `RunEngine::set_checkpoint_hook`.
     ///
     /// Mid-run checkpoints of the same run are coalesced to one
-    /// appended record per [`MID_RUN_APPEND_INTERVAL_NS`]; the first
+    /// appended record per `MID_RUN_APPEND_INTERVAL_NS`; the first
     /// checkpoint of a run and every close record (`exit_status:
     /// Some`) are appended unconditionally.
     pub fn into_hook(self: Arc<Self>) -> CheckpointHook {

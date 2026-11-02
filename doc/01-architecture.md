@@ -21,7 +21,7 @@
 │                      (sync = blanket impl over async core)   │
 │                      ──────────────────────────────────      │
 │                      StandardDetector = DetectorControl      │
-│                                       + DetectorWriter       │
+│                                       + Vec<DataLogic>       │
 ├──────────────────────────────────────────────────────────────┤
 │ L1a  SignalBackend : 7-method async trait (sealed)           │
 │       impls: epics_ca / epics_pva / soft / mock              │
@@ -102,7 +102,7 @@ A direct port of `ophyd_async/core/_detector.py:116-148`.
 ```rust
 #[async_trait]
 pub trait DetectorWriter: Send + Sync {
-    async fn open(&self, multiplier: u32) -> Result<HashMap<String, DataKey>>;
+    async fn open(&self, datakey_name: &str, multiplier: u32) -> Result<HashMap<String, DataKey>>;
     fn observe_indices_written(&self) -> watch::Receiver<u64>;
     async fn indices_written(&self) -> u64;
     fn collect_stream_docs(&self, up_to: u64) -> BoxStream<'_, StreamAsset>;

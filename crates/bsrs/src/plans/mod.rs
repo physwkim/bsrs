@@ -504,7 +504,7 @@ pub mod stubs {
     /// shared group, then optionally `Msg::Wait` on that group. Mirrors
     /// bluesky `plan_stubs.kickoff_all`, where `wait` defaults to **true**.
     ///
-    /// `group` of `None` mints a process-unique default via [`short_uid`]
+    /// `group` of `None` mints a process-unique default via `short_uid`
     /// (`"kickoff_all-N"`), mirroring bluesky minting a fresh uuid here so the
     /// default cannot collide with a user group — pass an explicit group to
     /// share/await a known one across concurrent kickoffs.
@@ -529,7 +529,7 @@ pub mod stubs {
     /// Mirrors bluesky `plan_stubs.complete_all`, where `wait` defaults to
     /// **false** (note: opposite of [`kickoff_all`]).
     ///
-    /// `group` of `None` mints a process-unique default via [`short_uid`]
+    /// `group` of `None` mints a process-unique default via `short_uid`
     /// (`"complete_all-N"`); pass an explicit group when a later `wait` must
     /// name it (the `wait=false` default leaves the group outstanding).
     pub fn complete_all(
@@ -842,7 +842,7 @@ pub mod stubs {
     /// position and is not re-commanded (bluesky `move_per_step`'s
     /// skip-unchanged, plan_stubs.py:1678). The `Wait` is emitted
     /// unconditionally, matching bluesky — a wait on an empty group is a no-op.
-    /// A building block for custom [`PerStep`](super::PerStep) hooks.
+    /// A building block for custom [`PerStep`] hooks.
     pub fn move_per_step(motors: Vec<super::StepMotor>) -> Plan {
         plan_box(async_stream::stream! {
             yield Msg::Checkpoint;
@@ -855,7 +855,7 @@ pub mod stubs {
         })
     }
 
-    /// `one_nd_step(detectors, motors)` — the default [`PerStep`](super::PerStep):
+    /// `one_nd_step(detectors, motors)` — the default [`PerStep`]:
     /// [`move_per_step`] then read the motor readers and detectors into
     /// `"primary"` as a `Create → Read* → Save` bundle. bsrs's port of bluesky's
     /// `one_nd_step` (plan_stubs.py:1707); reads without triggering (bsrs step
@@ -882,8 +882,8 @@ pub mod stubs {
         })
     }
 
-    /// `read_shot(detectors)` — the default read-only [`PerShot`](super::PerShot)
-    /// for [`count`](super::count): a `Checkpoint` then read the detectors into
+    /// `read_shot(detectors)` — the default read-only [`PerShot`]
+    /// for [`count`]: a `Checkpoint` then read the detectors into
     /// `"primary"` as a `Create → Read* → Save` bundle, without triggering. This
     /// is the plain-read analogue of [`one_shot`], which triggers via
     /// `trigger_and_read`; `count` takes plain `Readable` detectors, so its
@@ -1309,7 +1309,7 @@ pub fn list_scan_per_step(
 ///
 /// Like bluesky's `scan_nd`/`move_per_step`, a motor is not re-commanded at a
 /// point where its target equals its previous one (the `pos_cache` in
-/// [`scan_nd_with_md`]). All motors are reported as one combined axis in the
+/// `scan_nd_with_md`). All motors are reported as one combined axis in the
 /// `dimensions` hint (bluesky's coupled `derive_default_hints`), unlike the
 /// per-axis Grid hint of [`list_grid_scan`].
 pub fn list_scan_nd(
@@ -1686,7 +1686,7 @@ pub fn x2x_scan(
 /// accepts `cycler` objects, this one takes the pre-computed list. The motors
 /// are reported as a single combined axis in the `dimensions` hint (bluesky's
 /// `derive_default_hints` default, plans.py:58-63); outer-product callers that
-/// want one axis per motor use [`scan_nd_with_md`] with a `Grid`-grouped md.
+/// want one axis per motor use `scan_nd_with_md` with a `Grid`-grouped md.
 pub fn scan_nd(
     detectors: Vec<Arc<dyn ReadableObj>>,
     motors: Vec<(Arc<dyn MovableObj>, Arc<dyn ReadableObj>)>,

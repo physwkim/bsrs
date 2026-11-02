@@ -10,7 +10,9 @@ use crate::core::subscription::Subscription;
 use crate::core::Kind;
 use crate::devices::SignalCache;
 use crate::event_model::{DataKey, Dtype};
-use crate::protocols_async::{AsyncMovable, AsyncReadable, Locatable, Location, SignalBackend};
+use crate::protocols_async::{
+    AsyncMovable, AsyncReadable, Locatable, Location, SignalBackend, Stoppable,
+};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -170,10 +172,19 @@ impl MonitorableObj for SoftMotor {
 }
 
 #[async_trait]
-impl StoppableObj for SoftMotor {
-    async fn stop_dyn(&self, _success: bool) -> Result<()> {
-        // Soft motor: no motion in flight to halt; just record the call.
-        // Real implementations would write to a STOP PV.
+impl Stoppable for SoftMotor {
+    /// ophyd-async `SimMotorMoveLogic.stop` writes the readback to the
+    /// setpoint and cancels the move. Every move completes inside `set`, and
+    /// `put` is the only write to the private backend, setting setpoint and
+    /// readback together, so that already holds and nothing is in flight.
+    async fn stop(&self, _success: bool) -> Result<()> {
         Ok(())
+    }
+}
+
+#[async_trait]
+impl StoppableObj for SoftMotor {
+    async fn stop_dyn(&self, success: bool) -> Result<()> {
+        Stoppable::stop(self, success).await
     }
 }

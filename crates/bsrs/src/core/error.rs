@@ -9,6 +9,31 @@ pub enum BsrsError {
     /// Operation timed out.
     #[error("timeout after {0:?}")]
     Timeout(std::time::Duration),
+    /// [`wait_for_value`](crate::devices::wait_for_value) timed out; the
+    /// message is ophyd-async `wait_for_value`'s `TimeoutError` text.
+    #[error(
+        "{name} didn't match {matcher} in {}s, last value {last}",
+        .timeout.as_secs_f64()
+    )]
+    ValueTimeout {
+        /// Subscription key (the signal name).
+        name: String,
+        /// The predicate's fn name, or `<closure>`.
+        matcher: String,
+        /// The timeout that elapsed.
+        timeout: std::time::Duration,
+        /// The last value the subscription delivered (boxed to keep
+        /// `BsrsError` small).
+        last: Box<serde_json::Value>,
+    },
+    /// A signal's backend connect failed; every caller that joined that
+    /// connect gets this same error, as ophyd-async callers share one
+    /// `_connect_task`.
+    #[error(transparent)]
+    Connect(std::sync::Arc<BsrsError>),
+    /// A connect failed: ophyd-async `NotConnectedError`.
+    #[error("not connected:{}", NotConnectedText(.0, ""))]
+    NotConnected(NotConnected),
     /// Cancellation was requested.
     #[error("cancelled")]
     Cancelled,
@@ -21,6 +46,10 @@ pub enum BsrsError {
     /// A signal value was rejected by `check_value`.
     #[error("invalid value: {0}")]
     InvalidValue(String),
+    /// A PV cannot be read as the signal's datatype: ophyd-async
+    /// `make_converter`'s `TypeError` at connect.
+    #[error("{0}")]
+    Datatype(String),
     /// A device was used in the wrong state (e.g. read before stage).
     #[error("device state error: {0}")]
     State(String),
@@ -43,6 +72,65 @@ pub enum BsrsError {
 
 /// Type alias for bsrs results.
 pub type Result<T, E = BsrsError> = std::result::Result<T, E>;
+
+/// What did not connect, as ophyd-async `NotConnectedError` built from a
+/// `str` or from a `dict` of `sub_errors`.
+#[derive(Debug)]
+pub enum NotConnected {
+    /// A signal whose PV never answered, by its source (`ca://PV`).
+    Source(String),
+    /// Every child of a device that failed to connect, by child name, in
+    /// connect order. A child that is itself a device nests its own
+    /// [`Children`](NotConnected::Children).
+    Children(Vec<(String, BsrsError)>),
+}
+
+impl BsrsError {
+    /// The not-connected failure for `source` (`ca://PV`), with `why` logged
+    /// at debug, as aioca and p4p log a connect timeout before raising
+    /// `NotConnectedError(source)`: what a backend's `connect` returns when
+    /// its PV did not answer.
+    pub fn not_connected(source: String, why: impl std::fmt::Display) -> Self {
+        tracing::debug!("signal {source} not connected: {why}");
+        BsrsError::NotConnected(NotConnected::Source(source))
+    }
+
+    /// The [`NotConnected`] this error is, seen through a shared
+    /// [`Connect`](BsrsError::Connect).
+    pub(crate) fn as_not_connected(&self) -> Option<&NotConnected> {
+        match self {
+            BsrsError::NotConnected(nc) => Some(nc),
+            BsrsError::Connect(inner) => inner.as_not_connected(),
+            _ => None,
+        }
+    }
+}
+
+/// [`NotConnected`] as ophyd-async `format_error_string`: a source after a
+/// space, or the children one per line at `indent`, a nested device's own
+/// children four spaces further in.
+struct NotConnectedText<'a>(&'a NotConnected, &'a str);
+
+impl std::fmt::Display for NotConnectedText<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let NotConnectedText(nc, indent) = *self;
+        let children = match nc {
+            NotConnected::Source(source) => return write!(f, " {source}"),
+            NotConnected::Children(children) => children,
+        };
+        for (name, err) in children {
+            match err.as_not_connected() {
+                Some(sub @ NotConnected::Children(_)) => {
+                    write!(f, "\n{indent}{name}:")?;
+                    let deeper = format!("{indent}    ");
+                    NotConnectedText(sub, &deeper).fmt(f)?;
+                }
+                _ => write!(f, "\n{indent}{name}: {err}")?,
+            }
+        }
+        Ok(())
+    }
+}
 
 /// An interrupt the engine throws into the running plan so its contingency
 /// regions unwind — bluesky's `RequestStop` / `RequestAbort`. `halt` is not
@@ -83,5 +171,62 @@ impl From<&str> for BsrsError {
 impl From<String> for BsrsError {
     fn from(s: String) -> Self {
         BsrsError::Other(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BsrsError::{self, InvalidValue};
+    use super::NotConnected::{self, Children};
+
+    fn child(name: &str, err: BsrsError) -> (String, BsrsError) {
+        (name.to_string(), err)
+    }
+
+    fn not_connected(nc: NotConnected) -> BsrsError {
+        BsrsError::NotConnected(nc)
+    }
+
+    fn timeout_signal() -> (String, BsrsError) {
+        child(
+            "timeout_signal",
+            BsrsError::not_connected("ca://A_NON_EXISTENT_SIGNAL".into(), "test"),
+        )
+    }
+
+    /// ophyd-async test_utils::test_not_connected_error_output and the
+    /// `init_devices` case of test_combining_top_level_signal_and_child_device:
+    /// one line per failed child, each nested device four spaces further in.
+    #[test]
+    fn not_connected_lists_every_failed_child_nested_by_device() {
+        let err = not_connected(Children(vec![
+            child(
+                "timeout_child_device_ca",
+                not_connected(Children(vec![timeout_signal()])),
+            ),
+            child(
+                "dummy_device2",
+                not_connected(Children(vec![
+                    timeout_signal(),
+                    child(
+                        "sub_device",
+                        not_connected(Children(vec![child(
+                            "value_error_signal",
+                            InvalidValue("Some ValueError text".into()),
+                        )])),
+                    ),
+                ])),
+            ),
+        ]));
+        assert_eq!(
+            err.to_string(),
+            "not connected:\n\
+             timeout_child_device_ca:\n    \
+             timeout_signal: not connected: ca://A_NON_EXISTENT_SIGNAL\n\
+             dummy_device2:\n    \
+             timeout_signal: not connected: ca://A_NON_EXISTENT_SIGNAL\n    \
+             sub_device:\n        \
+             value_error_signal: invalid value: Some ValueError text"
+        );
     }
 }

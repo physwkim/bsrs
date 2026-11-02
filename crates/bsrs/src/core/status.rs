@@ -2,18 +2,13 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
-
-const PENDING: u8 = 0;
-const SUCCESS: u8 = 1;
-const ERROR: u8 = 2;
-const CANCELLED: u8 = 3;
 
 /// Errors that a `Status` can carry.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -21,12 +16,32 @@ pub enum StatusError {
     /// The operation was cancelled before completion.
     #[error("cancelled")]
     Cancelled,
-    /// The operation timed out waiting for completion.
+    /// The status's own timeout ([`Status::with_timeout`]) ran out — ophyd's
+    /// `StatusTimeoutError`. Only that timer can build a [`TimedOut`], so a
+    /// producer reports its own timeout as `Failed`, as ophyd bans
+    /// `set_exception(StatusTimeoutError)`. A [`Status::wait`] running out is
+    /// not this: see [`WaitError::Timeout`].
     #[error("timed out")]
-    Timeout,
+    Timeout(TimedOut),
     /// The operation completed with an error message.
     #[error("{0}")]
     Failed(String),
+}
+
+/// Carried by [`StatusError::Timeout`]; built only by a status's own timer.
+#[derive(Debug, Clone)]
+pub struct TimedOut(());
+
+/// Why [`Status::wait`] returned without success.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum WaitError {
+    /// The wait ran out with the status still pending — ophyd's
+    /// `WaitTimeoutError`. Not an outcome, so no setter can record it.
+    #[error("status has not completed yet")]
+    Timeout,
+    /// The status finished without success.
+    #[error(transparent)]
+    Status(#[from] StatusError),
 }
 
 /// Outcome of a status. Used by the ophyd-style `add_callback` API.
@@ -97,13 +112,37 @@ pub trait Watcher: Send {
 
 type StatusCallback = Box<dyn FnOnce(&StatusOutcome) + Send>;
 
+/// Where a status is: waiting, with whoever waits for it, or finished, with
+/// its outcome. One value under one lock, so no reader sees a finished status
+/// without its outcome and no waiter registers after the waiters were run.
+enum Phase {
+    Pending {
+        callbacks: Vec<StatusCallback>,
+        wakers: Vec<Waker>,
+    },
+    Done(End),
+}
+
+/// How a status ended. `Err(StatusError::Cancelled)` is its only cancelled
+/// form, whether [`Status::cancel`] or the producer recorded it.
+type End = Result<(), StatusError>;
+
+fn outcome(end: &End) -> StatusOutcome {
+    match end {
+        Ok(()) => StatusOutcome::Success,
+        Err(e) => StatusOutcome::Failed(e.clone()),
+    }
+}
+
 struct Inner {
-    state: AtomicU8,
-    error: Mutex<Option<StatusError>>,
+    phase: Mutex<Phase>,
     progress: watch::Sender<f64>,
+    /// The latest update only; back-to-back updates replace each other here.
     watcher: watch::Sender<Option<WatcherUpdate>>,
-    callbacks: Mutex<Vec<StatusCallback>>,
-    wakers: Mutex<Vec<Waker>>,
+    /// One queue per running [`Status::observe_watcher`], fed every update.
+    /// Its lock also covers the `watcher` store, so an observer that registers
+    /// gets each update once: as the latest, or through its queue.
+    observers: Mutex<Vec<mpsc::UnboundedSender<WatcherUpdate>>>,
     /// Signalled by [`Status::cancel`] (consumer side) so a producer running
     /// long work can observe the request and abort. Held here, shared by every
     /// `Status`/`StatusSetter` clone of the same operation.
@@ -112,21 +151,44 @@ struct Inner {
     /// for producers that omit it. Mirrors ophyd-async's
     /// `WatchableAsyncStatus._start` (`_status.py:200`).
     start: Instant,
+    /// How long a reported success takes to land (ophyd `settle_time`).
+    settle_time: Duration,
+}
+
+/// Runs a status timer on the calling tokio runtime, or on the bsrs runtime
+/// from sync code; ophyd runs its timers on threads of their own.
+fn spawn_timer<F: Future<Output = ()> + Send + 'static>(timer: F) {
+    tokio::runtime::Handle::try_current()
+        .unwrap_or_else(|_| crate::core::runtime::runtime_handle())
+        .spawn(timer);
 }
 
 impl Inner {
-    /// Drain and run completion callbacks + wakers. Shared by the three
-    /// terminal transitions (`success`, `fail`, `cancel`) so each fires exactly
-    /// the same way. Takes `&self` — the single owner is whoever won the state
-    /// CAS, which is enforced at the call sites, not here.
-    fn fire(&self, outcome: StatusOutcome) {
-        let cbs: Vec<_> = std::mem::take(&mut *self.callbacks.lock().unwrap());
-        for cb in cbs {
+    /// The only transition: the first call finishes the status and runs its
+    /// waiters, after the lock is released; later calls change nothing.
+    fn finish(&self, end: End) {
+        let (callbacks, wakers) = {
+            let mut phase = self.phase.lock().unwrap();
+            let Phase::Pending { callbacks, wakers } = &mut *phase else {
+                return;
+            };
+            let waiters = (std::mem::take(callbacks), std::mem::take(wakers));
+            *phase = Phase::Done(end.clone());
+            waiters
+        };
+        let outcome = outcome(&end);
+        for cb in callbacks {
             cb(&outcome);
         }
-        let wakers: Vec<_> = std::mem::take(&mut *self.wakers.lock().unwrap());
         for w in wakers {
             w.wake();
+        }
+    }
+
+    fn end(&self) -> Option<End> {
+        match &*self.phase.lock().unwrap() {
+            Phase::Pending { .. } => None,
+            Phase::Done(end) => Some(end.clone()),
         }
     }
 }
@@ -135,6 +197,9 @@ impl Inner {
 #[derive(Clone)]
 pub struct Status {
     inner: Arc<Inner>,
+    /// The two statuses an [`and`](Status::and) status combines. Held on the
+    /// handle, not in `Inner`, which the parts' callbacks keep alive.
+    parts: Option<Arc<(Status, Status)>>,
     progress_rx: watch::Receiver<f64>,
     watcher_rx: watch::Receiver<Option<WatcherUpdate>>,
 }
@@ -147,26 +212,48 @@ pub struct StatusSetter {
 impl Status {
     /// Build a fresh pair of `(Status, setter)`.
     pub fn new() -> (Self, StatusSetter) {
+        Self::with_timeout(None, Duration::ZERO)
+    }
+
+    /// Build a `(Status, setter)` pair with ophyd `StatusBase`'s `timeout`
+    /// and `settle_time`: [`StatusSetter::success`] lands `settle_time` after
+    /// it is called (a failure lands at once), and a status not finished by
+    /// `timeout + settle_time` after this call fails with
+    /// [`StatusError::Timeout`]. An outcome reported later changes nothing.
+    pub fn with_timeout(timeout: Option<Duration>, settle_time: Duration) -> (Self, StatusSetter) {
         let (tx, rx) = watch::channel(0.0_f64);
         let (wtx, wrx) = watch::channel::<Option<WatcherUpdate>>(None);
         let inner = Arc::new(Inner {
-            state: AtomicU8::new(PENDING),
-            error: Mutex::new(None),
+            phase: Mutex::new(Phase::Pending {
+                callbacks: Vec::new(),
+                wakers: Vec::new(),
+            }),
             progress: tx,
             watcher: wtx,
-            callbacks: Mutex::new(Vec::new()),
-            wakers: Mutex::new(Vec::new()),
+            observers: Mutex::new(Vec::new()),
             cancel: CancellationToken::new(),
             start: Instant::now(),
+            settle_time,
         });
-        (
-            Status {
-                inner: inner.clone(),
-                progress_rx: rx,
-                watcher_rx: wrx,
-            },
-            StatusSetter { inner },
-        )
+        let status = Status {
+            inner: inner.clone(),
+            parts: None,
+            progress_rx: rx,
+            watcher_rx: wrx,
+        };
+        if let Some(timeout) = timeout {
+            let status = status.clone();
+            spawn_timer(async move {
+                let deadline = timeout.saturating_add(settle_time);
+                if tokio::time::timeout(deadline, status.clone())
+                    .await
+                    .is_err()
+                {
+                    status.inner.finish(Err(StatusError::Timeout(TimedOut(()))));
+                }
+            });
+        }
+        (status, StatusSetter { inner })
     }
 
     /// Construct an already-done success status.
@@ -183,30 +270,58 @@ impl Status {
         s
     }
 
+    /// ophyd's `self & other` (`AndStatus`): succeeds once both succeed, and
+    /// fails with the first failure without waiting for the other.
+    pub fn and(&self, other: &Status) -> Status {
+        let (mut status, _setter) = Status::new();
+        let pending = Arc::new(AtomicUsize::new(2));
+        for part in [self, other] {
+            let (inner, pending) = (status.inner.clone(), pending.clone());
+            part.add_callback(move |outcome| match outcome {
+                StatusOutcome::Failed(e) => inner.finish(Err(e.clone())),
+                StatusOutcome::Success => {
+                    if pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        inner.finish(Ok(()));
+                    }
+                }
+            });
+        }
+        status.parts = Some(Arc::new((self.clone(), other.clone())));
+        status
+    }
+
+    /// Is `status` one of the statuses this [`and`](Self::and) status
+    /// combines, at any depth? ophyd `AndStatus.__contains__`.
+    pub fn contains(&self, status: &Status) -> bool {
+        self.parts.as_deref().is_some_and(|(left, right)| {
+            [left, right]
+                .into_iter()
+                .any(|p| Arc::ptr_eq(&p.inner, &status.inner) || p.contains(status))
+        })
+    }
+
     /// Has the operation completed?
     pub fn done_state(&self) -> bool {
-        self.inner.state.load(Ordering::Acquire) != PENDING
+        self.inner.end().is_some()
     }
 
     /// Has the operation completed successfully?
     pub fn success(&self) -> bool {
-        self.inner.state.load(Ordering::Acquire) == SUCCESS
+        matches!(self.inner.end(), Some(Ok(())))
     }
 
     /// If failed or cancelled, returns the error (cancellation surfaces as
     /// [`StatusError::Cancelled`]).
     pub fn exception(&self) -> Option<StatusError> {
-        match self.inner.state.load(Ordering::Acquire) {
-            ERROR | CANCELLED => self.inner.error.lock().unwrap().clone(),
-            _ => None,
-        }
+        self.inner.end()?.err()
     }
 
-    /// Did the operation end in cancellation? Mirrors ophyd-async
-    /// `Status.cancelled` (`_status.py:91`); a cancelled status is *not*
-    /// `success()`.
+    /// Did the operation end in cancellation, by [`Status::cancel`] or by the
+    /// producer failing with [`StatusError::Cancelled`]? Mirrors ophyd-async
+    /// `Status.cancelled` (`_status.py:91`), where a task that raises
+    /// `CancelledError` is cancelled; a cancelled status is *not* `success()`.
     pub fn cancelled(&self) -> bool {
-        self.inner.state.load(Ordering::Acquire) == CANCELLED
+        matches!(self.inner.end(), Some(Err(StatusError::Cancelled)))
     }
 
     /// Request cancellation (consumer side). Signals the producer via the
@@ -221,16 +336,7 @@ impl Status {
     /// ophyd-async drives from `async with status:` (`_status.py:113-118`).
     pub fn cancel(&self) {
         self.inner.cancel.cancel();
-        if self
-            .inner
-            .state
-            .compare_exchange(PENDING, CANCELLED, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            *self.inner.error.lock().unwrap() = Some(StatusError::Cancelled);
-            self.inner
-                .fire(StatusOutcome::Failed(StatusError::Cancelled));
-        }
+        self.inner.finish(Err(StatusError::Cancelled));
     }
 
     /// Wrap this status in a [`CancelGuard`] that cancels it on scope exit —
@@ -256,19 +362,12 @@ impl Status {
     ///
     /// `success` is `null` while pending; once `done`, it's a bool.
     pub fn inspect(&self) -> serde_json::Value {
-        let state = self.inner.state.load(Ordering::Acquire);
-        let done = state != PENDING;
-        let success = match state {
-            SUCCESS => Some(true),
-            ERROR | CANCELLED => Some(false),
-            _ => None,
-        };
-        let exception = self.exception().map(|e| e.to_string());
+        let end = self.inner.end();
         serde_json::json!({
-            "done": done,
-            "success": success,
-            "cancelled": state == CANCELLED,
-            "exception": exception,
+            "done": end.is_some(),
+            "success": end.as_ref().map(Result::is_ok),
+            "cancelled": matches!(end, Some(Err(StatusError::Cancelled))),
+            "exception": end.and_then(Result::err).map(|e| e.to_string()),
             "progress": self.progress(),
         })
     }
@@ -279,43 +378,35 @@ impl Status {
     /// A *cancelled* status counts as done — like a cancelled asyncio task in
     /// ophyd-async (`_status.py:56-60`, `if self.done: callback(self)`), so a
     /// callback registered after `cancel()` fires immediately with the stored
-    /// `Cancelled` error. `cancel()` already drained the pending callback queue,
-    /// so an enqueued callback here would never fire; only `PENDING` may enqueue.
-    /// This mirrors the `ERROR | CANCELLED` grouping in `exception()`, `inspect()`,
-    /// and the `Future::poll` impl.
+    /// `Cancelled` error. Registration and completion take the same lock, so a
+    /// callback is either queued before completion runs the queue or run here.
     pub fn add_callback<F>(&self, cb: F)
     where
         F: FnOnce(&StatusOutcome) + Send + 'static,
     {
-        match self.inner.state.load(Ordering::Acquire) {
-            SUCCESS => cb(&StatusOutcome::Success),
-            ERROR | CANCELLED => {
-                let err = self
-                    .inner
-                    .error
-                    .lock()
-                    .unwrap()
-                    .clone()
-                    .unwrap_or(StatusError::Failed("unknown".into()));
-                cb(&StatusOutcome::Failed(err));
+        let outcome = match &mut *self.inner.phase.lock().unwrap() {
+            Phase::Pending { callbacks, .. } => {
+                callbacks.push(Box::new(cb));
+                return;
             }
-            _ => self.inner.callbacks.lock().unwrap().push(Box::new(cb)),
-        }
+            Phase::Done(end) => outcome(end),
+        };
+        cb(&outcome);
     }
 
-    /// Sync wait — blocks (via bsrs runtime) until completion.
-    pub fn wait(&self, timeout: Option<Duration>) -> Result<(), StatusError> {
+    /// Sync wait — blocks (via bsrs runtime) until completion, or until
+    /// `timeout` runs out with the status still pending.
+    pub fn wait(&self, timeout: Option<Duration>) -> Result<(), WaitError> {
         let fut = self.clone();
-        let result = match timeout {
-            Some(d) => crate::core::runtime::block_on(async move {
-                tokio::time::timeout(d, fut)
+        crate::core::runtime::block_on(async move {
+            let outcome = match timeout {
+                Some(d) => tokio::time::timeout(d, fut)
                     .await
-                    .map_err(|_| StatusError::Timeout)
-                    .and_then(|r| r)
-            }),
-            None => crate::core::runtime::block_on(fut),
-        };
-        result
+                    .map_err(|_| WaitError::Timeout)?,
+                None => fut.await,
+            };
+            outcome.map_err(WaitError::Status)
+        })
     }
 
     /// Subscribe to progress updates as a `watch::Receiver<f64>`.
@@ -335,66 +426,60 @@ impl Status {
     ///
     /// Calls `watcher.watch(&update)` immediately if an update has already been
     /// posted (via [`StatusSetter::update_watcher`]), then on every subsequent
-    /// update, returning once the status completes. A final update that lands
-    /// together with completion is delivered exactly once.
+    /// update in the order posted, returning once the status completes. Updates
+    /// are never merged: one posted right after another, or together with
+    /// completion, is still delivered.
     pub async fn observe_watcher<W: Watcher>(&self, watcher: &mut W) {
-        let mut rx = self.watch_updates();
+        let (tx, mut queue) = mpsc::unbounded_channel();
+        let latest = {
+            let mut observers = self.inner.observers.lock().unwrap();
+            observers.push(tx);
+            self.inner.watcher.borrow().clone()
+        };
         // "called immediately if there has already been an update".
-        if let Some(update) = rx.borrow_and_update().clone() {
+        if let Some(update) = latest {
             watcher.watch(&update);
         }
         let mut done = self.clone();
         loop {
             tokio::select! {
                 biased;
-                _ = &mut done => {
-                    // A final update posted together with completion is
-                    // delivered here; the immediate/changed paths already
-                    // cleared the "seen" flag, so this fires only on new data.
-                    if rx.has_changed().unwrap_or(false) {
-                        if let Some(update) = rx.borrow_and_update().clone() {
-                            watcher.watch(&update);
-                        }
-                    }
-                    return;
-                }
-                res = rx.changed() => {
-                    if res.is_err() {
-                        return;
-                    }
-                    if let Some(update) = rx.borrow_and_update().clone() {
-                        watcher.watch(&update);
-                    }
-                }
+                _ = &mut done => break,
+                Some(update) = queue.recv() => watcher.watch(&update),
             }
+        }
+        // Updates posted before completion are already queued.
+        while let Ok(update) = queue.try_recv() {
+            watcher.watch(&update);
         }
     }
 }
 
 impl StatusSetter {
-    /// Mark the status as successful and fire callbacks/wakers.
+    /// Mark the status as successful and fire callbacks/wakers, after the
+    /// settle time given to [`Status::with_timeout`], if any.
     pub fn success(self) {
-        if self
-            .inner
-            .state
-            .compare_exchange(PENDING, SUCCESS, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            self.inner.fire(StatusOutcome::Success);
+        let inner = self.inner;
+        if inner.settle_time.is_zero() {
+            inner.finish(Ok(()));
+            return;
         }
+        spawn_timer(async move {
+            tokio::time::sleep(inner.settle_time).await;
+            inner.finish(Ok(()));
+        });
     }
 
-    /// Mark the status as failed.
+    /// Mark the status as failed. The status's own timeout is not a failure
+    /// a producer can report:
+    ///
+    /// ```compile_fail
+    /// use bsrs::core::status::{Status, StatusError, TimedOut};
+    /// let (_status, setter) = Status::new();
+    /// setter.fail(StatusError::Timeout(TimedOut(())));
+    /// ```
     pub fn fail(self, err: StatusError) {
-        if self
-            .inner
-            .state
-            .compare_exchange(PENDING, ERROR, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            *self.inner.error.lock().unwrap() = Some(err.clone());
-            self.inner.fire(StatusOutcome::Failed(err));
-        }
+        self.inner.finish(Err(err));
     }
 
     /// Resolves when the consumer requests cancellation via [`Status::cancel`].
@@ -418,9 +503,10 @@ impl StatusSetter {
         let _ = self.inner.progress.send(p);
     }
 
-    /// Push a structured progress update. Receivers see the latest update via
-    /// [`Status::watch_updates`]; the scalar [`Status::progress`] fraction is
-    /// also updated when the update carries one. Best-effort.
+    /// Push a structured progress update. [`Status::watch_updates`] receivers
+    /// see the latest update and each running [`Status::observe_watcher`] every
+    /// one; the scalar [`Status::progress`] fraction is also updated when the
+    /// update carries one. Best-effort.
     ///
     /// When the producer omits `time_elapsed`, it is back-filled from the
     /// operation's start instant before the update is stored and broadcast, so
@@ -434,6 +520,8 @@ impl StatusSetter {
         if let Some(f) = update.fraction {
             let _ = self.inner.progress.send(f);
         }
+        let mut observers = self.inner.observers.lock().unwrap();
+        observers.retain(|tx| tx.send(update.clone()).is_ok());
         let _ = self.inner.watcher.send(Some(update));
     }
 }
@@ -472,31 +560,25 @@ impl Drop for CancelGuard {
 impl Future for Status {
     type Output = Result<(), StatusError>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.inner.state.load(Ordering::Acquire) {
-            SUCCESS => Poll::Ready(Ok(())),
-            ERROR | CANCELLED => {
-                let err = self
-                    .inner
-                    .error
-                    .lock()
-                    .unwrap()
-                    .clone()
-                    .unwrap_or(StatusError::Failed("unknown".into()));
-                Poll::Ready(Err(err))
-            }
-            _ => {
-                self.inner.wakers.lock().unwrap().push(cx.waker().clone());
+        match &mut *self.inner.phase.lock().unwrap() {
+            Phase::Pending { wakers, .. } => {
+                // A task re-polling in a select! loop must not add a waker per poll.
+                if !wakers.iter().any(|w| w.will_wake(cx.waker())) {
+                    wakers.push(cx.waker().clone());
+                }
                 Poll::Pending
             }
+            Phase::Done(end) => Poll::Ready(end.clone()),
         }
     }
 }
 
 impl std::fmt::Debug for Status {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let end = self.inner.end();
         f.debug_struct("Status")
-            .field("done", &self.done_state())
-            .field("success", &self.success())
+            .field("done", &end.is_some())
+            .field("success", &matches!(end, Some(Ok(()))))
             .finish()
     }
 }
@@ -757,6 +839,35 @@ mod tests {
         let fracs: Vec<_> = rec.lock().unwrap().iter().map(|u| u.fraction).collect();
         assert!(fracs.contains(&Some(0.2)), "immediate update: {fracs:?}");
         assert!(fracs.contains(&Some(0.8)), "subsequent update: {fracs:?}");
+    }
+
+    // Boundary: one task re-polling a pending status (a select! loop) is
+    // stored once, not once per poll, and is still woken on completion.
+    #[test]
+    fn repolling_a_pending_status_stores_its_waker_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Wakes(AtomicUsize);
+        impl std::task::Wake for Wakes {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let (s, setter) = Status::new();
+        let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+        let waker = Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = std::pin::pin!(s.clone());
+        for _ in 0..100 {
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+        }
+        let stored = match &*s.inner.phase.lock().unwrap() {
+            Phase::Pending { wakers, .. } => wakers.len(),
+            Phase::Done(_) => panic!("status finished early"),
+        };
+        assert_eq!(stored, 1);
+        setter.success();
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+        assert!(fut.as_mut().poll(&mut cx).is_ready());
     }
 
     // Boundary: no update ever posted → watcher never called, driver still

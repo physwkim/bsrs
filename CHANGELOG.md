@@ -33,6 +33,180 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stream of optimization runs to a shared, editable sink list) and
   `OptimizationLogger` (plain-text progress tables and running statistics),
   ports of blop's `callbacks` package as `DocumentSink`s.
+- Tests ported from ophyd and ophyd-async for signals, devices, `Status`,
+  motors, the EPICS backends and detectors. Those that need a live IOC boot
+  one of the epics-rs example IOCs (ophyd-test-ioc, mini-beamline,
+  sim-detector, qsrv-ioc) and are `#[ignore]`d; run them with
+  `BSRS_EPICS_RS=<epics-rs checkout> cargo nextest run -p bsrs --run-ignored
+  only` (see `tests/example_ioc`).
+- `Status::with_timeout(timeout, settle_time)`, ophyd `StatusBase`'s
+  timeout and settle time; `Status::and`, ophyd's `AndStatus`; and
+  `Status::contains`.
+- Writable `Signal`s are `AsyncMovable`/`MovableObj` and read-write ones
+  `Locatable`/`LocatableObj`, so `mv`/`mvr` take a signal as ophyd-async's
+  `SignalW`/`SignalRW` do. `Signal::reconnect` forces a new connect.
+- `SoftSignalBackend::with_precision`, `with_getter` and `with_setter`
+  (ophyd-async soft getter, setter and poll period);
+  `MockSignalBackend::reset_put_calls`, `set_values`, `set_units`,
+  `set_precision` and `set_put_callback_async` (ophyd-async `set_mock_*`).
+- `BsrsError::ValueTimeout`, raised by `wait_for_value` with the signal,
+  matcher, timeout and last value seen, and `BsrsError::Connect`, the one
+  connect failure shared by every caller that joined it.
+- `CaMotor::set_current_position` and `PvaMotor::set_current_position`
+  (ophyd `EpicsMotor.set_current_position`).
+- `StandardDetector::events_to_kickoff` / `set_events_to_kickoff`,
+  `TriggerInfo::effective_exposure_timeout`, `DetectorWriter::hinted_fields`
+  and `AreaDetectorCam::acquire_time_rbv` / `acquire_period_rbv`.
+- `host::areadetector::PluginSignalDataLogic` (ophyd-async
+  `PluginSignalDataLogic`), a `SingleDataLogic` that reads a plugin signal
+  with each event after setting the new `AreaDetectorCam::wait_for_plugins`;
+  and `NdStats::total`.
+- `host::areadetector::NdArrayDescription::new` (ophyd-async
+  `NDArrayDescription`) describes a writer's frame from any shape signals,
+  such as the new `NdRoi::size_y_rbv` / `size_x_rbv` for a writer fed from
+  an ROI.
+- `StandardDetector::add_plugin` (ophyd-async `AreaDetector(plugins=...)`)
+  and `StandardDetector::connect`, which connects the control (the new
+  `DetectorControl::connect`), every writer and every plugin, so a plugin
+  the IOC lacks fails the connect. `NdPlugin`, `NdFile`, `NdFileHdf5`,
+  `NdStats` and `NdRoi` implement `Device`.
+- `StandardDetector` implements `PreparableObj`, so a plan prepares it with
+  `plans::prepare(det, json!({...}))`, the value deserialized as
+  ophyd-async's `TriggerInfo` model (`TriggerInfo` and `DetectorTrigger`
+  implement `Deserialize`).
+- `SoftMotor` implements `protocols_async::Stoppable`.
+- `BsrsError::Datatype`, ophyd-async's `make_converter` `TypeError`.
+- `YmdPathProvider` and `AutoMaxIncrementingPathProvider` in
+  `bsrs::devices`, ophyd-async's date-named and next-free-number
+  directories; bsrs now depends on `chrono` for the local date.
+  `AutoMaxIncrementingPathProvider` always numbers one past the highest
+  existing directory, where ophyd-async can return that directory again.
+
+### Changed
+
+- **Breaking**: `Status::wait` returns `Result<(), WaitError>`.
+  `WaitError::Timeout` is a wait that ran out with the status pending
+  (ophyd `WaitTimeoutError`); `WaitError::Status` is a status that finished
+  without success. `StatusError::Timeout` carries a `TimedOut` that only the
+  `with_timeout` timer builds, so a setter cannot record it, and the
+  RunEngine reports a timed-out status as a status failure.
+- **Breaking**: `StandardReadable::add_child(Arc<dyn ReadableObj>)` and
+  `add_signal(Arc<Signal<T, B, A>>, StandardReadableFormat)` replace
+  `add_readables` and return `Result`: a duplicate reading key or hint
+  field ("Hint fields {f} overrides existing hint") is an error, as in
+  ophyd-async. Stageable children and hinted signals are staged
+  automatically, uncached formats read live, and children are gathered
+  concurrently.
+- **Breaking**: `#[derive(Device)]` parses `#[signal]`/`#[device]` with
+  `syn`; an unknown role, key or kind is a compile error instead of
+  `Kind::Normal`.
+- **Breaking**: a failed connect is `BsrsError::NotConnected`, naming every
+  child that failed by field and nesting each sub-device's own failures, as
+  ophyd-async's `NotConnectedError`, in place of the first child's error.
+  `#[derive(Device)]` `connect_all`, `DeviceVector::connect_all`,
+  `StandardDetector::connect`, the areaDetector cam and plugins and the CA
+  and PVA motors' setpoint and readback report it, through
+  `devices::wait_for_connection` (ophyd-async `wait_for_connection`).
+  It holds a `core::NotConnected`: `Children` for a device, or `Source`
+  (`ca://PV`, `pva://PV`) for a CA or PVA signal whose PV did not answer
+  in time, the cause logged at debug. Any other child failure is logged at
+  error as an "unexpected exception", as ophyd-async does.
+- **Breaking**: `EpicsCaBackend::new` and `EpicsPvaBackend::new` take only
+  `f64`, `i64`, `bool`, `String` and a `Vec` of the waveform's own element
+  type, as ophyd-async's `Array1D`/`Sequence[str]` (`i16`, `f32`, `u8`,
+  `i32`, `f64` or `String` over CA; `bool`, `i8` through `u64`, `f32`,
+  `f64` or `String` over PVA), and `connect` refuses with
+  `BsrsError::Datatype` a PV the type cannot read, as ophyd-async's
+  `make_converter`: `Vec<f64>` on a LONG waveform, `bool` on an enum without
+  two choices, `i64` on a float record with a nonzero PREC. Generic code
+  builds a backend with `BackendFromPv::from_pv`.
+- **Breaking**: areaDetector enum fields (`image_mode`, `detector_state_rbv`,
+  `data_type`, `color_mode`, `file_write_mode`) are `String` labels, as are
+  the `AD_STATE_*`, `AD_IMAGE_MODE_*`, `AD_COLOR_MODE_*` and
+  `AD_FILE_WRITE_MODE_*` constants; `ad_datatype_to_numpy` and
+  `NdFile::set_write_mode` take a label, and Lua `cam:state()` and
+  `cam:set_image_mode` use labels.
+- `CaDetector`, `PvaDetector`, `ca_suspender` and the `CaPositioner` done PV
+  read their PV as whatever number it is (ophyd-async `datatype=None`), an
+  enum as its index.
+- `SoftSignalBackend::set_callback`, and so `Signal::subscribe` and
+  `observe_value`, delivers the current reading first, as ophyd-async does;
+  readings reach each callback in store order and carry `alarm_severity` 0.
+  `MockSignalBackend` delivers its value the same way.
+- `put(None)` on the EPICS backends writes the value read at connect, as
+  ophyd-async does, instead of `T::default()`.
+- `CaEnumBackend` is `EpicsCaBackend<String>`, which reads a DBR_ENUM as its
+  label with the choices in the datakey.
+- EPICS datakeys take dtype and shape from the datatype as ophyd-async
+  `make_datakey` does: `Vec<f64>` is `array`, a string is `|S40`, and an
+  empty EGU is reported as units `""`.
+- `StandardDetector` follows ophyd-async: `prepare` sets up the hardware and
+  opens the writer for `collections_per_event`; `trigger` prepares
+  implicitly, rejects a multi-event prepare and fails when the writer index
+  stalls past the exposure timeout; `stage` drops the last prepare;
+  `kickoff` fails without a prepare since stage ("Prepare not called") and
+  cannot run past the prepared frames; `read` and `describe` fail before a
+  prepare.
+- **Breaking**: `StandardDetector<C>` holds a list of `DataLogic`s
+  (ophyd-async `DetectorDataLogic`) in place of its writer parameter `W`:
+  `DataLogic::Unbounded` is a `DetectorWriter`, `DataLogic::Single` a
+  `SingleDataLogic` read with the event of a one-collection prepare.
+  `with_data_logics`, `add_data_logic` and `connect` replace `writer()`,
+  and `DetectorWriter::connect` the inherent
+  `AdHdfWriter::connect`/`AdMultipartWriter::connect`. `trigger` waits for
+  the least writer index, `kickoff` needs a writer and refuses writers that
+  disagree on their index, asset documents chain the writers in order, and
+  the hints join every data logic's.
+- **Breaking**: `CamFrameInfo` is replaced by `NdArrayDescription`, whose
+  fields are private; `AreaDetectorCam::frame_info` is an
+  `Arc<NdArrayDescription>`.
+- **Breaking**: the detector names each data logic's data key
+  `name + datakey_suffix`, as ophyd-async does, so a writer's key is `det`,
+  not `det_image`. `DetectorWriter::open`/`hinted_fields`,
+  `SingleDataLogic::prepare_single`/`hinted_fields` and `open_writer` take
+  that name, and both traits gain `datakey_suffix` (`with_datakey_suffix`
+  on `AdHdfWriter` and `AdMultipartWriter`). `AdHdfWriter::new`,
+  `AdMultipartWriter::{new, jpeg, tiff}`, `BinaryFrameSink::new` and
+  `SoftDetectorWriter::new` no longer take a name; a writer collects no
+  documents before `open` and leaves the key's `object_name` to the run
+  engine.
+- **Breaking**: `WritesStreamAssets::collect_asset_docs` returns `Result`,
+  and `StandardDetector` fails it without a prepare since stage ("Prepare
+  not called"), as ophyd-async does, instead of re-emitting the documents
+  of the previous scan's prepare.
+- **Breaking**: ophyd-async's path providers are in `bsrs::devices`:
+  `PathProvider`, `FilenameProvider`, `PathInfo`, `StaticFilenameProvider`,
+  `UuidFilenameProvider`, `AutoIncrementFilenameProvider`,
+  `StaticPathProvider` and `AutoIncrementingPathProvider`, replacing
+  `host::areadetector::StaticPathProvider`. `AdHdfWriter`,
+  `AdMultipartWriter` and the `area_detector_*` factories take an
+  `Arc<dyn PathProvider>` and ask it for a `PathInfo` at every `open`;
+  `AdFileIo::configure` takes that `PathInfo`, and
+  `AdFileIo::full_file_name` is removed because the HDF `StreamResource`
+  uri is the provider's `directory_uri` plus `{filename}.h5`, not
+  `FullFileName_RBV`. Paths are `PurePath`s, posix or Windows whatever
+  the host (pathlib `PurePosixPath`/`PureWindowsPath`); `&str`, `&Path`
+  and `PathBuf` convert to the host's flavor. An IOC on Windows gets a
+  `FilePath` ending in `\` and a `file://localhost/C:/...` URI.
+- `AreaDetectorCam::arm` resolves once the cam is acquiring, and its
+  configuration is described from `AcquireTime_RBV`/`AcquirePeriod_RBV`.
+- `CaMotor`, `PvaMotor` and `CaPositioner` press `.STOP` in `stop_dyn`,
+  refuse moves outside their limits (ophyd-async `Motor.check_move`, ophyd
+  `PVPositioner.check_value`), post `WatcherUpdate`s while moving and hint
+  their readback. `PvaMotor` and `PvaDetector` are described from their PVs.
+- `spiral_square_pattern` visits points in bluesky's order.
+- The `mini_beamline_scan` example builds on `ca_devices` and needs the
+  `host` feature.
+
+### Removed
+
+- **Breaking**: `StandardReadable::add_readables`, `add_stageable` and
+  `StandardReadableFormat::Child`; use `add_child` / `add_signal`.
+- **Breaking**: `CaStringKind` and `EpicsCaBackend::new_long_string`;
+  `EpicsCaBackend<String>` reads a CHAR waveform as a long string, and
+  `EpicsPvaBackend<String>` an int8 array.
+- **Breaking**: `connect_area_detector_hdf` and
+  `connect_area_detector_multipart`; use `StandardDetector::connect`.
 
 ### Fixed
 
@@ -41,6 +215,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reading into the event only while bundling, so such a read is ad-hoc
   inspection that returns the value and touches no document; the engine now
   does the same.
+- `EpicsPvaBackend::connect` honours its timeout instead of the client's
+  5 s operation timeout.
+- The CA decoders read DBR_CHAR, which arrives as `UChar`/`UCharArray`, so
+  long strings read; CA reads ask for the current element count, not NELM.
+- A PVA put to an NTEnum reaches `value.index`, by label or by index, and a
+  PVA bool reads an `enum_t` index.
+- A CA PV maps to the same `CaContext` shard on every lookup, so backends on
+  one PV share its channel and its one put-callback in flight.
+- A CA call waits for the channel with its own timeout, and a CA monitor
+  survives a disconnect and resumes when the server returns.
+- `Status::observe_watcher` delivers every update to each observer; a
+  status's phase, outcome and waiters change under one lock, so a racing
+  reader no longer sees an error-less failure or misses a wake.
+- A `StandardReadable` child's configuration reaches `read_configuration`.
+- `Signal::describe` takes `DataKey.source` from `Signal::source`.
+- `AreaDetectorCam::arm` no longer misses acquisitions shorter than a poll,
+  and `AdHdfWriter` no longer stalls `kickoff` on a FlushNow put.
 
 ## [0.5.8] - 2026-09-22
 

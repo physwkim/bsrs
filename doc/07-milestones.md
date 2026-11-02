@@ -7,7 +7,7 @@
 | M0 | ✅ done | `bsrs-event-model` + `bsrs-core` + protocols (async + sync) |
 | M1 | ✅ done | `bsrs-backends/soft` + `bsrs-engine` + `count` plan + `JsonlSink` |
 | M2 | ⚠️ partial | `bsrs-backends/epics-ca` real impl behind `--features ca` (compiles, no live IOC test) |
-| M3 | ✅ done | `StandardDetector<C, W>` + `BinaryFrameSink` (DetectorWriter) + `scan` plan |
+| M3 | ✅ done | `StandardDetector` + `BinaryFrameSink` (DetectorWriter) + `scan` plan |
 | M4 | ✅ done | pause / resume / checkpoint / suspender + SIGINT 3-tap |
 | M5 | ✅ done | `bsrs-backends/epics-pva` real impl + `PvaMonitorSource` (NTNDArray zero-copy) + `BinaryFrameSink` |
 | M6 | 🔄 in progress | Document sinks for the bluesky Python ecosystem (Zmq, Tiled, …) |
@@ -25,7 +25,7 @@ Phase 2 will plug into.
 | **M0** | `bsrs-event-model` + `bsrs-core` + `bsrs-protocols-async` + `bsrs-protocols-sync` | Round-trip test: Document JSON → deserialize → re-serialize → equal. 11 protocol traits compile. |
 | **M1** | `bsrs-backends/soft` + `bsrs-engine` + `count` plan + `JsonlSink` | `count(soft_det, 5)` emits the expected 8-document sequence. |
 | **M2** | `bsrs-backends/epics-ca` (`epics-ca-rs`) | `Signal<f64, EpicsCaBackend>` connect/get/put/subscribe; sharded registry (K3); pending-Notify dedup (K4). |
-| **M3** | `StandardDetector<C, W>` + `scan` plan + `BinaryFrameSink` (DetectorWriter) | 5-point scan emits StreamResource + StreamDatum; Hdf5 follow-up via M5 sinks. |
+| **M3** | `StandardDetector` + `scan` plan + `BinaryFrameSink` (DetectorWriter) | 5-point scan emits StreamResource + StreamDatum; Hdf5 follow-up via M5 sinks. |
 | **M4** | pause / resume / checkpoint / suspender + SIGINT 3-tap | Three integration tests cover {pause→resume, abort→close-run, suspender auto-resume}. |
 | **M5** | `bsrs-backends/epics-pva` + `PvaMonitorSource` (NTNDArray zero-copy) | NTNDArray decode emits Frames whose `Bytes` share the PVA decode buffer's refcount (verified by unit tests). |
 | **M6** | **Document sinks for the Python ecosystem** | `ZmqDocumentSink` round-trips with bluesky `RemoteDispatcher` (msgpack envelope, prefix, name, body). `TiledSink` (minimal) registers runs in a Tiled HTTP catalog. `JsonlSink` already in M1. |

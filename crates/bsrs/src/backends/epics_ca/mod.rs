@@ -4,7 +4,7 @@
 //!
 //! - **`ca`** feature (on by default): wires up `epics_ca_rs::CaClient` +
 //!   `CaChannel`, with a sharded process-singleton client registry (rule
-//!   **K3**) and in-flight de-dup via `pending: Notify` (rule **K4**).
+//!   **K3**) that holds each PV's one channel from its creation (rule **K4**).
 //!   Subscription tokens propagate `Drop` to `MonitorHandle::drop`,
 //!   satisfying rule **K2**.
 //! - **`--no-default-features`**: exposes [`EpicsCaBackend`] as a stub whose

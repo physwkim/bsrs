@@ -771,6 +771,7 @@ dependencies = [
  "async-trait",
  "bsrs-derive",
  "bytes",
+ "chrono",
  "clap",
  "criterion",
  "epics-base-rs",
@@ -1759,7 +1760,7 @@ checksum = "869b0adbda23651a9c5c0c3d270aac9fcb52e8622a8f2b17e57802d7791962f2"
 [[package]]
 name = "epics-base-rs"
 version = "0.33.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#366ec84efbc4da0e02f10af1e98d72dad6af5430"
+source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#2c1db5edd3cefb7df902dd7a0d7037006a7d8ee6"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1785,7 +1786,7 @@ dependencies = [
 [[package]]
 name = "epics-ca-rs"
 version = "0.33.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#366ec84efbc4da0e02f10af1e98d72dad6af5430"
+source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#2c1db5edd3cefb7df902dd7a0d7037006a7d8ee6"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1809,7 +1810,7 @@ dependencies = [
 [[package]]
 name = "epics-libcom-rs"
 version = "0.33.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#366ec84efbc4da0e02f10af1e98d72dad6af5430"
+source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#2c1db5edd3cefb7df902dd7a0d7037006a7d8ee6"
 dependencies = [
  "chrono",
  "hostname",
@@ -1825,7 +1826,7 @@ dependencies = [
 [[package]]
 name = "epics-macros-rs"
 version = "0.33.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#366ec84efbc4da0e02f10af1e98d72dad6af5430"
+source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#2c1db5edd3cefb7df902dd7a0d7037006a7d8ee6"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1836,7 +1837,7 @@ dependencies = [
 [[package]]
 name = "epics-pva-rs"
 version = "0.33.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#366ec84efbc4da0e02f10af1e98d72dad6af5430"
+source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#2c1db5edd3cefb7df902dd7a0d7037006a7d8ee6"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -1875,7 +1876,7 @@ dependencies = [
 [[package]]
 name = "epics-rtems-boot"
 version = "0.33.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#366ec84efbc4da0e02f10af1e98d72dad6af5430"
+source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#2c1db5edd3cefb7df902dd7a0d7037006a7d8ee6"
 dependencies = [
  "cc",
  "libc",

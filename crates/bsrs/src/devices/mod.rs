@@ -6,14 +6,20 @@
 pub mod detector;
 pub mod device;
 pub mod observe;
+pub mod path_provider;
 pub mod signal;
 pub mod signal_cache;
 pub mod stage_sigs;
 pub mod standard_readable;
 
-pub use detector::{DetectorTrigger, StandardDetector, TriggerInfo};
-pub use device::{walk_signal_sources, Device, DeviceVector};
+pub use detector::{DataLogic, DetectorTrigger, StandardDetector, TriggerInfo};
+pub use device::{wait_for_connection, walk_signal_sources, Device, DeviceVector};
 pub use observe::{observe_signals_value, observe_value, wait_for_value};
+pub use path_provider::{
+    AutoIncrementFilenameProvider, AutoIncrementingPathProvider, AutoMaxIncrementingPathProvider,
+    FilenameProvider, PathInfo, PathProvider, PurePath, StaticFilenameProvider, StaticPathProvider,
+    UuidFilenameProvider, YmdPathProvider,
+};
 pub use signal::{
     Access, Execute, Read, ReadWrite, Readable, Signal, SignalConfig, SignalKind, SignalR,
     SignalRW, SignalW, SignalX, Writable, Write,
@@ -55,7 +61,7 @@ pub mod __derive {
     }
 
     /// Connect a Signal — used by generated `connect_all` to homogenize
-    /// future types so they can be `try_join`'d.
+    /// future types for [`wait_for_connection`](super::wait_for_connection).
     pub fn connect_signal<'a, T, B, A>(
         sig: &'a Signal<T, B, A>,
         timeout: Duration,
@@ -66,16 +72,5 @@ pub mod __derive {
         A: Access + 'static,
     {
         Box::pin(sig.connect(timeout))
-    }
-
-    /// `try_join_all` over heterogeneous boxed futures.
-    pub async fn try_join_all_connects(
-        futs: Vec<Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>>,
-    ) -> Result<()> {
-        let results = futures::future::join_all(futs).await;
-        for r in results {
-            r?;
-        }
-        Ok(())
     }
 }

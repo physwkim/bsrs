@@ -3,6 +3,7 @@
 //! state, records every `put`, lets a callback rewrite the put value, and
 //! gates put completion on a `put_proceeds` flag so tests can block puts.
 
+use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -13,13 +14,18 @@ use crate::core::status::SubToken;
 use crate::event_model::{DataKey, Dtype};
 use crate::protocols_async::{PutCompletion, ReadingValueCallback, SignalBackend};
 use async_trait::async_trait;
+use futures::future::BoxFuture;
 use serde::Serialize;
+use std::future::Future;
 use tokio::sync::watch;
 
 /// Callback run on every `put`. Returns `Some(v)` to override the value written
 /// to the readback, or `None` to keep the put value. Mirrors ophyd-async
 /// `MockPutCallback` (the sync form).
 pub type MockPutCallback<T> = Box<dyn Fn(Option<T>) -> Option<T> + Send + Sync>;
+
+/// The installed put callback, sync ones wrapped as already-ready futures.
+type PutCallbackFn<T> = Arc<dyn Fn(Option<T>) -> BoxFuture<'static, Option<T>> + Send + Sync>;
 
 struct Inner<T: Clone + Send + Sync + 'static> {
     soft: SoftSignalBackend<T>,
@@ -28,7 +34,7 @@ struct Inner<T: Clone + Send + Sync + 'static> {
     /// `true` ⟹ puts complete immediately; `false` ⟹ a put writes the value
     /// but blocks (does not complete) until set back to `true`. Initially set.
     proceeds: watch::Sender<bool>,
-    put_callback: Mutex<Option<MockPutCallback<T>>>,
+    put_callback: Mutex<Option<PutCallbackFn<T>>>,
 }
 
 /// Mock signal backend for unit tests. Cheap to clone (shared inner) so a test
@@ -83,6 +89,36 @@ where
         self.inner.soft.write_now(value);
     }
 
+    /// An iterator whose every `next` sets the readback to the next of
+    /// `values` and yields it (ophyd `set_mock_values`). With
+    /// `require_all_consumed`, dropping it before `values` is exhausted
+    /// panics, naming the consumed and unconsumed values; `values` must then
+    /// be finite.
+    pub fn set_values<I>(&self, values: I, require_all_consumed: bool) -> SetValues<T, I::IntoIter>
+    where
+        T: Debug,
+        I: IntoIterator<Item = T>,
+    {
+        SetValues {
+            backend: self.clone(),
+            values: values.into_iter(),
+            consumed: require_all_consumed.then(Vec::new),
+        }
+    }
+
+    /// Set the units `describe` reports (ophyd `set_mock_units`).
+    pub fn set_units(&self, units: impl Into<String>) {
+        let units = units.into();
+        self.inner.soft.update_metadata(|m| m.units = Some(units));
+    }
+
+    /// Set the precision `describe` reports (ophyd `set_mock_precision`).
+    pub fn set_precision(&self, precision: i64) {
+        self.inner
+            .soft
+            .update_metadata(|m| m.precision = Some(precision));
+    }
+
     /// Allow (`true`) or block (`false`) puts from completing (ophyd
     /// `set_mock_put_proceeds`).
     pub fn set_put_proceeds(&self, proceeds: bool) {
@@ -92,7 +128,20 @@ where
     /// Install (or clear with `None`) the put callback (ophyd
     /// `set_mock_put_callback`).
     pub fn set_put_callback(&self, cb: Option<MockPutCallback<T>>) {
-        *self.inner.put_callback.lock().unwrap() = cb;
+        *self.inner.put_callback.lock().unwrap() = cb
+            .map(|f| -> PutCallbackFn<T> { Arc::new(move |v| Box::pin(std::future::ready(f(v)))) });
+    }
+
+    /// Install an async put callback (ophyd `set_mock_put_callback` with a
+    /// coroutine function). The put awaits it before writing the readback,
+    /// so a slow callback delays the readback. Clear it with
+    /// `set_put_callback(None)`.
+    pub fn set_put_callback_async<F, Fut>(&self, cb: F)
+    where
+        F: Fn(Option<T>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Option<T>> + Send + 'static,
+    {
+        *self.inner.put_callback.lock().unwrap() = Some(Arc::new(move |v| Box::pin(cb(v))));
     }
 
     /// Snapshot of every `put` argument received, in call order (ophyd
@@ -104,6 +153,11 @@ where
     /// Number of `put` calls recorded.
     pub fn put_count(&self) -> usize {
         self.inner.put_log.lock().unwrap().len()
+    }
+
+    /// Forget the recorded `put` calls (ophyd `get_mock_put(...).reset_mock()`).
+    pub fn reset_put_calls(&self) {
+        self.inner.put_log.lock().unwrap().clear();
     }
 
     /// Block puts for the lifetime of the returned guard; puts unblock when it
@@ -135,6 +189,56 @@ where
     }
 }
 
+/// Iterator from [`MockSignalBackend::set_values`].
+pub struct SetValues<T, I>
+where
+    T: Clone + Debug + Send + Sync + Serialize + 'static,
+    I: Iterator<Item = T>,
+{
+    backend: MockSignalBackend<T>,
+    values: I,
+    /// `Some` iff all values must be consumed; kept only then, since the
+    /// values may otherwise be endless.
+    consumed: Option<Vec<T>>,
+}
+
+impl<T, I> Iterator for SetValues<T, I>
+where
+    T: Clone + Debug + Send + Sync + Serialize + 'static,
+    I: Iterator<Item = T>,
+{
+    type Item = T;
+    fn next(&mut self) -> Option<T> {
+        let value = self.values.next()?;
+        self.backend.set_value(value.clone());
+        if let Some(consumed) = &mut self.consumed {
+            consumed.push(value.clone());
+        }
+        Some(value)
+    }
+}
+
+impl<T, I> Drop for SetValues<T, I>
+where
+    T: Clone + Debug + Send + Sync + Serialize + 'static,
+    I: Iterator<Item = T>,
+{
+    fn drop(&mut self) {
+        let Some(consumed) = self.consumed.take() else {
+            return;
+        };
+        // A second panic while unwinding would abort the test binary.
+        if std::thread::panicking() {
+            return;
+        }
+        let rest: Vec<T> = self.values.by_ref().collect();
+        assert!(
+            rest.is_empty(),
+            "{consumed:?} were consumed but {rest:?} were not consumed"
+        );
+    }
+}
+
 /// RAII guard from [`MockSignalBackend::mock_puts_blocked`]; unblocks puts on drop.
 pub struct PutsBlockedGuard<T: Clone + Send + Sync + Serialize + 'static> {
     backend: MockSignalBackend<T>,
@@ -162,9 +266,10 @@ where
         self.inner.put_log.lock().unwrap().push(value.clone());
         // Callback may rewrite the value written to the readback; `None` keeps
         // the put value (ophyd: new_value = put_mock(value) or value).
-        let overridden = {
-            let cb = self.inner.put_callback.lock().unwrap();
-            cb.as_ref().and_then(|f| f(value.clone()))
+        let cb = self.inner.put_callback.lock().unwrap().clone();
+        let overridden = match cb {
+            Some(f) => f(value.clone()).await,
+            None => None,
         };
         let new_value = overridden.or(value);
         self.inner.soft.put(new_value).await?;

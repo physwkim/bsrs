@@ -1,5 +1,5 @@
 //! bsrs host runtime — reusable components for embedding a bsrs
-//! `RunEngine` + queue server into a process.
+//! `RunEngine` + queue server into a process (feature `host`).
 //!
 //! Split out of the old `bsrs-cli` crate (now the thin `bsrs`
 //! binary in `bin/bsrs`) so downstream binaries — e.g. a
@@ -15,14 +15,14 @@
 //! - [`manager_lua::ManagerLuaState`] — implements
 //!   `crate::qs::LuaEvaluator`; auto-publishes every device in the
 //!   `Registry` as a Lua global.
-//! - [`ca_devices::CaMotor`] / [`ca_devices::CaDetector`] — CA-backed
+//! - `ca_devices::CaMotor` / `ca_devices::CaDetector` — CA-backed
 //!   ophyd-equivalent device handles (feature `ca`).
-//! - [`pva_devices::PvaMotor`] / [`pva_devices::PvaDetector`] — same
+//! - `pva_devices::PvaMotor` / `pva_devices::PvaDetector` — same
 //!   for PV Access (feature `pva`).
 //! - [`checkpoint_store::JsonlCheckpointStore`] — JSONL-backed
 //!   `CheckpointHook` for crash-recovery audit.
-//! - [`lua_tiled`] — `tiled.*` Lua bindings (feature `tiled`).
-//! - [`ca_suspender`] — CA-PV-backed `SuspendThreshold` / boolean
+//! - `lua_tiled` — `tiled.*` Lua bindings (feature `tiled`).
+//! - `ca_suspender` — CA-PV-backed `SuspendThreshold` / boolean
 //!   suspender installers (feature `ca`).
 
 #[cfg(feature = "ca")]

@@ -236,11 +236,12 @@ impl DetectorControl for SoftDetectorControl {
 /// Soft `DetectorWriter` — keeps a vec of frame timestamps in memory and emits
 /// `StreamResource` + `StreamDatum` documents.
 pub struct SoftDetectorWriter {
-    name: String,
     indices_rx: watch::Receiver<u64>,
     counter: Arc<AtomicU64>,
     /// Tracks whether we already emitted the StreamResource.
     resource_emitted: std::sync::Mutex<Option<String>>,
+    /// Data key the detector named at `open`; `None` until then.
+    data_key: std::sync::Mutex<Option<String>>,
     /// Index of last emitted StreamDatum (frames `[0, last_emitted)`).
     last_emitted: AtomicU64,
     /// Mimetype label (for tests).
@@ -254,16 +255,12 @@ pub struct SoftDetectorWriter {
 impl SoftDetectorWriter {
     /// Build with a counter handle and a watch receiver driven by the paired
     /// `SoftDetectorControl` (obtained via `SoftDetectorControl::subscribe_index`).
-    pub fn new(
-        name: impl Into<String>,
-        counter: Arc<AtomicU64>,
-        indices_rx: watch::Receiver<u64>,
-    ) -> Self {
+    pub fn new(counter: Arc<AtomicU64>, indices_rx: watch::Receiver<u64>) -> Self {
         Self {
-            name: name.into(),
             indices_rx,
             counter,
             resource_emitted: std::sync::Mutex::new(None),
+            data_key: std::sync::Mutex::new(None),
             last_emitted: AtomicU64::new(0),
             mimetype: "application/x-bsrs-soft-frames".into(),
             uri: "memory://soft-frames".into(),
@@ -280,19 +277,20 @@ impl SoftDetectorWriter {
 
 #[async_trait]
 impl DetectorWriter for SoftDetectorWriter {
-    async fn open(&self, _multiplier: u32) -> Result<HashMap<String, DataKey>> {
+    async fn open(&self, datakey_name: &str, _multiplier: u32) -> Result<HashMap<String, DataKey>> {
+        *self.data_key.lock().unwrap() = Some(datakey_name.to_string());
         let mut out = HashMap::new();
         out.insert(
-            format!("{}_image", self.name),
+            datakey_name.to_string(),
             DataKey {
-                source: format!("soft://{}/image", self.name),
+                source: format!("soft://{datakey_name}/image"),
                 dtype: Dtype::Number,
                 shape: vec![Some(1)],
                 dtype_numpy: Some("<f4".into()),
                 external: Some("STREAM:".into()),
                 units: None,
                 precision: None,
-                object_name: Some(self.name.clone()),
+                object_name: None,
                 dims: Some(vec!["pixel".into()]),
                 limits: None,
                 choices: None,
@@ -307,6 +305,9 @@ impl DetectorWriter for SoftDetectorWriter {
         self.counter.load(Ordering::SeqCst)
     }
     fn collect_stream_docs(&self, up_to: u64, descriptor: &str) -> BoxStream<'_, StreamAsset> {
+        let Some(data_key) = self.data_key.lock().unwrap().clone() else {
+            return stream::empty().boxed();
+        };
         let mut docs: Vec<StreamAsset> = Vec::new();
         // Resource (only once)
         let resource_uid = {
@@ -318,7 +319,7 @@ impl DetectorWriter for SoftDetectorWriter {
                 *guard = Some(new_uid.clone());
                 let resource = crate::event_model::StreamResource {
                     uid: new_uid.clone(),
-                    data_key: format!("{}_image", self.name),
+                    data_key,
                     mimetype: self.mimetype.clone(),
                     uri: self.uri.clone(),
                     parameters: Default::default(),
@@ -355,14 +356,12 @@ impl DetectorWriter for SoftDetectorWriter {
 }
 
 /// Convenience constructor for a `StandardDetector` backed by soft control + writer.
-pub fn soft_detector(
-    name: impl Into<String>,
-) -> StandardDetector<SoftDetectorControl, SoftDetectorWriter> {
+pub fn soft_detector(name: impl Into<String>) -> StandardDetector<SoftDetectorControl> {
     let control = SoftDetectorControl::new(Duration::from_micros(0));
     let counter = control.arm_count();
     let indices_rx = control.subscribe_index();
     let name: String = name.into();
-    let writer = SoftDetectorWriter::new(name.clone(), counter, indices_rx);
+    let writer = SoftDetectorWriter::new(counter, indices_rx);
     StandardDetector::new(name, control, writer)
 }
 

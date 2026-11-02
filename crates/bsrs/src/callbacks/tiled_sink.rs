@@ -45,7 +45,7 @@ pub struct TiledSink {
 
 impl TiledSink {
     /// Build with a base URL and container path. Reads `TILED_API_KEY`
-    /// from the environment if no key is supplied via [`with_api_key`].
+    /// from the environment if no key is supplied via [`with_api_key`](Self::with_api_key).
     pub fn new(base_url: impl Into<String>, container: impl Into<String>) -> Result<Self> {
         let api_key = std::env::var("TILED_API_KEY").ok();
         let mut opts = ContextOptions::default();

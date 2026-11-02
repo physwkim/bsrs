@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bsrs::core::error::Result;
-use bsrs::core::msg::{DynLocation, LocatableObj, MovableObj, NamedObj, ReadableObj};
+use bsrs::core::msg::{DynLocation, LocatableObj, MovableObj, NamedObj, ReadableObj, StoppableObj};
 use bsrs::core::reading::ReadingValue;
 use bsrs::core::status::Status;
 use bsrs::event_model::DataKey;
@@ -93,12 +93,28 @@ impl ReadableObj for Dcm {
         out.extend(t?);
         Ok(out)
     }
+
+    /// ophyd `Device.hints`: the energy readback. `theta_rbv` is a
+    /// normal-kind component and hints nothing.
+    fn hint_fields(&self) -> Option<Vec<String>> {
+        self.energy.hint_fields()
+    }
 }
 
 #[async_trait]
 impl MovableObj for Dcm {
     async fn set_dyn(&self, value: f64) -> Status {
         self.energy.set_dyn(value).await
+    }
+    async fn stop_on_pause(&self, success: bool) -> Result<()> {
+        self.energy.stop_dyn(success).await
+    }
+}
+
+#[async_trait]
+impl StoppableObj for Dcm {
+    async fn stop_dyn(&self, success: bool) -> Result<()> {
+        self.energy.stop_dyn(success).await
     }
 }
 
@@ -131,5 +147,27 @@ impl Dcm {
         v.value
             .as_f64()
             .ok_or_else(|| format!("theta_rbv: expected number, got {:?}", v.value))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs BSRS_EPICS_RS; see crates/bsrs/tests/example_ioc"]
+    async fn hints_the_energy_readback() {
+        crate::example_ioc::boot("mini-ioc", "mini-beamline");
+        let dcm = Dcm::connect(
+            "dcm",
+            "mini:BraggEAO",
+            "mini:BraggERdbkAO",
+            "mini:KohzuMoving",
+            "mini:BraggThetaRdbkAO",
+        )
+        .await
+        .unwrap();
+        assert_eq!(dcm.hint_fields(), Some(vec!["dcm_energy".to_string()]));
+        assert!(dcm.describe_dyn().await.unwrap().contains_key("dcm_energy"));
     }
 }

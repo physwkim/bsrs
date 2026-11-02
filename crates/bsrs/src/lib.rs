@@ -33,15 +33,12 @@ pub mod stream;
 #[cfg(feature = "zmq")]
 mod zmq_socket;
 
-/// Queue-server-compatible 0MQ JSON-RPC daemon (feature `qs`).
 #[cfg(feature = "qs")]
 pub mod qs;
 
-/// Host runtime — Lua bridge + CA/PVA device factories (feature `host`).
 #[cfg(feature = "host")]
 pub mod host;
 
-/// Beamline optimization plans — the blop port (feature `blop`).
 #[cfg(feature = "blop")]
 pub mod blop;
 
@@ -63,8 +60,8 @@ pub mod ophyd {
     pub use crate::protocols_async::{
         AsyncConfigurable, AsyncMovable, AsyncReadable, AsyncSubscribable, Collectable,
         DetectorControl, DetectorWriter, FlyMotorInfo, Flyable, Frame, FrameSink, FrameSource,
-        Locatable, Pausable, Preparable, SignalBackend, Stageable, Stoppable, StreamAsset,
-        TriggerInfo, Triggerable, WritesStreamAssets,
+        Locatable, Pausable, Preparable, SignalBackend, SingleDataLogic, Stageable, Stoppable,
+        StreamAsset, TriggerInfo, Triggerable, WritesStreamAssets,
     };
     pub use crate::protocols_sync::{
         Configurable, FlyableSync, Movable, Readable, StageableSync, TriggerableSync,
