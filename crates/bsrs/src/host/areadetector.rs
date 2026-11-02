@@ -40,7 +40,7 @@ use crate::core::status::{Status, StatusError, SubToken};
 use crate::devices::device::Device;
 use crate::devices::signal::{Read, Readable, Signal};
 use crate::devices::stage_sigs::StageSigs;
-use crate::devices::{wait_for_connection, PathInfo, PathProvider, StandardDetector};
+use crate::devices::{wait_for_connection, PathInfo, PathProvider, PurePath, StandardDetector};
 use crate::event_model::{DataKey, Dtype, StreamDatum, StreamRange, StreamResource};
 use crate::protocols_async::{
     DetectorControl, DetectorTrigger, DetectorWriter, SignalBackend, SingleDataLogic, StreamAsset,
@@ -106,6 +106,13 @@ pub fn ad_datatype_to_numpy(dt: &str) -> Option<&'static str> {
 
 fn join(prefix: &str, suffix: &str) -> String {
     format!("{prefix}{suffix}")
+}
+
+/// `FilePath` for `directory`, ending in its own separator: with it left
+/// off, areaDetector appends `/` even on Windows and the readback never
+/// matches the put.
+fn file_path_pv(directory: &PurePath) -> String {
+    format!("{directory}{}", directory.separator())
 }
 
 /// Run a backend `put` to completion, bounding it with [`PUT_TIMEOUT`].
@@ -943,10 +950,7 @@ impl NdFile {
         template: &str,
         num_capture: i64,
     ) -> Result<()> {
-        // With the separator left off, areaDetector appends it and the
-        // `FilePath` readback never matches the put. POSIX IOC hosts only:
-        // ophyd-async's `PureWindowsPath` + `\` arm is not ported.
-        let directory = format!("{}/", path_info.directory_path().display());
+        let directory = file_path_pv(path_info.directory_path());
         self.set_create_directory(path_info.create_dir_depth())
             .await?;
         self.set_path(&directory).await?;
@@ -3149,7 +3153,7 @@ mod ad_hdf_tests {
             if !self.path_exists.load(Ordering::SeqCst) {
                 return Err(BsrsError::Backend(format!(
                     "FilePath {} doesn't exist on the IOC host or is not writable",
-                    path_info.directory_path().display()
+                    path_info.directory_path()
                 )));
             }
             *self.configured.lock().unwrap() = Some((path_info.clone(), t.into(), n));
@@ -3208,7 +3212,7 @@ mod ad_hdf_tests {
     fn scans() -> Arc<dyn PathProvider> {
         Arc::new(StaticPathProvider::new(
             Arc::new(StaticFilenameProvider::new("scan")),
-            "/data/scans/",
+            PurePath::posix("/data/scans/"),
         ))
     }
 
@@ -3427,7 +3431,7 @@ mod ad_hdf_tests {
             .unwrap()
             .clone()
             .expect("configure called");
-        assert_eq!(cfg.0.directory_path(), std::path::Path::new("/data/scans"));
+        assert_eq!(cfg.0.directory_path(), &PurePath::posix("/data/scans"));
         assert_eq!(cfg.0.filename(), "scan");
         assert_eq!(cfg.1, AD_HDF_TEMPLATE);
         assert_eq!(cfg.2, 0, "NumCapture=0 (capture until stopped)");
@@ -3480,7 +3484,7 @@ mod ad_hdf_tests {
         let io = FakeAdFileIo::new();
         let provider = StaticPathProvider::new(
             Arc::new(AutoIncrementFilenameProvider::new("scan")),
-            "/data/scans",
+            PurePath::posix("/data/scans"),
         )
         .with_directory_uri("http://files.example/scans");
         let w = AdHdfWriter::new(io.clone(), Arc::new(FakeFrameInfo), Arc::new(provider));
@@ -3496,6 +3500,63 @@ mod ad_hdf_tests {
             match &docs[0] {
                 StreamAsset::Resource(r) => assert_eq!(r.uri, uri),
                 _ => panic!("first doc must be StreamResource"),
+            }
+        }
+    }
+
+    /// ophyd-async test_can_override_uri_with_different_path_semantics:
+    /// `FilePath` ends in the write path's own separator, and the resource
+    /// points at the override URI (the file for HDF, the directory else).
+    #[tokio::test]
+    async fn file_path_takes_the_write_paths_separator_under_an_override_uri() {
+        let windows = PurePath::windows("C:\\Users\\test\\AppData\\Local\\Temp\\ophyd_async_tests");
+        let posix = PurePath::posix("/tmp/ophyd_async_tests");
+        for (write_path, separator) in [(windows, '\\'), (posix, '/')] {
+            for kind in ["hdf", "jpeg", "tiff"] {
+                let io = FakeAdFileIo::new();
+                let provider: Arc<dyn PathProvider> = Arc::new(
+                    StaticPathProvider::new(
+                        Arc::new(StaticFilenameProvider::new("test")),
+                        write_path.clone(),
+                    )
+                    .with_directory_uri("file://nfs-share/something/"),
+                );
+                let (keys, docs) = match kind {
+                    "hdf" => {
+                        let w = AdHdfWriter::new(io.clone(), Arc::new(FakeFrameInfo), provider);
+                        let keys = w.open("det", 1).await.unwrap();
+                        io.set_captured(1);
+                        let docs: Vec<StreamAsset> = w.collect_stream_docs(1, "d").collect().await;
+                        (keys, docs)
+                    }
+                    _ => {
+                        let w = if kind == "jpeg" {
+                            AdMultipartWriter::jpeg(io.clone(), Arc::new(FakeFrameInfo), provider)
+                        } else {
+                            AdMultipartWriter::tiff(io.clone(), Arc::new(FakeFrameInfo), provider)
+                        };
+                        let keys = w.open("det", 1).await.unwrap();
+                        io.set_captured(1);
+                        let docs: Vec<StreamAsset> = w.collect_stream_docs(1, "d").collect().await;
+                        (keys, docs)
+                    }
+                };
+                let cfg = io.configured.lock().unwrap().clone().unwrap();
+                assert_eq!(
+                    file_path_pv(cfg.0.directory_path()),
+                    format!("{write_path}{separator}")
+                );
+                let uri = if kind == "hdf" {
+                    "file://nfs-share/something/test.h5"
+                } else {
+                    "file://nfs-share/something/"
+                };
+                assert_eq!(keys["det"].source, uri, "{kind}");
+                assert_eq!(docs.len(), 2, "{kind}");
+                match &docs[0] {
+                    StreamAsset::Resource(r) => assert_eq!(r.uri, uri, "{kind}"),
+                    _ => panic!("first doc must be StreamResource"),
+                }
             }
         }
     }
@@ -3858,7 +3919,7 @@ mod ad_hdf_tests {
         let keys = w.open("det", 1).await.unwrap();
 
         let cfg = io.configured.lock().unwrap().clone().unwrap();
-        assert_eq!(cfg.0.directory_path(), std::path::Path::new("/data/scans"));
+        assert_eq!(cfg.0.directory_path(), &PurePath::posix("/data/scans"));
         assert_eq!(cfg.0.filename(), "scan");
         assert_eq!(cfg.1, "%s%s_%6.6d.jpg");
         assert_eq!(cfg.2, 0, "NumCapture=0: capture until close()");
@@ -3884,7 +3945,7 @@ mod ad_hdf_tests {
         let io = FakeAdFileIo::new();
         let provider = AutoIncrementingPathProvider::new(
             Arc::new(StaticFilenameProvider::new("img")),
-            "/data/scans",
+            PurePath::posix("/data/scans"),
         );
         let w = AdMultipartWriter::tiff(io.clone(), Arc::new(FakeFrameInfo), Arc::new(provider));
         let keys = w.open("det", 1).await.unwrap();
@@ -3901,7 +3962,7 @@ mod ad_hdf_tests {
         let cfg = io.configured.lock().unwrap().clone().unwrap();
         assert_eq!(
             cfg.0.directory_path(),
-            std::path::Path::new("/data/scans/det_00001")
+            &PurePath::posix("/data/scans/det_00001")
         );
     }
 
