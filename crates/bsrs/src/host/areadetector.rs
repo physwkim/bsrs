@@ -277,28 +277,44 @@ pub trait AdFrameInfoSource: Send + Sync {
     async fn frame_info(&self) -> Result<(Vec<u64>, String)>;
 }
 
-/// Compose the frame shape ophyd-async's `get_ndarray_resource_info`
-/// (`_data_logic.py:61-84`) derives from the shape readbacks: `dims`
-/// slowest first (matching the row-major HDF dataset), zero dims dropped,
-/// RGB1 prepending the color dim; any other non-Mono color mode is
-/// unsupported.
-fn compose_frame_shape(dims: &[i64], color_mode: &str, pv: &str) -> Result<Vec<u64>> {
+/// The frame shape and numpy dtype ophyd-async's `get_ndarray_resource_info`
+/// (`_data_logic.py:69-106`) derives from the shape readbacks, `data_type`
+/// (read from `data_type_source`) and `color_mode`: `dims` slowest first
+/// (matching the row-major HDF dataset), zero dims dropped, RGB1 prepending
+/// the color dim; a blank data type and any other color mode are refused.
+fn ndarray_frame_info(
+    dims: &[i64],
+    data_type: &str,
+    color_mode: &str,
+    data_type_source: &str,
+) -> Result<(Vec<u64>, String)> {
     let mut shape: Vec<u64> = dims
         .iter()
         .copied()
         .filter(|&d| d > 0)
         .map(|d| d as u64)
         .collect();
+    if data_type.is_empty() {
+        return Err(BsrsError::Other(format!(
+            "{data_type_source} is blank, this is not supported"
+        )));
+    }
     match color_mode {
         AD_COLOR_MODE_MONO => {}
         AD_COLOR_MODE_RGB1 => shape.insert(0, 3),
         other => {
-            return Err(BsrsError::Backend(format!(
-                "{pv}ColorMode_RBV={other} is not supported (only Mono and RGB1)"
+            return Err(BsrsError::Other(format!(
+                "Unsupported ColorMode {other}! Only Mono and RGB1 are supported."
             )));
         }
     }
-    Ok(shape)
+    // Read as a `String`, the PV can hold a label `ADBaseDataType` lacks.
+    let dtype_numpy = ad_datatype_to_numpy(data_type).ok_or_else(|| {
+        BsrsError::Backend(format!(
+            "{data_type_source}={data_type:?} is not a known ADBaseDataType"
+        ))
+    })?;
+    Ok((shape, dtype_numpy.to_string()))
 }
 
 #[async_trait::async_trait]
@@ -313,15 +329,12 @@ impl AdFrameInfoSource for NdArrayDescription {
             SignalBackend::<String>::get_value(self.data_type.as_ref()),
             SignalBackend::<String>::get_value(self.color_mode.as_ref()),
         );
-        let shape = compose_frame_shape(&dims?, &cm?, &self.prefix)?;
-        let dt = dt?;
-        let dtype_numpy = ad_datatype_to_numpy(&dt).ok_or_else(|| {
-            BsrsError::Backend(format!(
-                "{}DataType_RBV={dt:?} is not a known ADBaseDataType",
-                self.prefix
-            ))
-        })?;
-        Ok((shape, dtype_numpy.to_string()))
+        let source = SignalBackend::<String>::source(
+            self.data_type.as_ref(),
+            &join(&self.prefix, "DataType_RBV"),
+            true,
+        );
+        ndarray_frame_info(&dims?, &dt?, &cm?, &source)
     }
 }
 
@@ -3190,27 +3203,35 @@ mod ad_hdf_tests {
     }
 
     #[test]
-    fn compose_frame_shape_orders_zyx_and_handles_color_modes() {
+    fn ndarray_frame_info_orders_zyx_and_handles_color_modes() {
+        let info = |dims: &[i64], dt: &str, cm: &str| {
+            ndarray_frame_info(dims, dt, cm, "ca://P:DataType_RBV").map_err(|e| e.to_string())
+        };
         // Mono 2-D frame: Z unused (0) → [Y, X].
         assert_eq!(
-            compose_frame_shape(&[0, 768, 1024], AD_COLOR_MODE_MONO, "P:").unwrap(),
-            vec![768, 1024]
+            info(&[0, 768, 1024], "UInt16", AD_COLOR_MODE_MONO),
+            Ok((vec![768, 1024], "<u2".into()))
         );
         // 3-D mono: [Z, Y, X], slowest first.
         assert_eq!(
-            compose_frame_shape(&[4, 20, 10], AD_COLOR_MODE_MONO, "P:").unwrap(),
-            vec![4, 20, 10]
+            info(&[4, 20, 10], "Float64", AD_COLOR_MODE_MONO),
+            Ok((vec![4, 20, 10], "<f8".into()))
         );
         // RGB1 prepends the color dim (ophyd-async `shape = [3, *shape]`).
         assert_eq!(
-            compose_frame_shape(&[0, 768, 1024], AD_COLOR_MODE_RGB1, "P:").unwrap(),
-            vec![3, 768, 1024]
+            info(&[0, 768, 1024], "UInt8", AD_COLOR_MODE_RGB1),
+            Ok((vec![3, 768, 1024], "|u1".into()))
         );
-        // Any other non-Mono color mode is unsupported.
-        let err = compose_frame_shape(&[0, 768, 1024], "Bayer", "P:")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("ColorMode_RBV=Bayer"), "{err}");
+        // Any other color mode is unsupported.
+        assert_eq!(
+            info(&[0, 768, 1024], "UInt8", "Bayer"),
+            Err("Unsupported ColorMode Bayer! Only Mono and RGB1 are supported.".into())
+        );
+        // A blank data type is refused first, whatever the color mode.
+        assert_eq!(
+            info(&[0, 768, 1024], "", "Bayer"),
+            Err("ca://P:DataType_RBV is blank, this is not supported".into())
+        );
     }
 
     #[test]
