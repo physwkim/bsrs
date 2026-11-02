@@ -641,12 +641,19 @@ async fn connect_all_connects_every_child_concurrently() {
 }
 
 // ophyd-async test_device::test_wait_for_connection_propagates_error: one
-// failing child fails the device while its siblings still finish connecting.
+// failing child fails the device while its siblings still finish connecting,
+// and the error names the failed child (test_utils NotConnectedError output).
 #[tokio::test(start_paused = true)]
 async fn connect_all_propagates_child_failure_after_attempting_all() {
     let stage = MixedStage::new("M");
     let err = stage.connect_all(Duration::from_secs(1)).await.unwrap_err();
-    assert!(err.to_string().contains("M:FAIL"), "{err}");
+    assert_eq!(
+        err.to_string(),
+        "not connected:\n\
+         bad:\n    \
+         setpoint: backend error: cannot connect M:FAIL.VAL\n    \
+         readback: backend error: cannot connect M:FAIL.RBV"
+    );
     assert_axis_connected(&stage.ok).await;
     assert!(stage.bad.readback.get().await.is_err());
 
@@ -655,9 +662,48 @@ async fn connect_all_propagates_child_failure_after_attempting_all() {
     vec.insert(1, healthy.clone());
     vec.insert(2, MixedStage::new("N"));
     let err = vec.connect_all(Duration::from_secs(1)).await.unwrap_err();
-    assert!(err.to_string().contains("N:FAIL"), "{err}");
+    assert_eq!(
+        err.to_string(),
+        "not connected:\n\
+         2:\n    \
+         bad:\n        \
+         setpoint: backend error: cannot connect N:FAIL.VAL\n        \
+         readback: backend error: cannot connect N:FAIL.RBV"
+    );
     assert_axis_connected(&healthy.x).await;
     assert_axis_connected(&healthy.y).await;
+}
+
+#[derive(Device)]
+struct SignalAndSubDevice {
+    name: String,
+    #[signal(rw, "{prefix}:FAIL")]
+    timeout_signal: SignalRW<f64, ProbeBackend>,
+    #[device("{prefix}:FAIL")]
+    sub_device: Arc<ProbeAxis>,
+}
+
+// ophyd-async test_utils::test_combining_top_level_signal_and_child_device
+// and test_introspecting_sub_errors: a failed signal and a failed sub-device
+// are both named, in field order, the sub-device's own failures nested.
+#[tokio::test(start_paused = true)]
+async fn connect_all_names_failed_signals_and_sub_devices_in_field_order() {
+    let dev = SignalAndSubDevice::new("C");
+    let err = dev.connect_all(Duration::from_secs(1)).await.unwrap_err();
+    let BsrsError::NotConnected(children) = &err else {
+        panic!("{err:?}");
+    };
+    let names: Vec<&str> = children.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["timeout_signal", "sub_device"]);
+    assert!(matches!(children[1].1, BsrsError::NotConnected(ref sub) if sub.len() == 2));
+    assert_eq!(
+        err.to_string(),
+        "not connected:\n\
+         timeout_signal: backend error: cannot connect C:FAIL\n\
+         sub_device:\n    \
+         setpoint: backend error: cannot connect C:FAIL.VAL\n    \
+         readback: backend error: cannot connect C:FAIL.RBV"
+    );
 }
 
 fn async_readable<T: AsyncReadable + ?Sized>() {}

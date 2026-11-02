@@ -95,6 +95,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Breaking**: `#[derive(Device)]` parses `#[signal]`/`#[device]` with
   `syn`; an unknown role, key or kind is a compile error instead of
   `Kind::Normal`.
+- **Breaking**: a failed connect is `BsrsError::NotConnected`, naming every
+  child that failed by field and nesting each sub-device's own failures, as
+  ophyd-async's `NotConnectedError`, in place of the first child's error.
+  `#[derive(Device)]` `connect_all`, `DeviceVector::connect_all`,
+  `StandardDetector::connect`, the areaDetector cam and plugins and the CA
+  and PVA motors' setpoint and readback report it, through
+  `devices::wait_for_connection` (ophyd-async `wait_for_connection`).
 - **Breaking**: `EpicsCaBackend::new` and `EpicsPvaBackend::new` take only
   `f64`, `i64`, `bool`, `String` and a `Vec` of the waveform's own element
   type, as ophyd-async's `Array1D`/`Sequence[str]` (`i16`, `f32`, `u8`,

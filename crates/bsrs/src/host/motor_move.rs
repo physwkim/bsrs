@@ -9,7 +9,7 @@ use tokio::sync::watch;
 
 use crate::core::error::{BsrsError, Result};
 use crate::core::status::{Status, StatusError, WatcherUpdate};
-use crate::devices::{BackendFromPv, SignalCache};
+use crate::devices::{wait_for_connection, BackendFromPv, SignalCache};
 use crate::event_model::{DataKey, LimitsRange};
 use crate::protocols_async::{PutCompletion, SignalBackend};
 
@@ -314,9 +314,11 @@ impl<B: MotorBackend> MotorChannels<B> {
             dhlm: B::from_pv(&format!("{record}.DHLM")),
         };
         let t = Duration::from_secs(5);
-        let (sp, rb, velo, accl, dmov, stop, set, llm, hlm, dllm, dhlm) = tokio::join!(
-            setpoint.connect(t),
-            readback.connect(t),
+        let (required, velo, accl, dmov, stop, set, llm, hlm, dllm, dhlm) = tokio::join!(
+            wait_for_connection([
+                ("setpoint", setpoint.connect(t)),
+                ("readback", readback.connect(t)),
+            ]),
             timing.velo.connect(t),
             timing.accl.connect(t),
             SignalBackend::<i64>::connect(&button.dmov, t),
@@ -327,8 +329,7 @@ impl<B: MotorBackend> MotorChannels<B> {
             limits.dllm.connect(t),
             limits.dhlm.connect(t),
         );
-        sp?;
-        rb?;
+        required?;
         let timing = match velo.and(accl) {
             Ok(()) => Some(timing),
             Err(e) => {

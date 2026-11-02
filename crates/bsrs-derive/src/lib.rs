@@ -6,7 +6,7 @@
 //!   fields, builds each `Signal<T, B>` with the resolved PV name, and
 //!   `#[device("subprefix")]` fields by recursively calling `Sub::new`.
 //! - `MyDevice::connect_all(timeout) -> Result<()>` — concurrently connects
-//!   every signal via `try_join_all`.
+//!   every signal and sub-device via `wait_for_connection`.
 //! - `MyDevice::name() -> &str` — the prefix passed to `new`.
 //!
 //! Field attribute syntax:
@@ -64,6 +64,8 @@ pub fn derive_device(input: TokenStream) -> TokenStream {
     let mut field_inits: Vec<TokenStream2> = Vec::new();
     let mut field_inits_named: Vec<TokenStream2> = Vec::new();
     let mut connect_calls: Vec<TokenStream2> = Vec::new();
+    // The field name each `connect_calls` entry reports a failure under.
+    let mut connect_names: Vec<String> = Vec::new();
     // Per-field `(dotted_path, source)` pushes for `Device::walk_signal_sources`
     // (CP-20). Same field walk as `connect_calls`: a `#[signal]` field pushes
     // its prefixed name + transport source; a `#[device]` field recurses.
@@ -119,6 +121,7 @@ pub fn derive_device(input: TokenStream) -> TokenStream {
             connect_calls.push(quote! {
                 ::bsrs::devices::__derive::connect_signal(&self.#id, timeout)
             });
+            connect_names.push(id_str.clone());
             walk_pushes.push(quote! {
                 out.push((::std::format!("{}{}", prefix, #id_str), self.#id.source()));
             });
@@ -143,6 +146,7 @@ pub fn derive_device(input: TokenStream) -> TokenStream {
             connect_calls.push(quote! {
                 ::std::boxed::Box::pin(async move { self.#id.connect_all(timeout).await })
             });
+            connect_names.push(id_str.clone());
             walk_pushes.push(quote! {
                 ::bsrs::devices::Device::walk_signal_sources(
                     &self.#id,
@@ -175,13 +179,13 @@ pub fn derive_device(input: TokenStream) -> TokenStream {
         quote! { Ok(()) }
     } else {
         quote! {
-            ::bsrs::devices::__derive::try_join_all_connects(vec![
-                #( ::std::boxed::Box::pin(#connect_calls)
+            ::bsrs::devices::wait_for_connection([
+                #( (#connect_names, ::std::boxed::Box::pin(#connect_calls)
                     as ::std::pin::Pin<::std::boxed::Box<
                         dyn ::std::future::Future<Output = ::bsrs::core::error::Result<()>>
                             + ::std::marker::Send
                             + '_
-                    >>, )*
+                    >>), )*
             ]).await
         }
     };
@@ -213,7 +217,9 @@ pub fn derive_device(input: TokenStream) -> TokenStream {
                 &self.name
             }
 
-            /// Connect every signal concurrently.
+            /// Connect every signal and sub-device concurrently; a failure
+            /// names every field that failed
+            /// ([`NotConnected`](::bsrs::core::error::BsrsError::NotConnected)).
             pub async fn connect_all(
                 &self,
                 timeout: ::std::time::Duration,

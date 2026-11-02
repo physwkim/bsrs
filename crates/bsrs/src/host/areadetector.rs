@@ -40,7 +40,7 @@ use crate::core::status::{Status, StatusError, SubToken};
 use crate::devices::device::Device;
 use crate::devices::signal::{Read, Readable, Signal};
 use crate::devices::stage_sigs::StageSigs;
-use crate::devices::StandardDetector;
+use crate::devices::{wait_for_connection, StandardDetector};
 use crate::event_model::{DataKey, Dtype, StreamDatum, StreamRange, StreamResource};
 use crate::protocols_async::{
     DetectorControl, DetectorTrigger, DetectorWriter, SignalBackend, SingleDataLogic, StreamAsset,
@@ -254,20 +254,17 @@ impl NdArrayDescription {
     }
 
     async fn connect(&self, timeout: Duration) -> Result<()> {
-        let shape = futures::future::try_join_all(
-            self.shape
-                .iter()
-                .map(|s| SignalBackend::<i64>::connect(s.as_ref(), timeout)),
-        );
-        let (a, b, c) = tokio::join!(
-            shape,
-            SignalBackend::<String>::connect(self.data_type.as_ref(), timeout),
-            SignalBackend::<String>::connect(self.color_mode.as_ref(), timeout),
-        );
-        a?;
-        b?;
-        c?;
-        Ok(())
+        let shape = self.shape.iter().enumerate().map(|(i, s)| {
+            let connect = SignalBackend::<i64>::connect(s.as_ref(), timeout);
+            (format!("shape[{i}]"), connect)
+        });
+        let data_type = SignalBackend::<String>::connect(self.data_type.as_ref(), timeout);
+        let color_mode = SignalBackend::<String>::connect(self.color_mode.as_ref(), timeout);
+        wait_for_connection(shape.chain([
+            ("data_type".to_string(), data_type),
+            ("color_mode".to_string(), color_mode),
+        ]))
+        .await
     }
 }
 
@@ -382,35 +379,61 @@ impl AreaDetectorCam {
 
     /// Connect every channel in parallel.
     pub async fn connect(&self, timeout: Duration) -> Result<()> {
-        let (a, b, c, d, e, f, g, h, i, j, k, l, m) = tokio::join!(
-            SignalBackend::<String>::connect(self.image_mode.as_ref(), timeout),
-            SignalBackend::<i64>::connect(self.num_images.as_ref(), timeout),
-            SignalBackend::<bool>::connect(self.acquire.as_ref(), timeout),
-            SignalBackend::<bool>::connect(self.acquire_rbv.as_ref(), timeout),
-            SignalBackend::<f64>::connect(self.acquire_time.as_ref(), timeout),
-            SignalBackend::<f64>::connect(self.acquire_period.as_ref(), timeout),
-            SignalBackend::<f64>::connect(self.acquire_time_rbv.as_ref(), timeout),
-            SignalBackend::<f64>::connect(self.acquire_period_rbv.as_ref(), timeout),
-            SignalBackend::<i64>::connect(self.array_counter_rbv.as_ref(), timeout),
-            SignalBackend::<String>::connect(self.detector_state_rbv.as_ref(), timeout),
-            SignalBackend::<String>::connect(self.nd_attributes_file.as_ref(), timeout),
-            SignalBackend::<bool>::connect(self.wait_for_plugins.as_ref(), timeout),
-            self.frame_info.connect(timeout),
-        );
-        a?;
-        b?;
-        c?;
-        d?;
-        e?;
-        f?;
-        g?;
-        h?;
-        i?;
-        j?;
-        k?;
-        l?;
-        m?;
-        Ok(())
+        wait_for_connection([
+            (
+                "image_mode",
+                SignalBackend::<String>::connect(self.image_mode.as_ref(), timeout),
+            ),
+            (
+                "num_images",
+                SignalBackend::<i64>::connect(self.num_images.as_ref(), timeout),
+            ),
+            (
+                "acquire",
+                SignalBackend::<bool>::connect(self.acquire.as_ref(), timeout),
+            ),
+            (
+                "acquire_rbv",
+                SignalBackend::<bool>::connect(self.acquire_rbv.as_ref(), timeout),
+            ),
+            (
+                "acquire_time",
+                SignalBackend::<f64>::connect(self.acquire_time.as_ref(), timeout),
+            ),
+            (
+                "acquire_period",
+                SignalBackend::<f64>::connect(self.acquire_period.as_ref(), timeout),
+            ),
+            (
+                "acquire_time_rbv",
+                SignalBackend::<f64>::connect(self.acquire_time_rbv.as_ref(), timeout),
+            ),
+            (
+                "acquire_period_rbv",
+                SignalBackend::<f64>::connect(self.acquire_period_rbv.as_ref(), timeout),
+            ),
+            (
+                "array_counter_rbv",
+                SignalBackend::<i64>::connect(self.array_counter_rbv.as_ref(), timeout),
+            ),
+            (
+                "detector_state_rbv",
+                SignalBackend::<String>::connect(self.detector_state_rbv.as_ref(), timeout),
+            ),
+            (
+                "nd_attributes_file",
+                SignalBackend::<String>::connect(self.nd_attributes_file.as_ref(), timeout),
+            ),
+            (
+                "wait_for_plugins",
+                SignalBackend::<bool>::connect(self.wait_for_plugins.as_ref(), timeout),
+            ),
+            (
+                "frame_info",
+                futures::FutureExt::boxed(self.frame_info.connect(timeout)),
+            ),
+        ])
+        .await
     }
 
     /// The descriptor `configuration` signals, as ophyd-async `AreaDetector`
@@ -572,17 +595,25 @@ impl NdPlugin {
 
     /// Connect all four channels.
     pub async fn connect(&self, timeout: Duration) -> Result<()> {
-        let (a, b, c, d) = tokio::join!(
-            SignalBackend::<bool>::connect(self.enable_callbacks.as_ref(), timeout),
-            SignalBackend::<bool>::connect(self.blocking_callbacks.as_ref(), timeout),
-            SignalBackend::<String>::connect(self.nd_array_port.as_ref(), timeout),
-            SignalBackend::<i64>::connect(self.queue_size.as_ref(), timeout),
-        );
-        a?;
-        b?;
-        c?;
-        d?;
-        Ok(())
+        wait_for_connection([
+            (
+                "enable_callbacks",
+                SignalBackend::<bool>::connect(self.enable_callbacks.as_ref(), timeout),
+            ),
+            (
+                "blocking_callbacks",
+                SignalBackend::<bool>::connect(self.blocking_callbacks.as_ref(), timeout),
+            ),
+            (
+                "nd_array_port",
+                SignalBackend::<String>::connect(self.nd_array_port.as_ref(), timeout),
+            ),
+            (
+                "queue_size",
+                SignalBackend::<i64>::connect(self.queue_size.as_ref(), timeout),
+            ),
+        ])
+        .await
     }
 
     /// Set `EnableCallbacks`.
@@ -716,40 +747,65 @@ impl NdFile {
 
     /// Connect plugin base + every file-specific channel.
     pub async fn connect(&self, timeout: Duration) -> Result<()> {
-        let p = self.plugin.connect(timeout);
-        let (a, b, c, d, e, f, g, h, i, j) = tokio::join!(
-            p,
-            SignalBackend::<String>::connect(self.file_path.as_ref(), timeout),
-            SignalBackend::<String>::connect(self.file_name.as_ref(), timeout),
-            SignalBackend::<String>::connect(self.file_template.as_ref(), timeout),
-            SignalBackend::<bool>::connect(self.auto_increment.as_ref(), timeout),
-            SignalBackend::<String>::connect(self.file_write_mode.as_ref(), timeout),
-            SignalBackend::<bool>::connect(self.capture.as_ref(), timeout),
-            SignalBackend::<i64>::connect(self.num_capture.as_ref(), timeout),
-            SignalBackend::<i64>::connect(self.num_captured_rbv.as_ref(), timeout),
-            SignalBackend::<String>::connect(self.full_file_name_rbv.as_ref(), timeout),
-        );
-        a?;
-        b?;
-        c?;
-        d?;
-        e?;
-        f?;
-        g?;
-        h?;
-        i?;
-        j?;
-        let (k, l, m, n) = tokio::join!(
-            SignalBackend::<i64>::connect(self.file_number.as_ref(), timeout),
-            SignalBackend::<bool>::connect(self.file_path_exists_rbv.as_ref(), timeout),
-            SignalBackend::<i64>::connect(self.create_directory.as_ref(), timeout),
-            SignalBackend::<bool>::connect(self.capture_rbv.as_ref(), timeout),
-        );
-        k?;
-        l?;
-        m?;
-        n?;
-        Ok(())
+        wait_for_connection([
+            (
+                "plugin",
+                futures::FutureExt::boxed(self.plugin.connect(timeout)),
+            ),
+            (
+                "file_path",
+                SignalBackend::<String>::connect(self.file_path.as_ref(), timeout),
+            ),
+            (
+                "file_name",
+                SignalBackend::<String>::connect(self.file_name.as_ref(), timeout),
+            ),
+            (
+                "file_template",
+                SignalBackend::<String>::connect(self.file_template.as_ref(), timeout),
+            ),
+            (
+                "auto_increment",
+                SignalBackend::<bool>::connect(self.auto_increment.as_ref(), timeout),
+            ),
+            (
+                "file_write_mode",
+                SignalBackend::<String>::connect(self.file_write_mode.as_ref(), timeout),
+            ),
+            (
+                "capture",
+                SignalBackend::<bool>::connect(self.capture.as_ref(), timeout),
+            ),
+            (
+                "num_capture",
+                SignalBackend::<i64>::connect(self.num_capture.as_ref(), timeout),
+            ),
+            (
+                "num_captured_rbv",
+                SignalBackend::<i64>::connect(self.num_captured_rbv.as_ref(), timeout),
+            ),
+            (
+                "full_file_name_rbv",
+                SignalBackend::<String>::connect(self.full_file_name_rbv.as_ref(), timeout),
+            ),
+            (
+                "file_number",
+                SignalBackend::<i64>::connect(self.file_number.as_ref(), timeout),
+            ),
+            (
+                "file_path_exists_rbv",
+                SignalBackend::<bool>::connect(self.file_path_exists_rbv.as_ref(), timeout),
+            ),
+            (
+                "create_directory",
+                SignalBackend::<i64>::connect(self.create_directory.as_ref(), timeout),
+            ),
+            (
+                "capture_rbv",
+                SignalBackend::<bool>::connect(self.capture_rbv.as_ref(), timeout),
+            ),
+        ])
+        .await
     }
 
     /// Set `FilePath` — directory the writer drops files into.
@@ -964,27 +1020,45 @@ impl NdFileHdf5 {
 
     /// Connect the embedded file plugin + the HDF5-specific channels.
     pub async fn connect(&self, timeout: Duration) -> Result<()> {
-        let (a, b, c, d, e, f, g, h, i) = tokio::join!(
-            self.file.connect(timeout),
-            SignalBackend::<i64>::connect(self.num_frames_chunks.as_ref(), timeout),
-            SignalBackend::<i64>::connect(self.num_frames_chunks_rbv.as_ref(), timeout),
-            SignalBackend::<bool>::connect(self.chunk_size_auto.as_ref(), timeout),
-            SignalBackend::<bool>::connect(self.lazy_open.as_ref(), timeout),
-            SignalBackend::<bool>::connect(self.swmr_mode.as_ref(), timeout),
-            SignalBackend::<i64>::connect(self.num_extra_dims.as_ref(), timeout),
-            SignalBackend::<String>::connect(self.xml_file_name.as_ref(), timeout),
-            SignalBackend::<bool>::connect(self.flush_now.as_ref(), timeout),
-        );
-        a?;
-        b?;
-        c?;
-        d?;
-        e?;
-        f?;
-        g?;
-        h?;
-        i?;
-        Ok(())
+        wait_for_connection([
+            (
+                "file",
+                futures::FutureExt::boxed(self.file.connect(timeout)),
+            ),
+            (
+                "num_frames_chunks",
+                SignalBackend::<i64>::connect(self.num_frames_chunks.as_ref(), timeout),
+            ),
+            (
+                "num_frames_chunks_rbv",
+                SignalBackend::<i64>::connect(self.num_frames_chunks_rbv.as_ref(), timeout),
+            ),
+            (
+                "chunk_size_auto",
+                SignalBackend::<bool>::connect(self.chunk_size_auto.as_ref(), timeout),
+            ),
+            (
+                "lazy_open",
+                SignalBackend::<bool>::connect(self.lazy_open.as_ref(), timeout),
+            ),
+            (
+                "swmr_mode",
+                SignalBackend::<bool>::connect(self.swmr_mode.as_ref(), timeout),
+            ),
+            (
+                "num_extra_dims",
+                SignalBackend::<i64>::connect(self.num_extra_dims.as_ref(), timeout),
+            ),
+            (
+                "xml_file_name",
+                SignalBackend::<String>::connect(self.xml_file_name.as_ref(), timeout),
+            ),
+            (
+                "flush_now",
+                SignalBackend::<bool>::connect(self.flush_now.as_ref(), timeout),
+            ),
+        ])
+        .await
     }
 
     /// The HDF5-specific arming puts of ophyd-async's `prepare_unbounded`
@@ -1115,22 +1189,33 @@ impl NdStats {
 
     /// Connect plugin base + every stats-compute channel.
     pub async fn connect(&self, timeout: Duration) -> Result<()> {
-        let p = self.plugin.connect(timeout);
-        let (a, b, c, d, e, f) = tokio::join!(
-            p,
-            SignalBackend::<bool>::connect(self.compute_statistics.as_ref(), timeout),
-            SignalBackend::<bool>::connect(self.compute_centroid.as_ref(), timeout),
-            SignalBackend::<bool>::connect(self.compute_profiles.as_ref(), timeout),
-            SignalBackend::<bool>::connect(self.compute_histogram.as_ref(), timeout),
-            SignalBackend::<f64>::connect(self.total.as_ref(), timeout),
-        );
-        a?;
-        b?;
-        c?;
-        d?;
-        e?;
-        f?;
-        Ok(())
+        wait_for_connection([
+            (
+                "plugin",
+                futures::FutureExt::boxed(self.plugin.connect(timeout)),
+            ),
+            (
+                "compute_statistics",
+                SignalBackend::<bool>::connect(self.compute_statistics.as_ref(), timeout),
+            ),
+            (
+                "compute_centroid",
+                SignalBackend::<bool>::connect(self.compute_centroid.as_ref(), timeout),
+            ),
+            (
+                "compute_profiles",
+                SignalBackend::<bool>::connect(self.compute_profiles.as_ref(), timeout),
+            ),
+            (
+                "compute_histogram",
+                SignalBackend::<bool>::connect(self.compute_histogram.as_ref(), timeout),
+            ),
+            (
+                "total",
+                SignalBackend::<f64>::connect(self.total.as_ref(), timeout),
+            ),
+        ])
+        .await
     }
 
     /// `EnableCallbacks = true` AND `ComputeStatistics = true`. Other
@@ -1204,28 +1289,45 @@ impl NdRoi {
 
     /// Connect plugin base + every ROI channel.
     pub async fn connect(&self, timeout: Duration) -> Result<()> {
-        let p = self.plugin.connect(timeout);
-        let (a, b, c, d, e, f, g, h, i) = tokio::join!(
-            p,
-            SignalBackend::<i64>::connect(self.min_x.as_ref(), timeout),
-            SignalBackend::<i64>::connect(self.min_y.as_ref(), timeout),
-            SignalBackend::<i64>::connect(self.size_x.as_ref(), timeout),
-            SignalBackend::<i64>::connect(self.size_y.as_ref(), timeout),
-            SignalBackend::<i64>::connect(self.size_x_rbv.as_ref(), timeout),
-            SignalBackend::<i64>::connect(self.size_y_rbv.as_ref(), timeout),
-            SignalBackend::<bool>::connect(self.enable_x.as_ref(), timeout),
-            SignalBackend::<bool>::connect(self.enable_y.as_ref(), timeout),
-        );
-        a?;
-        b?;
-        c?;
-        d?;
-        e?;
-        f?;
-        g?;
-        h?;
-        i?;
-        Ok(())
+        wait_for_connection([
+            (
+                "plugin",
+                futures::FutureExt::boxed(self.plugin.connect(timeout)),
+            ),
+            (
+                "min_x",
+                SignalBackend::<i64>::connect(self.min_x.as_ref(), timeout),
+            ),
+            (
+                "min_y",
+                SignalBackend::<i64>::connect(self.min_y.as_ref(), timeout),
+            ),
+            (
+                "size_x",
+                SignalBackend::<i64>::connect(self.size_x.as_ref(), timeout),
+            ),
+            (
+                "size_y",
+                SignalBackend::<i64>::connect(self.size_y.as_ref(), timeout),
+            ),
+            (
+                "size_x_rbv",
+                SignalBackend::<i64>::connect(self.size_x_rbv.as_ref(), timeout),
+            ),
+            (
+                "size_y_rbv",
+                SignalBackend::<i64>::connect(self.size_y_rbv.as_ref(), timeout),
+            ),
+            (
+                "enable_x",
+                SignalBackend::<bool>::connect(self.enable_x.as_ref(), timeout),
+            ),
+            (
+                "enable_y",
+                SignalBackend::<bool>::connect(self.enable_y.as_ref(), timeout),
+            ),
+        ])
+        .await
     }
 
     /// Set the four ROI bounds at once.

@@ -12,7 +12,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::core::error::Result;
+use crate::core::error::{BsrsError, Result};
 
 /// Object-safe device interface: a stable name plus connect-all.
 ///
@@ -166,17 +166,36 @@ impl<D: Device> DeviceVector<D> {
         self.children.iter().map(|(k, v)| (k.to_string(), v))
     }
 
-    /// Connect every child concurrently.
+    /// Connect every child concurrently; a failure names every child that
+    /// failed by its key.
     pub async fn connect_all(&self, timeout: Duration) -> Result<()> {
-        let futs: Vec<_> = self
-            .children
-            .values()
-            .map(|d| d.connect_all_boxed(timeout))
-            .collect();
-        for r in futures::future::join_all(futs).await {
-            r?;
-        }
+        wait_for_connection(
+            self.children
+                .iter()
+                .map(|(k, d)| (k.to_string(), d.connect_all_boxed(timeout))),
+        )
+        .await
+    }
+}
+
+/// Run every named connect concurrently, then fail with
+/// [`BsrsError::NotConnected`] naming each one that failed, in the order
+/// given: ophyd-async `wait_for_connection`.
+pub async fn wait_for_connection<N, F>(connects: impl IntoIterator<Item = (N, F)>) -> Result<()>
+where
+    N: Into<String>,
+    F: Future<Output = Result<()>>,
+{
+    let (names, futs): (Vec<N>, Vec<F>) = connects.into_iter().unzip();
+    let failed: Vec<(String, BsrsError)> = names
+        .into_iter()
+        .zip(futures::future::join_all(futs).await)
+        .filter_map(|(name, r)| r.err().map(|e| (name.into(), e)))
+        .collect();
+    if failed.is_empty() {
         Ok(())
+    } else {
+        Err(BsrsError::NotConnected(failed))
     }
 }
 

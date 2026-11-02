@@ -31,6 +31,11 @@ pub enum BsrsError {
     /// `_connect_task`.
     #[error(transparent)]
     Connect(std::sync::Arc<BsrsError>),
+    /// Every child of a device that failed to connect, by child name, in
+    /// connect order: ophyd-async `NotConnectedError` with `sub_errors`. A
+    /// child that is itself a device nests its own `NotConnected`.
+    #[error("not connected:{}", NotConnectedTree(.0, ""))]
+    NotConnected(Vec<(String, BsrsError)>),
     /// Cancellation was requested.
     #[error("cancelled")]
     Cancelled,
@@ -69,6 +74,27 @@ pub enum BsrsError {
 
 /// Type alias for bsrs results.
 pub type Result<T, E = BsrsError> = std::result::Result<T, E>;
+
+/// `NotConnected`'s children, one per line at `indent`, a nested device's
+/// own children four spaces further in, as ophyd-async `format_error_string`.
+struct NotConnectedTree<'a>(&'a [(String, BsrsError)], &'a str);
+
+impl std::fmt::Display for NotConnectedTree<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let NotConnectedTree(children, indent) = *self;
+        for (name, err) in children {
+            match err {
+                BsrsError::NotConnected(sub) => {
+                    write!(f, "\n{indent}{name}:")?;
+                    let deeper = format!("{indent}    ");
+                    NotConnectedTree(sub, &deeper).fmt(f)?;
+                }
+                _ => write!(f, "\n{indent}{name}: {err}")?,
+            }
+        }
+        Ok(())
+    }
+}
 
 /// An interrupt the engine throws into the running plan so its contingency
 /// regions unwind — bluesky's `RequestStop` / `RequestAbort`. `halt` is not
@@ -109,5 +135,56 @@ impl From<&str> for BsrsError {
 impl From<String> for BsrsError {
     fn from(s: String) -> Self {
         BsrsError::Other(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BsrsError::{self, Backend, InvalidValue, NotConnected};
+
+    fn child(name: &str, err: BsrsError) -> (String, BsrsError) {
+        (name.to_string(), err)
+    }
+
+    /// ophyd-async test_utils::test_not_connected_error_output and the
+    /// `init_devices` case of test_combining_top_level_signal_and_child_device:
+    /// one line per failed child, each nested device four spaces further in.
+    #[test]
+    fn not_connected_lists_every_failed_child_nested_by_device() {
+        let err = NotConnected(vec![
+            child(
+                "timeout_child_device_ca",
+                NotConnected(vec![child(
+                    "timeout_signal",
+                    Backend("ca://A_NON_EXISTENT_SIGNAL".into()),
+                )]),
+            ),
+            child(
+                "dummy_device2",
+                NotConnected(vec![
+                    child(
+                        "timeout_signal",
+                        Backend("ca://A_NON_EXISTENT_SIGNAL".into()),
+                    ),
+                    child(
+                        "sub_device",
+                        NotConnected(vec![child(
+                            "value_error_signal",
+                            InvalidValue("Some ValueError text".into()),
+                        )]),
+                    ),
+                ]),
+            ),
+        ]);
+        assert_eq!(
+            err.to_string(),
+            "not connected:\n\
+             timeout_child_device_ca:\n    \
+             timeout_signal: backend error: ca://A_NON_EXISTENT_SIGNAL\n\
+             dummy_device2:\n    \
+             timeout_signal: backend error: ca://A_NON_EXISTENT_SIGNAL\n    \
+             sub_device:\n        \
+             value_error_signal: invalid value: Some ValueError text"
+        );
     }
 }

@@ -8,7 +8,7 @@ use crate::core::msg::{
 };
 use crate::core::reading::ReadingValue;
 use crate::core::status::Status;
-use crate::devices::device::Device;
+use crate::devices::device::{wait_for_connection, Device};
 use crate::event_model::DataKey;
 use crate::protocols_async::{
     DetectorControl, DetectorWriter, Flyable, Preparable, SingleDataLogic, Stageable, StreamAsset,
@@ -16,6 +16,7 @@ use crate::protocols_async::{
 };
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
+use futures::FutureExt;
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -144,16 +145,28 @@ where
     }
 
     /// Connect the control, every writer and every plugin, as ophyd-async
-    /// connects a detector's children.
+    /// connects a detector's children. A failure names each one that failed:
+    /// `control`, `data_logics` by position, `plugins` by position.
     pub async fn connect(&self, timeout: std::time::Duration) -> Result<()> {
-        futures::try_join!(
-            self.control.connect(timeout),
-            futures::future::try_join_all(self.writers().map(|w| w.connect(timeout))),
-            futures::future::try_join_all(
-                self.plugins.iter().map(|p| p.connect_all_boxed(timeout))
-            ),
-        )?;
-        Ok(())
+        let writers = self
+            .data_logics
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| match l {
+                DataLogic::Unbounded(w) => Some((i.to_string(), w.connect(timeout))),
+                DataLogic::Single(_) => None,
+            });
+        let plugins = self
+            .plugins
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i.to_string(), p.connect_all_boxed(timeout)));
+        wait_for_connection([
+            ("control", self.control.connect(timeout)),
+            ("data_logics", wait_for_connection(writers).boxed()),
+            ("plugins", wait_for_connection(plugins).boxed()),
+        ])
+        .await
     }
 
     fn writers(&self) -> impl Iterator<Item = &Arc<dyn DetectorWriter>> {
@@ -930,19 +943,31 @@ mod tests {
     }
 
     /// ophyd-async `AreaDetector(plugins=...)`: an added plugin is connected
-    /// with the detector, and its failure is the detector's.
+    /// with the detector, and its failure is the detector's, named under
+    /// `plugins` by position.
     #[tokio::test]
     async fn connect_connects_every_plugin() {
         for fails in [false, true] {
             let (mut det, _, _) = detector();
             let connects = Arc::new(AtomicU64::new(0));
-            det.add_plugin(Arc::new(FakePlugin {
-                connects: connects.clone(),
-                fails,
-            }));
+            for _ in 0..2 {
+                det.add_plugin(Arc::new(FakePlugin {
+                    connects: connects.clone(),
+                    fails,
+                }));
+            }
             let connected = det.connect(Duration::from_secs(1)).await;
-            assert_eq!(connects.load(Ordering::SeqCst), 1);
-            assert_eq!(connected.is_err(), fails, "{connected:?}");
+            assert_eq!(connects.load(Ordering::SeqCst), 2);
+            match connected {
+                Ok(()) => assert!(!fails),
+                Err(e) => assert_eq!(
+                    e.to_string(),
+                    "not connected:\n\
+                     plugins:\n    \
+                     0: backend error: roi1 not connected\n    \
+                     1: backend error: roi1 not connected"
+                ),
+            }
         }
     }
 
