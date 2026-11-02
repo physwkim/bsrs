@@ -35,10 +35,17 @@ pub enum DataLogic {
 }
 
 impl DataLogic {
-    fn hinted_fields(&self) -> Vec<String> {
+    fn hinted_fields(&self, datakey_name: &str) -> Vec<String> {
         match self {
-            Self::Unbounded(w) => w.hinted_fields(),
-            Self::Single(s) => s.hinted_fields(),
+            Self::Unbounded(w) => w.hinted_fields(datakey_name),
+            Self::Single(s) => s.hinted_fields(datakey_name),
+        }
+    }
+
+    fn datakey_suffix(&self) -> &str {
+        match self {
+            Self::Unbounded(w) => w.datakey_suffix(),
+            Self::Single(s) => s.datakey_suffix(),
         }
     }
 
@@ -137,6 +144,12 @@ where
             DataLogic::Unbounded(w) => Some(w),
             DataLogic::Single(_) => None,
         })
+    }
+
+    /// ophyd-async `self.name + dl.datakey_suffix`: the detector names the
+    /// data key of each of its data logics.
+    fn datakey_name(&self, logic: &DataLogic) -> String {
+        format!("{}{}", self.name, logic.datakey_suffix())
     }
 
     /// ophyd-async `_get_collections_written` with `_all_the_same`: what
@@ -252,12 +265,20 @@ where
         info: &TriggerInfo,
     ) -> Result<(HashMap<String, DataKey>, Vec<Arc<dyn SingleDataLogic>>)> {
         let collections = info.number_of_collections();
+        let per_event = info.collections_per_event;
         let mut opens = Vec::new();
         let mut singles = Vec::new();
+        let mut single_prepares = Vec::new();
         for logic in &self.data_logics {
+            let datakey_name = self.datakey_name(logic);
             match logic {
-                DataLogic::Unbounded(w) => opens.push(w.open(info.collections_per_event)),
-                DataLogic::Single(s) if collections == 1 => singles.push(s.clone()),
+                DataLogic::Unbounded(w) => {
+                    opens.push(async move { w.open(&datakey_name, per_event).await })
+                }
+                DataLogic::Single(s) if collections == 1 => {
+                    singles.push(s.clone());
+                    single_prepares.push(async move { s.prepare_single(&datakey_name).await });
+                }
                 DataLogic::Single(_) => tracing::warn!(
                     "{}: a single data logic only supports a single collection, but the \
                      detector was prepared for {collections} collections.",
@@ -267,7 +288,7 @@ where
         }
         let (keys, _) = futures::future::try_join(
             futures::future::try_join_all(opens),
-            futures::future::try_join_all(singles.iter().map(|s| s.prepare_single())),
+            futures::future::try_join_all(single_prepares),
         )
         .await?;
         Ok((keys.into_iter().flatten().collect(), singles))
@@ -527,9 +548,10 @@ where
 /// Helper to expose the writer's `data_keys` after `open`.
 pub async fn open_writer<W: DetectorWriter>(
     w: &W,
+    datakey_name: &str,
     multiplier: u32,
 ) -> Result<HashMap<String, DataKey>> {
-    w.open(multiplier).await
+    w.open(datakey_name, multiplier).await
 }
 
 // -- bridges from StandardDetector to engine `*Obj` traits --------------
@@ -679,7 +701,7 @@ where
         Some(
             self.data_logics
                 .iter()
-                .flat_map(DataLogic::hinted_fields)
+                .flat_map(|l| l.hinted_fields(&self.datakey_name(l)))
                 .collect(),
         )
     }
@@ -784,7 +806,11 @@ mod tests {
 
     #[async_trait]
     impl DetectorWriter for CountingWriter {
-        async fn open(&self, multiplier: u32) -> Result<HashMap<String, DataKey>> {
+        async fn open(
+            &self,
+            datakey_name: &str,
+            multiplier: u32,
+        ) -> Result<HashMap<String, DataKey>> {
             self.log.opens.lock().unwrap().push(multiplier);
             let key = DataKey {
                 source: "test://det".into(),
@@ -799,7 +825,7 @@ mod tests {
                 limits: None,
                 choices: None,
             };
-            Ok(HashMap::from([("det_image".to_string(), key)]))
+            Ok(HashMap::from([(datakey_name.to_string(), key)]))
         }
         fn observe_indices_written(&self) -> watch::Receiver<u64> {
             self.rx.clone()
@@ -906,7 +932,7 @@ mod tests {
         prepare_per_event(&det, 2, 2).await;
         assert_eq!(log.opens(), [2]);
         let keys = ReadableObj::describe_dyn(&det).await.unwrap();
-        assert_eq!(keys["det_image"].shape, [Some(2)]);
+        assert_eq!(keys["det"].shape, [Some(2)]);
 
         prepare_per_event(&det, 3, 2).await;
         assert_eq!(log.opens(), [2], "same collections_per_event reuses it");
@@ -938,7 +964,11 @@ mod tests {
 
     #[async_trait]
     impl DetectorWriter for ControlledWriter {
-        async fn open(&self, _multiplier: u32) -> Result<HashMap<String, DataKey>> {
+        async fn open(
+            &self,
+            _datakey_name: &str,
+            _multiplier: u32,
+        ) -> Result<HashMap<String, DataKey>> {
             Ok(HashMap::new())
         }
         fn observe_indices_written(&self) -> watch::Receiver<u64> {
@@ -1197,7 +1227,7 @@ mod tests {
 
     #[async_trait]
     impl SingleDataLogic for ReadableOnly {
-        async fn prepare_single(&self) -> Result<()> {
+        async fn prepare_single(&self, _datakey_name: &str) -> Result<()> {
             self.prepares.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -1213,7 +1243,7 @@ mod tests {
             let reading = ReadingValue::new(42.into(), 0.0);
             Ok(HashMap::from([("foo-value".to_string(), reading)]))
         }
-        fn hinted_fields(&self) -> Vec<String> {
+        fn hinted_fields(&self, _datakey_name: &str) -> Vec<String> {
             vec!["foo-value".into()]
         }
         async fn stop(&self) -> Result<()> {
@@ -1222,23 +1252,30 @@ mod tests {
         }
     }
 
-    /// ophyd-async test `StreamableOnlyDataLogic`: the DataKey `key`, an
-    /// index `rx` drives, and a `StreamResource` for `key` on every drain.
+    /// ophyd-async test `StreamableOnlyDataLogic`: the DataKey the detector
+    /// names, an index `rx` drives, and a `StreamResource` for that key on
+    /// every drain after an open.
     struct StreamableOnly {
-        key: &'static str,
+        suffix: &'static str,
         rx: watch::Receiver<u64>,
+        opened: std::sync::Mutex<Option<String>>,
     }
 
     #[async_trait]
     impl DetectorWriter for StreamableOnly {
-        async fn open(&self, multiplier: u32) -> Result<HashMap<String, DataKey>> {
+        async fn open(
+            &self,
+            datakey_name: &str,
+            multiplier: u32,
+        ) -> Result<HashMap<String, DataKey>> {
             let mut key = data_key(
                 "test://h5",
                 crate::event_model::Dtype::Array,
                 vec![multiplier.into(), 10, 15],
             );
             key.external = Some("STREAM:".into());
-            Ok(HashMap::from([(self.key.to_string(), key)]))
+            *self.opened.lock().unwrap() = Some(datakey_name.into());
+            Ok(HashMap::from([(datakey_name.to_string(), key)]))
         }
         fn observe_indices_written(&self) -> watch::Receiver<u64> {
             self.rx.clone()
@@ -1251,30 +1288,38 @@ mod tests {
             _up_to: u64,
             _descriptor: &str,
         ) -> BoxStream<'_, StreamAsset> {
-            let resource = crate::event_model::StreamResource {
-                uid: self.key.into(),
-                data_key: self.key.into(),
-                mimetype: "application/x-hdf5".into(),
-                uri: "test://h5".into(),
-                parameters: HashMap::new(),
-                run_start: None,
-            };
-            stream::iter([StreamAsset::Resource(resource)]).boxed()
+            let opened = self.opened.lock().unwrap().clone();
+            let resource = opened.map(|key| {
+                StreamAsset::Resource(crate::event_model::StreamResource {
+                    uid: key.clone(),
+                    data_key: key,
+                    mimetype: "application/x-hdf5".into(),
+                    uri: "test://h5".into(),
+                    parameters: HashMap::new(),
+                    run_start: None,
+                })
+            });
+            stream::iter(resource).boxed()
         }
         async fn close(&self) -> Result<()> {
             Ok(())
         }
-        fn hinted_fields(&self) -> Vec<String> {
-            vec![self.key.into()]
+        fn hinted_fields(&self, datakey_name: &str) -> Vec<String> {
+            vec![datakey_name.into()]
+        }
+        fn datakey_suffix(&self) -> &str {
+            self.suffix
         }
     }
 
-    fn streamable(key: &'static str) -> (DataLogic, watch::Sender<u64>) {
+    fn streamable(suffix: &'static str) -> (DataLogic, watch::Sender<u64>) {
         let (tx, rx) = watch::channel(0u64);
-        (
-            DataLogic::Unbounded(Arc::new(StreamableOnly { key, rx })),
-            tx,
-        )
+        let writer = StreamableOnly {
+            suffix,
+            rx,
+            opened: std::sync::Mutex::new(None),
+        };
+        (DataLogic::Unbounded(Arc::new(writer)), tx)
     }
 
     /// A detector over `logics`, and its count of `wait_for_idle`.
@@ -1296,12 +1341,13 @@ mod tests {
     #[tokio::test]
     async fn hints_join_every_data_logic_in_order() {
         // ophyd-async test_standard_detector.py:602.
-        let (writer, _tx) = streamable("bar");
+        let (writer, _tx) = streamable("");
+        let (roi, _tx) = streamable("-roi1");
         let single = DataLogic::Single(Arc::new(ReadableOnly::default()));
-        let (det, _) = with_logics("bar", vec![single, writer]);
+        let (det, _) = with_logics("bar", vec![single, writer, roi]);
         assert_eq!(
             ReadableObj::hint_fields(&det).unwrap(),
-            ["foo-value", "bar"]
+            ["foo-value", "bar", "bar-roi1"]
         );
     }
 
@@ -1354,7 +1400,7 @@ mod tests {
     #[tokio::test]
     async fn describe_joins_single_and_writer_keys_and_collect_only_writers() {
         // ophyd-async test_standard_detector.py:945.
-        let (writer, _tx) = streamable("det");
+        let (writer, _tx) = streamable("");
         let single = DataLogic::Single(Arc::new(ReadableOnly::default()));
         let (det, _) = with_logics("det", vec![single, writer]);
         prepare_events(&det, 1).await;
@@ -1374,8 +1420,8 @@ mod tests {
     async fn writers_that_disagree_on_collections_refuse_kickoff() {
         // ophyd-async test_standard_detector.py:922; get_index takes the
         // least of them.
-        let (w1, tx1) = streamable("roi1");
-        let (w2, tx2) = streamable("roi2");
+        let (w1, tx1) = streamable("-roi1");
+        let (w2, tx2) = streamable("-roi2");
         let (det, _) = with_logics("det", vec![w1, w2]);
         prepare_events(&det, 5).await;
         tx1.send(3).unwrap();
@@ -1393,8 +1439,8 @@ mod tests {
     async fn trigger_waits_for_every_writer_and_assets_chain_in_order() {
         // ophyd-async `_wait_for_index` waits on the least index;
         // `collect_asset_docs` yields each writer's documents in turn.
-        let (w1, tx1) = streamable("roi1");
-        let (w2, tx2) = streamable("roi2");
+        let (w1, tx1) = streamable("-roi1");
+        let (w2, tx2) = streamable("-roi2");
         let (det, idles) = with_logics("det", vec![w1, w2]);
         let det = Arc::new(det);
         prepare_events(&det, 1).await;
@@ -1422,6 +1468,6 @@ mod tests {
             })
             .collect()
             .await;
-        assert_eq!(keys, ["roi1", "roi2"]);
+        assert_eq!(keys, ["det-roi1", "det-roi2"]);
     }
 }

@@ -23,7 +23,6 @@ const MAGIC: &[u8] = b"CIRBIN1\n";
 
 /// File-backed binary sink. Each `accept()` appends one length-prefixed frame.
 pub struct BinaryFrameSink {
-    name: String,
     path: PathBuf,
     file: Mutex<Option<tokio::fs::File>>,
     indices_tx: watch::Sender<u64>,
@@ -31,17 +30,18 @@ pub struct BinaryFrameSink {
     counter: AtomicU64,
     last_emitted: AtomicU64,
     resource_uid: StdMutex<Option<String>>,
+    /// Data key the detector named at `open`; `None` until then.
+    data_key: StdMutex<Option<String>>,
     /// Bytes-per-frame hint exposed in the DataKey shape (unused if 0).
     payload_size: u64,
 }
 
 impl BinaryFrameSink {
-    /// Build for `path` with a logical `name`. Does not open the file until
-    /// the first `open()` (DetectorWriter contract) or first `accept()` call.
-    pub fn new(name: impl Into<String>, path: impl Into<PathBuf>, payload_size: u64) -> Self {
+    /// Build for `path`. Does not open the file until the first `open()`
+    /// (DetectorWriter contract) or first `accept()` call.
+    pub fn new(path: impl Into<PathBuf>, payload_size: u64) -> Self {
         let (tx, rx) = watch::channel(0_u64);
         Self {
-            name: name.into(),
             path: path.into(),
             file: Mutex::new(None),
             indices_tx: tx,
@@ -49,6 +49,7 @@ impl BinaryFrameSink {
             counter: AtomicU64::new(0),
             last_emitted: AtomicU64::new(0),
             resource_uid: StdMutex::new(None),
+            data_key: StdMutex::new(None),
             payload_size,
         }
     }
@@ -106,11 +107,12 @@ impl FrameSink for BinaryFrameSink {
 
 #[async_trait]
 impl DetectorWriter for BinaryFrameSink {
-    async fn open(&self, _multiplier: u32) -> Result<HashMap<String, DataKey>> {
+    async fn open(&self, datakey_name: &str, _multiplier: u32) -> Result<HashMap<String, DataKey>> {
         self.ensure_open().await?;
+        *self.data_key.lock().unwrap() = Some(datakey_name.to_string());
         let mut out = HashMap::new();
         out.insert(
-            format!("{}_image", self.name),
+            datakey_name.to_string(),
             DataKey {
                 source: crate::event_model::file_uri(&self.path.display().to_string()),
                 dtype: Dtype::Number,
@@ -123,7 +125,7 @@ impl DetectorWriter for BinaryFrameSink {
                 external: Some("STREAM:".into()),
                 units: None,
                 precision: None,
-                object_name: Some(self.name.clone()),
+                object_name: None,
                 dims: Some(vec!["byte".into()]),
                 limits: None,
                 choices: None,
@@ -138,6 +140,9 @@ impl DetectorWriter for BinaryFrameSink {
         self.counter.load(Ordering::SeqCst)
     }
     fn collect_stream_docs(&self, up_to: u64, descriptor: &str) -> BoxStream<'_, StreamAsset> {
+        let Some(data_key) = self.data_key.lock().unwrap().clone() else {
+            return stream::empty().boxed();
+        };
         let mut docs: Vec<StreamAsset> = Vec::new();
         let resource_uid = {
             let mut g = self.resource_uid.lock().unwrap();
@@ -148,7 +153,7 @@ impl DetectorWriter for BinaryFrameSink {
                 *g = Some(new_uid.clone());
                 docs.push(StreamAsset::Resource(StreamResource {
                     uid: new_uid.clone(),
-                    data_key: format!("{}_image", self.name),
+                    data_key,
                     mimetype: "application/x-cirbin1".into(),
                     uri: crate::event_model::file_uri(&self.path.display().to_string()),
                     parameters: Default::default(),

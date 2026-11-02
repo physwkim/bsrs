@@ -273,7 +273,7 @@ async fn moving_dot_frames_are_described_from_the_driver_readbacks() {
         .expect("trigger not done")
         .expect("trigger");
     let keys = ReadableObj::describe_dyn(&det).await.expect("describe");
-    let image = &keys["dot_image"];
+    let image = &keys["dot"];
     let h5 = dir.path().join("dot.h5");
     let uri = format!("file://localhost{}", h5.display());
     assert_eq!(image.dtype, Dtype::Array);

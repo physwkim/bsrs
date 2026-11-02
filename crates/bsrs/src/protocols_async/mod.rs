@@ -458,10 +458,13 @@ impl FlyMotorInfo {
 /// Sealed: detector writer half (open / observe / collect_stream_docs / close).
 #[async_trait]
 pub trait DetectorWriter: Send + Sync {
-    /// Open the writer for `multiplier` collections per event
-    /// ([`TriggerInfo::collections_per_event`]), which leads each returned
-    /// `DataKey`'s shape (ophyd-async `make_datakeys`).
-    async fn open(&self, multiplier: u32) -> Result<HashMap<String, DataKey>>;
+    /// Open the writer to write the data key `datakey_name` for `multiplier`
+    /// collections per event ([`TriggerInfo::collections_per_event`]), which
+    /// leads each returned `DataKey`'s shape (ophyd-async
+    /// `prepare_unbounded` and `make_datakeys`). Until then the writer has
+    /// no data key and [`collect_stream_docs`](Self::collect_stream_docs)
+    /// yields nothing.
+    async fn open(&self, datakey_name: &str, multiplier: u32) -> Result<HashMap<String, DataKey>>;
     /// Observe the collections (frames) written; the detector divides by the
     /// multiplier for its event index (ophyd-async
     /// `collections_written_signal`).
@@ -474,10 +477,17 @@ pub trait DetectorWriter: Send + Sync {
     fn collect_stream_docs(&self, up_to: u64, descriptor: &str) -> BoxStream<'_, StreamAsset>;
     /// Close the writer.
     async fn close(&self) -> Result<()>;
-    /// The data keys of [`open`](Self::open) a plot should show (ophyd-async
-    /// `DetectorDataLogic.get_hinted_fields`); none by default.
-    fn hinted_fields(&self) -> Vec<String> {
+    /// The data keys of [`open`](Self::open) for `datakey_name` a plot should
+    /// show (ophyd-async `DetectorDataLogic.get_hinted_fields`); none by
+    /// default.
+    fn hinted_fields(&self, _datakey_name: &str) -> Vec<String> {
         Vec::new()
+    }
+    /// What the detector appends to its name for the `datakey_name` it
+    /// passes (ophyd-async `DetectorDataLogic.datakey_suffix`); each data
+    /// logic of one detector needs its own. Empty by default.
+    fn datakey_suffix(&self) -> &str {
+        ""
     }
     /// Connect what the writer drives (ophyd-async connects a writer's
     /// plugin as a child of its detector); nothing by default.
@@ -491,16 +501,21 @@ pub trait DetectorWriter: Send + Sync {
 /// makes, set up only for a prepare of one collection.
 #[async_trait]
 pub trait SingleDataLogic: Send + Sync {
-    /// Set up for one collection (`prepare_single`).
-    async fn prepare_single(&self) -> Result<()>;
+    /// Set up for one collection of the data key `datakey_name`
+    /// (`prepare_single`).
+    async fn prepare_single(&self, datakey_name: &str) -> Result<()>;
     /// The data keys of [`read`](Self::read) (`make_datakeys`).
     async fn describe(&self) -> Result<HashMap<String, DataKey>>;
     /// This event's readings (`make_readings`).
     async fn read(&self) -> Result<HashMap<String, ReadingValue>>;
-    /// The data keys a plot should show (`get_hinted_fields`); none by
-    /// default.
-    fn hinted_fields(&self) -> Vec<String> {
+    /// The data keys a plot should show for `datakey_name`
+    /// (`get_hinted_fields`); none by default.
+    fn hinted_fields(&self, _datakey_name: &str) -> Vec<String> {
         Vec::new()
+    }
+    /// As [`DetectorWriter::datakey_suffix`]; empty by default.
+    fn datakey_suffix(&self) -> &str {
+        ""
     }
     /// Stop taking data (`stop`); nothing by default.
     async fn stop(&self) -> Result<()> {

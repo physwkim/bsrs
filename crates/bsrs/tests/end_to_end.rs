@@ -221,10 +221,10 @@ async fn binary_frame_sink_writes_and_emits_stream_docs() {
 
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("frames.cirbin1");
-    let sink = BinaryFrameSink::new("det", &path, 4);
+    let sink = BinaryFrameSink::new(&path, 4);
 
     // Open + accept 3 frames + close.
-    sink.open(1).await.unwrap();
+    sink.open("det", 1).await.unwrap();
     for i in 0..3_u32 {
         sink.accept(Frame {
             payload: bytes::Bytes::from(i.to_le_bytes().to_vec()),

@@ -139,6 +139,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Breaking**: `CamFrameInfo` is replaced by `NdArrayDescription`, whose
   fields are private; `AreaDetectorCam::frame_info` is an
   `Arc<NdArrayDescription>`.
+- **Breaking**: the detector names each data logic's data key
+  `name + datakey_suffix`, as ophyd-async does, so a writer's key is `det`,
+  not `det_image`. `DetectorWriter::open`/`hinted_fields`,
+  `SingleDataLogic::prepare_single`/`hinted_fields` and `open_writer` take
+  that name, and both traits gain `datakey_suffix` (`with_datakey_suffix`
+  on `AdHdfWriter` and `AdMultipartWriter`). `AdHdfWriter::new`,
+  `AdMultipartWriter::{new, jpeg, tiff}`, `BinaryFrameSink::new` and
+  `SoftDetectorWriter::new` no longer take a name; a writer collects no
+  documents before `open` and leaves the key's `object_name` to the run
+  engine.
 - `AreaDetectorCam::arm` resolves once the cam is acquiring, and its
   configuration is described from `AcquireTime_RBV`/`AcquirePeriod_RBV`.
 - `CaMotor`, `PvaMotor` and `CaPositioner` press `.STOP` in `stop_dyn`,

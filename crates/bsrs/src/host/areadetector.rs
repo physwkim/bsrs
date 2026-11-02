@@ -1775,14 +1775,15 @@ fn ad_stream_datum(resource_uid: String, descriptor: &str, start: u64, stop: u64
     }
 }
 
-/// Emit state for [`AdHdfWriter`]: the attribute set staged by the last
-/// `open()` (discovered from the XML sources, merged with the declared specs),
-/// the once-emitted `StreamResource` UIDs (main image + one per NDAttribute),
-/// and the event cursor (`StreamDatum`s cover events `[last_emitted, up_to)`).
-/// `open()` is the only writer of `attrs`; `collect_stream_docs` only reads it,
-/// so the emitted datasets always match the data keys reported at `open()`.
-#[derive(Default)]
+/// Emit state for [`AdHdfWriter`]: the data key and attribute set staged by
+/// the last `open()` (attributes discovered from the XML sources, merged with
+/// the declared specs), the once-emitted `StreamResource` UIDs (main image +
+/// one per NDAttribute), and the event cursor (`StreamDatum`s cover events
+/// `[last_emitted, up_to)`). `open()` is the only writer of `data_key` and
+/// `attrs`; `collect_stream_docs` only reads them, so the emitted datasets
+/// always match the data keys reported at `open()`.
 struct AdEmitState {
+    data_key: String,
     attrs: Vec<NdAttributeDataset>,
     main_resource_uid: Option<String>,
     attr_resource_uids: HashMap<String, String>,
@@ -1800,7 +1801,7 @@ struct AdEmitState {
 /// (e.g. a Tiled-writing process) at the IOC's file. Port of ophyd-async's
 /// `ADHDFWriter` data-logic (`epics/adcore/_data_logic.py`).
 pub struct AdHdfWriter {
-    name: String,
+    datakey_suffix: String,
     io: Arc<dyn AdHdfFileIo>,
     /// Driver-side frame description (`ArraySizeZ/Y/X_RBV` etc.), read at
     /// `open()` for the image `DataKey`'s shape/dtype.
@@ -1814,28 +1815,36 @@ pub struct AdHdfWriter {
     /// `NDAttributesFile` holds a filename on the IOC host that discovery
     /// cannot read.
     ndattributes: Vec<NdAttributeDataset>,
-    /// Guards single-`StreamResource` emission and the datum cursor.
-    emit: tokio::sync::Mutex<AdEmitState>,
+    /// Guards single-`StreamResource` emission and the datum cursor; `None`
+    /// until the first `open()`.
+    emit: tokio::sync::Mutex<Option<AdEmitState>>,
 }
 
 impl AdHdfWriter {
     /// Build a writer over `io`, describing frames per `frame`, writing files
     /// per `path_provider`.
     pub fn new(
-        name: impl Into<String>,
         io: Arc<dyn AdHdfFileIo>,
         frame: Arc<dyn AdFrameInfoSource>,
         path_provider: StaticPathProvider,
     ) -> Self {
         Self {
-            name: name.into(),
+            datakey_suffix: String::new(),
             io,
             frame,
             path_provider,
             attr_sources: Vec::new(),
             ndattributes: Vec::new(),
-            emit: tokio::sync::Mutex::new(AdEmitState::default()),
+            emit: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// Append `suffix` to the detector's name for this writer's data key
+    /// (ophyd-async `ADWriterFactory.hdf(datakey_suffix=...)`), e.g. `-roi1`
+    /// for a second writer of one detector.
+    pub fn with_datakey_suffix(mut self, suffix: impl Into<String>) -> Self {
+        self.datakey_suffix = suffix.into();
+        self
     }
 
     /// Set the `NDAttributesFile` sources (driver + extra plugins) whose inline
@@ -1853,10 +1862,6 @@ impl AdHdfWriter {
     pub fn with_ndattributes(mut self, attrs: Vec<NdAttributeDataset>) -> Self {
         self.ndattributes = attrs;
         self
-    }
-
-    fn data_key_name(&self) -> String {
-        format!("{}_image", self.name)
     }
 
     /// The file URI the path provider + `%s%s.h5` template resolve to — the
@@ -1909,7 +1914,7 @@ impl DetectorWriter for AdHdfWriter {
     async fn connect(&self, timeout: Duration) -> Result<()> {
         self.io.connect(timeout).await
     }
-    async fn open(&self, multiplier: u32) -> Result<HashMap<String, DataKey>> {
+    async fn open(&self, datakey_name: &str, multiplier: u32) -> Result<HashMap<String, DataKey>> {
         let multiplier = u64::from(multiplier.max(1));
         // Frames per HDF chunk — read before the setup puts, then let the
         // plugin derive the rest of the chunking from the frame
@@ -1942,17 +1947,17 @@ impl DetectorWriter for AdHdfWriter {
         // Discover the NDAttribute datasets from the NDAttributesFile sources,
         // merged with the declared specs.
         let attrs = self.discover_ndattributes().await?;
-        // Reset emit state for this staging; the staged attribute set is what
-        // collect_stream_docs will emit resources/datums for.
-        {
-            let mut st = self.emit.lock().await;
-            st.attrs = attrs.clone();
-            st.main_resource_uid = None;
-            st.attr_resource_uids.clear();
-            st.last_emitted = 0;
-            st.frame_shape = shape.clone();
-            st.frames_per_chunk = frames_per_chunk;
-        }
+        // Fresh emit state for this staging; the staged data key and attribute
+        // set are what collect_stream_docs will emit resources/datums for.
+        *self.emit.lock().await = Some(AdEmitState {
+            data_key: datakey_name.to_string(),
+            attrs: attrs.clone(),
+            main_resource_uid: None,
+            attr_resource_uids: HashMap::new(),
+            last_emitted: 0,
+            frame_shape: shape.clone(),
+            frames_per_chunk,
+        });
         // DataKey shapes carry the frames-per-index prefix, `[multiplier,
         // *frame_shape]` for the image and `[multiplier]` for the scalar
         // NDAttributes (ophyd-async `make_datakeys`); the image source is the
@@ -1961,7 +1966,7 @@ impl DetectorWriter for AdHdfWriter {
             std::iter::once(multiplier).chain(shape).map(Some).collect();
         let mut out = HashMap::new();
         out.insert(
-            self.data_key_name(),
+            datakey_name.to_string(),
             DataKey {
                 source: self.provider_uri(),
                 dtype: stream_datakey_dtype(multiplier, image_shape.len()),
@@ -1970,7 +1975,7 @@ impl DetectorWriter for AdHdfWriter {
                 external: Some("STREAM:".into()),
                 units: None,
                 precision: None,
-                object_name: Some(self.name.clone()),
+                object_name: None,
                 dims: None,
                 limits: None,
                 choices: None,
@@ -1994,7 +1999,7 @@ impl DetectorWriter for AdHdfWriter {
                     external: Some("STREAM:".into()),
                     units: None,
                     precision: None,
-                    object_name: Some(self.name.clone()),
+                    object_name: None,
                     dims: None,
                     limits: None,
                     choices: None,
@@ -2011,19 +2016,22 @@ impl DetectorWriter for AdHdfWriter {
     }
     fn collect_stream_docs(&self, up_to: u64, descriptor: &str) -> BoxStream<'_, StreamAsset> {
         let descriptor = descriptor.to_string();
-        let data_key = self.data_key_name();
         // Build the docs in one future (the FullFileName_RBV read is async), then
         // flatten to a stream. `stream::once(..).flat_map(stream::iter)` gives a
         // `BoxStream` without pulling in a generator macro.
         let fut = async move {
+            let mut docs: Vec<StreamAsset> = Vec::new();
+            let mut guard = self.emit.lock().await;
+            let Some(st) = guard.as_mut() else {
+                return docs;
+            };
             // ophyd-async `make_stream_docs`: flush so SWMR readers see the
             // frames these datums cover. The stream has no error channel.
             if let Err(e) = self.io.flush().await {
-                tracing::warn!("{}: {e}", self.name);
+                tracing::warn!("{}: {e}", st.data_key);
             }
-            let mut docs: Vec<StreamAsset> = Vec::new();
-            let mut st = self.emit.lock().await;
-            // The attribute set staged by the last open().
+            // The data key and attribute set staged by the last open().
+            let data_key = st.data_key.clone();
             let attrs = st.attrs.clone();
             // Emit each StreamResource once. The main image and every
             // NDAttribute live in the same .h5, so they share one URI resolved
@@ -2110,15 +2118,19 @@ impl DetectorWriter for AdHdfWriter {
         self.io.stop_capture().await
     }
     /// ophyd-async `_data_logic.py`: the main NDArray dataset is always hinted.
-    fn hinted_fields(&self) -> Vec<String> {
-        vec![self.data_key_name()]
+    fn hinted_fields(&self, datakey_name: &str) -> Vec<String> {
+        vec![datakey_name.to_string()]
+    }
+    fn datakey_suffix(&self) -> &str {
+        &self.datakey_suffix
     }
 }
 
-/// Emit state for [`AdMultipartWriter`]: the once-emitted `StreamResource`
-/// UID, the event cursor, and the shape staged by `open()`.
-#[derive(Default)]
+/// Emit state for [`AdMultipartWriter`]: the data key staged by `open()`,
+/// the once-emitted `StreamResource` UID, the event cursor, and the shape
+/// staged by `open()`.
 struct AdMultipartEmitState {
+    data_key: String,
     resource_uid: Option<String>,
     last_emitted: u64,
     /// Frame shape discovered at `open()`, for the resource's `chunk_shape`
@@ -2133,7 +2145,7 @@ struct AdMultipartEmitState {
 /// parameter reconstructs each frame's filename. Port of ophyd-async's
 /// `ADMultipartDataLogic` (`epics/adcore/_data_logic.py:240`).
 pub struct AdMultipartWriter {
-    name: String,
+    datakey_suffix: String,
     io: Arc<dyn AdFileIo>,
     /// Driver-side frame description (`ArraySizeZ/Y/X_RBV` etc.), read at
     /// `open()` for the image `DataKey`'s shape/dtype.
@@ -2143,8 +2155,9 @@ pub struct AdMultipartWriter {
     extension: String,
     /// `StreamResource` mimetype, e.g. `"multipart/related;type=image/jpeg"`.
     mimetype: String,
-    /// Guards single-`StreamResource` emission and the datum cursor.
-    emit: tokio::sync::Mutex<AdMultipartEmitState>,
+    /// Guards single-`StreamResource` emission and the datum cursor; `None`
+    /// until the first `open()`.
+    emit: tokio::sync::Mutex<Option<AdMultipartEmitState>>,
 }
 
 impl AdMultipartWriter {
@@ -2152,7 +2165,6 @@ impl AdMultipartWriter {
     /// per `path_provider`, with the given file `extension` (dot included)
     /// and `StreamResource` `mimetype`.
     pub fn new(
-        name: impl Into<String>,
         io: Arc<dyn AdFileIo>,
         frame: Arc<dyn AdFrameInfoSource>,
         path_provider: StaticPathProvider,
@@ -2160,26 +2172,31 @@ impl AdMultipartWriter {
         mimetype: impl Into<String>,
     ) -> Self {
         Self {
-            name: name.into(),
+            datakey_suffix: String::new(),
             io,
             frame,
             path_provider,
             extension: extension.into(),
             mimetype: mimetype.into(),
-            emit: tokio::sync::Mutex::new(AdMultipartEmitState::default()),
+            emit: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// Append `suffix` to the detector's name for this writer's data key
+    /// (ophyd-async `ADWriterFactory.jpeg/tiff(datakey_suffix=...)`).
+    pub fn with_datakey_suffix(mut self, suffix: impl Into<String>) -> Self {
+        self.datakey_suffix = suffix.into();
+        self
     }
 
     /// JPEG variant (`.jpg`, `multipart/related;type=image/jpeg`) — the
     /// `ADWriterType.JPEG` arm of ophyd-async's `make_writer_data_logic`.
     pub fn jpeg(
-        name: impl Into<String>,
         io: Arc<dyn AdFileIo>,
         frame: Arc<dyn AdFrameInfoSource>,
         path_provider: StaticPathProvider,
     ) -> Self {
         Self::new(
-            name,
             io,
             frame,
             path_provider,
@@ -2191,23 +2208,17 @@ impl AdMultipartWriter {
     /// TIFF variant (`.tiff`, `multipart/related;type=image/tiff`) — the
     /// `ADWriterType.TIFF` arm of ophyd-async's `make_writer_data_logic`.
     pub fn tiff(
-        name: impl Into<String>,
         io: Arc<dyn AdFileIo>,
         frame: Arc<dyn AdFrameInfoSource>,
         path_provider: StaticPathProvider,
     ) -> Self {
         Self::new(
-            name,
             io,
             frame,
             path_provider,
             ".tiff",
             "multipart/related;type=image/tiff",
         )
-    }
-
-    fn data_key_name(&self) -> String {
-        format!("{}_image", self.name)
     }
 
     /// The directory URI the frames land under — both the `StreamResource`
@@ -2231,7 +2242,7 @@ impl DetectorWriter for AdMultipartWriter {
     async fn connect(&self, timeout: Duration) -> Result<()> {
         self.io.connect(timeout).await
     }
-    async fn open(&self, multiplier: u32) -> Result<HashMap<String, DataKey>> {
+    async fn open(&self, datakey_name: &str, multiplier: u32) -> Result<HashMap<String, DataKey>> {
         let multiplier = u64::from(multiplier.max(1));
         // Plugin callbacks on, then the file paths. ophyd-async's
         // `ADMultipartDataLogic.prepare_unbounded` does not enable callbacks
@@ -2253,17 +2264,17 @@ impl DetectorWriter for AdMultipartWriter {
         // Frame shape + dtype from the driver's readbacks (primed detector
         // required, as for the HDF writer).
         let (shape, dtype_numpy) = self.frame.frame_info().await?;
-        {
-            let mut st = self.emit.lock().await;
-            st.resource_uid = None;
-            st.last_emitted = 0;
-            st.frame_shape = shape.clone();
-        }
+        *self.emit.lock().await = Some(AdMultipartEmitState {
+            data_key: datakey_name.to_string(),
+            resource_uid: None,
+            last_emitted: 0,
+            frame_shape: shape.clone(),
+        });
         let image_shape: Vec<Option<u64>> =
             std::iter::once(multiplier).chain(shape).map(Some).collect();
         let mut out = HashMap::new();
         out.insert(
-            self.data_key_name(),
+            datakey_name.to_string(),
             DataKey {
                 source: self.directory_uri(),
                 dtype: stream_datakey_dtype(multiplier, image_shape.len()),
@@ -2272,7 +2283,7 @@ impl DetectorWriter for AdMultipartWriter {
                 external: Some("STREAM:".into()),
                 units: None,
                 precision: None,
-                object_name: Some(self.name.clone()),
+                object_name: None,
                 dims: None,
                 limits: None,
                 choices: None,
@@ -2288,10 +2299,12 @@ impl DetectorWriter for AdMultipartWriter {
     }
     fn collect_stream_docs(&self, up_to: u64, descriptor: &str) -> BoxStream<'_, StreamAsset> {
         let descriptor = descriptor.to_string();
-        let data_key = self.data_key_name();
         let fut = async move {
             let mut docs: Vec<StreamAsset> = Vec::new();
-            let mut st = self.emit.lock().await;
+            let mut guard = self.emit.lock().await;
+            let Some(st) = guard.as_mut() else {
+                return docs;
+            };
             // Emit the one StreamResource on first use. The URI is the
             // directory (known up front from the provider — no
             // FullFileName_RBV read; that readback names only the latest
@@ -2319,7 +2332,7 @@ impl DetectorWriter for AdMultipartWriter {
                 );
                 docs.push(StreamAsset::Resource(StreamResource {
                     uid,
-                    data_key: data_key.clone(),
+                    data_key: st.data_key.clone(),
                     mimetype: self.mimetype.clone(),
                     uri: self.directory_uri(),
                     parameters,
@@ -2350,8 +2363,11 @@ impl DetectorWriter for AdMultipartWriter {
         self.io.stop_capture().await
     }
     /// ophyd-async `_data_logic.py`: the main NDArray dataset is always hinted.
-    fn hinted_fields(&self) -> Vec<String> {
-        vec![self.data_key_name()]
+    fn hinted_fields(&self, datakey_name: &str) -> Vec<String> {
+        vec![datakey_name.to_string()]
+    }
+    fn datakey_suffix(&self) -> &str {
+        &self.datakey_suffix
     }
 }
 
@@ -2563,7 +2579,7 @@ where
     B: SignalBackend<T> + 'static,
     A: Readable,
 {
-    async fn prepare_single(&self) -> Result<()> {
+    async fn prepare_single(&self, _datakey_name: &str) -> Result<()> {
         await_put(
             SignalBackend::<bool>::put(self.wait_for_plugins.as_ref(), Some(true)),
             "PluginSignalDataLogic::prepare_single",
@@ -2576,7 +2592,7 @@ where
     async fn read(&self) -> Result<HashMap<String, ReadingValue>> {
         self.signal.read_cached(Some(false)).await
     }
-    fn hinted_fields(&self) -> Vec<String> {
+    fn hinted_fields(&self, _datakey_name: &str) -> Vec<String> {
         if self.hinted {
             vec![self.signal.name().to_string()]
         } else {
@@ -2608,7 +2624,6 @@ pub fn area_detector_hdf(
     // ArraySize/DataType/ColorMode readbacks are the frame-shape source
     // (ophyd-async `make_writer_data_logic` shape_signals).
     let writer = AdHdfWriter::new(
-        name.clone(),
         io,
         cam.frame_info.clone() as Arc<dyn AdFrameInfoSource>,
         path_provider,
@@ -2635,7 +2650,6 @@ fn area_detector_multipart(
     file_prefix: impl Into<String>,
     path_provider: StaticPathProvider,
     make_writer: impl FnOnce(
-        String,
         Arc<dyn AdFileIo>,
         Arc<dyn AdFrameInfoSource>,
         StaticPathProvider,
@@ -2644,7 +2658,6 @@ fn area_detector_multipart(
     let cam = AreaDetectorCam::new(cam_prefix);
     let io: Arc<dyn AdFileIo> = Arc::new(NdPluginFileIo::new(Arc::new(NdFile::new(file_prefix))));
     let writer = make_writer(
-        name.clone(),
         io,
         cam.frame_info.clone() as Arc<dyn AdFrameInfoSource>,
         path_provider,
@@ -3156,7 +3169,6 @@ mod ad_hdf_tests {
 
     fn writer_with(io: Arc<FakeAdFileIo>) -> AdHdfWriter {
         AdHdfWriter::new(
-            "det",
             io,
             Arc::new(FakeFrameInfo),
             StaticPathProvider::new("/data/scans/", "scan"),
@@ -3165,7 +3177,6 @@ mod ad_hdf_tests {
 
     fn multipart_writer_with(io: Arc<FakeAdFileIo>) -> AdMultipartWriter {
         AdMultipartWriter::jpeg(
-            "det",
             io,
             Arc::new(FakeFrameInfo),
             StaticPathProvider::new("/data/scans/", "scan"),
@@ -3185,9 +3196,9 @@ mod ad_hdf_tests {
                 "multipart",
             ),
         ] {
-            let keys = w.open(1).await.unwrap();
-            let hinted = w.hinted_fields();
-            assert_eq!(hinted, ["det_image"], "{label}");
+            let keys = w.open("det", 1).await.unwrap();
+            let hinted = w.hinted_fields("det");
+            assert_eq!(hinted, ["det"], "{label}");
             assert!(keys.contains_key(&hinted[0]), "{label}");
         }
     }
@@ -3296,7 +3307,7 @@ mod ad_hdf_tests {
         </Attributes>"#;
         let w = writer_with(io.clone())
             .with_ndattribute_sources(vec![Arc::new(FakeXmlSource(xml.into()))]);
-        let keys = w.open(1).await.unwrap();
+        let keys = w.open("det", 1).await.unwrap();
         // EPICS_PV attribute sources from its PV; PARAM falls back to the
         // path-provider file URI (ophyd `resource.source or self.uri`).
         assert_eq!(keys["temp"].source, "ca://SIM:TEMP");
@@ -3344,14 +3355,14 @@ mod ad_hdf_tests {
                 NdAttributeDataset::new("temp", "<i4"),
                 NdAttributeDataset::new("extra", "<f8"),
             ]);
-        let keys = w.open(1).await.unwrap();
+        let keys = w.open("det", 1).await.unwrap();
         // Declared "temp" replaces the discovered one (dtype <i4, no source).
         assert_eq!(
             keys["temp"].dtype_numpy,
             Some(crate::event_model::DtypeNumpy::Scalar("<i4".to_string()))
         );
         assert!(keys.contains_key("extra"));
-        // det_image + temp + extra, no duplicate for the collision.
+        // det + temp + extra, no duplicate for the collision.
         assert_eq!(keys.len(), 3);
     }
 
@@ -3363,16 +3374,16 @@ mod ad_hdf_tests {
         let w = writer_with(io.clone()).with_ndattribute_sources(vec![Arc::new(FakeXmlSource(
             "/epics/attributes.xml".into(),
         ))]);
-        let keys = w.open(1).await.unwrap();
+        let keys = w.open("det", 1).await.unwrap();
         assert_eq!(keys.len(), 1, "main image only");
-        assert!(keys.contains_key("det_image"));
+        assert!(keys.contains_key("det"));
     }
 
     #[tokio::test]
     async fn open_configures_stream_capture_and_reports_external_datakey() {
         let io = FakeAdFileIo::new("/data/scans/scan.h5");
         let w = writer_with(io.clone());
-        let keys = w.open(1).await.unwrap();
+        let keys = w.open("det", 1).await.unwrap();
         let cfg = io
             .configured
             .lock()
@@ -3393,7 +3404,7 @@ mod ad_hdf_tests {
             io.callbacks_enabled.load(Ordering::SeqCst),
             "plugin callbacks enabled"
         );
-        let dk = keys.get("det_image").expect("det_image data key");
+        let dk = keys.get("det").expect("det data key");
         assert_eq!(dk.external.as_deref(), Some("STREAM:"));
         assert_eq!(dk.dtype, Dtype::Array);
         // Shape = [multiplier, *frame_shape]; frame shape + dtype discovered
@@ -3412,7 +3423,7 @@ mod ad_hdf_tests {
         let io = FakeAdFileIo::new("/x.h5");
         io.path_exists.store(false, Ordering::SeqCst);
         let w = writer_with(io.clone());
-        let err = w.open(1).await.unwrap_err().to_string();
+        let err = w.open("det", 1).await.unwrap_err().to_string();
         assert!(err.contains("doesn't exist"), "{err}");
         assert!(
             !io.capturing.load(Ordering::SeqCst),
@@ -3438,8 +3449,8 @@ mod ad_hdf_tests {
         let io = FakeAdFileIo::new("/x.h5");
         let w =
             writer_with(io.clone()).with_ndattributes(vec![NdAttributeDataset::new("temp", "<f8")]);
-        let keys = w.open(2).await.unwrap();
-        assert_eq!(keys["det_image"].shape, [Some(2), Some(20), Some(10)]);
+        let keys = w.open("det", 2).await.unwrap();
+        assert_eq!(keys["det"].shape, [Some(2), Some(20), Some(10)]);
         assert_eq!(keys["temp"].shape, [Some(2)]);
         assert_eq!(keys["temp"].dtype, Dtype::Array);
         io.set_captured(4);
@@ -3484,7 +3495,7 @@ mod ad_hdf_tests {
         let io = FakeAdFileIo::new("/data/scans/scan.h5");
         io.frames_per_chunk.store(4, Ordering::SeqCst);
         let w = writer_with(io.clone());
-        w.open(1).await.unwrap();
+        w.open("det", 1).await.unwrap();
         assert!(
             io.chunk_size_auto.load(Ordering::SeqCst),
             "open() sets ChunkSizeAuto"
@@ -3498,7 +3509,7 @@ mod ad_hdf_tests {
             StreamAsset::Resource(r) => {
                 assert_eq!(r.uri, "file://localhost/data/scans/scan.h5");
                 assert_eq!(r.mimetype, "application/x-hdf5");
-                assert_eq!(r.data_key, "det_image");
+                assert_eq!(r.data_key, "det");
                 assert_eq!(
                     r.parameters.get("dataset").and_then(|v| v.as_str()),
                     Some("/entry/data/data")
@@ -3550,8 +3561,8 @@ mod ad_hdf_tests {
             NdAttributeDataset::new("counter", "<i4"),
         ]);
         // open() reports a scalar external data key per attribute + the image.
-        let keys = w.open(1).await.unwrap();
-        assert!(keys.contains_key("det_image"));
+        let keys = w.open("det", 1).await.unwrap();
+        assert!(keys.contains_key("det"));
         for name in ["temp", "counter"] {
             let dk = keys
                 .get(name)
@@ -3593,7 +3604,7 @@ mod ad_hdf_tests {
         assert!(datasets.contains(&"/entry/instrument/NDAttributes/counter"));
         // Attribute datasets chunk in fixed 16384-element blocks.
         for r in &resources {
-            if r.data_key != "det_image" {
+            if r.data_key != "det" {
                 assert_eq!(
                     r.parameters.get("chunk_shape"),
                     Some(&serde_json::json!([16384])),
@@ -3643,7 +3654,7 @@ mod ad_hdf_tests {
     async fn empty_full_file_name_yields_empty_uri() {
         let io = FakeAdFileIo::new("");
         let w = writer_with(io.clone());
-        w.open(1).await.unwrap();
+        w.open("det", 1).await.unwrap();
         io.set_captured(1);
         let docs: Vec<StreamAsset> = w.collect_stream_docs(1, "d").collect().await;
         match &docs[0] {
@@ -3658,7 +3669,7 @@ mod ad_hdf_tests {
         // and reads the count without one in get_index (`_detector.py:779`).
         let io = FakeAdFileIo::new("/x.h5");
         let w = writer_with(io.clone());
-        w.open(1).await.unwrap();
+        w.open("det", 1).await.unwrap();
         io.set_captured(4);
         assert_eq!(w.indices_written().await, 4);
         assert_eq!(io.flushes.load(Ordering::SeqCst), 0, "indices_written");
@@ -3681,7 +3692,7 @@ mod ad_hdf_tests {
     async fn close_stops_capture() {
         let io = FakeAdFileIo::new("/x.h5");
         let w = writer_with(io.clone());
-        w.open(1).await.unwrap();
+        w.open("det", 1).await.unwrap();
         assert!(io.capturing.load(Ordering::SeqCst));
         w.close().await.unwrap();
         assert!(!io.capturing.load(Ordering::SeqCst));
@@ -3700,7 +3711,7 @@ mod ad_hdf_tests {
             cam,
             vec![crate::devices::DataLogic::Unbounded(writer.clone())],
         );
-        writer.open(1).await.unwrap();
+        writer.open("det", 1).await.unwrap();
         io.set_captured(2);
         let docs: Vec<StreamAsset> = det.collect_asset_docs(2, "descZ").collect().await;
         assert_eq!(docs.len(), 2);
@@ -3789,7 +3800,7 @@ mod ad_hdf_tests {
     async fn multipart_open_arms_plugin_and_describes_directory_source() {
         let io = FakeAdFileIo::new("/data/scans/scan_000000.jpg");
         let w = multipart_writer_with(io.clone());
-        let keys = w.open(1).await.unwrap();
+        let keys = w.open("det", 1).await.unwrap();
 
         let cfg = io.configured.lock().unwrap().clone().unwrap();
         assert_eq!(cfg.0, "/data/scans/");
@@ -3800,7 +3811,7 @@ mod ad_hdf_tests {
         assert!(io.callbacks_enabled.load(Ordering::SeqCst));
         assert!(io.capturing.load(Ordering::SeqCst));
 
-        let dk = keys.get("det_image").expect("image data key");
+        let dk = keys.get("det").expect("image data key");
         assert_eq!(dk.source, "file://localhost/data/scans/");
         assert_eq!(dk.shape, vec![Some(1), Some(20), Some(10)]);
         assert_eq!(dk.dtype, Dtype::Array);
@@ -3815,8 +3826,8 @@ mod ad_hdf_tests {
     async fn multipart_open_leads_the_key_with_the_multiplier_and_counts_frames() {
         let io = FakeAdFileIo::new("");
         let w = multipart_writer_with(io.clone());
-        let keys = w.open(2).await.unwrap();
-        assert_eq!(keys["det_image"].shape, [Some(2), Some(20), Some(10)]);
+        let keys = w.open("det", 2).await.unwrap();
+        assert_eq!(keys["det"].shape, [Some(2), Some(20), Some(10)]);
         io.set_captured(4);
         assert_eq!(w.indices_written().await, 4);
         assert_eq!(*w.observe_indices_written().borrow(), 4);
@@ -3830,7 +3841,7 @@ mod ad_hdf_tests {
     async fn multipart_collect_emits_directory_resource_then_datums() {
         let io = FakeAdFileIo::new("/data/scans/scan_000001.jpg");
         let w = multipart_writer_with(io.clone());
-        w.open(1).await.unwrap();
+        w.open("det", 1).await.unwrap();
         io.set_captured(2);
         let docs: Vec<StreamAsset> = w
             .collect_stream_docs(w.indices_written().await, "desc-mp-1")
@@ -3839,7 +3850,7 @@ mod ad_hdf_tests {
         assert_eq!(docs.len(), 2);
         let resource_uid = match &docs[0] {
             StreamAsset::Resource(r) => {
-                assert_eq!(r.data_key, "det_image");
+                assert_eq!(r.data_key, "det");
                 assert_eq!(r.mimetype, "multipart/related;type=image/jpeg");
                 assert_eq!(r.uri, "file://localhost/data/scans/");
                 assert_eq!(
@@ -3890,19 +3901,18 @@ mod ad_hdf_tests {
     async fn multipart_close_stops_capture_and_tiff_variant_maps_mimetype() {
         let io = FakeAdFileIo::new("");
         let w = multipart_writer_with(io.clone());
-        w.open(1).await.unwrap();
+        w.open("det", 1).await.unwrap();
         assert!(io.capturing.load(Ordering::SeqCst));
         w.close().await.unwrap();
         assert!(!io.capturing.load(Ordering::SeqCst));
 
         let tio = FakeAdFileIo::new("");
         let t = AdMultipartWriter::tiff(
-            "det",
             tio.clone(),
             Arc::new(FakeFrameInfo),
             StaticPathProvider::new("/data/scans/", "scan"),
         );
-        t.open(1).await.unwrap();
+        t.open("det", 1).await.unwrap();
         let cfg = tio.configured.lock().unwrap().clone().unwrap();
         assert_eq!(cfg.2, "%s%s_%6.6d.tiff");
         let docs: Vec<StreamAsset> = t.collect_stream_docs(0, "d").collect().await;

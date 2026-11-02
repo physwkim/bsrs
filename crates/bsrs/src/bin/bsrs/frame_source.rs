@@ -153,6 +153,10 @@ async fn run_wired(args: FrameSourceArgs) -> i32 {
         args.output.clone(),
         args.payload_size,
     ));
+    if let Err(e) = writer.open(&args.name, 1).await {
+        eprintln!("hdf5 open {}: {e}", args.output.display());
+        return 1;
+    }
     let pipe = match FramePipe::builder()
         .primary(writer.clone() as Arc<dyn FrameSink>)
         .start()

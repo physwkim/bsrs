@@ -237,7 +237,7 @@ async fn hdf_step_scan_points_its_documents_at_the_file_the_ioc_wrote() {
 
     trigger(&det).await.unwrap();
     let keys = ReadableObj::describe_dyn(&det).await.expect("describe");
-    let image = &keys["det_image"];
+    let image = &keys["det"];
     assert_eq!(image.shape, shape(&[1, HEIGHT as u64, WIDTH as u64]));
     assert_eq!(image.dtype, Dtype::Array);
     assert_eq!(numpy(image), Some("|u1"));
@@ -247,7 +247,7 @@ async fn hdf_step_scan_points_its_documents_at_the_file_the_ioc_wrote() {
     let (resources, datums) = drain(&det).await;
     assert_eq!(resources.len(), 1, "{resources:?}");
     let r = &resources[0];
-    assert_eq!(r.data_key, "det_image");
+    assert_eq!(r.data_key, "det");
     assert_eq!(r.mimetype, "application/x-hdf5");
     assert_eq!(r.uri, file_uri(&h5));
     assert_eq!(r.parameters["dataset"], json!("/entry/data/data"));
@@ -303,7 +303,7 @@ async fn hdf_ndattributes_get_a_key_resource_and_datum_each() {
     trigger(&det).await.unwrap();
     let keys = ReadableObj::describe_dyn(&det).await.expect("describe");
     let names: HashSet<&str> = keys.keys().map(String::as_str).collect();
-    assert_eq!(names, HashSet::from(["det_image", "AcqTime", "Temp"]));
+    assert_eq!(names, HashSet::from(["det", "AcqTime", "Temp"]));
     for (name, source) in [
         ("AcqTime", file_uri(&h5)),
         ("Temp", format!("ca://{CAM}Temperature_RBV")),
@@ -662,11 +662,8 @@ async fn collections_per_event_groups_frames_into_events() {
         .await
         .unwrap();
     let keys = ReadableObj::describe_dyn(&det).await.expect("describe");
-    assert_eq!(
-        keys["det_image"].shape,
-        shape(&[2, HEIGHT as u64, WIDTH as u64])
-    );
-    assert_eq!(keys["det_image"].dtype, Dtype::Array);
+    assert_eq!(keys["det"].shape, shape(&[2, HEIGHT as u64, WIDTH as u64]));
+    assert_eq!(keys["det"].dtype, Dtype::Array);
     finish(Flyable::kickoff(&det).await, "kickoff")
         .await
         .unwrap();
@@ -865,7 +862,7 @@ async fn rgb1_frames_get_a_colour_dimension() {
     staged.expect("stage");
     prepared.unwrap();
     assert_eq!(
-        keys.expect("describe")["det_image"].shape,
+        keys.expect("describe")["det"].shape,
         shape(&[1, 3, HEIGHT as u64, WIDTH as u64])
     );
 }
@@ -981,18 +978,22 @@ async fn writers_fed_from_rois_describe_the_roi_frames() {
             vec![roi.size_y_rbv.clone(), roi.size_x_rbv.clone()],
         ))
     };
-    let hdf: Arc<dyn DetectorWriter> = Arc::new(AdHdfWriter::new(
-        "det_roi1",
-        Arc::new(NdFileIo::new(Arc::new(NdFileHdf5::new(HDF)))),
-        shape_of(&rois[0]),
-        provider(dir.path(), "roi1"),
-    ));
-    let tiff: Arc<dyn DetectorWriter> = Arc::new(AdMultipartWriter::tiff(
-        "det_roi2",
-        Arc::new(NdPluginFileIo::new(Arc::new(NdFile::new(TIFF)))),
-        shape_of(&rois[1]),
-        provider(dir.path(), "roi2"),
-    ));
+    let hdf: Arc<dyn DetectorWriter> = Arc::new(
+        AdHdfWriter::new(
+            Arc::new(NdFileIo::new(Arc::new(NdFileHdf5::new(HDF)))),
+            shape_of(&rois[0]),
+            provider(dir.path(), "roi1"),
+        )
+        .with_datakey_suffix("-roi1"),
+    );
+    let tiff: Arc<dyn DetectorWriter> = Arc::new(
+        AdMultipartWriter::tiff(
+            Arc::new(NdPluginFileIo::new(Arc::new(NdFile::new(TIFF)))),
+            shape_of(&rois[1]),
+            provider(dir.path(), "roi2"),
+        )
+        .with_datakey_suffix("-roi2"),
+    );
     let det = StandardDetector::with_data_logics(
         "det",
         cam,
@@ -1024,24 +1025,18 @@ async fn writers_fed_from_rois_describe_the_roi_frames() {
     triggered.unwrap();
     let keys = keys.expect("describe");
     assert_eq!(keys.len(), 2, "{keys:?}");
-    for (key, dims) in [
-        ("det_roi1_image", [1, 30, 40]),
-        ("det_roi2_image", [1, 10, 14]),
-    ] {
+    for (key, dims) in [("det-roi1", [1, 30, 40]), ("det-roi2", [1, 10, 14])] {
         assert_eq!(keys[key].shape, shape(&dims), "{key}");
         assert_eq!(numpy(&keys[key]), Some("|u1"), "{key}");
         assert_eq!(keys[key].external.as_deref(), Some("STREAM:"), "{key}");
     }
     assert_eq!(
-        keys["det_roi1_image"].source,
+        keys["det-roi1"].source,
         file_uri(&dir.path().join("roi1.h5"))
     );
     assert_eq!(
         hints,
-        Some(vec![
-            "det_roi1_image".to_string(),
-            "det_roi2_image".to_string()
-        ])
+        Some(vec!["det-roi1".to_string(), "det-roi2".to_string()])
     );
     let order: Vec<String> = docs
         .iter()
@@ -1053,9 +1048,9 @@ async fn writers_fed_from_rois_describe_the_roi_frames() {
     assert_eq!(
         order,
         [
-            "resource det_roi1_image",
+            "resource det-roi1",
             "datum 0..1",
-            "resource det_roi2_image",
+            "resource det-roi2",
             "datum 0..1"
         ]
     );
@@ -1209,7 +1204,7 @@ async fn step_scan_through_the_run_engine_links_datums_to_events() {
             _ => None,
         })
         .expect("descriptor");
-    let image = &descriptor.data_keys["adsim_image"];
+    let image = &descriptor.data_keys["adsim"];
     assert_eq!(image.source, file_uri(&h5));
     assert_eq!(image.shape, shape(&[1, HEIGHT as u64, WIDTH as u64]));
     let config = &descriptor.configuration["adsim"];
@@ -1237,12 +1232,11 @@ async fn step_scan_through_the_run_engine_links_datums_to_events() {
     for e in &events {
         assert!(e.data.is_empty(), "event data: {:?}", e.data);
     }
-    // `hints={"adsim": {"fields": ["adsim"]}}` at test_adsim_system.py:241,
-    // with bsrs's `_image` data key.
+    // `hints={"adsim": {"fields": ["adsim"]}}` at test_adsim_system.py:241.
     let hints = descriptor.hints.as_ref().expect("descriptor hints");
     assert_eq!(
         hints["adsim"].fields.as_deref(),
-        Some(&["adsim_image".to_string()][..])
+        Some(&["adsim".to_string()][..])
     );
     let resources: Vec<_> = docs
         .iter()

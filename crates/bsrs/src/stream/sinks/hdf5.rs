@@ -96,6 +96,8 @@ pub struct Hdf5FrameSink {
     counter: AtomicU64,
     last_emitted: AtomicU64,
     resource_uid: StdMutex<Option<String>>,
+    /// Data key the detector named at `open`; `None` until then.
+    data_key: StdMutex<Option<String>>,
 }
 
 impl Hdf5FrameSink {
@@ -130,6 +132,7 @@ impl Hdf5FrameSink {
             counter: AtomicU64::new(0),
             last_emitted: AtomicU64::new(0),
             resource_uid: StdMutex::new(None),
+            data_key: StdMutex::new(None),
         }
     }
 
@@ -189,11 +192,12 @@ impl FrameSink for Hdf5FrameSink {
 
 #[async_trait]
 impl DetectorWriter for Hdf5FrameSink {
-    async fn open(&self, _multiplier: u32) -> Result<HashMap<String, DataKey>> {
+    async fn open(&self, datakey_name: &str, _multiplier: u32) -> Result<HashMap<String, DataKey>> {
         self.ensure_open().await?;
+        *self.data_key.lock().unwrap() = Some(datakey_name.to_string());
         let mut out = HashMap::new();
         out.insert(
-            format!("{}_image", self.name),
+            datakey_name.to_string(),
             DataKey {
                 source: crate::event_model::file_uri(&self.path.display().to_string()),
                 dtype: Dtype::Number,
@@ -206,7 +210,7 @@ impl DetectorWriter for Hdf5FrameSink {
                 external: Some("STREAM:".into()),
                 units: None,
                 precision: None,
-                object_name: Some(self.name.clone()),
+                object_name: None,
                 dims: Some(vec!["byte".into()]),
                 limits: None,
                 choices: None,
@@ -228,6 +232,9 @@ impl DetectorWriter for Hdf5FrameSink {
         Ok(())
     }
     fn collect_stream_docs(&self, up_to: u64, descriptor: &str) -> BoxStream<'_, StreamAsset> {
+        let Some(data_key) = self.data_key.lock().unwrap().clone() else {
+            return stream::empty().boxed();
+        };
         let mut docs: Vec<StreamAsset> = Vec::new();
         let resource_uid = {
             let mut g = self.resource_uid.lock().unwrap();
@@ -243,7 +250,7 @@ impl DetectorWriter for Hdf5FrameSink {
                 );
                 docs.push(StreamAsset::Resource(StreamResource {
                     uid: new_uid.clone(),
-                    data_key: format!("{}_image", self.name),
+                    data_key,
                     mimetype: "application/x-hdf5".into(),
                     uri: crate::event_model::file_uri(&self.path.display().to_string()),
                     parameters: params,
