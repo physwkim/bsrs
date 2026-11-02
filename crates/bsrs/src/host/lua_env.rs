@@ -4232,6 +4232,7 @@ mod ad_lua_smoke {
     #[test]
     #[ignore]
     fn lua_ad_factories_smoke() {
+        let _ioc = crate::host::areadetector::tests::lock_live_ioc();
         let re = Arc::new(RunEngine::new(vec![]));
         let lua = build_lua(re).expect("build_lua");
         let prefix = ad_prefix();

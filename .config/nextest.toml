@@ -20,13 +20,3 @@ leak-timeout = "500ms"
 # Re-list leaky tests next to the final summary so the culprit's name
 # survives scrolled or truncated output instead of only appearing mid-stream.
 final-status-level = "leak"
-
-[test-groups]
-live-ad-ioc = { max-threads = 1 }
-
-# The in-crate live areaDetector tests drive one external IOC's cam and
-# check it is restored afterwards; in parallel processes one test's
-# ImageMode write lands between another's snapshot and its check.
-[[profile.default.overrides]]
-filter = '''package(bsrs) & kind(lib) & test(/^host::(areadetector::tests::ad_\w+_against_sim_detector|areadetector::ad_hdf_tests::area_detector_hdf_live_|lua_env::ad_lua_smoke::)/)'''
-test-group = "live-ad-ioc"

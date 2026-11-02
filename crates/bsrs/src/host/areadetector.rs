@@ -2729,7 +2729,7 @@ pub fn area_detector_tiff(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -2862,8 +2862,7 @@ mod tests {
     //   cd ~/codes/epics-rs/examples/sim-detector
     //   cargo run --bin sim-ioc --features ioc -- ioc/st.cmd
     //
-    // Then in another shell (the `live-ad-ioc` nextest group runs them one
-    // at a time, as they share the cam):
+    // Then in another shell:
     //   cargo nextest run -p bsrs --features host --run-ignored only \
     //       -E 'kind(lib) & test(/^host::/)'
     //
@@ -2871,6 +2870,16 @@ mod tests {
     // `SIM1`); for the mini-beamline:
     //   BSRS_AD_PREFIX=mini:dot:  BSRS_AD_PORT=DOT
     // -------------------------------------------------------------
+
+    /// Held for a live test's whole run. The tests drive one IOC's cam and
+    /// check it is restored afterwards, so they take turns, across threads
+    /// (`cargo test`) and processes (nextest) alike.
+    pub(crate) fn lock_live_ioc() -> std::fs::File {
+        let path = std::env::temp_dir().join("bsrs-live-ad-ioc.lock");
+        let file = std::fs::File::create(path).expect("live IOC lock file");
+        file.lock().expect("live IOC lock");
+        file
+    }
 
     pub(super) fn ad_prefix() -> String {
         std::env::var("BSRS_AD_PREFIX").unwrap_or_else(|_| "SIM1:".to_string())
@@ -2892,6 +2901,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     async fn ad_warmup_against_sim_detector() {
+        let _ioc = lock_live_ioc();
         let prefix = ad_prefix();
         let cam = AreaDetectorCam::new(format!("{prefix}cam1:"));
         cam.connect(Duration::from_secs(5))
@@ -2953,6 +2963,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     async fn ad_select_save_plugin_against_sim_detector() {
+        let _ioc = lock_live_ioc();
         async fn en(f: &NdFile) -> bool {
             SignalBackend::<bool>::get_value(f.plugin.enable_callbacks.as_ref())
                 .await
@@ -3753,6 +3764,7 @@ mod ad_hdf_tests {
     #[tokio::test]
     #[ignore]
     async fn area_detector_hdf_live_emits_real_file_stream_resource() {
+        let _ioc = super::tests::lock_live_ioc();
         let prefix = super::tests::ad_prefix();
         let dir = std::env::var("BSRS_AD_DIR").unwrap_or_else(|_| "/tmp/".to_string());
         let det = area_detector_hdf(
