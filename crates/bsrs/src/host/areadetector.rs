@@ -40,7 +40,7 @@ use crate::core::status::{Status, StatusError, SubToken};
 use crate::devices::device::Device;
 use crate::devices::signal::{Read, Readable, Signal};
 use crate::devices::stage_sigs::StageSigs;
-use crate::devices::{wait_for_connection, StandardDetector};
+use crate::devices::{wait_for_connection, PathInfo, PathProvider, StandardDetector};
 use crate::event_model::{DataKey, Dtype, StreamDatum, StreamRange, StreamResource};
 use crate::protocols_async::{
     DetectorControl, DetectorTrigger, DetectorWriter, SignalBackend, SingleDataLogic, StreamAsset,
@@ -931,23 +931,26 @@ impl NdFile {
         Ok(s.trim_end_matches('\0').to_string())
     }
 
-    /// Point the plugin at `directory`/`filename` with `template`, switch it
-    /// to Stream mode with `AutoIncrement` on and `FileNumber` reset, and set
-    /// `NumCapture`. Single owner of the put ordering (depth before path: the
-    /// directory-creation callback fires when `FilePath` is processed) and of
-    /// the `FilePathExists_RBV` check. Port of ophyd-async's
-    /// `prepare_file_paths` (`_data_logic.py:124`).
+    /// Point the plugin at `path_info`'s directory and filename with
+    /// `template`, switch it to Stream mode with `AutoIncrement` on and
+    /// `FileNumber` reset, and set `NumCapture`. Single owner of the put
+    /// ordering (depth before path: the directory-creation callback fires when
+    /// `FilePath` is processed) and of the `FilePathExists_RBV` check. Port of
+    /// ophyd-async's `prepare_file_paths` (`_data_logic.py:124`).
     pub async fn configure(
         &self,
-        directory: &str,
-        filename: &str,
+        path_info: &PathInfo,
         template: &str,
         num_capture: i64,
-        create_dir_depth: i64,
     ) -> Result<()> {
-        self.set_create_directory(create_dir_depth).await?;
-        self.set_path(directory).await?;
-        self.set_name(filename).await?;
+        // With the separator left off, areaDetector appends it and the
+        // `FilePath` readback never matches the put. POSIX IOC hosts only:
+        // ophyd-async's `PureWindowsPath` + `\` arm is not ported.
+        let directory = format!("{}/", path_info.directory_path().display());
+        self.set_create_directory(path_info.create_dir_depth())
+            .await?;
+        self.set_path(&directory).await?;
+        self.set_name(path_info.filename()).await?;
         self.set_template(template).await?;
         self.set_auto_increment(true).await?;
         self.set_file_number(0).await?;
@@ -1459,7 +1462,7 @@ const AD_HDF_DATASET: &str = "/entry/data/data";
 /// in fixed 16384-element chunks (ophyd-async `_data_logic.py:216`).
 const AD_HDF_ATTR_CHUNK: u64 = 16384;
 /// Default `FileTemplate` — `<path><name>.h5`, no auto-increment suffix, so the
-/// IOC-resolved `FullFileName_RBV` is deterministic.
+/// file is `PathInfo.directory_uri` + `filename` + `.h5`.
 const AD_HDF_TEMPLATE: &str = "%s%s.h5";
 
 /// `FileTemplate` base for the multipart (one-file-per-frame) writers —
@@ -1467,49 +1470,6 @@ const AD_HDF_TEMPLATE: &str = "%s%s.h5";
 /// plugin. Matches ophyd-async's `"%s%s_%6.6d" + self.extension`
 /// (`ADMultipartDataLogic.prepare_unbounded`).
 const AD_MULTIPART_TEMPLATE: &str = "%s%s_%6.6d";
-
-/// Where the areaDetector file plugin should write and under what basename.
-/// Mirrors ophyd-async's `PathProvider`/`PathInfo`: the writer sets the IOC's
-/// `FilePath`/`FileName` from this, then builds the `StreamResource` URI from
-/// the IOC's `FullFileName_RBV` readback (so it points at what the IOC wrote).
-#[derive(Clone, Debug)]
-pub struct StaticPathProvider {
-    /// Directory the IOC writes into (must be visible on the IOC host).
-    /// Always stored with a trailing `/`, fixed at construction — left to the
-    /// IOC, areaDetector appends the separator itself and the `FilePath`
-    /// readback never matches the put (ophyd-async `prepare_file_paths`,
-    /// `_data_logic.py:130`). POSIX IOC hosts only; ophyd's
-    /// `PureWindowsPath` + `\` variant is not ported.
-    pub directory: String,
-    /// File basename (pre-template), e.g. `"scan"`.
-    pub filename: String,
-    /// `CreateDirectory` depth — how many missing trailing path levels the
-    /// IOC may create (`0` = create nothing). Set via
-    /// [`with_create_dir_depth`](Self::with_create_dir_depth).
-    pub create_dir_depth: i64,
-}
-
-impl StaticPathProvider {
-    /// Build a provider that always returns the same directory + basename.
-    pub fn new(directory: impl Into<String>, filename: impl Into<String>) -> Self {
-        let mut directory = directory.into();
-        if !directory.ends_with('/') {
-            directory.push('/');
-        }
-        Self {
-            directory,
-            filename: filename.into(),
-            create_dir_depth: 0,
-        }
-    }
-
-    /// Let the IOC create up to `depth` missing trailing path levels
-    /// (`CreateDirectory` PV; ophyd-async `PathInfo.create_dir_depth`).
-    pub fn with_create_dir_depth(mut self, depth: i64) -> Self {
-        self.create_dir_depth = depth;
-        self
-    }
-}
 
 /// The subset of an areaDetector file plugin the [`AdHdfWriter`] drives.
 /// Splitting this out (mirroring ophyd-async's `NDFileHDF5IO` vs `ADHDFWriter`)
@@ -1519,20 +1479,15 @@ impl StaticPathProvider {
 pub trait AdFileIo: Send + Sync {
     /// Connect the underlying transport and install the frames-written monitor.
     async fn connect(&self, timeout: Duration) -> Result<()>;
-    /// Point the plugin at `directory`/`filename` with `template`, switch it
-    /// to Stream mode with `AutoIncrement` on and `FileNumber` reset, and set
-    /// `NumCapture` (`0` = until `stop_capture`). `create_dir_depth` missing
-    /// trailing path levels may be created by the IOC; errors if the IOC then
-    /// still cannot see the directory (`FilePathExists_RBV`). Port of
-    /// ophyd-async's `prepare_file_paths` (`_data_logic.py:124`).
-    async fn configure(
-        &self,
-        directory: &str,
-        filename: &str,
-        template: &str,
-        num_capture: i64,
-        create_dir_depth: i64,
-    ) -> Result<()>;
+    /// Point the plugin at `path_info`'s directory and filename with
+    /// `template`, switch it to Stream mode with `AutoIncrement` on and
+    /// `FileNumber` reset, and set `NumCapture` (`0` = until `stop_capture`).
+    /// The IOC may create `path_info.create_dir_depth()` missing levels;
+    /// errors if it then still cannot see the directory
+    /// (`FilePathExists_RBV`). Port of ophyd-async's `prepare_file_paths`
+    /// (`_data_logic.py:124`).
+    async fn configure(&self, path_info: &PathInfo, template: &str, num_capture: i64)
+        -> Result<()>;
     /// Enable the plugin's callbacks (`EnableCallbacks=1`) so it consumes
     /// frames from its NDArray port.
     async fn enable_callbacks(&self) -> Result<()>;
@@ -1542,8 +1497,6 @@ pub trait AdFileIo: Send + Sync {
     async fn stop_capture(&self) -> Result<()>;
     /// Frames written so far (the per-frame write index).
     async fn num_captured(&self) -> Result<u64>;
-    /// Absolute path the IOC resolved for the open file.
-    async fn full_file_name(&self) -> Result<String>;
     /// Watch the frames-written counter, for `complete()` in fly scans.
     fn observe_num_captured(&self) -> watch::Receiver<u64>;
 }
@@ -1606,15 +1559,13 @@ impl AdFileIo for NdFileIo {
     }
     async fn configure(
         &self,
-        directory: &str,
-        filename: &str,
+        path_info: &PathInfo,
         template: &str,
         num_capture: i64,
-        create_dir_depth: i64,
     ) -> Result<()> {
         self.file
             .file
-            .configure(directory, filename, template, num_capture, create_dir_depth)
+            .configure(path_info, template, num_capture)
             .await
     }
     async fn enable_callbacks(&self) -> Result<()> {
@@ -1628,9 +1579,6 @@ impl AdFileIo for NdFileIo {
     }
     async fn num_captured(&self) -> Result<u64> {
         self.file.file.num_captured().await
-    }
-    async fn full_file_name(&self) -> Result<String> {
-        self.file.file.full_file_name().await
     }
     fn observe_num_captured(&self) -> watch::Receiver<u64> {
         self.index_rx.clone()
@@ -1694,15 +1642,11 @@ impl AdFileIo for NdPluginFileIo {
     }
     async fn configure(
         &self,
-        directory: &str,
-        filename: &str,
+        path_info: &PathInfo,
         template: &str,
         num_capture: i64,
-        create_dir_depth: i64,
     ) -> Result<()> {
-        self.file
-            .configure(directory, filename, template, num_capture, create_dir_depth)
-            .await
+        self.file.configure(path_info, template, num_capture).await
     }
     async fn enable_callbacks(&self) -> Result<()> {
         self.file.plugin.set_enabled(true).await
@@ -1715,9 +1659,6 @@ impl AdFileIo for NdPluginFileIo {
     }
     async fn num_captured(&self) -> Result<u64> {
         self.file.num_captured().await
-    }
-    async fn full_file_name(&self) -> Result<String> {
-        self.file.full_file_name().await
     }
     fn observe_num_captured(&self) -> watch::Receiver<u64> {
         self.index_rx.clone()
@@ -1916,6 +1857,9 @@ fn ad_stream_datum(resource_uid: String, descriptor: &str, start: u64, stop: u64
 /// always match the data keys reported at `open()`.
 struct AdEmitState {
     data_key: String,
+    /// The `.h5` URI from the `PathInfo` staged by `open()`: the
+    /// `StreamResource` URI and the attribute `DataKey.source` fallback.
+    uri: String,
     attrs: Vec<NdAttributeDataset>,
     main_resource_uid: Option<String>,
     attr_resource_uids: HashMap<String, String>,
@@ -1938,7 +1882,7 @@ pub struct AdHdfWriter {
     /// Driver-side frame description (`ArraySizeZ/Y/X_RBV` etc.), read at
     /// `open()` for the image `DataKey`'s shape/dtype.
     frame: Arc<dyn AdFrameInfoSource>,
-    path_provider: StaticPathProvider,
+    path_provider: Arc<dyn PathProvider>,
     /// `NDAttributesFile` sources (driver + extra plugins) read at `open()` to
     /// discover the per-frame NDAttribute datasets in the IOC's file.
     attr_sources: Vec<Arc<dyn NdAttributeXmlSource>>,
@@ -1954,11 +1898,11 @@ pub struct AdHdfWriter {
 
 impl AdHdfWriter {
     /// Build a writer over `io`, describing frames per `frame`, writing files
-    /// per `path_provider`.
+    /// where `path_provider` says at each `open()`.
     pub fn new(
         io: Arc<dyn AdHdfFileIo>,
         frame: Arc<dyn AdFrameInfoSource>,
-        path_provider: StaticPathProvider,
+        path_provider: Arc<dyn PathProvider>,
     ) -> Self {
         Self {
             datakey_suffix: String::new(),
@@ -1994,16 +1938,6 @@ impl AdHdfWriter {
     pub fn with_ndattributes(mut self, attrs: Vec<NdAttributeDataset>) -> Self {
         self.ndattributes = attrs;
         self
-    }
-
-    /// The file URI the path provider + `%s%s.h5` template resolve to — the
-    /// `DataKey.source` fallback for attributes with no PV source, mirroring
-    /// ophyd-async composing the uri from `path_info` (`_data_logic.py:224`).
-    fn provider_uri(&self) -> String {
-        crate::event_model::file_uri(&format!(
-            "{}{}.h5",
-            self.path_provider.directory, self.path_provider.filename
-        ))
     }
 
     /// Effective NDAttribute set for this staging: every source's inline XML,
@@ -2048,6 +1982,10 @@ impl DetectorWriter for AdHdfWriter {
     }
     async fn open(&self, datakey_name: &str, multiplier: u32) -> Result<HashMap<String, DataKey>> {
         let multiplier = u64::from(multiplier.max(1));
+        let path_info = self.path_provider.path_info(Some(datakey_name))?;
+        // The file the `%s%s.h5` template names, as a reader resolves it
+        // (ophyd-async `_data_logic.py:233`).
+        let uri = format!("{}{}.h5", path_info.directory_uri(), path_info.filename());
         // Frames per HDF chunk — read before the setup puts, then let the
         // plugin derive the rest of the chunking from the frame
         // (ophyd-async `prepare_unbounded`, `_data_logic.py:180-186`).
@@ -2061,15 +1999,7 @@ impl DetectorWriter for AdHdfWriter {
         // Configure + arm the IOC file plugin. NumCapture=0: capture until
         // close() clears Capture, matching a step scan whose frame count is
         // unknown until the plan ends.
-        self.io
-            .configure(
-                &self.path_provider.directory,
-                &self.path_provider.filename,
-                AD_HDF_TEMPLATE,
-                0,
-                self.path_provider.create_dir_depth,
-            )
-            .await?;
+        self.io.configure(&path_info, AD_HDF_TEMPLATE, 0).await?;
         self.io.start_capture().await?;
         // Discover the frame shape + dtype from the driver's ArraySizeZ/Y/X +
         // DataType + ColorMode RBVs. Requires a primed detector — the shape is
@@ -2083,6 +2013,7 @@ impl DetectorWriter for AdHdfWriter {
         // set are what collect_stream_docs will emit resources/datums for.
         *self.emit.lock().await = Some(AdEmitState {
             data_key: datakey_name.to_string(),
+            uri: uri.clone(),
             attrs: attrs.clone(),
             main_resource_uid: None,
             attr_resource_uids: HashMap::new(),
@@ -2093,14 +2024,14 @@ impl DetectorWriter for AdHdfWriter {
         // DataKey shapes carry the frames-per-index prefix, `[multiplier,
         // *frame_shape]` for the image and `[multiplier]` for the scalar
         // NDAttributes (ophyd-async `make_datakeys`); the image source is the
-        // file URI the writer resolves to, not a PV.
+        // file URI, not a PV.
         let image_shape: Vec<Option<u64>> =
             std::iter::once(multiplier).chain(shape).map(Some).collect();
         let mut out = HashMap::new();
         out.insert(
             datakey_name.to_string(),
             DataKey {
-                source: self.provider_uri(),
+                source: uri.clone(),
                 dtype: stream_datakey_dtype(multiplier, image_shape.len()),
                 shape: image_shape,
                 dtype_numpy: Some(dtype_numpy.into()),
@@ -2121,7 +2052,7 @@ impl DetectorWriter for AdHdfWriter {
                 a.name.clone(),
                 DataKey {
                     source: if a.source.is_empty() {
-                        self.provider_uri()
+                        uri.clone()
                     } else {
                         a.source.clone()
                     },
@@ -2148,9 +2079,9 @@ impl DetectorWriter for AdHdfWriter {
     }
     fn collect_stream_docs(&self, up_to: u64, descriptor: &str) -> BoxStream<'_, StreamAsset> {
         let descriptor = descriptor.to_string();
-        // Build the docs in one future (the FullFileName_RBV read is async), then
-        // flatten to a stream. `stream::once(..).flat_map(stream::iter)` gives a
-        // `BoxStream` without pulling in a generator macro.
+        // Build the docs in one future (the emit lock and flush are async),
+        // then flatten to a stream. `stream::once(..).flat_map(stream::iter)`
+        // gives a `BoxStream` without pulling in a generator macro.
         let fut = async move {
             let mut docs: Vec<StreamAsset> = Vec::new();
             let mut guard = self.emit.lock().await;
@@ -2166,49 +2097,37 @@ impl DetectorWriter for AdHdfWriter {
             let data_key = st.data_key.clone();
             let attrs = st.attrs.clone();
             // Emit each StreamResource once. The main image and every
-            // NDAttribute live in the same .h5, so they share one URI resolved
-            // from FullFileName_RBV — read it only when a resource still needs
-            // emitting.
-            let need_main = st.main_resource_uid.is_none();
-            let need_attr = attrs
-                .iter()
-                .any(|a| !st.attr_resource_uids.contains_key(&a.name));
-            if need_main || need_attr {
-                let path = self.io.full_file_name().await.unwrap_or_default();
-                let uri = if path.is_empty() {
-                    String::new()
-                } else {
-                    crate::event_model::file_uri(&path)
-                };
-                if need_main {
+            // NDAttribute live in the same .h5, so they share the URI staged
+            // by open().
+            let uri = st.uri.clone();
+            if st.main_resource_uid.is_none() {
+                let uid = uuid::Uuid::new_v4().to_string();
+                st.main_resource_uid = Some(uid.clone());
+                // The IOC chunks the image dataset [frames_per_chunk,
+                // *frame_shape] (ophyd-async `_data_logic.py:88`).
+                let chunk: Vec<u64> = std::iter::once(st.frames_per_chunk.max(1))
+                    .chain(st.frame_shape.iter().copied())
+                    .collect();
+                docs.push(StreamAsset::Resource(ad_stream_resource(
+                    uid,
+                    data_key.clone(),
+                    &uri,
+                    AD_HDF_DATASET,
+                    &chunk,
+                )));
+            }
+            for a in &attrs {
+                if !st.attr_resource_uids.contains_key(&a.name) {
                     let uid = uuid::Uuid::new_v4().to_string();
-                    st.main_resource_uid = Some(uid.clone());
-                    // The IOC chunks the image dataset [frames_per_chunk,
-                    // *frame_shape] (ophyd-async `_data_logic.py:88`).
-                    let chunk: Vec<u64> = std::iter::once(st.frames_per_chunk.max(1))
-                        .chain(st.frame_shape.iter().copied())
-                        .collect();
+                    st.attr_resource_uids.insert(a.name.clone(), uid.clone());
+                    let dataset = format!("/entry/instrument/NDAttributes/{}", a.name);
                     docs.push(StreamAsset::Resource(ad_stream_resource(
                         uid,
-                        data_key.clone(),
+                        a.name.clone(),
                         &uri,
-                        AD_HDF_DATASET,
-                        &chunk,
+                        &dataset,
+                        &[AD_HDF_ATTR_CHUNK],
                     )));
-                }
-                for a in &attrs {
-                    if !st.attr_resource_uids.contains_key(&a.name) {
-                        let uid = uuid::Uuid::new_v4().to_string();
-                        st.attr_resource_uids.insert(a.name.clone(), uid.clone());
-                        let dataset = format!("/entry/instrument/NDAttributes/{}", a.name);
-                        docs.push(StreamAsset::Resource(ad_stream_resource(
-                            uid,
-                            a.name.clone(),
-                            &uri,
-                            &dataset,
-                            &[AD_HDF_ATTR_CHUNK],
-                        )));
-                    }
                 }
             }
             // One StreamDatum per dataset (main + each attribute) for the new
@@ -2263,6 +2182,13 @@ impl DetectorWriter for AdHdfWriter {
 /// staged by `open()`.
 struct AdMultipartEmitState {
     data_key: String,
+    /// `PathInfo.directory_uri` staged by `open()`: the `StreamResource` URI
+    /// and the `DataKey.source` (the frames' filenames are in `template`).
+    directory_uri: String,
+    /// The `template` `StreamResource` parameter, Python-format style; the
+    /// consumer substitutes the frame number:
+    /// `path_info.filename + "_{:06d}" + extension`.
+    template: String,
     resource_uid: Option<String>,
     last_emitted: u64,
     /// Frame shape discovered at `open()`, for the resource's `chunk_shape`
@@ -2282,7 +2208,7 @@ pub struct AdMultipartWriter {
     /// Driver-side frame description (`ArraySizeZ/Y/X_RBV` etc.), read at
     /// `open()` for the image `DataKey`'s shape/dtype.
     frame: Arc<dyn AdFrameInfoSource>,
-    path_provider: StaticPathProvider,
+    path_provider: Arc<dyn PathProvider>,
     /// File extension including the dot, e.g. `".jpg"`.
     extension: String,
     /// `StreamResource` mimetype, e.g. `"multipart/related;type=image/jpeg"`.
@@ -2294,12 +2220,12 @@ pub struct AdMultipartWriter {
 
 impl AdMultipartWriter {
     /// Build a writer over `io`, describing frames per `frame`, writing files
-    /// per `path_provider`, with the given file `extension` (dot included)
-    /// and `StreamResource` `mimetype`.
+    /// where `path_provider` says at each `open()`, with the given file
+    /// `extension` (dot included) and `StreamResource` `mimetype`.
     pub fn new(
         io: Arc<dyn AdFileIo>,
         frame: Arc<dyn AdFrameInfoSource>,
-        path_provider: StaticPathProvider,
+        path_provider: Arc<dyn PathProvider>,
         extension: impl Into<String>,
         mimetype: impl Into<String>,
     ) -> Self {
@@ -2326,7 +2252,7 @@ impl AdMultipartWriter {
     pub fn jpeg(
         io: Arc<dyn AdFileIo>,
         frame: Arc<dyn AdFrameInfoSource>,
-        path_provider: StaticPathProvider,
+        path_provider: Arc<dyn PathProvider>,
     ) -> Self {
         Self::new(
             io,
@@ -2342,7 +2268,7 @@ impl AdMultipartWriter {
     pub fn tiff(
         io: Arc<dyn AdFileIo>,
         frame: Arc<dyn AdFrameInfoSource>,
-        path_provider: StaticPathProvider,
+        path_provider: Arc<dyn PathProvider>,
     ) -> Self {
         Self::new(
             io,
@@ -2351,21 +2277,6 @@ impl AdMultipartWriter {
             ".tiff",
             "multipart/related;type=image/tiff",
         )
-    }
-
-    /// The directory URI the frames land under — both the `StreamResource`
-    /// URI and the `DataKey.source` (ophyd-async's multipart provider uses
-    /// `path_info.directory_uri` for both; the per-frame filename lives in
-    /// the `template` parameter).
-    fn directory_uri(&self) -> String {
-        crate::event_model::file_uri(&self.path_provider.directory)
-    }
-
-    /// The `template` `StreamResource` parameter — Python-format style, the
-    /// consumer substitutes the frame number:
-    /// `path_info.filename + "_{:06d}" + extension`.
-    fn template_parameter(&self) -> String {
-        format!("{}_{{:06d}}{}", self.path_provider.filename, self.extension)
     }
 }
 
@@ -2376,6 +2287,7 @@ impl DetectorWriter for AdMultipartWriter {
     }
     async fn open(&self, datakey_name: &str, multiplier: u32) -> Result<HashMap<String, DataKey>> {
         let multiplier = u64::from(multiplier.max(1));
+        let path_info = self.path_provider.path_info(Some(datakey_name))?;
         // Plugin callbacks on, then the file paths. ophyd-async's
         // `ADMultipartDataLogic.prepare_unbounded` does not enable callbacks
         // itself (its plugin chain is armed elsewhere); bsrs's open() is the
@@ -2385,11 +2297,9 @@ impl DetectorWriter for AdMultipartWriter {
         // 6-digit frame number, capture until close() (`NumCapture=0`).
         self.io
             .configure(
-                &self.path_provider.directory,
-                &self.path_provider.filename,
+                &path_info,
                 &format!("{AD_MULTIPART_TEMPLATE}{}", self.extension),
                 0,
-                self.path_provider.create_dir_depth,
             )
             .await?;
         self.io.start_capture().await?;
@@ -2398,6 +2308,8 @@ impl DetectorWriter for AdMultipartWriter {
         let (shape, dtype_numpy) = self.frame.frame_info().await?;
         *self.emit.lock().await = Some(AdMultipartEmitState {
             data_key: datakey_name.to_string(),
+            directory_uri: path_info.directory_uri().to_string(),
+            template: format!("{}_{{:06d}}{}", path_info.filename(), self.extension),
             resource_uid: None,
             last_emitted: 0,
             frame_shape: shape.clone(),
@@ -2408,7 +2320,7 @@ impl DetectorWriter for AdMultipartWriter {
         out.insert(
             datakey_name.to_string(),
             DataKey {
-                source: self.directory_uri(),
+                source: path_info.directory_uri().to_string(),
                 dtype: stream_datakey_dtype(multiplier, image_shape.len()),
                 shape: image_shape,
                 dtype_numpy: Some(dtype_numpy.into()),
@@ -2438,17 +2350,15 @@ impl DetectorWriter for AdMultipartWriter {
                 return docs;
             };
             // Emit the one StreamResource on first use. The URI is the
-            // directory (known up front from the provider — no
-            // FullFileName_RBV read; that readback names only the latest
-            // frame's file); the per-frame filename is reconstructed by the
-            // consumer from the `template` parameter.
+            // directory; the consumer rebuilds each frame's filename from the
+            // `template` parameter.
             if st.resource_uid.is_none() {
                 let uid = uuid::Uuid::new_v4().to_string();
                 st.resource_uid = Some(uid.clone());
                 let mut parameters = HashMap::new();
                 parameters.insert(
                     "template".to_string(),
-                    serde_json::Value::String(self.template_parameter()),
+                    serde_json::Value::String(st.template.clone()),
                 );
                 // One file per frame: chunk_shape [1, *frame_shape]
                 // (ophyd-async `get_ndarray_resource_info` with its default
@@ -2466,7 +2376,7 @@ impl DetectorWriter for AdMultipartWriter {
                     uid,
                     data_key: st.data_key.clone(),
                     mimetype: self.mimetype.clone(),
-                    uri: self.directory_uri(),
+                    uri: st.directory_uri.clone(),
                     parameters,
                     run_start: None,
                 }));
@@ -2742,13 +2652,13 @@ where
 pub type AreaDetectorHdf = StandardDetector<AreaDetectorCam>;
 
 /// Build an [`AreaDetectorHdf`] from a cam prefix and an HDF-plugin prefix,
-/// writing files per `path_provider`. Call [`StandardDetector::connect`]
+/// writing files where `path_provider` says. Call [`StandardDetector::connect`]
 /// before running a plan.
 pub fn area_detector_hdf(
     name: impl Into<String>,
     cam_prefix: impl Into<String>,
     hdf_prefix: impl Into<String>,
-    path_provider: StaticPathProvider,
+    path_provider: Arc<dyn PathProvider>,
 ) -> AreaDetectorHdf {
     let name = name.into();
     let cam = AreaDetectorCam::new(cam_prefix);
@@ -2777,11 +2687,11 @@ fn area_detector_multipart(
     name: String,
     cam_prefix: impl Into<String>,
     file_prefix: impl Into<String>,
-    path_provider: StaticPathProvider,
+    path_provider: Arc<dyn PathProvider>,
     make_writer: impl FnOnce(
         Arc<dyn AdFileIo>,
         Arc<dyn AdFrameInfoSource>,
-        StaticPathProvider,
+        Arc<dyn PathProvider>,
     ) -> AdMultipartWriter,
 ) -> AreaDetectorMultipart {
     let cam = AreaDetectorCam::new(cam_prefix);
@@ -2795,14 +2705,14 @@ fn area_detector_multipart(
 }
 
 /// Build an [`AreaDetectorMultipart`] over an NDFileJPEG plugin from a cam
-/// prefix and the plugin prefix, writing files per `path_provider`. Call
+/// prefix and the plugin prefix, writing files where `path_provider` says. Call
 /// [`StandardDetector::connect`] before running a plan. The
 /// `ADWriterType.JPEG` arm of ophyd-async's `make_writer_data_logic`.
 pub fn area_detector_jpeg(
     name: impl Into<String>,
     cam_prefix: impl Into<String>,
     jpeg_prefix: impl Into<String>,
-    path_provider: StaticPathProvider,
+    path_provider: Arc<dyn PathProvider>,
 ) -> AreaDetectorMultipart {
     area_detector_multipart(
         name.into(),
@@ -2819,7 +2729,7 @@ pub fn area_detector_tiff(
     name: impl Into<String>,
     cam_prefix: impl Into<String>,
     tiff_prefix: impl Into<String>,
-    path_provider: StaticPathProvider,
+    path_provider: Arc<dyn PathProvider>,
 ) -> AreaDetectorMultipart {
     area_detector_multipart(
         name.into(),
@@ -3180,18 +3090,21 @@ pub(crate) mod tests {
 #[cfg(test)]
 mod ad_hdf_tests {
     use super::*;
+    use crate::devices::{
+        AutoIncrementFilenameProvider, AutoIncrementingPathProvider, StaticFilenameProvider,
+        StaticPathProvider,
+    };
     use crate::protocols_async::{Preparable, Stageable, Triggerable, WritesStreamAssets};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-    /// What [`AdFileIo::configure`] received: `(directory, filename,
-    /// template, num_capture, create_dir_depth)`.
-    type ConfigureArgs = (String, String, String, i64, i64);
+    /// What [`AdFileIo::configure`] received: `(path_info, template,
+    /// num_capture)`.
+    type ConfigureArgs = (PathInfo, String, i64);
 
     /// In-memory `AdFileIo` so the document-composition logic is testable with
     /// no live IOC (mirrors ophyd-async's IO-vs-writer split).
     struct FakeAdFileIo {
         captured: AtomicU64,
-        full_name: String,
         index_tx: Arc<watch::Sender<u64>>,
         index_rx: watch::Receiver<u64>,
         configured: std::sync::Mutex<Option<ConfigureArgs>>,
@@ -3205,11 +3118,10 @@ mod ad_hdf_tests {
     }
 
     impl FakeAdFileIo {
-        fn new(full_name: &str) -> Arc<Self> {
+        fn new() -> Arc<Self> {
             let (tx, rx) = watch::channel(0u64);
             Arc::new(Self {
                 captured: AtomicU64::new(0),
-                full_name: full_name.to_string(),
                 index_tx: Arc::new(tx),
                 index_rx: rx,
                 configured: std::sync::Mutex::new(None),
@@ -3233,13 +3145,14 @@ mod ad_hdf_tests {
         async fn connect(&self, _t: Duration) -> Result<()> {
             Ok(())
         }
-        async fn configure(&self, d: &str, f: &str, t: &str, n: i64, depth: i64) -> Result<()> {
+        async fn configure(&self, path_info: &PathInfo, t: &str, n: i64) -> Result<()> {
             if !self.path_exists.load(Ordering::SeqCst) {
                 return Err(BsrsError::Backend(format!(
-                    "FilePath {d} doesn't exist on the IOC host or is not writable"
+                    "FilePath {} doesn't exist on the IOC host or is not writable",
+                    path_info.directory_path().display()
                 )));
             }
-            *self.configured.lock().unwrap() = Some((d.into(), f.into(), t.into(), n, depth));
+            *self.configured.lock().unwrap() = Some((path_info.clone(), t.into(), n));
             Ok(())
         }
         async fn enable_callbacks(&self) -> Result<()> {
@@ -3256,9 +3169,6 @@ mod ad_hdf_tests {
         }
         async fn num_captured(&self) -> Result<u64> {
             Ok(self.captured.load(Ordering::SeqCst))
-        }
-        async fn full_file_name(&self) -> Result<String> {
-            Ok(self.full_name.clone())
         }
         fn observe_num_captured(&self) -> watch::Receiver<u64> {
             self.index_rx.clone()
@@ -3294,20 +3204,20 @@ mod ad_hdf_tests {
         }
     }
 
+    /// `scan` files in `/data/scans`.
+    fn scans() -> Arc<dyn PathProvider> {
+        Arc::new(StaticPathProvider::new(
+            Arc::new(StaticFilenameProvider::new("scan")),
+            "/data/scans/",
+        ))
+    }
+
     fn writer_with(io: Arc<FakeAdFileIo>) -> AdHdfWriter {
-        AdHdfWriter::new(
-            io,
-            Arc::new(FakeFrameInfo),
-            StaticPathProvider::new("/data/scans/", "scan"),
-        )
+        AdHdfWriter::new(io, Arc::new(FakeFrameInfo), scans())
     }
 
     fn multipart_writer_with(io: Arc<FakeAdFileIo>) -> AdMultipartWriter {
-        AdMultipartWriter::jpeg(
-            io,
-            Arc::new(FakeFrameInfo),
-            StaticPathProvider::new("/data/scans/", "scan"),
-        )
+        AdMultipartWriter::jpeg(io, Arc::new(FakeFrameInfo), scans())
     }
 
     #[tokio::test]
@@ -3315,11 +3225,11 @@ mod ad_hdf_tests {
         // ophyd-async `_data_logic.py:243`/`:299`: the main dataset is hinted.
         for (w, label) in [
             (
-                Box::new(writer_with(FakeAdFileIo::new("/x.h5"))) as Box<dyn DetectorWriter>,
+                Box::new(writer_with(FakeAdFileIo::new())) as Box<dyn DetectorWriter>,
                 "hdf",
             ),
             (
-                Box::new(multipart_writer_with(FakeAdFileIo::new("/x.jpg"))),
+                Box::new(multipart_writer_with(FakeAdFileIo::new())),
                 "multipart",
             ),
         ] {
@@ -3427,7 +3337,7 @@ mod ad_hdf_tests {
 
     #[tokio::test]
     async fn open_discovers_ndattributes_from_xml_sources() {
-        let io = FakeAdFileIo::new("/data/scans/scan.h5");
+        let io = FakeAdFileIo::new();
         let xml = r#"<Attributes>
             <Attribute name="temp" type="EPICS_PV" source="SIM:TEMP" dbrtype="DBR_DOUBLE"/>
             <Attribute name="id" type="PARAM" source="UNIQUE_ID" datatype="INT64"/>
@@ -3472,7 +3382,7 @@ mod ad_hdf_tests {
 
     #[tokio::test]
     async fn declared_ndattributes_override_discovered_by_name() {
-        let io = FakeAdFileIo::new("/x.h5");
+        let io = FakeAdFileIo::new();
         let xml = r#"<Attributes>
             <Attribute name="temp" type="EPICS_PV" source="SIM:TEMP" dbrtype="DBR_DOUBLE"/>
         </Attributes>"#;
@@ -3495,7 +3405,7 @@ mod ad_hdf_tests {
 
     #[tokio::test]
     async fn filename_ndattributes_source_is_skipped() {
-        let io = FakeAdFileIo::new("/x.h5");
+        let io = FakeAdFileIo::new();
         // ADCore treats content without "<Attributes>" as a filename on the
         // IOC host; discovery cannot read it, so it contributes nothing.
         let w = writer_with(io.clone()).with_ndattribute_sources(vec![Arc::new(FakeXmlSource(
@@ -3508,7 +3418,7 @@ mod ad_hdf_tests {
 
     #[tokio::test]
     async fn open_configures_stream_capture_and_reports_external_datakey() {
-        let io = FakeAdFileIo::new("/data/scans/scan.h5");
+        let io = FakeAdFileIo::new();
         let w = writer_with(io.clone());
         let keys = w.open("det", 1).await.unwrap();
         let cfg = io
@@ -3517,11 +3427,15 @@ mod ad_hdf_tests {
             .unwrap()
             .clone()
             .expect("configure called");
-        assert_eq!(cfg.0, "/data/scans/");
-        assert_eq!(cfg.1, "scan");
-        assert_eq!(cfg.2, AD_HDF_TEMPLATE);
-        assert_eq!(cfg.3, 0, "NumCapture=0 (capture until stopped)");
-        assert_eq!(cfg.4, 0, "CreateDirectory depth defaults to 0");
+        assert_eq!(cfg.0.directory_path(), std::path::Path::new("/data/scans"));
+        assert_eq!(cfg.0.filename(), "scan");
+        assert_eq!(cfg.1, AD_HDF_TEMPLATE);
+        assert_eq!(cfg.2, 0, "NumCapture=0 (capture until stopped)");
+        assert_eq!(
+            cfg.0.create_dir_depth(),
+            0,
+            "CreateDirectory depth defaults to 0"
+        );
         assert!(io.capturing.load(Ordering::SeqCst), "capture started");
         assert!(
             io.hdf_setup.load(Ordering::SeqCst),
@@ -3547,7 +3461,7 @@ mod ad_hdf_tests {
 
     #[tokio::test]
     async fn open_fails_when_file_path_does_not_exist_on_ioc() {
-        let io = FakeAdFileIo::new("/x.h5");
+        let io = FakeAdFileIo::new();
         io.path_exists.store(false, Ordering::SeqCst);
         let w = writer_with(io.clone());
         let err = w.open("det", 1).await.unwrap_err().to_string();
@@ -3558,14 +3472,48 @@ mod ad_hdf_tests {
         );
     }
 
-    #[test]
-    fn static_path_provider_normalizes_trailing_slash_and_depth() {
-        let p = StaticPathProvider::new("/data/scans", "scan");
-        assert_eq!(p.directory, "/data/scans/");
-        assert_eq!(p.create_dir_depth, 0);
-        let p = StaticPathProvider::new("/data/scans/", "scan").with_create_dir_depth(2);
-        assert_eq!(p.directory, "/data/scans/", "no double slash");
-        assert_eq!(p.create_dir_depth, 2);
+    /// Each `open()` asks the provider once, and that staging's data keys and
+    /// `StreamResource` carry its file at the reader's `directory_uri`
+    /// (ophyd-async `_data_logic.py:185`, `:233`).
+    #[tokio::test]
+    async fn open_stages_the_providers_path_info_per_staging() {
+        let io = FakeAdFileIo::new();
+        let provider = StaticPathProvider::new(
+            Arc::new(AutoIncrementFilenameProvider::new("scan")),
+            "/data/scans",
+        )
+        .with_directory_uri("http://files.example/scans");
+        let w = AdHdfWriter::new(io.clone(), Arc::new(FakeFrameInfo), Arc::new(provider));
+        for n in 0..2 {
+            let keys = w.open("det", 1).await.unwrap();
+            let file = format!("scan_{n:05}");
+            let uri = format!("http://files.example/scans/{file}.h5");
+            assert_eq!(keys["det"].source, uri);
+            let cfg = io.configured.lock().unwrap().clone().unwrap();
+            assert_eq!(cfg.0.filename(), file);
+            io.set_captured(1);
+            let docs: Vec<StreamAsset> = w.collect_stream_docs(1, "d").collect().await;
+            match &docs[0] {
+                StreamAsset::Resource(r) => assert_eq!(r.uri, uri),
+                _ => panic!("first doc must be StreamResource"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn open_fails_on_a_provider_error_before_arming_the_plugin() {
+        let io = FakeAdFileIo::new();
+        let provider =
+            StaticPathProvider::new(Arc::new(StaticFilenameProvider::new("scan")), "relative");
+        let w = AdHdfWriter::new(io.clone(), Arc::new(FakeFrameInfo), Arc::new(provider));
+        let err = w.open("det", 1).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("directory_path must be an absolute path"),
+            "{err}"
+        );
+        assert!(io.configured.lock().unwrap().is_none());
+        assert!(!io.hdf_setup.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -3573,7 +3521,7 @@ mod ad_hdf_tests {
         // ophyd-async `make_datakeys(collections_per_event)` shapes, a
         // `collections_written_signal` of frames, and datums of events
         // (`make_stream_docs`, `_data_providers.py:138-155`).
-        let io = FakeAdFileIo::new("/x.h5");
+        let io = FakeAdFileIo::new();
         let w =
             writer_with(io.clone()).with_ndattributes(vec![NdAttributeDataset::new("temp", "<f8")]);
         let keys = w.open("det", 2).await.unwrap();
@@ -3619,7 +3567,7 @@ mod ad_hdf_tests {
 
     #[tokio::test]
     async fn collect_emits_resource_pointing_at_ioc_file_then_datum() {
-        let io = FakeAdFileIo::new("/data/scans/scan.h5");
+        let io = FakeAdFileIo::new();
         io.frames_per_chunk.store(4, Ordering::SeqCst);
         let w = writer_with(io.clone());
         w.open("det", 1).await.unwrap();
@@ -3682,7 +3630,7 @@ mod ad_hdf_tests {
 
     #[tokio::test]
     async fn ndattributes_emit_extra_resource_and_datum_per_attribute() {
-        let io = FakeAdFileIo::new("/data/scans/scan.h5");
+        let io = FakeAdFileIo::new();
         let w = writer_with(io.clone()).with_ndattributes(vec![
             NdAttributeDataset::new("temp", "<f8"),
             NdAttributeDataset::new("counter", "<i4"),
@@ -3778,23 +3726,10 @@ mod ad_hdf_tests {
     }
 
     #[tokio::test]
-    async fn empty_full_file_name_yields_empty_uri() {
-        let io = FakeAdFileIo::new("");
-        let w = writer_with(io.clone());
-        w.open("det", 1).await.unwrap();
-        io.set_captured(1);
-        let docs: Vec<StreamAsset> = w.collect_stream_docs(1, "d").collect().await;
-        match &docs[0] {
-            StreamAsset::Resource(r) => assert_eq!(r.uri, "", "no readback → empty URI"),
-            _ => panic!("first doc must be StreamResource"),
-        }
-    }
-
-    #[tokio::test]
     async fn only_collect_stream_docs_flushes() {
         // ophyd-async flushes in make_stream_docs (`_data_providers.py:142`)
         // and reads the count without one in get_index (`_detector.py:779`).
-        let io = FakeAdFileIo::new("/x.h5");
+        let io = FakeAdFileIo::new();
         let w = writer_with(io.clone());
         w.open("det", 1).await.unwrap();
         io.set_captured(4);
@@ -3806,7 +3741,7 @@ mod ad_hdf_tests {
 
     #[tokio::test]
     async fn observe_reflects_num_captured_updates() {
-        let io = FakeAdFileIo::new("/x.h5");
+        let io = FakeAdFileIo::new();
         let w = writer_with(io.clone());
         let mut rx = w.observe_indices_written();
         assert_eq!(*rx.borrow_and_update(), 0);
@@ -3817,7 +3752,7 @@ mod ad_hdf_tests {
 
     #[tokio::test]
     async fn close_stops_capture() {
-        let io = FakeAdFileIo::new("/x.h5");
+        let io = FakeAdFileIo::new();
         let w = writer_with(io.clone());
         w.open("det", 1).await.unwrap();
         assert!(io.capturing.load(Ordering::SeqCst));
@@ -3830,7 +3765,7 @@ mod ad_hdf_tests {
         // The WritesStreamAssets seam — the exact one the engine's step/fly
         // save path drains — yields the AD writer's resource + datum. The
         // cam needs an IOC to prepare; area_detector_hdf_live drives it.
-        let io = FakeAdFileIo::new("/data/scan.h5");
+        let io = FakeAdFileIo::new();
         let writer: Arc<dyn DetectorWriter> = Arc::new(writer_with(io.clone()));
         let det = StandardDetector::with_data_logics(
             "det",
@@ -3851,13 +3786,6 @@ mod ad_hdf_tests {
         }
     }
 
-    #[test]
-    fn path_provider_stores_directory_and_filename() {
-        let p = StaticPathProvider::new("/gpfs/data/", "img");
-        assert_eq!(p.directory, "/gpfs/data/");
-        assert_eq!(p.filename, "img");
-    }
-
     // Live-IOC smoke test — drives a real areaDetector cam + NDFileHDF5 plugin
     // end to end and asserts the emitted StreamResource points at the file the
     // IOC actually wrote. `#[ignore]`; run with `--ignored` against an IOC.
@@ -3873,7 +3801,10 @@ mod ad_hdf_tests {
             "addet",
             format!("{prefix}cam1:"),
             format!("{prefix}HDF1:"),
-            StaticPathProvider::new(dir, "bsrs_ad_live"),
+            Arc::new(StaticPathProvider::new(
+                Arc::new(StaticFilenameProvider::new("bsrs_ad_live")),
+                dir,
+            )),
         );
         det.connect(Duration::from_secs(5)).await.expect("connect");
         // Prime array dims so the HDF plugin can open the file.
@@ -3922,16 +3853,16 @@ mod ad_hdf_tests {
     /// `ADMultipartDataLogic.prepare_unbounded` + `make_datakeys`).
     #[tokio::test]
     async fn multipart_open_arms_plugin_and_describes_directory_source() {
-        let io = FakeAdFileIo::new("/data/scans/scan_000000.jpg");
+        let io = FakeAdFileIo::new();
         let w = multipart_writer_with(io.clone());
         let keys = w.open("det", 1).await.unwrap();
 
         let cfg = io.configured.lock().unwrap().clone().unwrap();
-        assert_eq!(cfg.0, "/data/scans/");
-        assert_eq!(cfg.1, "scan");
-        assert_eq!(cfg.2, "%s%s_%6.6d.jpg");
-        assert_eq!(cfg.3, 0, "NumCapture=0: capture until close()");
-        assert_eq!(cfg.4, 0, "default create_dir_depth");
+        assert_eq!(cfg.0.directory_path(), std::path::Path::new("/data/scans"));
+        assert_eq!(cfg.0.filename(), "scan");
+        assert_eq!(cfg.1, "%s%s_%6.6d.jpg");
+        assert_eq!(cfg.2, 0, "NumCapture=0: capture until close()");
+        assert_eq!(cfg.0.create_dir_depth(), 0, "default create_dir_depth");
         assert!(io.callbacks_enabled.load(Ordering::SeqCst));
         assert!(io.capturing.load(Ordering::SeqCst));
 
@@ -3946,9 +3877,37 @@ mod ad_hdf_tests {
         assert_eq!(dk.external.as_deref(), Some("STREAM:"));
     }
 
+    /// The directory comes from the provider at each `open()`; a provider
+    /// that names it by data key gets the writer's key.
+    #[tokio::test]
+    async fn multipart_open_stages_the_providers_directory() {
+        let io = FakeAdFileIo::new();
+        let provider = AutoIncrementingPathProvider::new(
+            Arc::new(StaticFilenameProvider::new("img")),
+            "/data/scans",
+        );
+        let w = AdMultipartWriter::tiff(io.clone(), Arc::new(FakeFrameInfo), Arc::new(provider));
+        let keys = w.open("det", 1).await.unwrap();
+        assert_eq!(keys["det"].source, "file://localhost/data/scans/det_00000/");
+        let docs: Vec<StreamAsset> = w.collect_stream_docs(0, "d").collect().await;
+        match &docs[0] {
+            StreamAsset::Resource(r) => {
+                assert_eq!(r.uri, "file://localhost/data/scans/det_00000/");
+                assert_eq!(r.parameters["template"], "img_{:06d}.tiff");
+            }
+            _ => panic!("first doc must be StreamResource"),
+        }
+        w.open("det", 1).await.unwrap();
+        let cfg = io.configured.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            cfg.0.directory_path(),
+            std::path::Path::new("/data/scans/det_00001")
+        );
+    }
+
     #[tokio::test]
     async fn multipart_open_leads_the_key_with_the_multiplier_and_counts_frames() {
-        let io = FakeAdFileIo::new("");
+        let io = FakeAdFileIo::new();
         let w = multipart_writer_with(io.clone());
         let keys = w.open("det", 2).await.unwrap();
         assert_eq!(keys["det"].shape, [Some(2), Some(20), Some(10)]);
@@ -3963,7 +3922,7 @@ mod ad_hdf_tests {
     /// for the engine. A second collect emits only the incremental datum.
     #[tokio::test]
     async fn multipart_collect_emits_directory_resource_then_datums() {
-        let io = FakeAdFileIo::new("/data/scans/scan_000001.jpg");
+        let io = FakeAdFileIo::new();
         let w = multipart_writer_with(io.clone());
         w.open("det", 1).await.unwrap();
         io.set_captured(2);
@@ -4023,22 +3982,18 @@ mod ad_hdf_tests {
     /// the TIFF variant carries its own extension + mimetype.
     #[tokio::test]
     async fn multipart_close_stops_capture_and_tiff_variant_maps_mimetype() {
-        let io = FakeAdFileIo::new("");
+        let io = FakeAdFileIo::new();
         let w = multipart_writer_with(io.clone());
         w.open("det", 1).await.unwrap();
         assert!(io.capturing.load(Ordering::SeqCst));
         w.close().await.unwrap();
         assert!(!io.capturing.load(Ordering::SeqCst));
 
-        let tio = FakeAdFileIo::new("");
-        let t = AdMultipartWriter::tiff(
-            tio.clone(),
-            Arc::new(FakeFrameInfo),
-            StaticPathProvider::new("/data/scans/", "scan"),
-        );
+        let tio = FakeAdFileIo::new();
+        let t = AdMultipartWriter::tiff(tio.clone(), Arc::new(FakeFrameInfo), scans());
         t.open("det", 1).await.unwrap();
         let cfg = tio.configured.lock().unwrap().clone().unwrap();
-        assert_eq!(cfg.2, "%s%s_%6.6d.tiff");
+        assert_eq!(cfg.1, "%s%s_%6.6d.tiff");
         let docs: Vec<StreamAsset> = t.collect_stream_docs(0, "d").collect().await;
         match &docs[0] {
             StreamAsset::Resource(r) => {

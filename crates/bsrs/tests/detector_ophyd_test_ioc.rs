@@ -6,14 +6,15 @@
 
 mod example_ioc;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bsrs::backends::epics_ca::EpicsCaBackend;
 use bsrs::core::msg::StageableObj;
-use bsrs::devices::BackendFromPv;
+use bsrs::devices::{BackendFromPv, StaticFilenameProvider, StaticPathProvider};
 use bsrs::host::areadetector::{
-    area_detector_hdf, select_save_plugin, AreaDetectorCam, NdFile, StaticPathProvider,
-    AD_COLOR_MODE_MONO, AD_IMAGE_MODE_SINGLE,
+    area_detector_hdf, select_save_plugin, AreaDetectorCam, NdFile, AD_COLOR_MODE_MONO,
+    AD_IMAGE_MODE_SINGLE,
 };
 use bsrs::protocols_async::{
     DetectorControl, SignalBackend, Stageable, Triggerable, WritesStreamAssets,
@@ -147,7 +148,10 @@ async fn trigger_waits_for_the_exposure_through_either_prefix() {
             "test",
             format!("{p}cam1:"),
             format!("{p}HDF1:"),
-            StaticPathProvider::new(dir.path().to_str().unwrap(), "basic"),
+            Arc::new(StaticPathProvider::new(
+                Arc::new(StaticFilenameProvider::new("basic")),
+                dir.path(),
+            )),
         );
         det.connect(TIMEOUT)
             .await

@@ -17,14 +17,15 @@ use bsrs::callbacks::CapturingSink;
 use bsrs::core::msg::{ConfigurableObj, ReadableObj, StageableObj, TriggerableObj};
 use bsrs::core::status::Status;
 use bsrs::devices::{
-    BackendFromPv, DataLogic, SignalConfig, SignalR, StandardDetector, TriggerInfo,
+    BackendFromPv, DataLogic, SignalConfig, SignalR, StandardDetector, StaticFilenameProvider,
+    StaticPathProvider, TriggerInfo,
 };
 use bsrs::event_model::{DataKey, Dtype, DtypeNumpy, StreamDatum, StreamResource};
 use bsrs::host::areadetector::{
     area_detector_hdf, num_rois, AdHdfWriter, AdMultipartWriter, AreaDetectorCam, AreaDetectorHdf,
     NdArrayDescription, NdFile, NdFileHdf5, NdFileIo, NdPluginFileIo, NdRoi, NdStats,
-    PluginSignalDataLogic, StaticPathProvider, AD_COLOR_MODE_MONO, AD_COLOR_MODE_RGB1,
-    AD_IMAGE_MODE_CONTINUOUS, AD_IMAGE_MODE_MULTIPLE, AD_IMAGE_MODE_SINGLE,
+    PluginSignalDataLogic, AD_COLOR_MODE_MONO, AD_COLOR_MODE_RGB1, AD_IMAGE_MODE_CONTINUOUS,
+    AD_IMAGE_MODE_MULTIPLE, AD_IMAGE_MODE_SINGLE,
 };
 use bsrs::prelude::*;
 use bsrs::protocols_async::{
@@ -148,11 +149,11 @@ async fn ready_cam(cam: &AreaDetectorCam, feed: &str) {
 }
 
 fn provider(dir: &Path, filename: &str) -> StaticPathProvider {
-    StaticPathProvider::new(dir.to_str().expect("utf-8 tempdir"), filename)
+    StaticPathProvider::new(Arc::new(StaticFilenameProvider::new(filename)), dir)
 }
 
 async fn hdf_det(name: &str, dir: &Path, filename: &str) -> AreaDetectorHdf {
-    let det = area_detector_hdf(name, CAM, HDF, provider(dir, filename));
+    let det = area_detector_hdf(name, CAM, HDF, Arc::new(provider(dir, filename)));
     det.connect(TIMEOUT).await.expect("connect");
     ready_cam(det.control(), HDF).await;
     put::<i64>(&format!("{HDF}NumFramesChunks"), 1).await;
@@ -826,7 +827,7 @@ async fn hdf_prepare_needs_the_directory_or_leave_to_create_it() {
         "det",
         CAM,
         HDF,
-        provider(&missing, "mkdir").with_create_dir_depth(-2),
+        Arc::new(provider(&missing, "mkdir").with_create_dir_depth(-2)),
     );
     det.connect(TIMEOUT).await.unwrap();
     Stageable::stage(&det)
@@ -963,7 +964,7 @@ async fn writers_fed_from_rois_describe_the_roi_frames() {
         AdHdfWriter::new(
             Arc::new(NdFileIo::new(Arc::new(NdFileHdf5::new(HDF)))),
             shape_of(&rois[0]),
-            provider(dir.path(), "roi1"),
+            Arc::new(provider(dir.path(), "roi1")),
         )
         .with_datakey_suffix("-roi1"),
     );
@@ -971,7 +972,7 @@ async fn writers_fed_from_rois_describe_the_roi_frames() {
         AdMultipartWriter::tiff(
             Arc::new(NdPluginFileIo::new(Arc::new(NdFile::new(TIFF)))),
             shape_of(&rois[1]),
-            provider(dir.path(), "roi2"),
+            Arc::new(provider(dir.path(), "roi2")),
         )
         .with_datakey_suffix("-roi2"),
     );

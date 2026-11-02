@@ -165,6 +165,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and `StandardDetector` fails it without a prepare since stage ("Prepare
   not called"), as ophyd-async does, instead of re-emitting the documents
   of the previous scan's prepare.
+- **Breaking**: ophyd-async's path providers are in `bsrs::devices`:
+  `PathProvider`, `FilenameProvider`, `PathInfo`, `StaticFilenameProvider`,
+  `UuidFilenameProvider`, `AutoIncrementFilenameProvider`,
+  `StaticPathProvider` and `AutoIncrementingPathProvider`, replacing
+  `host::areadetector::StaticPathProvider`. `AdHdfWriter`,
+  `AdMultipartWriter` and the `area_detector_*` factories take an
+  `Arc<dyn PathProvider>` and ask it for a `PathInfo` at every `open`;
+  `AdFileIo::configure` takes that `PathInfo`, and
+  `AdFileIo::full_file_name` is removed because the HDF `StreamResource`
+  uri is the provider's `directory_uri` plus `{filename}.h5`, not
+  `FullFileName_RBV`.
 - `AreaDetectorCam::arm` resolves once the cam is acquiring, and its
   configuration is described from `AcquireTime_RBV`/`AcquirePeriod_RBV`.
 - `CaMotor`, `PvaMotor` and `CaPositioner` press `.STOP` in `stop_dyn`,

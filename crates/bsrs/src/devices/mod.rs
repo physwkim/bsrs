@@ -6,6 +6,7 @@
 pub mod detector;
 pub mod device;
 pub mod observe;
+pub mod path_provider;
 pub mod signal;
 pub mod signal_cache;
 pub mod stage_sigs;
@@ -14,6 +15,10 @@ pub mod standard_readable;
 pub use detector::{DataLogic, DetectorTrigger, StandardDetector, TriggerInfo};
 pub use device::{wait_for_connection, walk_signal_sources, Device, DeviceVector};
 pub use observe::{observe_signals_value, observe_value, wait_for_value};
+pub use path_provider::{
+    AutoIncrementFilenameProvider, AutoIncrementingPathProvider, FilenameProvider, PathInfo,
+    PathProvider, StaticFilenameProvider, StaticPathProvider, UuidFilenameProvider,
+};
 pub use signal::{
     Access, Execute, Read, ReadWrite, Readable, Signal, SignalConfig, SignalKind, SignalR,
     SignalRW, SignalW, SignalX, Writable, Write,

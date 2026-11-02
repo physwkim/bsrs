@@ -13,10 +13,10 @@ use std::time::Duration;
 use bsrs::backends::epics_ca::EpicsCaBackend;
 use bsrs::callbacks::CapturingSink;
 use bsrs::core::msg::{MonitorableObj, ReadableObj};
-use bsrs::devices::BackendFromPv;
+use bsrs::devices::{BackendFromPv, StaticFilenameProvider, StaticPathProvider};
 use bsrs::event_model::{Dtype, DtypeNumpy};
 use bsrs::host::areadetector::{
-    area_detector_hdf, NdFile, StaticPathProvider, AD_COLOR_MODE_MONO, AD_IMAGE_MODE_SINGLE,
+    area_detector_hdf, NdFile, AD_COLOR_MODE_MONO, AD_IMAGE_MODE_SINGLE,
 };
 use bsrs::host::ca_devices::CaDetector;
 use bsrs::prelude::*;
@@ -210,7 +210,10 @@ async fn moving_dot_frames_are_described_from_the_driver_readbacks() {
         "dot",
         "mini:dot:cam1:",
         "mini:dot:HDF1:",
-        StaticPathProvider::new(dir.path().to_str().unwrap(), "dot"),
+        Arc::new(StaticPathProvider::new(
+            Arc::new(StaticFilenameProvider::new("dot")),
+            dir.path(),
+        )),
     );
     det.connect(TIMEOUT).await.expect("connect");
     let cam = det.control();
