@@ -65,6 +65,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `NDArrayDescription`) describes a writer's frame from any shape signals,
   such as the new `NdRoi::size_y_rbv` / `size_x_rbv` for a writer fed from
   an ROI.
+- `StandardDetector` implements `PreparableObj`, so a plan prepares it with
+  `plans::prepare(det, json!({...}))`, the value deserialized as
+  ophyd-async's `TriggerInfo` model (`TriggerInfo` and `DetectorTrigger`
+  implement `Deserialize`).
 - `SoftMotor` implements `protocols_async::Stoppable`.
 - `BsrsError::Datatype`, ophyd-async's `make_converter` `TypeError`.
 

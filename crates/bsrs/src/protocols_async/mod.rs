@@ -20,6 +20,7 @@ use crate::event_model::{DataKey, StreamDatum, StreamResource};
 use futures::stream::BoxStream;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -265,7 +266,8 @@ pub trait DetectorControl: Send + Sync {
 
 /// Mechanism for triggering a detector to take exposures. Direct port of
 /// `ophyd_async/core/_detector.py:50-62` `DetectorTrigger`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum DetectorTrigger {
     /// On arm, generate internally timed exposures.
     #[default]
@@ -279,8 +281,10 @@ pub enum DetectorTrigger {
 }
 
 /// Detector trigger configuration. Direct port of
-/// `ophyd_async/core/_detector.py:65-113` `TriggerInfo`.
-#[derive(Clone, Debug)]
+/// `ophyd_async/core/_detector.py:65-113` `TriggerInfo`, and deserialized
+/// from that model's fields, as a plan's `prepare` carries it.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(try_from = "TriggerInfoModel")]
 pub struct TriggerInfo {
     /// What sort of triggering the detector should be set for.
     pub trigger: DetectorTrigger,
@@ -313,6 +317,62 @@ impl Default for TriggerInfo {
             collections_per_event: 1,
             exposure_timeout: None,
         }
+    }
+}
+
+/// `TriggerInfo` as ophyd-async's model takes it: its defaults, seconds as
+/// floats with 0 livetime or deadtime unset, and no other field
+/// (`extra="forbid"`).
+#[derive(serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct TriggerInfoModel {
+    trigger: DetectorTrigger,
+    livetime: f64,
+    deadtime: f64,
+    exposures_per_collection: NonZeroU32,
+    collections_per_event: NonZeroU32,
+    number_of_events: u32,
+    exposure_timeout: Option<f64>,
+}
+
+impl Default for TriggerInfoModel {
+    fn default() -> Self {
+        Self {
+            trigger: DetectorTrigger::Internal,
+            livetime: 0.0,
+            deadtime: 0.0,
+            exposures_per_collection: NonZeroU32::MIN,
+            collections_per_event: NonZeroU32::MIN,
+            number_of_events: 1,
+            exposure_timeout: None,
+        }
+    }
+}
+
+impl TryFrom<TriggerInfoModel> for TriggerInfo {
+    type Error = String;
+    fn try_from(m: TriggerInfoModel) -> std::result::Result<Self, String> {
+        let secs = |name: &str, s: f64| {
+            Duration::try_from_secs_f64(s).map_err(|e| format!("{name}={s}: {e}"))
+        };
+        let unset_at_zero = |name, s| secs(name, s).map(|d| (!d.is_zero()).then_some(d));
+        let exposure_timeout = match m.exposure_timeout {
+            Some(s) => Some(
+                Some(secs("exposure_timeout", s)?)
+                    .filter(|d| !d.is_zero())
+                    .ok_or_else(|| format!("exposure_timeout={s} is not > 0"))?,
+            ),
+            None => None,
+        };
+        Ok(Self {
+            trigger: m.trigger,
+            number_of_events: m.number_of_events,
+            livetime: unset_at_zero("livetime", m.livetime)?,
+            deadtime: unset_at_zero("deadtime", m.deadtime)?,
+            exposures_per_collection: m.exposures_per_collection.get(),
+            collections_per_event: m.collections_per_event.get(),
+            exposure_timeout,
+        })
     }
 }
 
@@ -513,6 +573,53 @@ mod tests {
         };
         assert_eq!(info.number_of_collections(), 50);
         assert_eq!(info.number_of_exposures(), 150);
+    }
+
+    /// The fields of ophyd-async's `TriggerInfo` model, at its defaults
+    /// where absent, with its bounds and no other field.
+    #[test]
+    fn trigger_info_deserializes_the_ophyd_async_model() {
+        let from = |v: Value| serde_json::from_value::<TriggerInfo>(v).map_err(|e| e.to_string());
+        let info = from(serde_json::json!({})).unwrap();
+        assert_eq!(info.trigger, DetectorTrigger::Internal);
+        assert_eq!(info.number_of_events, 1);
+        assert_eq!(
+            (info.livetime, info.deadtime, info.exposure_timeout),
+            (None, None, None)
+        );
+        assert_eq!(
+            (info.exposures_per_collection, info.collections_per_event),
+            (1, 1)
+        );
+        let info = from(serde_json::json!({
+            "trigger": "EXTERNAL_EDGE",
+            "number_of_events": 0,
+            "livetime": 0.5,
+            "deadtime": 0.0,
+            "exposures_per_collection": 2,
+            "collections_per_event": 3,
+            "exposure_timeout": 4.0,
+        }))
+        .unwrap();
+        assert_eq!(info.trigger, DetectorTrigger::ExternalEdge);
+        assert_eq!(info.number_of_events, 0);
+        assert_eq!(info.livetime, Some(Duration::from_millis(500)));
+        assert_eq!(info.deadtime, None);
+        assert_eq!(
+            (info.exposures_per_collection, info.collections_per_event),
+            (2, 3)
+        );
+        assert_eq!(info.exposure_timeout, Some(Duration::from_secs(4)));
+        for bad in [
+            serde_json::json!({"trigger": "constant_gate"}),
+            serde_json::json!({"livetime": -1.0}),
+            serde_json::json!({"collections_per_event": 0}),
+            serde_json::json!({"number_of_events": -1}),
+            serde_json::json!({"exposure_timeout": 0.0}),
+            serde_json::json!({"frames": 3}),
+        ] {
+            assert!(from(bad.clone()).is_err(), "{bad}");
+        }
     }
 
     #[test]

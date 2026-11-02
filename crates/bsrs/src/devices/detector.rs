@@ -3,8 +3,8 @@
 
 use crate::core::error::{BsrsError, Result};
 use crate::core::msg::{
-    CollectableObj, ConfigurableObj, FlyableObj, NamedObj, ReadableObj, StageableObj,
-    TriggerableObj,
+    CollectableObj, ConfigurableObj, FlyableObj, NamedObj, PreparableObj, ReadableObj,
+    StageableObj, TriggerableObj,
 };
 use crate::core::reading::ReadingValue;
 use crate::core::status::Status;
@@ -585,6 +585,23 @@ where
     }
 }
 
+/// A plan's `prepare(det, TriggerInfo(...))`, the value ophyd-async's
+/// `TriggerInfo` model.
+#[async_trait]
+impl<C> PreparableObj for StandardDetector<C>
+where
+    C: DetectorControl + Send + Sync + 'static,
+{
+    async fn prepare_dyn(&self, value: Value) -> Status {
+        match serde_json::from_value(value) {
+            Ok(info) => Preparable::prepare(self, info).await,
+            Err(e) => Status::fail(crate::core::status::StatusError::Failed(format!(
+                "prepare: {e}"
+            ))),
+        }
+    }
+}
+
 #[async_trait]
 impl<C> FlyableObj for StandardDetector<C>
 where
@@ -1049,6 +1066,28 @@ mod tests {
                 .contains("Kickoff requested 5:6, but detector was only prepared up to 5"),
             "{err}"
         );
+    }
+
+    /// A plan prepares with ophyd-async's `TriggerInfo` model as JSON.
+    #[tokio::test]
+    async fn prepare_dyn_takes_the_trigger_info_model() {
+        let (det, _tx, _) = controlled();
+        Stageable::stage(&det).await.unwrap();
+        let info = serde_json::json!({"number_of_events": 4, "livetime": 0.25});
+        PreparableObj::prepare_dyn(&det, info).await.await.unwrap();
+        let ctx = det.prepare_ctx("unprepared").unwrap();
+        assert_eq!(ctx.trigger_info.number_of_events, 4);
+        assert_eq!(
+            ctx.trigger_info.livetime,
+            Some(std::time::Duration::from_millis(250))
+        );
+        assert_eq!(det.events_to_kickoff(), 4);
+        let bad = serde_json::json!({"frames": 4});
+        let err = PreparableObj::prepare_dyn(&det, bad)
+            .await
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown field `frames`"), "{err}");
     }
 
     #[tokio::test]
