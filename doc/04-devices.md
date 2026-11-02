@@ -189,6 +189,7 @@ pub struct StandardDetector<C: DetectorControl> {
     name:        String,
     control:     C,
     data_logics: Vec<DataLogic>,
+    plugins:     Vec<Arc<dyn Device>>,    // add_plugin
     /* prepare and kickoff contexts */
 }
 
@@ -210,11 +211,13 @@ impl<C> Collectable       for StandardDetector<C> { /* delegates */ }
 impl<C> WritesStreamAssets for StandardDetector<C> { /* delegates */ }
 ```
 
-`DetectorControl` handles `prepare / arm / wait_for_idle / disarm`.
+`DetectorControl` handles `connect / prepare / arm / wait_for_idle / disarm`.
 `DetectorWriter` handles `connect / open / observe_indices_written / collect_stream_docs / close`
 (see [`01-architecture.md`](01-architecture.md) sealed trait 3); `SingleDataLogic`
 handles `prepare_single / describe / read / stop`, set up only for a prepare of one
-collection.
+collection. `StandardDetector::connect` connects the control, the writers and the
+plugins, such as an ROI whose size a writer reads (ophyd-async
+`AreaDetector(plugins=...)`).
 
 A `Hdf5Writer` impl is in M3. A `RogueHdf5Writer` impl is in Phase 2 — same trait, no
 plan-side change.

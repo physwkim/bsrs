@@ -262,6 +262,11 @@ pub trait DetectorControl: Send + Sync {
         let _ = name;
         Ok(HashMap::new())
     }
+    /// Connect what the control drives (ophyd-async connects the driver as
+    /// a child of its detector); nothing by default.
+    async fn connect(&self, _timeout: Duration) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Mechanism for triggering a detector to take exposures. Direct port of

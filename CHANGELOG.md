@@ -65,6 +65,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `NDArrayDescription`) describes a writer's frame from any shape signals,
   such as the new `NdRoi::size_y_rbv` / `size_x_rbv` for a writer fed from
   an ROI.
+- `StandardDetector::add_plugin` (ophyd-async `AreaDetector(plugins=...)`)
+  and `StandardDetector::connect`, which connects the control (the new
+  `DetectorControl::connect`), every writer and every plugin, so a plugin
+  the IOC lacks fails the connect. `NdPlugin`, `NdFile`, `NdFileHdf5`,
+  `NdStats` and `NdRoi` implement `Device`, and
+  `connect_area_detector_hdf`/`connect_area_detector_multipart` call
+  `connect`.
 - `StandardDetector` implements `PreparableObj`, so a plan prepares it with
   `plans::prepare(det, json!({...}))`, the value deserialized as
   ophyd-async's `TriggerInfo` model (`TriggerInfo` and `DetectorTrigger`
@@ -130,8 +137,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (ophyd-async `DetectorDataLogic`) in place of its writer parameter `W`:
   `DataLogic::Unbounded` is a `DetectorWriter`, `DataLogic::Single` a
   `SingleDataLogic` read with the event of a one-collection prepare.
-  `with_data_logics`, `add_data_logic` and `connect_writers` replace
-  `writer()`, and `DetectorWriter::connect` the inherent
+  `with_data_logics`, `add_data_logic` and `connect` replace `writer()`,
+  and `DetectorWriter::connect` the inherent
   `AdHdfWriter::connect`/`AdMultipartWriter::connect`. `trigger` waits for
   the least writer index, `kickoff` needs a writer and refuses writers that
   disagree on their index, asset documents chain the writers in order, and

@@ -951,27 +951,10 @@ async fn writers_fed_from_rois_describe_the_roi_frames() {
     let _cam = CAM_LOCK.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let cam = AreaDetectorCam::new(CAM);
-    cam.connect(TIMEOUT).await.expect("connect cam");
-    ready_cam(&cam, "").await;
-    let rois = [NdRoi::new("SIM1:ROI1:"), NdRoi::new("SIM1:ROI2:")];
-    // ROI2 asks past the frame's edge, which clips it to WIDTH - 50.
-    for (roi, [min_x, x, y]) in rois.iter().zip([[0, 40, 30], [50, 1000, 10]]) {
-        roi.connect(TIMEOUT).await.unwrap();
-        roi.plugin.set_source_port(PORT).await.unwrap();
-        roi.set_bounds(min_x, 0, x, y).await.unwrap();
-        roi.set_enabled_xy(true, true).await.unwrap();
-        roi.plugin.set_blocking(true).await.unwrap();
-        roi.plugin.set_enabled(true).await.unwrap();
-    }
-    for (prefix, port) in [(HDF, "ROI1"), (TIFF, "ROI2")] {
-        let f = file_plugin(prefix).await;
-        f.plugin.set_source_port(port).await.unwrap();
-        f.plugin.set_blocking(true).await.unwrap();
-        f.plugin.set_enabled(true).await.unwrap();
-    }
-    put::<i64>(&format!("{HDF}NumFramesChunks"), 1).await;
-    // A frame through the ROIs sets their SizeX/Y_RBV.
-    cam.warmup().await.expect("warmup");
+    let rois = [
+        Arc::new(NdRoi::new("SIM1:ROI1:")),
+        Arc::new(NdRoi::new("SIM1:ROI2:")),
+    ];
     let shape_of = |roi: &NdRoi| {
         Arc::new(NdArrayDescription::new(
             &cam,
@@ -994,12 +977,35 @@ async fn writers_fed_from_rois_describe_the_roi_frames() {
         )
         .with_datakey_suffix("-roi2"),
     );
-    let det = StandardDetector::with_data_logics(
+    let mut det = StandardDetector::with_data_logics(
         "det",
         cam,
         vec![DataLogic::Unbounded(hdf), DataLogic::Unbounded(tiff)],
     );
-    det.connect_writers(TIMEOUT).await.expect("connect writers");
+    for roi in &rois {
+        det.add_plugin(roi.clone());
+    }
+    // The ROIs, whose sizes the writers read, connect only with the detector.
+    det.connect(TIMEOUT).await.expect("connect");
+    let cam = det.control();
+    ready_cam(cam, "").await;
+    // ROI2 asks past the frame's edge, which clips it to WIDTH - 50.
+    for (roi, [min_x, x, y]) in rois.iter().zip([[0, 40, 30], [50, 1000, 10]]) {
+        roi.plugin.set_source_port(PORT).await.unwrap();
+        roi.set_bounds(min_x, 0, x, y).await.unwrap();
+        roi.set_enabled_xy(true, true).await.unwrap();
+        roi.plugin.set_blocking(true).await.unwrap();
+        roi.plugin.set_enabled(true).await.unwrap();
+    }
+    for (prefix, port) in [(HDF, "ROI1"), (TIFF, "ROI2")] {
+        let f = file_plugin(prefix).await;
+        f.plugin.set_source_port(port).await.unwrap();
+        f.plugin.set_blocking(true).await.unwrap();
+        f.plugin.set_enabled(true).await.unwrap();
+    }
+    put::<i64>(&format!("{HDF}NumFramesChunks"), 1).await;
+    // A frame through the ROIs sets their SizeX/Y_RBV.
+    cam.warmup().await.expect("warmup");
 
     Stageable::stage(&det).await.expect("stage");
     let triggered = trigger(&det).await;
@@ -1073,6 +1079,24 @@ async fn writers_fed_from_rois_describe_the_roi_frames() {
     );
 }
 
+/// ophyd-async `AreaDetector(plugins=...)`: the detector connects its
+/// plugins, so one the IOC lacks fails the detector's connect rather than
+/// its first get or put.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+async fn a_missing_plugin_fails_the_detector_connect() {
+    boot();
+    let mut det = StandardDetector::with_data_logics("det", AreaDetectorCam::new(CAM), Vec::new());
+    det.connect(TIMEOUT).await.expect("connect without plugins");
+    det.add_plugin(Arc::new(NdRoi::new("SIM1:NOROI:")));
+    let err = det
+        .connect(Duration::from_secs(1))
+        .await
+        .expect_err("connect")
+        .to_string();
+    assert!(err.contains("SIM1:NOROI:"), "{err}");
+}
+
 /// ophyd-async `test_use_cases.py:404` (ROI bounds) and `:532`
 /// `test_simdetector_with_stats_signal` (stats on): the plugin setters reach
 /// their records.
@@ -1114,12 +1138,7 @@ async fn plugin_signal_is_read_after_the_driver_waits_for_plugins() {
     boot();
     let _cam = CAM_LOCK.lock().await;
     let cam = AreaDetectorCam::new(CAM);
-    cam.connect(TIMEOUT).await.expect("connect cam");
-    ready_cam(&cam, "").await;
-    let stats = NdStats::new("SIM1:Stats1:");
-    stats.connect(TIMEOUT).await.unwrap();
-    stats.plugin.set_source_port(PORT).await.unwrap();
-    stats.force_enable_stats().await.unwrap();
+    let stats = Arc::new(NdStats::new("SIM1:Stats1:"));
     let total = Arc::new(SignalR::new(
         stats.total.clone(),
         SignalConfig {
@@ -1129,8 +1148,13 @@ async fn plugin_signal_is_read_after_the_driver_waits_for_plugins() {
         },
     ));
     let logic = PluginSignalDataLogic::new(&cam, total);
-    let det =
+    let mut det =
         StandardDetector::with_data_logics("det", cam, vec![DataLogic::Single(Arc::new(logic))]);
+    det.add_plugin(stats.clone());
+    det.connect(TIMEOUT).await.expect("connect");
+    ready_cam(det.control(), "").await;
+    stats.plugin.set_source_port(PORT).await.unwrap();
+    stats.force_enable_stats().await.unwrap();
     let wait_for_plugins = format!("{CAM}WaitForPlugins");
     put::<bool>(&wait_for_plugins, false).await;
 

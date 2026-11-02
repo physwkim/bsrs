@@ -37,6 +37,7 @@ use crate::core::error::{BsrsError, Result};
 use crate::core::msg::{NamedObj, StageableObj};
 use crate::core::reading::ReadingValue;
 use crate::core::status::{Status, StatusError, SubToken};
+use crate::devices::device::Device;
 use crate::devices::signal::{Read, Readable, Signal};
 use crate::devices::stage_sigs::StageSigs;
 use crate::devices::StandardDetector;
@@ -47,6 +48,8 @@ use crate::protocols_async::{
 };
 use futures::stream::{BoxStream, StreamExt};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -237,8 +240,9 @@ impl NdArrayDescription {
 
     /// `driver`'s data type and colour mode over a frame of `shape`, e.g. an
     /// [`NdRoi`]'s `size_y_rbv` and `size_x_rbv` for a writer fed from that
-    /// ROI. Zero dims are dropped. The writer does not connect `shape`; its
-    /// owner does (`NdRoi::connect`).
+    /// ROI. Zero dims are dropped. The writer does not connect `shape`; the
+    /// detector does once the ROI is added with
+    /// [`StandardDetector::add_plugin`].
     pub fn new(driver: &AreaDetectorCam, shape: Vec<Arc<EpicsCaBackend<i64>>>) -> Self {
         let own = &driver.frame_info;
         Self {
@@ -1278,6 +1282,32 @@ impl StageableObj for NdRoi {
     async fn unstage_dyn(&self) -> Result<()> {
         self.plugin.unstage_dyn().await
     }
+}
+
+// Every plugin handle is a `Device` named by its prefix, so a detector can
+// connect it with itself (`StandardDetector::add_plugin`).
+macro_rules! plugin_device {
+    ($($ty:ty => $($prefix:ident).+;)*) => {$(
+        impl Device for $ty {
+            fn name(&self) -> &str {
+                &self.$($prefix).+
+            }
+            fn connect_all_boxed<'a>(
+                &'a self,
+                timeout: Duration,
+            ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+                Box::pin(self.connect(timeout))
+            }
+        }
+    )*};
+}
+
+plugin_device! {
+    NdPlugin => prefix;
+    NdFile => plugin.prefix;
+    NdFileHdf5 => file.plugin.prefix;
+    NdStats => plugin.prefix;
+    NdRoi => plugin.prefix;
 }
 
 /// Route `file` to consume frames from `source_port` and enable its
@@ -2534,6 +2564,9 @@ impl DetectorControl for AreaDetectorCam {
         .await
         .map(HashMap::from_iter)
     }
+    async fn connect(&self, timeout: Duration) -> Result<()> {
+        AreaDetectorCam::connect(self, timeout).await
+    }
 }
 
 /// ophyd-async `PluginSignalDataLogic`: `signal`, a plugin's result, read
@@ -2634,10 +2667,9 @@ pub fn area_detector_hdf(
     StandardDetector::new(name, cam, writer)
 }
 
-/// Connect both halves of an [`AreaDetectorHdf`] (cam driver + HDF plugin IO).
+/// Connect an [`AreaDetectorHdf`]: [`StandardDetector::connect`].
 pub async fn connect_area_detector_hdf(det: &AreaDetectorHdf, timeout: Duration) -> Result<()> {
-    det.control().connect(timeout).await?;
-    det.connect_writers(timeout).await
+    det.connect(timeout).await
 }
 
 /// A `StandardDetector` composed of an areaDetector camera driver and a
@@ -2701,14 +2733,12 @@ pub fn area_detector_tiff(
     )
 }
 
-/// Connect both halves of an [`AreaDetectorMultipart`] (cam driver + file
-/// plugin IO).
+/// Connect an [`AreaDetectorMultipart`]: [`StandardDetector::connect`].
 pub async fn connect_area_detector_multipart(
     det: &AreaDetectorMultipart,
     timeout: Duration,
 ) -> Result<()> {
-    det.control().connect(timeout).await?;
-    det.connect_writers(timeout).await
+    det.connect(timeout).await
 }
 
 #[cfg(test)]

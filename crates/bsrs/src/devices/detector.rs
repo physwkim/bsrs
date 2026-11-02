@@ -8,6 +8,7 @@ use crate::core::msg::{
 };
 use crate::core::reading::ReadingValue;
 use crate::core::status::Status;
+use crate::devices::device::Device;
 use crate::event_model::DataKey;
 use crate::protocols_async::{
     DetectorControl, DetectorWriter, Flyable, Preparable, SingleDataLogic, Stageable, StreamAsset,
@@ -95,6 +96,7 @@ where
     control: C,
     // ophyd-async `_data_logics`, in the order added.
     data_logics: Vec<DataLogic>,
+    plugins: Vec<Arc<dyn Device>>,
     // `None` after stage, as in ophyd-async.
     prepared: std::sync::Mutex<Option<PrepareCtx>>,
     kicked_off: std::sync::Mutex<Option<KickoffCtx>>,
@@ -122,6 +124,7 @@ where
             name: name.into(),
             control,
             data_logics,
+            plugins: Vec::new(),
             prepared: std::sync::Mutex::new(None),
             kicked_off: std::sync::Mutex::new(None),
             events_to_kickoff: AtomicU64::new(0),
@@ -133,9 +136,23 @@ where
         self.data_logics.push(logic);
     }
 
-    /// Connect every writer.
-    pub async fn connect_writers(&self, timeout: std::time::Duration) -> Result<()> {
-        futures::future::try_join_all(self.writers().map(|w| w.connect(timeout))).await?;
+    /// Add a device the detector connects with itself, such as the ROI
+    /// plugin whose size a writer's frame is read from (ophyd-async
+    /// `AreaDetector(plugins=...)`).
+    pub fn add_plugin(&mut self, plugin: Arc<dyn Device>) {
+        self.plugins.push(plugin);
+    }
+
+    /// Connect the control, every writer and every plugin, as ophyd-async
+    /// connects a detector's children.
+    pub async fn connect(&self, timeout: std::time::Duration) -> Result<()> {
+        futures::try_join!(
+            self.control.connect(timeout),
+            futures::future::try_join_all(self.writers().map(|w| w.connect(timeout))),
+            futures::future::try_join_all(
+                self.plugins.iter().map(|p| p.connect_all_boxed(timeout))
+            ),
+        )?;
         Ok(())
     }
 
@@ -877,6 +894,49 @@ mod tests {
             .await
             .await
             .unwrap();
+    }
+
+    /// A plugin that counts its connects, failing them if `fails`.
+    struct FakePlugin {
+        connects: Arc<AtomicU64>,
+        fails: bool,
+    }
+
+    impl Device for FakePlugin {
+        fn name(&self) -> &str {
+            "roi1"
+        }
+        fn connect_all_boxed<'a>(
+            &'a self,
+            _timeout: Duration,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+            self.connects.fetch_add(1, Ordering::SeqCst);
+            let fails = self.fails;
+            Box::pin(async move {
+                if fails {
+                    Err(BsrsError::Backend("roi1 not connected".into()))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
+
+    /// ophyd-async `AreaDetector(plugins=...)`: an added plugin is connected
+    /// with the detector, and its failure is the detector's.
+    #[tokio::test]
+    async fn connect_connects_every_plugin() {
+        for fails in [false, true] {
+            let (mut det, _, _) = detector();
+            let connects = Arc::new(AtomicU64::new(0));
+            det.add_plugin(Arc::new(FakePlugin {
+                connects: connects.clone(),
+                fails,
+            }));
+            let connected = det.connect(Duration::from_secs(1)).await;
+            assert_eq!(connects.load(Ordering::SeqCst), 1);
+            assert_eq!(connected.is_err(), fails, "{connected:?}");
+        }
     }
 
     #[tokio::test]
