@@ -563,8 +563,8 @@ async fn trigger_fails_when_the_writer_does_not_advance() {
 }
 
 /// ophyd-async `test_standard_detector.py:574` `test_stage_resets_state`: a
-/// fresh stage forgets the previous scan's prepare, so a bare kickoff takes
-/// one frame.
+/// fresh stage forgets the previous scan's prepare, so a bare kickoff is
+/// refused and a trigger takes one frame.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
 async fn stage_forgets_the_previous_prepare() {
@@ -589,12 +589,11 @@ async fn stage_forgets_the_previous_prepare() {
     Stageable::unstage(&det).await.expect("unstage");
 
     Stageable::stage(&det).await.expect("restage");
-    finish(Flyable::kickoff(&det).await, "kickoff")
+    let err = finish(Flyable::kickoff(&det).await, "kickoff")
         .await
-        .unwrap();
-    finish(Flyable::complete(&det).await, "complete")
-        .await
-        .unwrap();
+        .expect_err("kickoff without a prepare since stage");
+    assert!(err.contains("Prepare not called"), "{err}");
+    trigger(&det).await.unwrap();
     let num_images = get::<i64>(&format!("{CAM}NumImages")).await;
     let n = index(&det).await;
     Stageable::unstage(&det).await.expect("unstage");

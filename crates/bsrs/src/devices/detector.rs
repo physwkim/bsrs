@@ -273,16 +273,6 @@ where
         Ok((keys.into_iter().flatten().collect(), singles))
     }
 
-    /// The prepare since stage, or an implicit `TriggerInfo::default()` one
-    /// (ophyd-async `trigger`; `kickoff` raises there instead).
-    async fn prepared_or_default(&self) -> Result<PrepareCtx> {
-        let prepared = self.prepared.lock().unwrap().clone();
-        match prepared {
-            Some(ctx) => Ok(ctx),
-            None => self.prepare_for(TriggerInfo::default()).await,
-        }
-    }
-
     /// ophyd-async `StandardDetector.trigger`: one event of the prepare since
     /// stage, or of an implicit `TriggerInfo()` one.
     async fn trigger_one(&self) -> Result<()> {
@@ -349,7 +339,7 @@ where
     /// ophyd-async `StandardDetector.kickoff` up to starting the acquisition:
     /// `events_to_kickoff` events from the index now, within the prepare.
     async fn kickoff_ctx(&self) -> Result<KickoffCtx> {
-        let ctx = self.prepared_or_default().await?;
+        let ctx = self.prepare_ctx("Prepare not called")?;
         if self.writers().next().is_none() {
             return Err(BsrsError::State(format!(
                 "Detector {} is not streamable, so cannot kickoff",
@@ -1045,6 +1035,16 @@ mod tests {
             .await
             .await
             .unwrap();
+    }
+
+    /// ophyd-async `kickoff`: `error_if_none(self._prepare_ctx, ...)`, where
+    /// `trigger` prepares implicitly.
+    #[tokio::test]
+    async fn kickoff_without_prepare_is_refused() {
+        let (det, _tx, _) = controlled();
+        Stageable::stage(&det).await.unwrap();
+        let err = Flyable::kickoff(&det).await.await.unwrap_err();
+        assert!(err.to_string().contains("det: Prepare not called"), "{err}");
     }
 
     #[tokio::test]

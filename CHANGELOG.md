@@ -123,8 +123,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   opens the writer for `collections_per_event`; `trigger` prepares
   implicitly, rejects a multi-event prepare and fails when the writer index
   stalls past the exposure timeout; `stage` drops the last prepare;
-  `kickoff` cannot run past the prepared frames; `read` and `describe` fail
-  before a prepare.
+  `kickoff` fails without a prepare since stage ("Prepare not called") and
+  cannot run past the prepared frames; `read` and `describe` fail before a
+  prepare.
 - **Breaking**: `StandardDetector<C>` holds a list of `DataLogic`s
   (ophyd-async `DetectorDataLogic`) in place of its writer parameter `W`:
   `DataLogic::Unbounded` is a `DetectorWriter`, `DataLogic::Single` a

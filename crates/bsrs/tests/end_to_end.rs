@@ -294,7 +294,7 @@ mod tempdir_shim {
 #[tokio::test]
 async fn fly_plan_drives_standard_detector_to_completion() {
     use bsrs::backends::soft::SoftDetector as ScalarDet;
-    use bsrs::core::msg::{CollectableObj, FlyableObj, StageableObj};
+    use bsrs::core::msg::{CollectableObj, FlyableObj, PreparableObj, StageableObj};
     let _ = ScalarDet::new("ignored"); // ensure the import path is real
 
     let det = Arc::new(bsrs::backends::soft::detector::soft_detector("flydet"));
@@ -302,12 +302,21 @@ async fn fly_plan_drives_standard_detector_to_completion() {
     let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
 
     // fly no longer stages its flyers (bluesky parity); stage externally, as
-    // bluesky's stage_decorator does.
+    // bluesky's stage_decorator does, and prepare before kickoff, as
+    // ophyd-async's kickoff requires.
     let plan = bsrs::plans::preprocessors::stage_wrapper(
-        bsrs::ophyd_async::fly(vec![(
-            det.clone() as Arc<dyn FlyableObj>,
-            det.clone() as Arc<dyn CollectableObj>,
-        )]),
+        bsrs::plans::preprocessors::pchain(vec![
+            bsrs::plans::stubs::prepare(
+                det.clone() as Arc<dyn PreparableObj>,
+                serde_json::json!({"number_of_events": 1}),
+                None,
+                true,
+            ),
+            bsrs::ophyd_async::fly(vec![(
+                det.clone() as Arc<dyn FlyableObj>,
+                det.clone() as Arc<dyn CollectableObj>,
+            )]),
+        ]),
         vec![det.clone() as Arc<dyn StageableObj>],
     );
     let result = re.run_async(plan).await.expect("fly failed");
