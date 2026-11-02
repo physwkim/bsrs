@@ -108,8 +108,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   opens the writer for `collections_per_event`; `trigger` prepares
   implicitly, rejects a multi-event prepare and fails when the writer index
   stalls past the exposure timeout; `stage` drops the last prepare;
-  `kickoff` cannot run past the prepared frames; `read` returns nothing and
-  the hints come from `DetectorWriter::hinted_fields`.
+  `kickoff` cannot run past the prepared frames; `read` and `describe` fail
+  before a prepare.
+- **Breaking**: `StandardDetector<C>` holds a list of `DataLogic`s
+  (ophyd-async `DetectorDataLogic`) in place of its writer parameter `W`:
+  `DataLogic::Unbounded` is a `DetectorWriter`, `DataLogic::Single` a
+  `SingleDataLogic` read with the event of a one-collection prepare.
+  `with_data_logics`, `add_data_logic` and `connect_writers` replace
+  `writer()`, and `DetectorWriter::connect` the inherent
+  `AdHdfWriter::connect`/`AdMultipartWriter::connect`. `trigger` waits for
+  the least writer index, `kickoff` needs a writer and refuses writers that
+  disagree on their index, asset documents chain the writers in order, and
+  the hints join every data logic's.
 - `AreaDetectorCam::arm` resolves once the cam is acquiring, and its
   configuration is described from `AcquireTime_RBV`/`AcquirePeriod_RBV`.
 - `CaMotor`, `PvaMotor` and `CaPositioner` press `.STOP` in `stop_dyn`,

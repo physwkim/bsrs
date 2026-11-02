@@ -419,6 +419,33 @@ pub trait DetectorWriter: Send + Sync {
     fn hinted_fields(&self) -> Vec<String> {
         Vec::new()
     }
+    /// Connect what the writer drives (ophyd-async connects a writer's
+    /// plugin as a child of its detector); nothing by default.
+    async fn connect(&self, _timeout: Duration) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// A detector's data read with each event: ophyd-async's
+/// `DetectorDataLogic.prepare_single` and the `ReadableDataProvider` it
+/// makes, set up only for a prepare of one collection.
+#[async_trait]
+pub trait SingleDataLogic: Send + Sync {
+    /// Set up for one collection (`prepare_single`).
+    async fn prepare_single(&self) -> Result<()>;
+    /// The data keys of [`read`](Self::read) (`make_datakeys`).
+    async fn describe(&self) -> Result<HashMap<String, DataKey>>;
+    /// This event's readings (`make_readings`).
+    async fn read(&self) -> Result<HashMap<String, ReadingValue>>;
+    /// The data keys a plot should show (`get_hinted_fields`); none by
+    /// default.
+    fn hinted_fields(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Stop taking data (`stop`); nothing by default.
+    async fn stop(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 // -- FrameSource / FrameSink -------------------------------------------------

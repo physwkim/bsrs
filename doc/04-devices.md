@@ -174,40 +174,47 @@ The macro generates:
 - An impl of the appropriate `Subscribable` / `Connectable` chain.
 - Type-safe path access via `motor.setpoint.put(...)`.
 
-## StandardDetector — composing Control + Writer
+## StandardDetector — composing Control + data logics
 
-ophyd-async's centerpiece. Expresses 8 protocols in one type by holding two trait
-objects:
+ophyd-async's centerpiece. Expresses 8 protocols in one type by holding a
+control and a list of data logics:
 
 ```rust
-pub struct StandardDetector<C: DetectorControl, W: DetectorWriter> {
-    control: C,
-    writer:  W,
-    tasks:   AbortOnDropSet,                    // K1: cleanup on drop
-    name:    String,
+pub enum DataLogic {
+    Unbounded(Arc<dyn DetectorWriter>),   // prepare_unbounded: step and fly
+    Single(Arc<dyn SingleDataLogic>),     // prepare_single: one collection
+}
+
+pub struct StandardDetector<C: DetectorControl> {
+    name:        String,
+    control:     C,
+    data_logics: Vec<DataLogic>,
+    /* prepare and kickoff contexts */
 }
 
 #[async_trait]
-impl<C, W> Stageable        for StandardDetector<C, W> { /* delegates */ }
+impl<C> Stageable        for StandardDetector<C> { /* delegates */ }
 #[async_trait]
-impl<C, W> AsyncConfigurable for StandardDetector<C, W> { /* delegates */ }
+impl<C> AsyncConfigurable for StandardDetector<C> { /* delegates */ }
 #[async_trait]
-impl<C, W> AsyncReadable     for StandardDetector<C, W> { /* delegates */ }
+impl<C> AsyncReadable     for StandardDetector<C> { /* delegates */ }
 #[async_trait]
-impl<C, W> Triggerable       for StandardDetector<C, W> { /* delegates */ }
+impl<C> Triggerable       for StandardDetector<C> { /* delegates */ }
 #[async_trait]
-impl<C, W> Preparable        for StandardDetector<C, W> { /* delegates */ }
+impl<C> Preparable        for StandardDetector<C> { /* delegates */ }
 #[async_trait]
-impl<C, W> Flyable           for StandardDetector<C, W> { /* delegates */ }
+impl<C> Flyable           for StandardDetector<C> { /* delegates */ }
 #[async_trait]
-impl<C, W> Collectable       for StandardDetector<C, W> { /* delegates */ }
+impl<C> Collectable       for StandardDetector<C> { /* delegates */ }
 #[async_trait]
-impl<C, W> WritesStreamAssets for StandardDetector<C, W> { /* delegates */ }
+impl<C> WritesStreamAssets for StandardDetector<C> { /* delegates */ }
 ```
 
 `DetectorControl` handles `prepare / arm / wait_for_idle / disarm`.
-`DetectorWriter` handles `open / observe_indices_written / collect_stream_docs / close`
-(see [`01-architecture.md`](01-architecture.md) sealed trait 3).
+`DetectorWriter` handles `connect / open / observe_indices_written / collect_stream_docs / close`
+(see [`01-architecture.md`](01-architecture.md) sealed trait 3); `SingleDataLogic`
+handles `prepare_single / describe / read / stop`, set up only for a prepare of one
+collection.
 
 A `Hdf5Writer` impl is in M3. A `RogueHdf5Writer` impl is in Phase 2 — same trait, no
 plan-side change.

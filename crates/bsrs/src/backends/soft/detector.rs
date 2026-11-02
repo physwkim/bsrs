@@ -355,9 +355,7 @@ impl DetectorWriter for SoftDetectorWriter {
 }
 
 /// Convenience constructor for a `StandardDetector` backed by soft control + writer.
-pub fn soft_detector(
-    name: impl Into<String>,
-) -> StandardDetector<SoftDetectorControl, SoftDetectorWriter> {
+pub fn soft_detector(name: impl Into<String>) -> StandardDetector<SoftDetectorControl> {
     let control = SoftDetectorControl::new(Duration::from_micros(0));
     let counter = control.arm_count();
     let indices_rx = control.subscribe_index();

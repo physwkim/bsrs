@@ -1803,11 +1803,6 @@ impl AdHdfWriter {
         self
     }
 
-    /// Connect the underlying file-plugin IO.
-    pub async fn connect(&self, timeout: Duration) -> Result<()> {
-        self.io.connect(timeout).await
-    }
-
     fn data_key_name(&self) -> String {
         format!("{}_image", self.name)
     }
@@ -1859,6 +1854,9 @@ fn stream_datakey_dtype(multiplier: u64, shape_len: usize) -> Dtype {
 
 #[async_trait::async_trait]
 impl DetectorWriter for AdHdfWriter {
+    async fn connect(&self, timeout: Duration) -> Result<()> {
+        self.io.connect(timeout).await
+    }
     async fn open(&self, multiplier: u32) -> Result<HashMap<String, DataKey>> {
         let multiplier = u64::from(multiplier.max(1));
         // Frames per HDF chunk — read before the setup puts, then let the
@@ -2156,11 +2154,6 @@ impl AdMultipartWriter {
         )
     }
 
-    /// Connect the underlying file-plugin IO.
-    pub async fn connect(&self, timeout: Duration) -> Result<()> {
-        self.io.connect(timeout).await
-    }
-
     fn data_key_name(&self) -> String {
         format!("{}_image", self.name)
     }
@@ -2183,6 +2176,9 @@ impl AdMultipartWriter {
 
 #[async_trait::async_trait]
 impl DetectorWriter for AdMultipartWriter {
+    async fn connect(&self, timeout: Duration) -> Result<()> {
+        self.io.connect(timeout).await
+    }
     async fn open(&self, multiplier: u32) -> Result<HashMap<String, DataKey>> {
         let multiplier = u64::from(multiplier.max(1));
         // Plugin callbacks on, then the file paths. ophyd-async's
@@ -2475,7 +2471,7 @@ impl DetectorControl for AreaDetectorCam {
 /// A `StandardDetector` composed of an areaDetector camera driver and an
 /// NDFileHDF5 plugin: the cam arms/acquires, the HDF plugin (inside the IOC)
 /// writes the `.h5`, and bsrs emits the pointing `StreamResource`/`StreamDatum`.
-pub type AreaDetectorHdf = StandardDetector<AreaDetectorCam, AdHdfWriter>;
+pub type AreaDetectorHdf = StandardDetector<AreaDetectorCam>;
 
 /// Build an [`AreaDetectorHdf`] from a cam prefix and an HDF-plugin prefix,
 /// writing files per `path_provider`. Call
@@ -2509,13 +2505,12 @@ pub fn area_detector_hdf(
 /// Connect both halves of an [`AreaDetectorHdf`] (cam driver + HDF plugin IO).
 pub async fn connect_area_detector_hdf(det: &AreaDetectorHdf, timeout: Duration) -> Result<()> {
     det.control().connect(timeout).await?;
-    det.writer().connect(timeout).await?;
-    Ok(())
+    det.connect_writers(timeout).await
 }
 
 /// A `StandardDetector` composed of an areaDetector camera driver and a
 /// multipart (one-file-per-frame) file plugin — NDFileJPEG or NDFileTIFF.
-pub type AreaDetectorMultipart = StandardDetector<AreaDetectorCam, AdMultipartWriter>;
+pub type AreaDetectorMultipart = StandardDetector<AreaDetectorCam>;
 
 fn area_detector_multipart(
     name: String,
@@ -2583,8 +2578,7 @@ pub async fn connect_area_detector_multipart(
     timeout: Duration,
 ) -> Result<()> {
     det.control().connect(timeout).await?;
-    det.writer().connect(timeout).await?;
-    Ok(())
+    det.connect_writers(timeout).await
 }
 
 #[cfg(test)]
@@ -3570,14 +3564,18 @@ mod ad_hdf_tests {
 
     #[tokio::test]
     async fn composite_writes_stream_assets_drains_ad_writer() {
-        // The composite StandardDetector<AreaDetectorCam, AdHdfWriter> builds,
-        // and its WritesStreamAssets seam — the exact one the engine's step/fly
-        // save path drains — yields the AD writer's resource + datum.
+        // The composite StandardDetector<AreaDetectorCam> builds, and its
+        // WritesStreamAssets seam — the exact one the engine's step/fly save
+        // path drains — yields the AD writer's resource + datum.
         let io = FakeAdFileIo::new("/data/scan.h5");
-        let writer = writer_with(io.clone());
+        let writer: Arc<dyn DetectorWriter> = Arc::new(writer_with(io.clone()));
         let cam = AreaDetectorCam::new("13SIM1:cam1:");
-        let det = StandardDetector::new("det", cam, writer);
-        det.writer().open(1).await.unwrap();
+        let det = StandardDetector::with_data_logics(
+            "det",
+            cam,
+            vec![crate::devices::DataLogic::Unbounded(writer.clone())],
+        );
+        writer.open(1).await.unwrap();
         io.set_captured(2);
         let docs: Vec<StreamAsset> = det.collect_asset_docs(2, "descZ").collect().await;
         assert_eq!(docs.len(), 2);

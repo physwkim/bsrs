@@ -11,7 +11,7 @@ pub mod signal_cache;
 pub mod stage_sigs;
 pub mod standard_readable;
 
-pub use detector::{DetectorTrigger, StandardDetector, TriggerInfo};
+pub use detector::{DataLogic, DetectorTrigger, StandardDetector, TriggerInfo};
 pub use device::{walk_signal_sources, Device, DeviceVector};
 pub use observe::{observe_signals_value, observe_value, wait_for_value};
 pub use signal::{
