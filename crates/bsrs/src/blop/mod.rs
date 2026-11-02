@@ -11,7 +11,7 @@
 //! and the [`Agent`] that binds them to an optimizer. Optimizer backends are
 //! not part of this module; any type implementing [`Optimizer`] plugs in,
 //! and the agent hands it the backend-neutral [`ExperimentSpec`]. Feature
-//! `blop-bridge` adds [`bridge::BridgeOptimizer`], which serves that spec to
+//! `blop-bridge` adds `bridge::BridgeOptimizer`, which serves that spec to
 //! an out-of-process optimizer (Ax, through the `bsrs_blop_bridge` Python
 //! package) over ZMQ.
 //!
