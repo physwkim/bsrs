@@ -135,6 +135,7 @@ impl EpicsPvaBackend<f64> {
     /// ophyd-async's `datatype=None` read as a number: any numeric or bool
     /// NTScalar, an NTEnum as its index, for the devices whose PV is the
     /// user's to name (`pva_detector`).
+    #[cfg(feature = "host")]
     pub(crate) fn new_inferred(pv: impl Into<String>) -> Self {
         Self::reading_as(pv.into(), Datatype::Number)
     }

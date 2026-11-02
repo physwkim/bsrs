@@ -500,6 +500,7 @@ impl EpicsCaBackend<f64> {
     /// ophyd-async's `datatype=None` read as a number: any numeric or enum
     /// scalar PV, an enum as its index, for the devices whose PV is the
     /// user's to name (`ca_value`, a suspender, a positioner's done PV).
+    #[cfg(feature = "host")]
     pub(crate) fn new_inferred(pv: impl Into<String>) -> Self {
         Self::reading_as(pv.into(), Datatype::Number)
     }
