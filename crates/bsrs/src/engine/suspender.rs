@@ -5,7 +5,7 @@
 //!
 //! Two layers live here:
 //!
-//! - The internal [`SuspenderHandle`], the engine's registration record for
+//! - The internal `SuspenderHandle`, the engine's registration record for
 //!   one installed suspender: the suspender itself (queried at plan start for
 //!   the ENG-12 gate), its watcher task and the release of a suspension it
 //!   holds. Drop aborts the task (rule **K1**) and releases the suspension, as

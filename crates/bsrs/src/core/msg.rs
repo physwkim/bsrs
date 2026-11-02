@@ -94,7 +94,7 @@ pub enum Msg {
     /// `msg.run` field (`run_engine.py:504` `_run_bundlers: dict`): every
     /// message carries an implicit run key, `None` (an unwrapped message) being
     /// the single default run. Wrapping `inner` in `InRun` sets that key to
-    /// `Some(run)`, so the engine dispatches it to the run's own [`RunBundler`],
+    /// `Some(run)`, so the engine dispatches it to the run's own [`RunBundler`](crate::engine::bundler::RunBundler),
     /// monitors, uncollected flyers and asset cache. Only the bundler-touching
     /// verbs (`OpenRun`/`CloseRun`/`Create`/`Save`/`Drop`/`DeclareStream`/
     /// `Read`/`Collect`/`Monitor`/`Unmonitor`/`Configure`/`Kickoff`) consult the

@@ -58,7 +58,7 @@ pub struct ZmqDocumentSource {
 impl ZmqDocumentSource {
     /// Open a SUB socket and `connect` it to the given endpoint
     /// (`ipc:///tmp/...` or `tcp://host:port`). The socket starts
-    /// with no subscription filter — call [`with_subscribe_prefix`]
+    /// with no subscription filter — call [`with_subscribe_prefix`](Self::with_subscribe_prefix)
     /// to register one. Default serializer = msgpack.
     pub fn connect(endpoint: &str) -> Result<Self> {
         let sock = omq::Context::new().blocking_socket(SocketType::Sub, Options::default());
@@ -100,7 +100,7 @@ impl ZmqDocumentSource {
     }
 
     /// Hand the source a [`CancellationToken`]; cancelling it ends
-    /// the [`run_into_engine`] loop on the next message boundary.
+    /// the [`run_into_engine`](Self::run_into_engine) loop on the next message boundary.
     pub fn with_cancel(mut self, t: CancellationToken) -> Self {
         self.cancel = t;
         self

@@ -11,12 +11,12 @@
 //! worker's progress.
 //!
 //! `RE:subscribe` and `msg.subscribe` solve this with thread-aware
-//! routing in [`make_lua_subscriber_cb`]: same-thread callbacks fire
+//! routing in `make_lua_subscriber_cb`: same-thread callbacks fire
 //! synchronously (reentrant lock OK); other-thread callbacks push
 //! into a per-subscriber buffer that is replayed on the REPL thread
 //! at the next opportunity: before the subscriber's next same-thread
 //! delivery, and after `RE:run`'s `block_on` returns (see
-//! [`drain_lua_subscriber_buffers`]). A subscriber therefore sees its
+//! `drain_lua_subscriber_buffers`). A subscriber therefore sees its
 //! documents in emission order; worker-emitted docs are only delayed
 //! until the REPL thread next emits or the run ends.
 //!
