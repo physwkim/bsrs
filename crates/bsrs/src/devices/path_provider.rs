@@ -42,10 +42,11 @@ impl Flavor {
 /// Linux (pathlib `PurePosixPath` / `PureWindowsPath`). It follows its own
 /// flavor's rules and never touches the filesystem; `&str`, `String`,
 /// `&Path` and `PathBuf` convert to this host's flavor, as `PurePath(...)`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct PurePath {
     flavor: Flavor,
-    /// `C:` or `\\server\share`; always empty for posix.
+    /// `C:`, `\\server\share` or `\\?\UNC\server\share`; always empty for
+    /// posix.
     drive: String,
     /// `/`, `//` (posix) or `\` after the drive, else empty.
     root: String,
@@ -59,8 +60,9 @@ impl PurePath {
         Self::parse(Flavor::Posix, path)
     }
 
-    /// pathlib `PureWindowsPath(path)`: `/` and `\` both separate, and `C:`
-    /// or `\\server\share` is the drive.
+    /// pathlib `PureWindowsPath(path)`: `/` and `\` both separate, and `C:`,
+    /// `\\server\share` or a `\\?\` device such as `\\?\UNC\server\share`
+    /// is the drive.
     pub fn windows(path: &str) -> Self {
         Self::parse(Flavor::Windows, path)
     }
@@ -71,7 +73,8 @@ impl PurePath {
             Flavor::Posix => split_posix_root(path),
             Flavor::Windows => {
                 windows = path.replace('/', "\\");
-                split_windows_root(&windows)
+                let (drive, root, rest) = split_windows_root(&windows);
+                (drive.into(), windows_root(drive, root).into(), rest)
             }
         };
         let parts = rest
@@ -105,31 +108,24 @@ impl PurePath {
         self.to_string().replace('\\', "/")
     }
 
-    /// `self / segment`, `segment` parsed by this path's flavor: an absolute
-    /// segment replaces the path, as `os.path.join`.
+    /// `self / segment`, as pathlib: the `os.path.join` of the two parsed
+    /// again, so an absolute segment replaces the path and `\\server` joined
+    /// with `share` becomes the drive `\\server\share`.
     pub fn join(&self, segment: &str) -> Self {
-        let other = Self::parse(self.flavor, segment);
-        let replaces = match self.flavor {
-            Flavor::Posix => !other.root.is_empty(),
-            Flavor::Windows => {
-                !other.root.is_empty()
-                    || (!other.drive.is_empty() && !other.drive.eq_ignore_ascii_case(&self.drive))
-            }
+        let path = self.to_string();
+        let joined = match self.flavor {
+            Flavor::Posix => posix_join(&path, segment),
+            Flavor::Windows => windows_join(&path, &segment.replace('/', "\\")),
         };
-        if replaces {
-            let drive = if other.drive.is_empty() {
-                self.drive.clone()
-            } else {
-                other.drive
-            };
-            return Self { drive, ..other };
+        Self::parse(self.flavor, &joined)
+    }
+
+    /// pathlib `_str_normcase`: the text, lowercased on Windows.
+    fn normcase(&self) -> String {
+        match self.flavor {
+            Flavor::Posix => self.to_string(),
+            Flavor::Windows => self.to_string().to_lowercase(),
         }
-        let mut joined = self.clone();
-        if !other.drive.is_empty() {
-            joined.drive = other.drive;
-        }
-        joined.parts.extend(other.parts);
-        joined
     }
 
     /// The path without its last name; the drive and root alone stay.
@@ -165,39 +161,104 @@ fn split_posix_root(path: &str) -> (String, String, &str) {
     }
 }
 
-/// ntpath `splitroot` of a path already separated by `\`, plus pathlib's
-/// root on a bare `\\server\share` drive.
-fn split_windows_root(path: &str) -> (String, String, &str) {
-    if let Some(unc) = path.strip_prefix("\\\\") {
-        let Some(server_end) = unc.find('\\') else {
-            return (path.into(), String::new(), "");
+/// ntpath `splitroot` of a path already separated by `\`.
+fn split_windows_root(path: &str) -> (&str, &str, &str) {
+    if path.starts_with("\\\\") {
+        // `\\server\share`, `\\?\UNC\server\share`, or a device `\\.\name`.
+        let unc = path
+            .get(..8)
+            .is_some_and(|p| p.eq_ignore_ascii_case("\\\\?\\UNC\\"));
+        let start = if unc { 8 } else { 2 };
+        let Some(index) = path[start..].find('\\').map(|i| start + i) else {
+            return (path, "", "");
         };
-        let share = &unc[server_end + 1..];
-        let (share_end, root, rest) = match share.find('\\') {
-            Some(i) => (i, "\\", &share[i + 1..]),
-            None => (share.len(), "", ""),
+        let Some(index2) = path[index + 1..].find('\\').map(|i| index + 1 + i) else {
+            return (path, "", "");
         };
-        let drive = &path[..2 + server_end + 1 + share_end];
-        let server = &unc[..server_end];
-        // `server not in '?.'` is a substring test, so `''` and `?.` count.
-        let root = if root.is_empty() && share_end > 0 && !"?.".contains(server) {
-            "\\"
-        } else {
-            root
-        };
-        (drive.into(), root.into(), rest)
+        (&path[..index2], "\\", &path[index2 + 1..])
     } else if let Some(rest) = path.strip_prefix('\\') {
-        (String::new(), "\\".into(), rest)
-    } else if path.get(1..2) == Some(":") {
-        let (root, rest) = match path[2..].strip_prefix('\\') {
-            Some(rest) => ("\\", rest),
-            None => ("", &path[2..]),
-        };
-        (path[..2].into(), root.into(), rest)
+        ("", "\\", rest)
+    } else if let Some((colon, ':')) = path.char_indices().nth(1) {
+        let (drive, rest) = path.split_at(colon + 1);
+        match rest.strip_prefix('\\') {
+            Some(rest) => (drive, "\\", rest),
+            None => (drive, "", rest),
+        }
     } else {
-        (String::new(), String::new(), path)
+        ("", "", path)
     }
 }
+
+/// pathlib's root on a drive `splitroot` left without one:
+/// `\\server\share` and `\\?\UNC\server\share` are absolute alone.
+fn windows_root<'a>(drive: &str, root: &'a str) -> &'a str {
+    if !root.is_empty() || !drive.starts_with('\\') || drive.ends_with('\\') {
+        return root;
+    }
+    let parts: Vec<&str> = drive.split('\\').collect();
+    match parts.len() {
+        // `not in '?.'` is a substring test, so `''` and `?.` get none either.
+        4 if !"?.".contains(parts[2]) => "\\",
+        6 => "\\",
+        _ => root,
+    }
+}
+
+/// posixpath `join` of two paths.
+fn posix_join(path: &str, segment: &str) -> String {
+    if segment.starts_with('/') {
+        segment.into()
+    } else if path.is_empty() || path.ends_with('/') {
+        format!("{path}{segment}")
+    } else {
+        format!("{path}/{segment}")
+    }
+}
+
+/// ntpath `join` of two paths already separated by `\`.
+fn windows_join(path: &str, segment: &str) -> String {
+    let (mut drive, root, rest) = split_windows_root(path);
+    let (seg_drive, seg_root, seg_rest) = split_windows_root(segment);
+    if !seg_root.is_empty() {
+        let drive = if seg_drive.is_empty() {
+            drive
+        } else {
+            seg_drive
+        };
+        return format!("{drive}{seg_root}{seg_rest}");
+    }
+    if !seg_drive.is_empty() {
+        if seg_drive.to_lowercase() != drive.to_lowercase() {
+            return segment.into();
+        }
+        drive = seg_drive;
+    }
+    let mut rest = rest.to_string();
+    if !rest.is_empty() && !rest.ends_with('\\') {
+        rest.push('\\');
+    }
+    rest.push_str(seg_rest);
+    // A `\` between a `\\server\share` drive and a relative rest.
+    let root = if root.is_empty()
+        && !rest.is_empty()
+        && !drive.is_empty()
+        && !drive.ends_with([':', '\\'])
+    {
+        "\\"
+    } else {
+        root
+    };
+    format!("{drive}{root}{rest}")
+}
+
+/// pathlib `==`: the same flavor and the same text, case-folded on Windows.
+impl PartialEq for PurePath {
+    fn eq(&self, other: &Self) -> bool {
+        self.flavor == other.flavor && self.normcase() == other.normcase()
+    }
+}
+
+impl Eq for PurePath {}
 
 /// pathlib `str()`: `.` when the path is empty.
 impl fmt::Display for PurePath {
@@ -880,6 +941,34 @@ mod tests {
             (PurePath::windows("\\\\server"), "\\\\server", false),
             (PurePath::windows("\\\\.\\share"), "\\\\.\\share", false),
             (PurePath::windows("\\\\?.\\share"), "\\\\?.\\share", false),
+            (
+                PurePath::windows("\\\\?\\C:\\data"),
+                "\\\\?\\C:\\data",
+                true,
+            ),
+            (
+                PurePath::windows("\\\\?\\UNC\\server\\share"),
+                "\\\\?\\UNC\\server\\share\\",
+                true,
+            ),
+            (
+                PurePath::windows("//?/unc/server/share/dir"),
+                "\\\\?\\unc\\server\\share\\dir",
+                true,
+            ),
+            (
+                PurePath::windows("\\\\?\\UNC\\server"),
+                "\\\\?\\UNC\\server",
+                false,
+            ),
+            (PurePath::windows("\\\\?\\UNC"), "\\\\?\\UNC", false),
+            (
+                PurePath::windows("\\\\.\\pipe\\name"),
+                "\\\\.\\pipe\\name",
+                true,
+            ),
+            (PurePath::windows("é:\\x"), "é:\\x", true),
+            (PurePath::windows("é:x"), "é:x", false),
         ] {
             assert_eq!(path.to_string(), shown);
             assert_eq!(path.is_absolute(), absolute, "{shown}");
@@ -898,9 +987,52 @@ mod tests {
             (PurePath::windows("C:\\a"), "D:\\b", "D:\\b"),
             (PurePath::windows("\\\\srv\\sh"), "x", "\\\\srv\\sh\\x"),
             (PurePath::windows("C:"), "x", "C:x"),
+            (posix("/"), "x", "/x"),
+            (posix("//"), "x", "//x"),
+            (
+                PurePath::windows("\\\\srv\\sh\\a"),
+                "\\\\srv\\sh",
+                "\\\\srv\\sh\\a",
+            ),
+            (
+                PurePath::windows("\\\\srv\\sh\\a"),
+                "\\\\SRV\\sh",
+                "\\\\SRV\\sh\\a",
+            ),
+            (
+                PurePath::windows("\\\\srv\\sh\\a"),
+                "\\\\srv\\sh\\",
+                "\\\\srv\\sh\\",
+            ),
+            (
+                PurePath::windows("\\\\server"),
+                "share",
+                "\\\\server\\share\\",
+            ),
+            (
+                PurePath::windows("\\\\?\\UNC\\srv\\sh\\a"),
+                "\\\\?\\unc\\SRV\\sh",
+                "\\\\?\\unc\\SRV\\sh\\a",
+            ),
+            (PurePath::windows("C:\\a"), "\\\\?\\C:\\b", "\\\\?\\C:\\b"),
+            (PurePath::windows("é:\\a"), "É:b", "É:\\a\\b"),
         ] {
             assert_eq!(base.join(segment).to_string(), joined);
         }
+    }
+
+    #[test]
+    fn pure_path_compares_like_pathlib() {
+        assert_eq!(
+            PurePath::windows("C:/Users/X"),
+            PurePath::windows("c:\\users\\x")
+        );
+        assert_eq!(
+            PurePath::windows("\\\\SRV\\É"),
+            PurePath::windows("\\\\srv\\é")
+        );
+        assert_ne!(posix("/A"), posix("/a"));
+        assert_ne!(PurePath::windows("a"), posix("a"));
     }
 
     // The cases below port ophyd-async tests/unit_tests/core/test_providers.py.

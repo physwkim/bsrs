@@ -186,7 +186,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   uri is the provider's `directory_uri` plus `{filename}.h5`, not
   `FullFileName_RBV`. Paths are `PurePath`s, posix or Windows whatever
   the host (pathlib `PurePosixPath`/`PureWindowsPath`); `&str`, `&Path`
-  and `PathBuf` convert to the host's flavor. An IOC on Windows gets a
+  and `PathBuf` convert to the host's flavor. Windows paths compare
+  case-insensitively, and `\\?\UNC\server\share` is a drive, as in
+  pathlib. An IOC on Windows gets a
   `FilePath` ending in `\` and a `file://localhost/C:/...` URI.
 - `AreaDetectorCam::arm` resolves once the cam is acquiring, and its
   configuration is described from `AcquireTime_RBV`/`AcquirePeriod_RBV`.
