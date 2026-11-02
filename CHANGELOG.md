@@ -87,7 +87,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `syn`; an unknown role, key or kind is a compile error instead of
   `Kind::Normal`.
 - **Breaking**: `EpicsCaBackend::new` and `EpicsPvaBackend::new` take only
-  `f64`, `i64`, `bool`, `String` and `Vec<f64>`, and `connect` refuses with
+  `f64`, `i64`, `bool`, `String` and a `Vec` of the waveform's own element
+  type, as ophyd-async's `Array1D`/`Sequence[str]` (`i16`, `f32`, `u8`,
+  `i32`, `f64` or `String` over CA; `bool`, `i8` through `u64`, `f32`,
+  `f64` or `String` over PVA), and `connect` refuses with
   `BsrsError::Datatype` a PV the type cannot read, as ophyd-async's
   `make_converter`: `Vec<f64>` on a LONG waveform, `bool` on an enum without
   two choices, `i64` on a float record with a nonzero PREC. Generic code

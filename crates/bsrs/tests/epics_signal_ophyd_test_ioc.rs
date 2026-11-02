@@ -484,6 +484,46 @@ fn pva_integer_lifecycle() {
     });
 }
 
+/// A LONG waveform (NELM 10) written and read as `Vec<i32>`, its
+/// `Array1D[np.int32]`. A put reads back at its own length, one element
+/// included: the reads ask for the current element count, as aioca's and
+/// p4p's do, and the datakey has that length.
+async fn assert_long_waveform_put_reads_back(b: &impl SignalBackend<Vec<i32>>, pv: &str) {
+    b.connect(CONNECT).await.unwrap();
+    let (token, mut rx) = subscribe(b);
+    next(&mut rx).await;
+    for put in [vec![3, 4, 5], vec![7]] {
+        b.put(Some(put.clone())).await.unwrap();
+        next_where(&mut rx, |v| *v == put).await;
+        assert_eq!(b.get_value().await.unwrap(), put);
+        let reading = b.get_reading().await.unwrap();
+        assert_eq!(reading.value, serde_json::json!(put));
+    }
+    assert_unsubscribed(token, rx).await;
+    let dk = b.get_datakey(pv).await.unwrap();
+    assert_eq!(dk.dtype, Dtype::Array);
+    assert_eq!(dk.dtype_numpy, numpy("<i4"));
+    assert_eq!(dk.shape, vec![Some(1)]);
+}
+
+#[test]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+fn ca_long_waveform_put_reads_back() {
+    run(async {
+        let pv = format!("{CAM}cam1:Dimensions");
+        assert_long_waveform_put_reads_back(&EpicsCaBackend::new(&pv), &pv).await;
+    });
+}
+
+#[test]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+fn pva_long_waveform_put_reads_back() {
+    run(async {
+        let pv = "ADSIM:cam1:Dimensions";
+        assert_long_waveform_put_reads_back(&EpicsPvaBackend::new(pv), pv).await;
+    });
+}
+
 /// A LONG waveform is no `Array1D[np.float64]`, nor a number: ophyd-async
 /// infers `Array1D[np.int32]` from it and refuses either at connect.
 async fn assert_long_waveform_refused(b: impl SignalBackend<Vec<f64>>, n: impl SignalBackend<f64>) {

@@ -53,7 +53,9 @@ impl<T: PvaType> EpicsPvaBackend<T> {
     /// `i64` an integer one (or a float one at precision 0), `bool` a
     /// two-choice NTEnum or a bool, int8, uint8, int32 or uint32 NTScalar,
     /// `String` a string NTScalar, an NTEnum's labels or an int8 array's
-    /// text, `Vec<f64>` a double NTScalarArray.
+    /// text, and a `Vec` an NTScalarArray of its element's type: `bool`,
+    /// `i8`, `u8`, `i16`, `u16`, `i32`, `u32`, `i64`, `u64`, `f32`, `f64` or
+    /// `String`.
     pub fn new(pv: impl Into<String>) -> Self {
         Self::reading_as(pv.into(), T::DATATYPE)
     }
@@ -444,7 +446,9 @@ pub enum Datatype {
     Int,
     Bool,
     Str,
-    FloatArray,
+    /// The `Array1D` of this element type; `Sequence[str]` for
+    /// [`ScalarType::String`].
+    Array(ScalarType),
     /// `datatype=None`, read as a number: whatever numeric or bool scalar
     /// the PV is, an NTEnum as its index (ophyd `EpicsSignalRO`).
     Number,
@@ -452,12 +456,24 @@ pub enum Datatype {
 
 impl Datatype {
     fn name(self) -> &'static str {
+        use ScalarType as S;
         match self {
             Self::Float | Self::Number => "float",
             Self::Int => "int",
             Self::Bool => "bool",
             Self::Str => "str",
-            Self::FloatArray => "Array1D[np.float64]",
+            Self::Array(S::Boolean) => "Array1D[np.bool]",
+            Self::Array(S::Byte) => "Array1D[np.int8]",
+            Self::Array(S::UByte) => "Array1D[np.uint8]",
+            Self::Array(S::Short) => "Array1D[np.int16]",
+            Self::Array(S::UShort) => "Array1D[np.uint16]",
+            Self::Array(S::Int) => "Array1D[np.int32]",
+            Self::Array(S::UInt) => "Array1D[np.uint32]",
+            Self::Array(S::Long) => "Array1D[np.int64]",
+            Self::Array(S::ULong) => "Array1D[np.uint64]",
+            Self::Array(S::Float) => "Array1D[np.float32]",
+            Self::Array(S::Double) => "Array1D[np.float64]",
+            Self::Array(S::String) => "Sequence[str]",
         }
     }
 }
@@ -530,27 +546,29 @@ fn specifier(value: Option<&PvField>) -> String {
 /// [`Datatype`] it is, if bsrs has one.
 fn inferred(typeid: &str, spec: &str) -> Option<(&'static str, Option<Datatype>)> {
     use Datatype as D;
-    Some(match (typeid, spec) {
-        (NT_SCALAR, "?") => ("bool", Some(D::Bool)),
-        (NT_SCALAR, "b" | "B" | "h" | "H" | "i" | "I" | "l" | "L") => ("int", Some(D::Int)),
-        (NT_SCALAR, "f" | "d") => ("float", Some(D::Float)),
-        (NT_SCALAR, "s") | (NT_ENUM, "S") => ("str", Some(D::Str)),
-        (NT_SCALAR_ARRAY, "ad") => ("Array1D[np.float64]", Some(D::FloatArray)),
-        (NT_SCALAR_ARRAY, "a?") => ("Array1D[np.bool]", None),
-        (NT_SCALAR_ARRAY, "ab") => ("Array1D[np.int8]", None),
-        (NT_SCALAR_ARRAY, "aB") => ("Array1D[np.uint8]", None),
-        (NT_SCALAR_ARRAY, "ah") => ("Array1D[np.int16]", None),
-        (NT_SCALAR_ARRAY, "aH") => ("Array1D[np.uint16]", None),
-        (NT_SCALAR_ARRAY, "ai") => ("Array1D[np.int32]", None),
-        (NT_SCALAR_ARRAY, "aI") => ("Array1D[np.uint32]", None),
-        (NT_SCALAR_ARRAY, "al") => ("Array1D[np.int64]", None),
-        (NT_SCALAR_ARRAY, "aL") => ("Array1D[np.uint64]", None),
-        (NT_SCALAR_ARRAY, "af") => ("Array1D[np.float32]", None),
-        (NT_SCALAR_ARRAY, "as") => ("Sequence[str]", None),
-        ("epics:nt/NTTable:1.0", "S") => ("Table", None),
-        ("epics:nt/NTNDArray:1.0", "v" | "U") => ("ndarray", None),
+    use ScalarType as S;
+    let datatype = match (typeid, spec) {
+        (NT_SCALAR, "?") => D::Bool,
+        (NT_SCALAR, "b" | "B" | "h" | "H" | "i" | "I" | "l" | "L") => D::Int,
+        (NT_SCALAR, "f" | "d") => D::Float,
+        (NT_SCALAR, "s") | (NT_ENUM, "S") => D::Str,
+        (NT_SCALAR_ARRAY, "a?") => D::Array(S::Boolean),
+        (NT_SCALAR_ARRAY, "ab") => D::Array(S::Byte),
+        (NT_SCALAR_ARRAY, "aB") => D::Array(S::UByte),
+        (NT_SCALAR_ARRAY, "ah") => D::Array(S::Short),
+        (NT_SCALAR_ARRAY, "aH") => D::Array(S::UShort),
+        (NT_SCALAR_ARRAY, "ai") => D::Array(S::Int),
+        (NT_SCALAR_ARRAY, "aI") => D::Array(S::UInt),
+        (NT_SCALAR_ARRAY, "al") => D::Array(S::Long),
+        (NT_SCALAR_ARRAY, "aL") => D::Array(S::ULong),
+        (NT_SCALAR_ARRAY, "af") => D::Array(S::Float),
+        (NT_SCALAR_ARRAY, "ad") => D::Array(S::Double),
+        (NT_SCALAR_ARRAY, "as") => D::Array(S::String),
+        ("epics:nt/NTTable:1.0", "S") => return Some(("Table", None)),
+        ("epics:nt/NTNDArray:1.0", "v" | "U") => return Some(("ndarray", None)),
         _ => return None,
-    })
+    };
+    Some((datatype.name(), Some(datatype)))
 }
 
 /// ophyd-async `make_converter`: the converter that reads `pv`, whose full
@@ -601,7 +619,7 @@ fn make_converter(pv: &str, want: Datatype, top: &PvField) -> Result<PvaConverte
             Some(PvaConverter::Value)
         }
         _ if inferred == Some(want) => Some(PvaConverter::Value),
-        D::Str if name == "Array1D[np.int8]" => Some(PvaConverter::LongStr),
+        D::Str if inferred == Some(D::Array(ScalarType::Byte)) => Some(PvaConverter::LongStr),
         _ => None,
     };
     conv.ok_or_else(|| {
@@ -699,17 +717,18 @@ fn primitive_datakey<T: Primitive>(source: String, meta: SignalMetadata) -> Data
     make_datakey(source, T::DTYPE, vec![], Some(T::DTYPE_NUMPY.into()), meta)
 }
 
-/// An `Array1D[np.float64]`'s datakey: shaped as the array read.
-fn array_datakey(source: String, value: &[f64], meta: SignalMetadata) -> DataKey {
-    let shape = vec![Some(value.len() as u64)];
-    make_datakey(source, Dtype::Array, shape, Some("<f8".into()), meta)
+/// An array's datakey: shaped as the `len` elements read.
+fn array_datakey(source: String, len: usize, dtype_numpy: &str, meta: SignalMetadata) -> DataKey {
+    let shape = vec![Some(len as u64)];
+    make_datakey(source, Dtype::Array, shape, Some(dtype_numpy.into()), meta)
 }
 
 mod sealed {
     use super::{Datatype, PvaConverter};
     use crate::core::error::Result;
     use crate::event_model::DataKey;
-    use epics_pva_rs::PvField;
+    use epics_pva_rs::pvdata::{ScalarType, TypedScalarArray};
+    use epics_pva_rs::{PvField, ScalarValue};
 
     /// A type [`EpicsPvaBackend`](super::EpicsPvaBackend) reads a PV as: its
     /// ophyd-async datatype, and its values through the converter
@@ -726,8 +745,26 @@ mod sealed {
         #[doc(hidden)]
         fn datakey(source: String, conv: &PvaConverter, top: &PvField) -> Result<DataKey>;
     }
+
+    /// An element of the `Vec` [`EpicsPvaBackend`](super::EpicsPvaBackend)
+    /// reads an NTScalarArray of its type as: ophyd-async's `Array1D`
+    /// dtype, or for `String` its `Sequence[str]`.
+    pub trait PvaElement: Into<serde_json::Value> + Clone + Send + Sync + 'static {
+        #[doc(hidden)]
+        const SCALAR_TYPE: ScalarType;
+        #[doc(hidden)]
+        const DTYPE_NUMPY: &'static str;
+        /// `None` when `a` is not an array of `SCALAR_TYPE`.
+        #[doc(hidden)]
+        fn from_array(a: &TypedScalarArray) -> Option<Vec<Self>>;
+        /// An element of the legacy untyped array.
+        #[doc(hidden)]
+        fn from_scalar(x: &ScalarValue) -> Option<Self>;
+        #[doc(hidden)]
+        fn to_array(v: Vec<Self>) -> TypedScalarArray;
+    }
 }
-use sealed::PvaType;
+use sealed::{PvaElement, PvaType};
 
 /// An NTEnum's `value.index`.
 fn enum_index(top: &PvField) -> Option<i64> {
@@ -826,28 +863,82 @@ impl PvaType for String {
     }
 }
 
-impl PvaType for Vec<f64> {
-    const DATATYPE: Datatype = Datatype::FloatArray;
+impl<E: PvaElement> PvaType for Vec<E> {
+    const DATATYPE: Datatype = Datatype::Array(E::SCALAR_TYPE);
     fn decode(_: &PvaConverter, top: &PvField) -> Option<Self> {
         match field(top_fields(top), "value")? {
-            PvField::ScalarArrayTyped(TypedScalarArray::Double(a)) => Some(a.to_vec()),
-            PvField::ScalarArray(items) => items
-                .iter()
-                .map(|x| match x {
-                    ScalarValue::Double(d) => Some(*d),
-                    _ => None,
-                })
-                .collect(),
+            PvField::ScalarArrayTyped(a) => E::from_array(a),
+            PvField::ScalarArray(items) => items.iter().map(E::from_scalar).collect(),
             _ => None,
         }
     }
     fn encode(_: &PvaConverter, v: Self) -> PvField {
-        PvField::ScalarArrayTyped(TypedScalarArray::Double(v.into()))
+        PvField::ScalarArrayTyped(E::to_array(v))
     }
     fn datakey(source: String, conv: &PvaConverter, top: &PvField) -> Result<DataKey> {
         let v = Self::decode(conv, top).ok_or_else(|| undecodable(top))?;
-        let meta = pv_field_to_metadata(top, Datatype::FloatArray);
-        Ok(array_datakey(source, &v, meta))
+        let meta = pv_field_to_metadata(top, Self::DATATYPE);
+        Ok(array_datakey(source, v.len(), E::DTYPE_NUMPY, meta))
+    }
+}
+
+/// `$t` as the element of an NTScalarArray of `$v`.
+macro_rules! pva_element {
+    ($t:ty, $v:ident, $numpy:literal) => {
+        impl PvaElement for $t {
+            const SCALAR_TYPE: ScalarType = ScalarType::$v;
+            const DTYPE_NUMPY: &'static str = $numpy;
+            fn from_array(a: &TypedScalarArray) -> Option<Vec<Self>> {
+                match a {
+                    TypedScalarArray::$v(a) => Some(a.to_vec()),
+                    _ => None,
+                }
+            }
+            fn from_scalar(x: &ScalarValue) -> Option<Self> {
+                match x {
+                    ScalarValue::$v(x) => Some(*x),
+                    _ => None,
+                }
+            }
+            fn to_array(v: Vec<Self>) -> TypedScalarArray {
+                TypedScalarArray::$v(v.into())
+            }
+        }
+    };
+}
+
+pva_element!(bool, Boolean, "|b1");
+pva_element!(i8, Byte, "|i1");
+pva_element!(u8, UByte, "|u1");
+pva_element!(i16, Short, "<i2");
+pva_element!(u16, UShort, "<u2");
+pva_element!(i32, Int, "<i4");
+pva_element!(u32, UInt, "<u4");
+pva_element!(i64, Long, "<i8");
+pva_element!(u64, ULong, "<u8");
+pva_element!(f32, Float, "<f4");
+pva_element!(f64, Double, "<f8");
+
+/// `Sequence[str]`.
+impl PvaElement for String {
+    const SCALAR_TYPE: ScalarType = ScalarType::String;
+    const DTYPE_NUMPY: &'static str = "|S40";
+    fn from_array(a: &TypedScalarArray) -> Option<Vec<Self>> {
+        match a {
+            TypedScalarArray::String(a) => {
+                Some(a.iter().map(|s| s.as_str_lossy().into_owned()).collect())
+            }
+            _ => None,
+        }
+    }
+    fn from_scalar(x: &ScalarValue) -> Option<Self> {
+        match x {
+            ScalarValue::String(s) => Some(s.as_str_lossy().into_owned()),
+            _ => None,
+        }
+    }
+    fn to_array(v: Vec<Self>) -> TypedScalarArray {
+        TypedScalarArray::String(v.into_iter().map(Into::into).collect())
     }
 }
 
@@ -1153,21 +1244,115 @@ mod tests {
         assert_eq!(decode(ntscalar_with_ts(1.0, 0, 0)), None);
     }
 
-    /// `Array1D[np.float64]` is a double array only, as ophyd-async infers
-    /// `Array1D[np.int32]` from an int one and coerces neither way.
-    #[test]
-    fn float_array_refuses_an_int_array() {
+    fn ntscalararray(value: PvField) -> PvField {
         let mut nt = PvStructure::new(NT_SCALAR_ARRAY);
-        let ints = TypedScalarArray::Int(vec![7, 8, 9].into());
-        nt.fields
-            .push(("value".into(), PvField::ScalarArrayTyped(ints)));
-        let err = make_converter("WF", Datatype::FloatArray, &PvField::Structure(nt));
+        nt.fields.push(("value".into(), value));
+        PvField::Structure(nt)
+    }
+
+    /// Each element type is the datatype ophyd-async infers from its own
+    /// NTScalarArray, and reads back what it writes.
+    #[test]
+    fn arrays_round_trip_their_own_scalar_array() {
+        fn round_trip<E: PvaElement + PartialEq + std::fmt::Debug>(v: Vec<E>) {
+            let top = ntscalararray(Vec::<E>::encode(&PvaConverter::Value, v.clone()));
+            let conv = make_converter("WF", Vec::<E>::DATATYPE, &top).unwrap();
+            assert_eq!(Vec::<E>::decode(&conv, &top), Some(v));
+        }
+        round_trip(vec![true, false]);
+        round_trip(vec![-1i8, 2]);
+        round_trip(vec![1u8, 255]);
+        round_trip(vec![-1i16, 2]);
+        round_trip(vec![1u16, 65535]);
+        round_trip(vec![-1i32, 2]);
+        round_trip(vec![1u32, u32::MAX]);
+        round_trip(vec![-1i64, 2]);
+        round_trip(vec![1u64, u64::MAX]);
+        round_trip(vec![1.5f32, -2.0]);
+        round_trip(vec![1.5f64, -2.0]);
+        round_trip(vec!["a".to_string(), String::new()]);
+        round_trip(Vec::<i32>::new());
+    }
+
+    /// An array is its own element type only, as ophyd-async infers
+    /// `Array1D[np.int32]` from an int one and coerces it to nothing else.
+    #[test]
+    fn array_refuses_another_element_type() {
+        let ints = ntscalararray(PvField::ScalarArrayTyped(TypedScalarArray::Int(
+            vec![7, 8, 9].into(),
+        )));
+        let err = |want: Datatype| make_converter("WF", want, &ints).unwrap_err().to_string();
         assert_eq!(
-            err.unwrap_err().to_string(),
+            err(Vec::<f64>::DATATYPE),
             "WF with inferred datatype Array1D[np.int32] from \
              typeid='epics:nt/NTScalarArray:1.0' specifier='ai' cannot be \
              coerced to Array1D[np.float64]"
         );
+        assert_eq!(
+            err(Vec::<i64>::DATATYPE),
+            "WF with inferred datatype Array1D[np.int32] from \
+             typeid='epics:nt/NTScalarArray:1.0' specifier='ai' cannot be \
+             coerced to Array1D[np.int64]"
+        );
+        assert!(Vec::<u32>::decode(&PvaConverter::Value, &ints).is_none());
+        let bytes = ntscalararray(PvField::ScalarArrayTyped(TypedScalarArray::Byte(
+            vec![104, 105, 0].into(),
+        )));
+        // An int8 array is `Array1D[np.int8]`, and still a long string.
+        assert!(make_converter("WF", Vec::<i8>::DATATYPE, &bytes).is_ok());
+        assert_eq!(
+            make_converter("WF", Datatype::Str, &bytes).unwrap(),
+            PvaConverter::LongStr
+        );
+        assert_eq!(
+            make_converter("WF", Vec::<String>::DATATYPE, &bytes)
+                .unwrap_err()
+                .to_string(),
+            "WF with inferred datatype Array1D[np.int8] from \
+             typeid='epics:nt/NTScalarArray:1.0' specifier='ab' cannot be \
+             coerced to Sequence[str]"
+        );
+    }
+
+    /// An array's datakey carries its element's numpy dtype, and a float
+    /// array's precision only.
+    #[test]
+    fn array_datakeys_carry_their_element_dtype() {
+        let with_display = |value: PvField| {
+            let mut display = PvStructure::new("display_t");
+            display.fields.push((
+                "units".into(),
+                PvField::Scalar(ScalarValue::String("mm".into())),
+            ));
+            display
+                .fields
+                .push(("precision".into(), PvField::Scalar(ScalarValue::Int(3))));
+            let PvField::Structure(mut nt) = ntscalararray(value) else {
+                unreachable!()
+            };
+            nt.fields
+                .push(("display".into(), PvField::Structure(display)));
+            PvField::Structure(nt)
+        };
+        let ints = with_display(Vec::<i32>::encode(&PvaConverter::Value, vec![1, 2, 3]));
+        let dk = Vec::<i32>::datakey("pva://WF".into(), &PvaConverter::Value, &ints).unwrap();
+        assert_eq!(dk.dtype, Dtype::Array);
+        assert_eq!(dk.shape, vec![Some(3)]);
+        assert_eq!(dk.dtype_numpy, Some("<i4".into()));
+        assert_eq!(dk.units.as_deref(), Some("mm"));
+        assert_eq!(dk.precision, None);
+        let floats = with_display(Vec::<f32>::encode(&PvaConverter::Value, vec![1.0]));
+        let dk = Vec::<f32>::datakey("pva://WF".into(), &PvaConverter::Value, &floats).unwrap();
+        assert_eq!(dk.dtype_numpy, Some("<f4".into()));
+        assert_eq!(dk.precision, Some(3));
+        let strs = with_display(Vec::<String>::encode(
+            &PvaConverter::Value,
+            vec!["a".into(), "b".into()],
+        ));
+        let dk = Vec::<String>::datakey("pva://WF".into(), &PvaConverter::Value, &strs).unwrap();
+        assert_eq!(dk.shape, vec![Some(2)]);
+        assert_eq!(dk.dtype_numpy, Some("|S40".into()));
+        assert_eq!(dk.units, None);
     }
 
     #[test]

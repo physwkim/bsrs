@@ -131,20 +131,22 @@ pub enum Datatype {
     Int,
     Bool,
     Str,
-    FloatArray,
+    /// The `Array1D` of a waveform of this DBR type; `Sequence[str]` for
+    /// [`DbFieldType::String`].
+    Array(DbFieldType),
     /// `datatype=None`, read as a number: whatever numeric or enum scalar
     /// the PV is, an enum as its index (ophyd `EpicsSignalRO`).
     Number,
 }
 
 impl Datatype {
-    fn name(self) -> &'static str {
+    fn name(self) -> String {
         match self {
-            Self::Float | Self::Number => "float",
-            Self::Int => "int",
-            Self::Bool => "bool",
-            Self::Str => "str",
-            Self::FloatArray => "Array1D[np.float64]",
+            Self::Float | Self::Number => "float".into(),
+            Self::Int => "int".into(),
+            Self::Bool => "bool".into(),
+            Self::Str => "str".into(),
+            Self::Array(t) => inferred_name(t, true),
         }
     }
 }
@@ -213,7 +215,9 @@ fn make_converter(
         | (D::Float, F::Float | F::Double, false)
         | (D::Int, F::Short | F::Char | F::Long, false)
         | (D::Str, F::String, false)
-        | (D::FloatArray, F::Double, true) => Ok(CaConverter::Native(native)),
+        // `Sequence[str]` reads an enum waveform too (`CaSequenceStrConverter`).
+        | (D::Array(F::String), F::Enum, true) => Ok(CaConverter::Native(native)),
+        (D::Array(t), _, true) if t == native => Ok(CaConverter::Native(native)),
         _ => Err(BsrsError::Datatype(format!(
             "{pv} with inferred datatype {} cannot be coerced to {}",
             inferred_name(native, is_array),
@@ -264,7 +268,7 @@ mod sealed {
     use super::{CaConverter, Datatype, Snapshot};
     use crate::core::error::Result;
     use crate::event_model::DataKey;
-    use epics_ca_rs::EpicsValue;
+    use epics_ca_rs::{DbFieldType, EpicsValue};
 
     /// A type [`EpicsCaBackend`](super::EpicsCaBackend) reads a PV as: its
     /// ophyd-async datatype, and its values through the converter
@@ -281,8 +285,23 @@ mod sealed {
         #[doc(hidden)]
         fn datakey(source: String, conv: &CaConverter, snap: &Snapshot) -> Result<DataKey>;
     }
+
+    /// An element of the `Vec` [`EpicsCaBackend`](super::EpicsCaBackend)
+    /// reads a waveform of its DBR type as: ophyd-async's `Array1D` dtype,
+    /// or for `String` its `Sequence[str]`.
+    pub trait CaElement: Into<serde_json::Value> + Clone + Send + Sync + 'static {
+        #[doc(hidden)]
+        const DBR: DbFieldType;
+        #[doc(hidden)]
+        const DTYPE_NUMPY: &'static str;
+        /// `None` when `v` is not a read of a waveform of `DBR`.
+        #[doc(hidden)]
+        fn decode_array(v: &EpicsValue) -> Option<Vec<Self>>;
+        #[doc(hidden)]
+        fn encode_array(v: Vec<Self>) -> EpicsValue;
+    }
 }
-use sealed::CaType;
+use sealed::{CaElement, CaType};
 
 impl CaType for f64 {
     const DATATYPE: Datatype = Datatype::Float;
@@ -366,17 +385,69 @@ impl CaType for String {
     }
 }
 
-impl CaType for Vec<f64> {
-    const DATATYPE: Datatype = Datatype::FloatArray;
+impl<E: CaElement> CaType for Vec<E> {
+    const DATATYPE: Datatype = Datatype::Array(E::DBR);
     fn decode(_: &CaConverter, v: &EpicsValue) -> Option<Self> {
-        epics_to_vec_f64(v)
+        E::decode_array(v)
     }
     fn encode(_: &CaConverter, v: Self) -> Result<EpicsValue> {
-        Ok(EpicsValue::DoubleArray(v.into()))
+        Ok(E::encode_array(v))
     }
     fn datakey(source: String, conv: &CaConverter, snap: &Snapshot) -> Result<DataKey> {
         let v = Self::decode(conv, &snap.value).ok_or_else(|| undecodable(&snap.value))?;
-        Ok(array_datakey(source, &v, ctrl_metadata(snap, true, true)))
+        let float = matches!(E::DBR, DbFieldType::Float | DbFieldType::Double);
+        let meta = ctrl_metadata(snap, true, float);
+        Ok(array_datakey(source, v.len(), E::DTYPE_NUMPY, meta))
+    }
+}
+
+/// `$t` as the element of a `$dbr` waveform, read as `$arr`, or `$one` for
+/// a one-element read (`EpicsValue::from_bytes_array`), and written as `$put`.
+macro_rules! ca_element {
+    ($t:ty, $dbr:ident, $numpy:literal, $arr:ident | $one:ident => $put:ident) => {
+        impl CaElement for $t {
+            const DBR: DbFieldType = DbFieldType::$dbr;
+            const DTYPE_NUMPY: &'static str = $numpy;
+            fn decode_array(v: &EpicsValue) -> Option<Vec<Self>> {
+                match v {
+                    EpicsValue::$arr(a) => Some(a.to_vec()),
+                    EpicsValue::$one(x) => Some(vec![*x]),
+                    _ => None,
+                }
+            }
+            fn encode_array(v: Vec<Self>) -> EpicsValue {
+                EpicsValue::$put(v.into())
+            }
+        }
+    };
+}
+
+ca_element!(i16, Short, "<i2", ShortArray | Short => ShortArray);
+ca_element!(f32, Float, "<f4", FloatArray | Float => FloatArray);
+// A DBR_CHAR read arrives as its unsigned carrier (`DbFieldType::wire_carrier`).
+ca_element!(u8, Char, "|u1", UCharArray | UChar => CharArray);
+ca_element!(i32, Long, "<i4", LongArray | Long => LongArray);
+ca_element!(f64, Double, "<f8", DoubleArray | Double => DoubleArray);
+
+/// `Sequence[str]`: a string waveform's strings, or an enum waveform's
+/// indices as `CaSequenceStrConverter`'s `str(v)` of a `DBR_ENUM` read gives
+/// them.
+impl CaElement for String {
+    const DBR: DbFieldType = DbFieldType::String;
+    const DTYPE_NUMPY: &'static str = "|S40";
+    fn decode_array(v: &EpicsValue) -> Option<Vec<Self>> {
+        match v {
+            EpicsValue::StringArray(a) => {
+                Some(a.iter().map(|s| s.as_str_lossy().into_owned()).collect())
+            }
+            EpicsValue::String(s) => Some(vec![s.as_str_lossy().into_owned()]),
+            EpicsValue::EnumArray(a) => Some(a.iter().map(u16::to_string).collect()),
+            EpicsValue::Enum(i) => Some(vec![i.to_string()]),
+            _ => None,
+        }
+    }
+    fn encode_array(v: Vec<Self>) -> EpicsValue {
+        EpicsValue::StringArray(v.iter().map(|s| s.as_str().into()).collect())
     }
 }
 
@@ -406,7 +477,9 @@ impl<T: CaType> EpicsCaBackend<T> {
     /// `T`, as ophyd-async's `make_converter`: `f64` is a float record,
     /// `i64` an integer one (or a float one at precision 0), `bool` a
     /// two-choice enum or a char/short, `String` a string, an enum's labels
-    /// or a char waveform's text, `Vec<f64>` a double waveform.
+    /// or a char waveform's text, and a `Vec` a waveform of its element's
+    /// type: `i16` short, `f32` float, `u8` char, `i32` long, `f64` double,
+    /// `String` string or enum (as its indices).
     pub fn new(pv: impl Into<String>) -> Self {
         Self::reading_as(pv.into(), T::DATATYPE)
     }
@@ -638,10 +711,10 @@ fn primitive_datakey<T: Primitive>(source: String, meta: SignalMetadata) -> Data
     make_datakey(source, T::DTYPE, vec![], Some(T::DTYPE_NUMPY.into()), meta)
 }
 
-/// An `Array1D[np.float64]`'s datakey: shaped as the array read.
-fn array_datakey(source: String, value: &[f64], meta: SignalMetadata) -> DataKey {
-    let shape = vec![Some(value.len() as u64)];
-    make_datakey(source, Dtype::Array, shape, Some("<f8".into()), meta)
+/// An array's datakey: shaped as the `len` elements read.
+fn array_datakey(source: String, len: usize, dtype_numpy: &str, meta: SignalMetadata) -> DataKey {
+    let shape = vec![Some(len as u64)];
+    make_datakey(source, Dtype::Array, shape, Some(dtype_numpy.into()), meta)
 }
 
 /// The DBR_CTRL read ophyd-async's `get_datakey` describes a PV from.
@@ -737,16 +810,6 @@ fn epics_to_f64(v: &EpicsValue) -> Option<f64> {
         EpicsValue::UChar(c) => Some(*c as f64),
         EpicsValue::Int64(i) => Some(*i as f64),
         EpicsValue::Enum(e) => Some(*e as f64),
-        _ => None,
-    }
-}
-
-/// Decode a `DBR_DOUBLE` waveform, the one array `Vec<f64>` is made for. A
-/// one-element answer arrives as the scalar (`EpicsValue::from_bytes_array`).
-fn epics_to_vec_f64(v: &EpicsValue) -> Option<Vec<f64>> {
-    match v {
-        EpicsValue::DoubleArray(a) => Some(a.to_vec()),
-        EpicsValue::Double(d) => Some(vec![*d]),
         _ => None,
     }
 }
@@ -1062,28 +1125,44 @@ mod tests {
     }
 
     #[test]
-    fn epics_to_vec_f64_reads_double_waveforms_only() {
+    fn arrays_decode_their_own_waveform_only() {
         assert_eq!(
-            epics_to_vec_f64(&EpicsValue::DoubleArray(vec![1.0, 2.0].into())),
+            f64::decode_array(&EpicsValue::DoubleArray(vec![1.0, 2.0].into())),
             Some(vec![1.0, 2.0])
         );
-        assert_eq!(epics_to_vec_f64(&EpicsValue::Double(3.0)), Some(vec![3.0]));
         assert_eq!(
-            epics_to_vec_f64(&EpicsValue::LongArray(vec![3, 4].into())),
+            f64::decode_array(&EpicsValue::LongArray(vec![3, 4].into())),
             None
+        );
+        assert_eq!(
+            i32::decode_array(&EpicsValue::LongArray(vec![3, 4].into())),
+            Some(vec![3, 4])
+        );
+        assert_eq!(
+            String::decode_array(&EpicsValue::EnumArray(vec![2, 0].into())),
+            Some(vec!["2".to_string(), "0".to_string()])
         );
     }
 
-    /// A read of the current element count decodes 0, 1 and n elements: the
-    /// one-element answer arrives as the scalar.
+    /// `put` written as `Vec<E>` and read back as a CA read of `n` elements
+    /// hands it back: the one-element answer arrives as the scalar.
+    fn wire_round_trip<E: CaElement + PartialEq + std::fmt::Debug>(put: Vec<E>) {
+        let n = put.len();
+        let wire = E::encode_array(put.clone()).to_bytes();
+        let v = EpicsValue::from_bytes_array(E::DBR.wire_carrier(), &wire, n).unwrap();
+        assert_eq!(E::decode_array(&v), Some(put), "{:?}[{n}]", E::DBR);
+    }
+
+    /// A read of the current element count decodes 0, 1 and n elements.
     #[test]
     fn autosized_reads_decode_at_every_count() {
-        let double = CaConverter::Native(DbFieldType::Double);
-        for n in [0, 1, 3] {
-            let put: Vec<f64> = (0..n).map(|i| i as f64 + 0.5).collect();
-            let wire = Vec::<f64>::encode(&double, put.clone()).unwrap().to_bytes();
-            let v = EpicsValue::from_bytes_array(DbFieldType::Double, &wire, n).unwrap();
-            assert_eq!(Vec::<f64>::decode(&double, &v), Some(put), "{n} elements");
+        for n in [0u8, 1, 3] {
+            wire_round_trip((0..n).map(|i| i16::from(i) - 1).collect());
+            wire_round_trip((0..n).map(|i| f32::from(i) + 0.5).collect());
+            wire_round_trip((0..n).map(|i| 200 + i).collect());
+            wire_round_trip((0..n).map(|i| i32::from(i) - 1).collect());
+            wire_round_trip((0..n).map(|i| f64::from(i) + 0.5).collect());
+            wire_round_trip((0..n).map(|i| format!("s{i}")).collect());
         }
         for s in ["", "a", "/data/scan42"] {
             let v = String::encode(&CaConverter::LongStr, s.into()).unwrap();
@@ -1242,20 +1321,76 @@ mod tests {
     }
 
     #[test]
-    fn float_array_on_double_waveform_only() {
+    fn array_on_waveform_of_its_type_only() {
         let none = ctrl(&[], None);
+        for (want, native) in [
+            (Vec::<i16>::DATATYPE, DbFieldType::Short),
+            (Vec::<f32>::DATATYPE, DbFieldType::Float),
+            (Vec::<u8>::DATATYPE, DbFieldType::Char),
+            (Vec::<i32>::DATATYPE, DbFieldType::Long),
+            (Vec::<f64>::DATATYPE, DbFieldType::Double),
+            (Vec::<String>::DATATYPE, DbFieldType::String),
+            (Vec::<String>::DATATYPE, DbFieldType::Enum),
+        ] {
+            assert_eq!(
+                converter(want, native, 10, &none),
+                CaConverter::Native(native)
+            );
+        }
         assert_eq!(
-            converter(Datatype::FloatArray, DbFieldType::Double, 10, &none),
-            CaConverter::Native(DbFieldType::Double)
+            refusal(Vec::<f64>::DATATYPE, DbFieldType::Long, 10, &none),
+            "P with inferred datatype Array1D[np.int32] cannot be coerced to Array1D[np.float64]"
         );
         assert_eq!(
-            refusal(Datatype::FloatArray, DbFieldType::Long, 10, &none),
-            "P with inferred datatype Array1D[np.int32] cannot be coerced to Array1D[np.float64]"
+            refusal(Vec::<String>::DATATYPE, DbFieldType::Char, 10, &none),
+            "P with inferred datatype Array1D[np.uint8] cannot be coerced to Sequence[str]"
+        );
+        // A one-element waveform is a scalar to ophyd-async.
+        assert_eq!(
+            refusal(Vec::<i32>::DATATYPE, DbFieldType::Long, 1, &none),
+            "P with inferred datatype int cannot be coerced to Array1D[np.int32]"
         );
         assert_eq!(
             refusal(Datatype::Float, DbFieldType::Double, 10, &none),
             "P with inferred datatype Array1D[np.float64] cannot be coerced to float"
         );
+    }
+
+    /// An array's datakey has its element's numpy dtype, and a precision
+    /// only for a float waveform.
+    #[test]
+    fn array_datakeys_carry_their_element_dtype() {
+        let mut snap = ctrl(&[], Some(3));
+        snap.value = EpicsValue::LongArray(vec![1, 2, 3].into());
+        let dk = Vec::<i32>::datakey(
+            "ca://P".into(),
+            &CaConverter::Native(DbFieldType::Long),
+            &snap,
+        )
+        .unwrap();
+        assert_eq!(dk.dtype, Dtype::Array);
+        assert_eq!(dk.shape, vec![Some(3)]);
+        assert_eq!(dk.dtype_numpy, Some("<i4".into()));
+        assert_eq!(dk.precision, None);
+        snap.value = EpicsValue::FloatArray(vec![0.5, 1.5].into());
+        let dk = Vec::<f32>::datakey(
+            "ca://P".into(),
+            &CaConverter::Native(DbFieldType::Float),
+            &snap,
+        )
+        .unwrap();
+        assert_eq!(dk.dtype_numpy, Some("<f4".into()));
+        assert_eq!(dk.precision, Some(3));
+        snap.value = EpicsValue::StringArray(vec!["a".into()].into());
+        snap.display = None;
+        let dk = Vec::<String>::datakey(
+            "ca://P".into(),
+            &CaConverter::Native(DbFieldType::String),
+            &snap,
+        )
+        .unwrap();
+        assert_eq!(dk.dtype_numpy, Some("|S40".into()));
+        assert_eq!(dk.shape, vec![Some(1)]);
     }
 
     #[test]
