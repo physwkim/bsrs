@@ -2952,7 +2952,7 @@ mod tests {
     }
 
     /// `stage_sigs` lifecycle smoke: `select_save_plugin(hdf1, <port>, [jpeg1,
-    /// magick1, nexus1])` (port from `BSRS_AD_PORT`, default `SIM1`) records the
+    /// tiff1, nexus1])` (port from `BSRS_AD_PORT`, default `SIM1`) records the
     /// routing into each plugin's `stage_sigs` **without touching the IOC**;
     /// staging then applies it — (a) `HDF1:NDArrayPort = <port>`,
     /// (b) `HDF1:EnableCallbacks` enabled, (c) siblings' `EnableCallbacks`
@@ -2979,14 +2979,14 @@ mod tests {
         let prefix = ad_prefix();
         let hdf1 = NdFile::new(format!("{prefix}HDF1:"));
         let jpeg1 = NdFile::new(format!("{prefix}JPEG1:"));
-        let magick1 = NdFile::new(format!("{prefix}Magick1:"));
+        let tiff1 = NdFile::new(format!("{prefix}TIFF1:"));
         let nexus1 = NdFile::new(format!("{prefix}Nexus1:"));
 
         let timeout = Duration::from_secs(5);
         tokio::try_join!(
             hdf1.connect(timeout),
             jpeg1.connect(timeout),
-            magick1.connect(timeout),
+            tiff1.connect(timeout),
             nexus1.connect(timeout),
         )
         .expect("connect file plugins");
@@ -3015,12 +3015,12 @@ mod tests {
         let port = ad_port();
         let pre_hdf1_en = en(&hdf1).await;
         let pre_jpeg1_en = en(&jpeg1).await;
-        let pre_magick1_en = en(&magick1).await;
+        let pre_tiff1_en = en(&tiff1).await;
         let pre_nexus1_en = en(&nexus1).await;
         let pre_hdf1_port = port_of(&hdf1).await;
 
         // Record the routing into stage_sigs — this must NOT write to the IOC.
-        let siblings = [&jpeg1, &magick1, &nexus1];
+        let siblings = [&jpeg1, &tiff1, &nexus1];
         select_save_plugin(&hdf1, &port, &siblings);
         assert_eq!(
             en(&hdf1).await,
@@ -3037,16 +3037,16 @@ mod tests {
         let hdf1_port = port_of(&hdf1).await;
         let hdf1_en = en(&hdf1).await;
         let jpeg1_en = en(&jpeg1).await;
-        let magick1_en = en(&magick1).await;
+        let tiff1_en = en(&tiff1).await;
         let nexus1_en = en(&nexus1).await;
         eprintln!(
             "staged: HDF1.port={hdf1_port:?}, \
-             enables HDF1={hdf1_en} JPEG1={jpeg1_en} Magick1={magick1_en} Nexus1={nexus1_en}"
+             enables HDF1={hdf1_en} JPEG1={jpeg1_en} TIFF1={tiff1_en} Nexus1={nexus1_en}"
         );
         assert_eq!(hdf1_port, port, "HDF1.NDArrayPort not routed to {port}");
         assert!(hdf1_en, "HDF1 was not enabled by staging");
         assert!(!jpeg1_en, "JPEG1 not disabled by staging");
-        assert!(!magick1_en, "Magick1 not disabled by staging");
+        assert!(!tiff1_en, "TIFF1 not disabled by staging");
         assert!(!nexus1_en, "Nexus1 not disabled by staging");
 
         // Unstage (reverse order): restore every signal to its pre-stage value.
@@ -3061,11 +3061,7 @@ mod tests {
             "HDF1 enable not restored on unstage"
         );
         assert_eq!(en(&jpeg1).await, pre_jpeg1_en, "JPEG1 enable not restored");
-        assert_eq!(
-            en(&magick1).await,
-            pre_magick1_en,
-            "Magick1 enable not restored"
-        );
+        assert_eq!(en(&tiff1).await, pre_tiff1_en, "TIFF1 enable not restored");
         assert_eq!(
             en(&nexus1).await,
             pre_nexus1_en,
