@@ -21,7 +21,7 @@
 │                      (sync = blanket impl over async core)   │
 │                      ──────────────────────────────────      │
 │                      StandardDetector = DetectorControl      │
-│                                       + DetectorWriter       │
+│                                       + Vec<DataLogic>       │
 ├──────────────────────────────────────────────────────────────┤
 │ L1a  SignalBackend : 7-method async trait (sealed)           │
 │       impls: epics_ca / epics_pva / soft / mock              │
