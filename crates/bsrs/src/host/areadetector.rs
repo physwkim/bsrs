@@ -3083,7 +3083,7 @@ mod tests {
 #[cfg(test)]
 mod ad_hdf_tests {
     use super::*;
-    use crate::protocols_async::{Preparable, Stageable, WritesStreamAssets};
+    use crate::protocols_async::{Preparable, Stageable, Triggerable, WritesStreamAssets};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     /// What [`AdFileIo::configure`] received: `(directory, filename,
@@ -3790,13 +3790,9 @@ mod ad_hdf_tests {
             .await
             .await
             .expect("prepare");
-        // One internal-trigger acquisition.
-        det.control().arm().await.await.expect("acquire");
-        // Fully-qualified: the inherent `wait_for_idle(timeout)` shadows the
-        // zero-arg trait method by name.
-        DetectorControl::wait_for_idle(det.control())
-            .await
-            .expect("idle");
+        // The cam reports idle before the HDF plugin has written the frame;
+        // trigger waits for NumCaptured as well.
+        Triggerable::trigger(&det).await.await.expect("trigger");
         let up_to = WritesStreamAssets::get_index(&det).await.expect("index");
         assert!(up_to >= 1, "expected >=1 frame written, got {up_to}");
         let docs: Vec<StreamAsset> = det.collect_asset_docs(up_to, "live-desc").collect().await;
