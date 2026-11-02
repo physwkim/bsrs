@@ -1,4 +1,4 @@
-//! bsrs-qs — queueserver-compatible 0MQ JSON-RPC daemon.
+//! bsrs-qs — queueserver-compatible 0MQ JSON-RPC daemon (feature `qs`).
 //!
 //! Exposes the bluesky-queueserver external API (the JSON-RPC methods that
 //! `qserver` CLI / `bluesky-httpserver` use) over a 0MQ REP socket. Internally

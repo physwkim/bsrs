@@ -1,5 +1,5 @@
 //! bsrs host runtime — reusable components for embedding a bsrs
-//! `RunEngine` + queue server into a process.
+//! `RunEngine` + queue server into a process (feature `host`).
 //!
 //! Split out of the old `bsrs-cli` crate (now the thin `bsrs`
 //! binary in `bin/bsrs`) so downstream binaries — e.g. a

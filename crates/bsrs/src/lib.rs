@@ -33,15 +33,12 @@ pub mod stream;
 #[cfg(feature = "zmq")]
 mod zmq_socket;
 
-/// Queue-server-compatible 0MQ JSON-RPC daemon (feature `qs`).
 #[cfg(feature = "qs")]
 pub mod qs;
 
-/// Host runtime — Lua bridge + CA/PVA device factories (feature `host`).
 #[cfg(feature = "host")]
 pub mod host;
 
-/// Beamline optimization plans — the blop port (feature `blop`).
 #[cfg(feature = "blop")]
 pub mod blop;
 
