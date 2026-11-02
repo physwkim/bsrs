@@ -2884,7 +2884,7 @@ mod tests {
     //   BSRS_AD_PREFIX=mini:dot:  BSRS_AD_PORT=DOT
     // -------------------------------------------------------------
 
-    fn ad_prefix() -> String {
+    pub(super) fn ad_prefix() -> String {
         std::env::var("BSRS_AD_PREFIX").unwrap_or_else(|_| "SIM1:".to_string())
     }
 
@@ -3762,21 +3762,17 @@ mod ad_hdf_tests {
     // Live-IOC smoke test — drives a real areaDetector cam + NDFileHDF5 plugin
     // end to end and asserts the emitted StreamResource points at the file the
     // IOC actually wrote. `#[ignore]`; run with `--ignored` against an IOC.
-    //   BSRS_AD_PREFIX  cam prefix   (default 13SIM1:cam1:)
-    //   BSRS_AD_HDF     HDF1 prefix  (default 13SIM1:HDF1:)
+    //   BSRS_AD_PREFIX  IOC prefix   (default SIM1:), as for `tests`
     //   BSRS_AD_DIR     write dir    (default /tmp/), must be IOC-visible
     #[tokio::test]
     #[ignore]
     async fn area_detector_hdf_live_emits_real_file_stream_resource() {
-        let cam_prefix =
-            std::env::var("BSRS_AD_PREFIX").unwrap_or_else(|_| "13SIM1:cam1:".to_string());
-        let hdf_prefix =
-            std::env::var("BSRS_AD_HDF").unwrap_or_else(|_| "13SIM1:HDF1:".to_string());
+        let prefix = super::tests::ad_prefix();
         let dir = std::env::var("BSRS_AD_DIR").unwrap_or_else(|_| "/tmp/".to_string());
         let det = area_detector_hdf(
             "addet",
-            cam_prefix,
-            hdf_prefix,
+            format!("{prefix}cam1:"),
+            format!("{prefix}HDF1:"),
             StaticPathProvider::new(dir, "bsrs_ad_live"),
         );
         connect_area_detector_hdf(&det, Duration::from_secs(5))
