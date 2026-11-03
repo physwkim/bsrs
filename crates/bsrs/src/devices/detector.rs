@@ -193,8 +193,7 @@ where
         match written.len() {
             0 | 1 => Ok(written.first().copied().unwrap_or(0)),
             _ => Err(BsrsError::State(format!(
-                "{}: Detectors have written different numbers of collections: {written:?}",
-                self.name
+                "Detectors have written different numbers of collections: {written:?}"
             ))),
         }
     }
@@ -244,7 +243,7 @@ where
             .lock()
             .unwrap()
             .clone()
-            .ok_or_else(|| BsrsError::State(format!("{}: {not_run}", self.name)))
+            .ok_or_else(|| BsrsError::State(not_run.into()))
     }
 
     /// ophyd-async `StandardDetector.prepare`: set the hardware up for `info`,
@@ -332,9 +331,9 @@ where
             None => self.prepare_for(TriggerInfo::default()).await?,
             Some(ctx) if ctx.trigger_info.number_of_events != 1 => {
                 return Err(BsrsError::Plan(format!(
-                    "{}: trigger() is not supported for multiple events, the detector \
+                    "trigger() is not supported for multiple events, the detector \
                      was prepared with number_of_events={}.",
-                    self.name, ctx.trigger_info.number_of_events
+                    ctx.trigger_info.number_of_events
                 )));
             }
             Some(ctx) => self.update_prepare_context(ctx.trigger_info).await?,
@@ -374,8 +373,7 @@ where
                 Ok((Ok(()), _, _)) => {}
                 Ok((Err(_), _, _)) => {
                     return Err(BsrsError::State(format!(
-                        "{}: writer closed at index {written} of {target}",
-                        self.name
+                        "writer closed at index {written} of {target}"
                     )))
                 }
                 Err(_) => return Err(BsrsError::Timeout(exposure_timeout)),
@@ -405,9 +403,8 @@ where
             ctx.collections_written + u64::from(ctx.trigger_info.number_of_collections());
         if last_requested > last_expected {
             return Err(BsrsError::State(format!(
-                "{}: Kickoff requested {collections_written}:{last_requested}, but \
-                 detector was only prepared up to {last_expected}",
-                self.name
+                "Kickoff requested {collections_written}:{last_requested}, but \
+                 detector was only prepared up to {last_expected}"
             )));
         }
         let kickoff = KickoffCtx {
@@ -510,10 +507,9 @@ where
     }
     async fn complete(&self) -> Status {
         let Some(kickoff) = *self.kicked_off.lock().unwrap() else {
-            return Status::fail(crate::core::status::StatusError::Failed(format!(
-                "{}: Kickoff not called",
-                self.name
-            )));
+            return Status::fail(crate::core::status::StatusError::Failed(
+                "complete: Kickoff not called".into(),
+            ));
         };
         let waited = self
             .wait_for_index(
@@ -774,10 +770,9 @@ where
         // Acquisition parameters are set through `prepare(TriggerInfo)`, not
         // a generic configure — same as ophyd-async, whose detectors expose
         // config signals read-only on the descriptor path.
-        Err(BsrsError::State(format!(
-            "{}: StandardDetector is configured via prepare(TriggerInfo), not configure()",
-            self.name
-        )))
+        Err(BsrsError::State(
+            "StandardDetector is configured via prepare(TriggerInfo), not configure()".into(),
+        ))
     }
 }
 
@@ -1166,7 +1161,10 @@ mod tests {
         let (det, _tx, _) = controlled();
         Stageable::stage(&det).await.unwrap();
         let err = Flyable::kickoff(&det).await.await.unwrap_err();
-        assert!(err.to_string().contains("det: Prepare not called"), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "kickoff: device state error: Prepare not called"
+        );
     }
 
     #[tokio::test]
@@ -1242,7 +1240,7 @@ mod tests {
         Stageable::stage(&det).await.unwrap();
         assert_eq!(det.events_to_kickoff(), 0);
         let err = Flyable::complete(&det).await.await.unwrap_err();
-        assert!(err.to_string().contains("Kickoff not called"), "{err}");
+        assert_eq!(err.to_string(), "complete: Kickoff not called");
     }
 
     #[tokio::test]
@@ -1538,7 +1536,7 @@ mod tests {
         let (det, _) = with_logics("det", vec![w1]);
         let unprepared = |det: &StandardDetector<RecordingControl>| {
             let err = det.collect_asset_docs(1, "d").err().expect("unprepared");
-            assert!(err.to_string().contains("det: Prepare not called"), "{err}");
+            assert_eq!(err.to_string(), "device state error: Prepare not called");
         };
         unprepared(&det);
         Stageable::stage(&det).await.unwrap();

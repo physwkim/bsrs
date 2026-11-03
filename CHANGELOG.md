@@ -204,6 +204,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `host` feature.
 - **Breaking**: `SignalCache::new` takes the signal's name, for the source
   its logs name.
+- `StandardDetector`'s errors no longer start with the detector's name, so
+  they read as ophyd-async's; `complete` without a kickoff fails with
+  `complete: Kickoff not called`.
 
 ### Removed
 
