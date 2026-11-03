@@ -85,6 +85,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   started, `get`, `put` and `trigger`, and a monitor's opening, updates and
   closing, with ophyd-async's message text and values spelled as Python's
   `str()` spells them.
+- `Command` and `TriggerableCommand` in `bsrs::devices`, ophyd-async's
+  typed commands: a `CommandBackend` executes them, `SoftCommandBackend` and
+  `soft_command` run a callback one call at a time, and `MockCommandBackend`
+  records calls and runs a test's callback. A command with no arguments and
+  no result is `Triggerable`.
+- `CaCommandBackend` and `PvaCommandBackend`, ophyd-async's EPICS command
+  backends: executing writes 1 (or `with_execute_value`) to the PV and
+  waits for the record to process, and `connect` refuses a PV that is not
+  a scalar integer, boolean or enum with ophyd-async's `TypeError` text.
+- `#[derive(Device)]` builds a `#[command("{prefix}...")]` field as a
+  `Command` over that PV and connects it with the device.
 
 ### Changed
 

@@ -70,18 +70,11 @@ impl<T: PvaType> EpicsPvaBackend<T> {
         }
     }
 
-    /// `connect`: wait for the channel, then make the converter from a full
-    /// read whose value is the one `put(None)` writes, both within
-    /// `timeout`, as ophyd-async's connect-time `pvget` and `make_converter`.
+    /// `connect`: make the converter from a [`connect_read`] whose value is
+    /// the one `put(None)` writes, as ophyd-async's connect-time `pvget` and
+    /// `make_converter`.
     async fn connect_reading(&self, timeout: Duration) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        pva_connect(&self.client, &self.pv, timeout).await?;
-        let top = tokio::time::timeout_at(deadline, pvget(&self.client, &self.pv))
-            .await
-            .map_err(|_| {
-                let why = format_args!("no value in {timeout:?}");
-                BsrsError::not_connected(format!("pva://{}", self.pv), why)
-            })??;
+        let top = connect_read(&self.client, &self.pv, timeout).await?;
         let conv = make_converter(&self.pv, self.want, &top)?;
         let v = T::decode(&conv, &top).ok_or_else(|| undecodable(&top))?;
         *self.converter.lock().unwrap() = Some(Arc::new(conv));
@@ -181,6 +174,19 @@ async fn pva_connect(client: &PvaClient, pv: &str, timeout: Duration) -> Result<
             let why = format_args!("no channel in {timeout:?}");
             BsrsError::not_connected(format!("pva://{pv}"), why)
         })
+}
+
+/// Wait for `pv`'s channel, then read it in full, both within `timeout`, as
+/// ophyd-async's connect-time `pvget_with_timeout`.
+async fn connect_read(client: &PvaClient, pv: &str, timeout: Duration) -> Result<PvField> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    pva_connect(client, pv, timeout).await?;
+    tokio::time::timeout_at(deadline, pvget(client, pv))
+        .await
+        .map_err(|_| {
+            let why = format_args!("no value in {timeout:?}");
+            BsrsError::not_connected(format!("pva://{pv}"), why)
+        })?
 }
 
 /// PVA put of `f` with `record[block=true]`: QSRV answers it once the record
@@ -1047,6 +1053,83 @@ impl<T: PvaType> SignalBackend<T> for EpicsPvaBackend<T> {
     }
     fn source(&self, name: &str, _read: bool) -> String {
         format!("pva://{name}")
+    }
+}
+
+/// [`Command`](crate::devices::Command) backend over PVA: ophyd-async
+/// `PvaCommandBackend`. Executing puts `execute_value` to the PV's `value`
+/// with `record[block=true]`, so a `.PROC` field's command completes when the
+/// record has processed.
+pub struct PvaCommandBackend {
+    pv: String,
+    execute_value: i64,
+    client: Arc<PvaClient>,
+}
+
+impl PvaCommandBackend {
+    /// Put 1 to `write_pv` on each execute.
+    pub fn new(write_pv: impl Into<String>) -> Self {
+        Self {
+            pv: write_pv.into(),
+            execute_value: 1,
+            client: pva_context(),
+        }
+    }
+
+    /// Put `execute_value` instead of 1.
+    pub fn with_execute_value(mut self, execute_value: i64) -> Self {
+        self.execute_value = execute_value;
+        self
+    }
+
+    /// The PV written.
+    pub fn write_pv(&self) -> &str {
+        &self.pv
+    }
+}
+
+impl crate::devices::BackendFromPv for PvaCommandBackend {
+    fn from_pv(pv: &str) -> Self {
+        Self::new(pv)
+    }
+}
+
+#[async_trait]
+impl crate::devices::CommandBackend for PvaCommandBackend {
+    type Args = ();
+    type Output = ();
+    fn source(&self, _name: &str) -> String {
+        format!("pva://{}", self.pv)
+    }
+    /// Refuses all but a boolean or integer NTScalar and an NTEnum.
+    async fn connect(&self, timeout: Duration) -> Result<()> {
+        let top = connect_read(&self.client, &self.pv, timeout).await?;
+        let typeid = match &top {
+            PvField::Structure(s) => s.struct_id.as_str(),
+            _ => "",
+        };
+        let spec = specifier(field(top_fields(&top), "value"));
+        let accepted = match typeid {
+            NT_SCALAR => matches!(
+                spec.as_str(),
+                "?" | "b" | "B" | "h" | "H" | "i" | "I" | "l" | "L"
+            ),
+            NT_ENUM => true,
+            _ => false,
+        };
+        if !accepted {
+            return Err(BsrsError::Datatype(format!(
+                "pva://{} is not a scalar boolean, scalar numeric, or enum PV \
+                 (typeid='{typeid}', specifier='{spec}'); PvaCommandBackend requires a \
+                 scalar boolean, scalar numeric, or enum PV",
+                self.pv
+            )));
+        }
+        Ok(())
+    }
+    async fn execute(&self, _args: ()) -> Result<()> {
+        let v = PvField::Scalar(ScalarValue::Long(self.execute_value));
+        put_block(&self.client, &self.pv, v).await?.await
     }
 }
 

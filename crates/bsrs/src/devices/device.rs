@@ -9,8 +9,10 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use futures::future::{BoxFuture, FutureExt, Shared};
 
 use crate::core::error::{BsrsError, NotConnected, Result};
 
@@ -175,6 +177,47 @@ impl<D: Device> DeviceVector<D> {
                 .map(|(k, d)| (k.to_string(), d.connect_all_boxed(timeout))),
         )
         .await
+    }
+}
+
+/// A spawned connect: every caller that joins it gets its one outcome, and a
+/// caller dropped meanwhile does not cancel it.
+type ConnectTask = Shared<BoxFuture<'static, std::result::Result<(), Arc<BsrsError>>>>;
+
+/// The last connect a signal or command started (ophyd-async
+/// `Device._connect_task`).
+#[derive(Default)]
+pub(crate) struct ConnectOnce(Mutex<Option<ConnectTask>>);
+
+impl ConnectOnce {
+    /// Join the connect still running, or the one that succeeded; otherwise,
+    /// or when `force`d, spawn `start()` as the new one (ophyd-async
+    /// `Device.connect`).
+    pub(crate) async fn join<F>(&self, force: bool, start: impl FnOnce() -> F) -> Result<()>
+    where
+        F: Future<Output = Result<()>> + Send + 'static,
+    {
+        let task = {
+            let mut slot = self.0.lock().unwrap();
+            match slot.as_ref() {
+                Some(task) if !force && !matches!(task.peek(), Some(Err(_))) => task.clone(),
+                _ => {
+                    let run = tokio::spawn(start());
+                    let task = async move {
+                        match run.await {
+                            Ok(outcome) => outcome.map_err(Arc::new),
+                            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+                            Err(_) => Err(Arc::new(BsrsError::Cancelled)),
+                        }
+                    }
+                    .boxed()
+                    .shared();
+                    *slot = Some(task.clone());
+                    task
+                }
+            }
+        };
+        task.await.map_err(BsrsError::Connect)
     }
 }
 

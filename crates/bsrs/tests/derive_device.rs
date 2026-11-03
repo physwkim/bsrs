@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use bsrs::backends::soft::SoftSignalBackend;
 use bsrs::core::Kind;
-use bsrs::devices::{walk_signal_sources, Device, DeviceVector, SignalR, SignalRW};
+use bsrs::devices::{
+    walk_signal_sources, Command, Device, DeviceVector, MockCommandBackend, SignalR, SignalRW,
+};
 
 #[derive(Device)]
 struct Motor {
@@ -150,4 +152,31 @@ async fn device_vector_holds_and_connects_derived_devices() {
     assert_eq!(keys, vec!["1", "2", "3"]);
     // connect_all drives every child's derived connect.
     cams.connect_all(Duration::from_millis(100)).await.unwrap();
+}
+
+#[derive(Device)]
+struct Shutter {
+    name: String,
+    #[signal(ro, "{prefix}:POS")]
+    position: SignalR<f64, SoftSignalBackend<f64>>,
+    #[command("{prefix}:OPEN.PROC")]
+    open: Command<MockCommandBackend<(), ()>>,
+}
+
+#[tokio::test]
+async fn command_field_is_built_connected_and_named_like_a_signal() {
+    let bare = Shutter::new("BL10C:sh");
+    assert_eq!(bare.open.name(), "BL10C:sh:OPEN.PROC");
+    assert_eq!(bare.open.source(), "mock+softcmd://BL10C:sh:OPEN.PROC");
+
+    let sh = Shutter::new_named("BL10C:sh", "shutter");
+    assert_eq!(sh.open.name(), "shutter-open");
+    sh.connect_all(Duration::from_millis(100)).await.unwrap();
+    sh.open.trigger().await.await.unwrap();
+    // A command is not a signal, so the walk names the signal only.
+    let sources = walk_signal_sources(&*sh);
+    assert_eq!(
+        sources,
+        vec![("position".to_string(), "soft://BL10C:sh:POS".to_string())]
+    );
 }

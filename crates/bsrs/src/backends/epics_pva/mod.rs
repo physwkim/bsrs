@@ -14,4 +14,4 @@ pub use stub::EpicsPvaBackend;
 #[cfg(feature = "pva")]
 mod real;
 #[cfg(feature = "pva")]
-pub use real::{pva_context, EpicsPvaBackend};
+pub use real::{pva_context, EpicsPvaBackend, PvaCommandBackend};

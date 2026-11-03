@@ -19,7 +19,7 @@ use crate::protocols_async::{PutCompletion, ReadingValueCallback, SignalBackend}
 use async_trait::async_trait;
 use epics_base_rs::server::snapshot::{ControlInfo, DbrClass, DisplayInfo, Snapshot};
 use epics_base_rs::types::WallTime;
-use epics_ca_rs::client::CaClient;
+use epics_ca_rs::client::{CaClient, ChannelInfo};
 use epics_ca_rs::protocol::ECA_DISCONN;
 use epics_ca_rs::{estdlib, CaError, DbFieldType, EpicsValue, PvString};
 use std::array;
@@ -528,25 +528,11 @@ impl<T: CaType> EpicsCaBackend<T> {
         Ok(ch.clone())
     }
 
-    /// `connect`: open the channel, then make the converter from a DBR_CTRL
-    /// read whose value is the one `put(None)` writes, all within `timeout`,
-    /// as ophyd-async's connect-time `caget` and `make_converter`. Any CA
-    /// failure on the way is not-connected, as aioca's `CANothing` there.
+    /// `connect`: make the converter from a [`connect_read`] whose value is
+    /// the one `put(None)` writes, as ophyd-async's connect-time `caget` and
+    /// `make_converter`.
     async fn connect_reading(&self, timeout: Duration) -> Result<()> {
-        let ch = self.channel();
-        let read = async {
-            ch.wait_connected(timeout).await?;
-            Ok::<_, CaError>((ctrl_read(ch).await?, ch.info().await?))
-        };
-        let source = || format!("ca://{}", self.pv);
-        let (snap, info) = match tokio::time::timeout(timeout, read).await {
-            Ok(Ok(read)) => read,
-            Ok(Err(e)) => return Err(BsrsError::not_connected(source(), e)),
-            Err(_) => {
-                let why = format_args!("no value in {timeout:?}");
-                return Err(BsrsError::not_connected(source(), why));
-            }
-        };
+        let (snap, info) = connect_read(&self.pv, self.channel(), timeout).await?;
         let conv = make_converter(
             &self.pv,
             self.want,
@@ -596,6 +582,29 @@ impl<T: CaType> EpicsCaBackend<T> {
             .await
             .map_err(|e| BsrsError::Backend(format!("ca get: {e}")))?;
         T::decode(&conv, &v).ok_or_else(|| undecodable(&v))
+    }
+}
+
+/// Open `ch` and read it with DBR_CTRL, all within `timeout`, as ophyd-async's
+/// connect-time `caget(format=FORMAT_CTRL)`. Any CA failure on the way is
+/// not-connected, as aioca's `CANothing` there.
+async fn connect_read(
+    pv: &str,
+    ch: &SharedChannel,
+    timeout: Duration,
+) -> Result<(Snapshot, ChannelInfo)> {
+    let read = async {
+        ch.wait_connected(timeout).await?;
+        Ok::<_, CaError>((ctrl_read(ch).await?, ch.info().await?))
+    };
+    let source = || format!("ca://{pv}");
+    match tokio::time::timeout(timeout, read).await {
+        Ok(Ok(read)) => Ok(read),
+        Ok(Err(e)) => Err(BsrsError::not_connected(source(), e)),
+        Err(_) => {
+            let why = format_args!("no value in {timeout:?}");
+            Err(BsrsError::not_connected(source(), why))
+        }
     }
 }
 
@@ -1003,6 +1012,113 @@ fn enum_labels_to_strings(labels: &[PvString]) -> Vec<String> {
 /// `TriggerMode`, `FileWriteMode`, `DetectorState_RBV`, …) as their labels:
 /// the `String` backend, which reads any `DBR_ENUM` channel so.
 pub type CaEnumBackend = EpicsCaBackend<String>;
+
+/// [`Command`](crate::devices::Command) backend over CA: ophyd-async
+/// `CaCommandBackend`. Executing writes `execute_value` to the PV and waits
+/// for its put-callback, so a `.PROC` field's command completes when the
+/// record has processed.
+pub struct CaCommandBackend {
+    pv: String,
+    execute_value: i64,
+    ctx: Arc<CaContext>,
+    channel: OnceLock<Arc<SharedChannel>>,
+    /// Held from an execute's start until its put-callback is answered.
+    serial: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl CaCommandBackend {
+    /// Write 1 to `write_pv` on each execute.
+    pub fn new(write_pv: impl Into<String>) -> Self {
+        Self {
+            pv: write_pv.into(),
+            execute_value: 1,
+            ctx: ca_context(),
+            channel: OnceLock::new(),
+            serial: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+
+    /// Write `execute_value` instead of 1.
+    pub fn with_execute_value(mut self, execute_value: i64) -> Self {
+        self.execute_value = execute_value;
+        self
+    }
+
+    /// The PV written.
+    pub fn write_pv(&self) -> &str {
+        &self.pv
+    }
+
+    fn channel(&self) -> &Arc<SharedChannel> {
+        self.channel.get_or_init(|| self.ctx.channel(&self.pv))
+    }
+}
+
+impl crate::devices::BackendFromPv for CaCommandBackend {
+    fn from_pv(pv: &str) -> Self {
+        Self::new(pv)
+    }
+}
+
+#[async_trait]
+impl crate::devices::CommandBackend for CaCommandBackend {
+    type Args = ();
+    type Output = ();
+    fn source(&self, _name: &str) -> String {
+        format!("ca://{}", self.pv)
+    }
+    /// Refuses an array PV, and a scalar one whose native type is not
+    /// `DBR_SHORT`, `DBR_CHAR`, `DBR_LONG` or `DBR_ENUM`.
+    async fn connect(&self, timeout: Duration) -> Result<()> {
+        let (_snap, info) = connect_read(&self.pv, self.channel(), timeout).await?;
+        let pv = &self.pv;
+        if info.element_count > 1 {
+            return Err(BsrsError::Datatype(format!(
+                "ca://{pv} is an array PV; CaCommandBackend requires a scalar numeric PV"
+            )));
+        }
+        let t = info.native_type;
+        if !matches!(
+            t,
+            DbFieldType::Short | DbFieldType::Char | DbFieldType::Long | DbFieldType::Enum
+        ) {
+            return Err(BsrsError::Datatype(format!(
+                "ca://{pv} is not a numeric PV (dbr={}); CaCommandBackend requires a scalar numeric PV",
+                t as u16
+            )));
+        }
+        Ok(())
+    }
+    /// Waits for the channel without limit, as aioca's `caput(timeout=None)`:
+    /// the [`Command`](crate::devices::Command)'s timeout bounds the call.
+    /// Executes run one at a time, each after the last one's put-callback is
+    /// answered even if its caller gave up, as rsrv holds a second
+    /// WRITE_NOTIFY: [`SharedChannel`] would write one made meanwhile at once
+    /// and again as its trailing put-callback, processing the record twice.
+    async fn execute(&self, _args: ()) -> Result<()> {
+        let serial = self.serial.clone().lock_owned().await;
+        let ch = self.channel();
+        ch.wait_connected(Duration::MAX)
+            .await
+            .map_err(|e| BsrsError::Backend(format!("ca connect {}: {e}", self.pv)))?;
+        let info = ch
+            .info()
+            .await
+            .map_err(|e| BsrsError::Backend(format!("ca connect {}: {e}", self.pv)))?;
+        let done = put_callback(
+            ch,
+            &i64_to_wire(info.native_type, self.execute_value),
+            "ca put",
+        )?;
+        tokio::spawn(async move {
+            let r = done.await;
+            drop(serial);
+            r
+        })
+        .await
+        .map_err(|e| BsrsError::Backend(format!("ca put: {e}")))?
+    }
+}
 
 #[cfg(test)]
 mod tests {
