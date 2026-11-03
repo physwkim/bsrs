@@ -13,7 +13,7 @@ use bsrs::backends::soft::SoftSignalBackend;
 use bsrs::core::error::BsrsError;
 use bsrs::core::msg::{LocatableObj, MovableObj, ReadableObj};
 use bsrs::core::status::SubToken;
-use bsrs::core::{Kind, ReadingValue};
+use bsrs::core::{Kind, NdArray, ReadingValue};
 use bsrs::devices::{
     observe_signals_value, observe_value, wait_for_value, BackendFromPv, Readable, Signal,
     SignalConfig, SignalR, SignalRW, SignalW,
@@ -82,6 +82,22 @@ async fn soft_signal_monitor_starts_at_initial_and_follows_puts() {
     lifecycle(String::new(), "goodbye".into(), Dtype::String).await;
     lifecycle(true, false, Dtype::Boolean).await;
     lifecycle(Vec::<f64>::new(), vec![1.0, 2.0], Dtype::Array).await;
+}
+
+// ophyd-async test_soft_signal_ndarray_can_change_dtype: an `np.ndarray`
+// signal starts empty of float64 and takes each value in its own dtype.
+#[tokio::test]
+async fn soft_ndarray_signal_takes_each_value_in_its_own_dtype() {
+    let sig: SignalRW<NdArray, _> =
+        Signal::new(soft(NdArray::default(), Dtype::Array), cfg("test"));
+    assert_eq!(sig.get().await.unwrap().data().dtype_numpy(), "<f8");
+    for v in [
+        NdArray::from((0..4).collect::<Vec<i32>>()),
+        NdArray::from(vec![0.0_f64, 1.0, 2.0, 3.0]),
+    ] {
+        assert!(sig.set(v.clone()).await.success());
+        assert_eq!(sig.get().await.unwrap(), v);
+    }
 }
 
 // ophyd-async SignalW is Movable and SignalRW Locatable, so plans move a

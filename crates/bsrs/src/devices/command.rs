@@ -379,6 +379,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::NdArray;
     use crate::devices::DeviceVector;
     use std::fmt::Debug;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -441,7 +442,7 @@ mod tests {
         echoes(vec![1_u64, 2]).await;
         echoes(vec![1.1_f32, 2.2]).await;
         echoes(vec![1.1_f64, 2.2]).await;
-        echoes(vec![vec![1_i64, 2], vec![3, 4]]).await;
+        echoes(NdArray::new(vec![2, 2], vec![1_i64, 2, 3, 4]).unwrap()).await;
         echoes(vec!["a".to_string(), "b".into()]).await;
         echoes(vec![Choice::A, Choice::B]).await;
         echoes(Table {

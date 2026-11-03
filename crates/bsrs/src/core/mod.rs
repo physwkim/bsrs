@@ -7,6 +7,7 @@ pub mod ext;
 pub mod kind;
 pub mod lua_exposable;
 pub mod msg;
+pub mod ndarray;
 pub mod plan;
 pub mod reading;
 pub mod runtime;
@@ -22,6 +23,7 @@ pub use ext::{
 pub use kind::Kind;
 pub use lua_exposable::{LuaExposable, LuaMethodEntry};
 pub use msg::{ConfigureArgs, GroupId, Msg, RunMetadata, Thrown};
+pub use ndarray::{NdArray, NdData};
 pub use plan::{plan_box, plan_items, respond, Plan, PlanItem};
 pub use reading::{ReadingF64, ReadingValue, TypedReading};
 pub use runtime::{bsrs_runtime, runtime_handle};

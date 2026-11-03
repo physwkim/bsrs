@@ -96,6 +96,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a scalar integer, boolean or enum with ophyd-async's `TypeError` text.
 - `#[derive(Device)]` builds a `#[command("{prefix}...")]` field as a
   `Command` over that PV and connects it with the device.
+- `NdArray` and `NdData` in `bsrs::core`, numpy's `np.ndarray`: an array of
+  any shape in one numeric or bool dtype, read as nested lists. A soft signal
+  holds one, and `EpicsPvaBackend::<NdArray>` reads an NTNDArray PV
+  reshaped to its dimensions and refuses a write as ophyd-async does.
 
 ### Changed
 
