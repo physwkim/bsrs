@@ -7,10 +7,11 @@
 pub mod mock_signal;
 pub use mock_signal::{MockPutCallback, MockSignalBackend, PutsBlockedGuard, SetValues};
 
+use crate::core::datatype::SignalDatatype;
 use crate::core::error::Result;
 use crate::core::reading::ReadingValue;
 use crate::core::status::SubToken;
-use crate::event_model::{make_datakey, DataKey, Dtype, SignalMetadata};
+use crate::event_model::{DataKey, SignalMetadata};
 use crate::protocols_async::{PutCompletion, ReadingValueCallback, SignalBackend};
 use async_trait::async_trait;
 use serde::Serialize;
@@ -35,7 +36,10 @@ impl<T: Clone + Send + Sync + 'static> MockBackend<T> {
 }
 
 #[async_trait]
-impl<T: Clone + Send + Sync + Serialize + 'static> SignalBackend<T> for MockBackend<T> {
+impl<T> SignalBackend<T> for MockBackend<T>
+where
+    T: SignalDatatype + Clone + Send + Sync + Serialize + 'static,
+{
     async fn connect(&self, _timeout: Duration) -> Result<()> {
         Ok(())
     }
@@ -43,13 +47,8 @@ impl<T: Clone + Send + Sync + Serialize + 'static> SignalBackend<T> for MockBack
         Ok(Box::pin(std::future::ready(Ok(()))))
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
-        Ok(make_datakey(
-            format!("mock://{source}"),
-            Dtype::Number,
-            vec![],
-            None,
-            SignalMetadata::default(),
-        ))
+        self.value
+            .make_datakey(format!("mock://{source}"), SignalMetadata::default())
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
         Ok(ReadingValue {

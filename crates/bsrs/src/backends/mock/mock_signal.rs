@@ -8,10 +8,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::backends::soft::SoftSignalBackend;
+use crate::core::datatype::SignalDatatype;
 use crate::core::error::Result;
 use crate::core::reading::ReadingValue;
 use crate::core::status::SubToken;
-use crate::event_model::{DataKey, Dtype};
+use crate::event_model::DataKey;
 use crate::protocols_async::{PutCompletion, ReadingValueCallback, SignalBackend};
 use async_trait::async_trait;
 use futures::future::BoxFuture;
@@ -57,7 +58,7 @@ where
     T: Clone + Default + Send + Sync + Serialize + 'static,
 {
     fn from_pv(_pv: &str) -> Self {
-        Self::new(SoftSignalBackend::new(T::default(), Dtype::Number))
+        Self::new(SoftSignalBackend::new(T::default()))
     }
 }
 
@@ -78,9 +79,9 @@ where
         }
     }
 
-    /// Convenience: build a mock over a fresh soft backend with `initial`/`dtype`.
-    pub fn with_value(initial: T, dtype: Dtype) -> Self {
-        Self::new(SoftSignalBackend::new(initial, dtype))
+    /// Convenience: build a mock over a fresh soft backend holding `initial`.
+    pub fn with_value(initial: T) -> Self {
+        Self::new(SoftSignalBackend::new(initial))
     }
 
     /// Directly set the readback value (ophyd `set_mock_value`). Runs the soft
@@ -253,7 +254,7 @@ impl<T: Clone + Send + Sync + Serialize + 'static> Drop for PutsBlockedGuard<T> 
 #[async_trait]
 impl<T> SignalBackend<T> for MockSignalBackend<T>
 where
-    T: Clone + Send + Sync + Serialize + 'static,
+    T: SignalDatatype + Clone + Send + Sync + Serialize + 'static,
 {
     async fn connect(&self, _timeout: Duration) -> Result<()> {
         // ophyd-async raises here because Device.connect(mock=True) swaps the
@@ -308,7 +309,7 @@ mod tests {
 
     #[tokio::test]
     async fn records_puts_and_callback_overrides_readback() {
-        let b = MockSignalBackend::with_value(0.0_f64, Dtype::Number);
+        let b = MockSignalBackend::with_value(0.0_f64);
         // Callback doubles the put value into the readback.
         b.set_put_callback(Some(Box::new(|v: Option<f64>| v.map(|x| x * 2.0))));
         SignalBackend::put(&b, Some(3.0)).await.unwrap();
@@ -325,7 +326,7 @@ mod tests {
 
     #[tokio::test]
     async fn blocked_put_writes_value_but_does_not_complete() {
-        let b = MockSignalBackend::with_value(0.0_f64, Dtype::Number);
+        let b = MockSignalBackend::with_value(0.0_f64);
         let done = Arc::new(AtomicBool::new(false));
 
         let guard = b.mock_puts_blocked();
@@ -357,7 +358,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_value_and_source_prefix() {
-        let b = MockSignalBackend::with_value(1.0_f64, Dtype::Number);
+        let b = MockSignalBackend::with_value(1.0_f64);
         b.set_value(42.0);
         assert_eq!(b.get_value().await.unwrap(), 42.0);
         // read=true (read-back source) and read=false (write source) are

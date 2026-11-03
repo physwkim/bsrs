@@ -2,6 +2,7 @@
 
 #![deny(missing_docs)]
 
+pub mod datatype;
 pub mod error;
 pub mod ext;
 pub mod kind;
@@ -18,6 +19,7 @@ pub mod table;
 
 /// `#[derive(Table)]`: a [`TypedTable`] of a struct's `Vec` fields.
 pub use bsrs_derive::Table;
+pub use datatype::SignalDatatype;
 pub use error::{BsrsError, Interrupt, NotConnected, Result};
 pub use ext::{
     FlyableExt, LocatableExt, MonitorableExt, MovableExt, ReadableExt, StageableExt, StoppableExt,

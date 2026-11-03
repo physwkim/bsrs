@@ -151,6 +151,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `make_converter`: `Vec<f64>` on a LONG waveform, `bool` on an enum without
   two choices, `i64` on a float record with a nonzero PREC. Generic code
   builds a backend with `BackendFromPv::from_pv`.
+- **Breaking**: `SoftSignalBackend::new(initial)` and
+  `MockSignalBackend::with_value(initial)` drop the `Dtype` argument, and
+  `with_dtype_numpy` is gone: a soft, mock or `MockBackend` signal's
+  DataKey is its current value's, as ophyd-async's `make_datakey`, with
+  `dtype_numpy` always set and an array's shape following its puts. The
+  value type must implement `core::SignalDatatype`: `bool`, `i64`, `f64`,
+  `String`, `()`, a `Vec` of `bool`, `i8` through `u64`, `f32`, `f64` or
+  `String`, `NdArray`, or a `Table`/`#[derive(Table)]` struct.
 - **Breaking**: areaDetector enum fields (`image_mode`, `detector_state_rbv`,
   `data_type`, `color_mode`, `file_write_mode`) are `String` labels, as are
   the `AD_STATE_*`, `AD_IMAGE_MODE_*`, `AD_COLOR_MODE_*` and

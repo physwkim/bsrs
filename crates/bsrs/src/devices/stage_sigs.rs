@@ -198,10 +198,9 @@ impl StageSigs {
 mod tests {
     use super::*;
     use crate::backends::soft::SoftSignalBackend;
-    use crate::event_model::Dtype;
 
     fn soft(initial: f64) -> Arc<dyn SignalBackend<f64>> {
-        Arc::new(SoftSignalBackend::new(initial, Dtype::Number))
+        Arc::new(SoftSignalBackend::new(initial))
     }
 
     #[tokio::test]

@@ -570,7 +570,6 @@ pub(crate) async fn describe_pv<B: SignalBackend<f64>>(
 mod tests {
     use super::*;
     use crate::backends::mock::MockSignalBackend;
-    use crate::core::Dtype;
 
     #[test]
     fn move_timeout_is_travel_plus_two_accelerations_plus_margin() {
@@ -640,7 +639,7 @@ mod tests {
     }
 
     fn mock(value: f64) -> MockSignalBackend<f64> {
-        MockSignalBackend::with_value(value, Dtype::Number)
+        MockSignalBackend::with_value(value)
     }
 
     fn axis<'a, B>(setpoint: &'a B, readback: &'a Readback<B>, halt: &'a Halt) -> Axis<'a, B> {
@@ -717,7 +716,7 @@ mod tests {
     async fn a_move_reports_each_readback_until_it_settles() {
         let sp = mock(0.0);
         let rb_mock = MockSignalBackend::new(
-            crate::backends::soft::SoftSignalBackend::new(0.0, Dtype::Number).with_units("mm"),
+            crate::backends::soft::SoftSignalBackend::new(0.0).with_units("mm"),
         );
         let rb = Readback::new(Arc::new(rb_mock.clone()), "rb");
         // A CA or PVA monitor delivers the current value as it opens; the

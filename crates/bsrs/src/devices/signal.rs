@@ -628,15 +628,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event_model::Dtype;
 
     // The access role gates the method surface at compile time: this test
     // exercises that `SignalR` reads, `SignalW` writes, and `SignalRW` does
     // both. (A `SignalR::put` / `SignalW::get` call would not compile.)
     #[tokio::test]
     async fn access_roles_expose_the_right_surface() {
-        use crate::event_model::Dtype;
-
         fn cfg(name: &str) -> SignalConfig {
             SignalConfig {
                 source: name.into(),
@@ -645,12 +642,7 @@ mod tests {
             }
         }
 
-        let backend = || {
-            Arc::new(crate::backends::soft::SoftSignalBackend::new(
-                0.0_f64,
-                Dtype::Number,
-            ))
-        };
+        let backend = || Arc::new(crate::backends::soft::SoftSignalBackend::new(0.0_f64));
 
         let r: SignalR<f64, _> = Signal::new(backend(), cfg("ro"));
         let w: SignalW<f64, _> = Signal::new(backend(), cfg("wo"));
@@ -671,15 +663,10 @@ mod tests {
     // not compile.)
     #[tokio::test]
     async fn signal_x_trigger_writes_backend_default() {
-        use crate::event_model::Dtype;
-
         // Soft backend's `put(None)` writes the configured initial value
         // (`_soft_signal_backend.py:164`); seed a non-default initial so the
         // trigger is observable through a separate read handle.
-        let backend = Arc::new(crate::backends::soft::SoftSignalBackend::new(
-            42.0_f64,
-            Dtype::Number,
-        ));
+        let backend = Arc::new(crate::backends::soft::SoftSignalBackend::new(42.0_f64));
         let x: SignalX<f64, _> = Signal::new(
             backend.clone(),
             SignalConfig {
@@ -704,12 +691,7 @@ mod tests {
     // forces a backend read; unstaging with no listeners tears the monitor down.
     #[tokio::test]
     async fn staged_signal_caches_reads_and_shares_one_monitor() {
-        use crate::event_model::Dtype;
-
-        let backend = Arc::new(crate::backends::soft::SoftSignalBackend::new(
-            1.0_f64,
-            Dtype::Number,
-        ));
+        let backend = Arc::new(crate::backends::soft::SoftSignalBackend::new(1.0_f64));
         let s: SignalR<f64, _> = Signal::new(
             backend.clone(),
             SignalConfig {
@@ -757,12 +739,8 @@ mod tests {
     #[tokio::test]
     async fn signal_is_monitorable_through_the_shared_monitor() {
         use crate::core::msg::MonitorableObj;
-        use crate::event_model::Dtype;
 
-        let backend = Arc::new(crate::backends::soft::SoftSignalBackend::new(
-            1.0_f64,
-            Dtype::Number,
-        ));
+        let backend = Arc::new(crate::backends::soft::SoftSignalBackend::new(1.0_f64));
         let s: Arc<SignalR<f64, _>> = Arc::new(Signal::new(
             backend.clone(),
             SignalConfig {
@@ -809,7 +787,7 @@ mod tests {
     #[tokio::test]
     async fn connect_is_logged_once_per_backend_connect() {
         let (caplog, _guard) = crate::caplog::Caplog::start();
-        let backend = crate::backends::soft::SoftSignalBackend::new(0_i64, Dtype::Integer);
+        let backend = crate::backends::soft::SoftSignalBackend::new(0_i64);
         let sig: SignalRW<i64, _> = Signal::new(Arc::new(backend), logged("x"));
         let connecting = || caplog.text().matches("Connecting to soft://x").count();
         let t = Duration::from_secs(1);
@@ -828,7 +806,7 @@ mod tests {
     #[tokio::test]
     async fn put_get_and_trigger_are_logged() {
         let (caplog, _guard) = crate::caplog::Caplog::start();
-        let backend = crate::backends::mock::MockSignalBackend::with_value(0_i64, Dtype::Integer);
+        let backend = crate::backends::mock::MockSignalBackend::with_value(0_i64);
         let sig: SignalRW<i64, _> = Signal::new(Arc::new(backend), logged("mock_signal"));
         sig.connect(Duration::from_secs(1)).await.unwrap();
 
@@ -844,10 +822,7 @@ mod tests {
             .contains("get_value() on source mock+soft://mock_signal returned 0"));
 
         let x: SignalX<i64, _> = Signal::new(
-            Arc::new(crate::backends::soft::SoftSignalBackend::new(
-                0,
-                Dtype::Integer,
-            )),
+            Arc::new(crate::backends::soft::SoftSignalBackend::new(0)),
             logged("proc"),
         );
         assert!(x.trigger().await.await.is_ok());
@@ -888,7 +863,6 @@ mod tests {
         let (caplog, _guard) = crate::caplog::Caplog::start();
         let backend = Arc::new(crate::backends::soft::SoftSignalBackend::new(
             "a".to_string(),
-            Dtype::String,
         ));
         let sig: SignalR<String, _> = Signal::new(backend.clone(), logged("x"));
 

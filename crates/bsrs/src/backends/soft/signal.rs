@@ -1,9 +1,10 @@
 //! `SoftSignalBackend<T>` — in-memory backend.
 
+use crate::core::datatype::SignalDatatype;
 use crate::core::error::Result;
 use crate::core::reading::ReadingValue;
 use crate::core::status::SubToken;
-use crate::event_model::{make_datakey, DataKey, Dtype, DtypeNumpy, SignalMetadata};
+use crate::event_model::{DataKey, SignalMetadata};
 use crate::protocols_async::{PutCompletion, ReadingValueCallback, SignalBackend};
 use async_trait::async_trait;
 use futures::future::BoxFuture;
@@ -122,9 +123,6 @@ struct Inner<T: Clone + Send + Sync + 'static> {
     /// The ophyd-async backend `metadata` dict: units and precision, which
     /// a mock may change after construction.
     metadata: Mutex<SignalMetadata>,
-    dtype: Dtype,
-    dtype_numpy: Option<DtypeNumpy>,
-    shape: Vec<Option<u64>>,
     getter: Option<Getter<T>>,
     /// The put action (ophyd-async `setter`); `Ok(Some(v))` is the settled
     /// readback.
@@ -149,7 +147,7 @@ where
     T: Clone + Default + Send + Sync + Serialize + 'static,
 {
     fn from_pv(_pv: &str) -> Self {
-        Self::new(T::default(), Dtype::Number)
+        Self::new(T::default())
     }
 }
 
@@ -157,8 +155,9 @@ impl<T> SoftSignalBackend<T>
 where
     T: Clone + Send + Sync + Serialize + 'static,
 {
-    /// Build with an initial value and a `Dtype` annotation for descriptors.
-    pub fn new(initial: T, dtype: Dtype) -> Self {
+    /// Build holding `initial`, which `put(None)` writes again. The
+    /// [`DataKey`] is the current value's ([`SignalDatatype`]).
+    pub fn new(initial: T) -> Self {
         Self {
             inner: Arc::new(Inner {
                 state: Mutex::new(State {
@@ -171,9 +170,6 @@ where
                 }),
                 initial,
                 metadata: Mutex::default(),
-                dtype,
-                dtype_numpy: None,
-                shape: vec![],
                 getter: None,
                 setter: None,
             }),
@@ -194,9 +190,6 @@ where
             }),
             initial: self.inner.initial.clone(),
             metadata: Mutex::new(self.inner.metadata.lock().unwrap().clone()),
-            dtype: self.inner.dtype,
-            dtype_numpy: self.inner.dtype_numpy.clone(),
-            shape: self.inner.shape.clone(),
             getter: self.inner.getter.clone(),
             setter: self.inner.setter.clone(),
         }
@@ -224,17 +217,6 @@ where
     /// backend (ophyd-async `MockSignalBackend.set_units`/`set_precision`).
     pub(crate) fn update_metadata(&self, f: impl FnOnce(&mut SignalMetadata)) {
         f(&mut self.inner.metadata.lock().unwrap());
-    }
-
-    /// Set the dtype_numpy metadata.
-    pub fn with_dtype_numpy(self, np: impl Into<DtypeNumpy>) -> Self {
-        let inner = Inner {
-            dtype_numpy: Some(np.into()),
-            ..self.rebuilt()
-        };
-        Self {
-            inner: Arc::new(inner),
-        }
     }
 
     /// Take the value from `getter` on every `get_value`/`get_reading`, and
@@ -334,7 +316,7 @@ where
 #[async_trait]
 impl<T> SignalBackend<T> for SoftSignalBackend<T>
 where
-    T: Clone + Send + Sync + Serialize + 'static,
+    T: SignalDatatype + Clone + Send + Sync + Serialize + 'static,
 {
     async fn connect(&self, _timeout: Duration) -> Result<()> {
         Ok(())
@@ -357,13 +339,11 @@ where
         Ok(Box::pin(std::future::ready(Ok(()))))
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
-        Ok(make_datakey(
-            format!("soft://{source}"),
-            self.inner.dtype,
-            self.inner.shape.clone(),
-            self.inner.dtype_numpy.clone(),
-            self.inner.metadata.lock().unwrap().clone(),
-        ))
+        // Of the stored value, as ophyd-async's `make_datakey(datatype,
+        // self.reading["value"], ...)`: an array's shape follows its puts.
+        let meta = self.inner.metadata.lock().unwrap().clone();
+        self.current_value()
+            .make_datakey(format!("soft://{source}"), meta)
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
         self.refresh().await?;
@@ -475,7 +455,7 @@ mod tests {
     // writes the configured initial value (SignalX-style default put).
     #[test]
     fn put_some_writes_value_and_setpoint() {
-        let b = SoftSignalBackend::new(0.0_f64, Dtype::Number);
+        let b = SoftSignalBackend::new(0.0_f64);
         block_on(SignalBackend::put(&b, Some(3.5))).unwrap();
         assert_eq!(b.current_value(), 3.5);
         assert_eq!(b.current_setpoint(), 3.5);
@@ -483,7 +463,7 @@ mod tests {
 
     #[test]
     fn put_none_writes_initial() {
-        let b = SoftSignalBackend::new(7.0_f64, Dtype::Number);
+        let b = SoftSignalBackend::new(7.0_f64);
         block_on(SignalBackend::put(&b, Some(3.0))).unwrap();
         assert_eq!(b.current_value(), 3.0);
         block_on(SignalBackend::put(&b, None)).unwrap();
@@ -498,7 +478,7 @@ mod tests {
     // so an unchanged value keeps its timestamp instead of appearing to update.
     #[test]
     fn get_reading_timestamp_is_put_time_not_read_time() {
-        let b = SoftSignalBackend::new(0.0_f64, Dtype::Number);
+        let b = SoftSignalBackend::new(0.0_f64);
         block_on(SignalBackend::put(&b, Some(1.0))).unwrap();
         let r1 = block_on(SignalBackend::get_reading(&b)).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -559,7 +539,7 @@ mod tests {
     // Boundary: a store while another thread is mid-delivery of an earlier one.
     #[test]
     fn a_store_during_another_delivery_reaches_each_callback_after_it() {
-        let b = SoftSignalBackend::new(0.0_f64, Dtype::Number);
+        let b = SoftSignalBackend::new(0.0_f64);
         let (slow, _, entered, release) = holding_recorder(1.0);
         let (fast, log) = recorder();
         let _t1 = b.set_callback(Some(slow));
@@ -579,7 +559,7 @@ mod tests {
     // Boundary: an unsubscribe while a store is queued for that callback.
     #[test]
     fn no_delivery_starts_after_unsubscribe() {
-        let b = SoftSignalBackend::new(0.0_f64, Dtype::Number);
+        let b = SoftSignalBackend::new(0.0_f64);
         let (slow, _, entered, release) = holding_recorder(1.0);
         let (fast, log) = recorder();
         let _t1 = b.set_callback(Some(slow));
@@ -598,7 +578,7 @@ mod tests {
     // Boundary: a store while a new callback is getting its initial reading.
     #[test]
     fn a_store_during_the_initial_delivery_follows_it() {
-        let b = SoftSignalBackend::new(0.0_f64, Dtype::Number);
+        let b = SoftSignalBackend::new(0.0_f64);
         let (cb, log, entered, release) = holding_recorder(0.0);
         let registrar = {
             let b = b.clone();
@@ -614,7 +594,7 @@ mod tests {
     // Boundary: a store from inside a callback, on the delivering thread.
     #[test]
     fn a_store_from_a_callback_is_delivered_after_it_returns() {
-        let b = SoftSignalBackend::new(0.0_f64, Dtype::Number);
+        let b = SoftSignalBackend::new(0.0_f64);
         let log: Log = Arc::default();
         let (seen, writer) = (log.clone(), b.clone());
         let _token = b.set_callback(Some(Box::new(move |v: &f64, _, _| {

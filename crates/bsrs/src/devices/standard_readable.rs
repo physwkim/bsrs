@@ -159,9 +159,9 @@ impl StandardReadable {
     /// ```
     /// # use std::sync::Arc;
     /// # use bsrs::backends::soft::SoftSignalBackend;
-    /// # use bsrs::core::{Dtype, Kind};
+    /// # use bsrs::core::Kind;
     /// # use bsrs::devices::{Signal, SignalConfig, SignalR, StandardReadable, StandardReadableFormat};
-    /// let backend = Arc::new(SoftSignalBackend::new(0.1, Dtype::Number));
+    /// let backend = Arc::new(SoftSignalBackend::new(0.1));
     /// let config = SignalConfig { source: "exp".into(), kind: Kind::Config, name: "exp".into() };
     /// let exposure: Arc<SignalR<f64, SoftSignalBackend<f64>>> = Arc::new(Signal::new(backend, config));
     /// let mut sr = StandardReadable::new("sr");
@@ -387,11 +387,10 @@ mod tests {
     use crate::backends::soft::SoftSignalBackend;
     use crate::core::Kind;
     use crate::devices::{Signal, SignalConfig, SignalR};
-    use crate::event_model::Dtype;
 
     fn sig(name: &str, kind: Kind, v: f64) -> Arc<SignalR<f64, SoftSignalBackend<f64>>> {
         Arc::new(Signal::new(
-            Arc::new(SoftSignalBackend::new(v, Dtype::Number)),
+            Arc::new(SoftSignalBackend::new(v)),
             SignalConfig {
                 source: name.into(),
                 kind,

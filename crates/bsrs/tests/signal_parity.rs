@@ -13,12 +13,12 @@ use bsrs::backends::soft::SoftSignalBackend;
 use bsrs::core::error::BsrsError;
 use bsrs::core::msg::{LocatableObj, MovableObj, ReadableObj};
 use bsrs::core::status::SubToken;
-use bsrs::core::{Kind, NdArray, ReadingValue, Table};
+use bsrs::core::{Kind, NdArray, ReadingValue, SignalDatatype, Table};
 use bsrs::devices::{
     observe_signals_value, observe_value, wait_for_value, BackendFromPv, Readable, Signal,
     SignalConfig, SignalR, SignalRW, SignalW,
 };
-use bsrs::event_model::{make_datakey, DataKey, Dtype, SignalMetadata};
+use bsrs::event_model::{make_datakey, DataKey, Dtype, DtypeNumpy, SignalMetadata};
 use bsrs::protocols_async::{
     AsyncMovable, AsyncSubscribable, Locatable, PutCompletion, ReadingValueCallback, SignalBackend,
 };
@@ -34,22 +34,30 @@ fn cfg(name: &str) -> SignalConfig {
     }
 }
 
-fn soft<T: Clone + Send + Sync + Serialize + 'static>(
+fn soft<T: SignalDatatype + Clone + Send + Sync + Serialize + 'static>(
     initial: T,
-    dtype: Dtype,
 ) -> Arc<SoftSignalBackend<T>> {
-    Arc::new(SoftSignalBackend::new(initial, dtype))
+    Arc::new(SoftSignalBackend::new(initial))
 }
 
-async fn lifecycle<T>(initial: T, put: T, dtype: Dtype)
-where
-    T: Clone + Send + Sync + Serialize + PartialEq + Debug + 'static,
+/// `descriptor` is ophyd-async's `integer_d`, `waveform_d`, ...: a value's
+/// dtype and shape.
+async fn lifecycle<T>(
+    initial: T,
+    put: T,
+    descriptor: impl Fn(&T) -> (Dtype, Vec<Option<u64>>),
+    dtype_numpy: DtypeNumpy,
+) where
+    T: SignalDatatype + Clone + Send + Sync + Serialize + PartialEq + Debug + 'static,
 {
-    let sig: SignalRW<T, _> = Signal::new(soft(initial.clone(), dtype), cfg("test"));
+    let datakey = |v: &T| {
+        let (dtype, shape) = descriptor(v);
+        let meta = SignalMetadata::default();
+        make_datakey("soft://test", dtype, shape, Some(dtype_numpy.clone()), meta)
+    };
+    let sig: SignalRW<T, _> = Signal::new(soft(initial.clone()), cfg("test"));
     sig.connect(Duration::from_secs(1)).await.unwrap();
-    let before = sig.describe().await.unwrap();
-    assert_eq!(before["test"].source, "soft://test");
-    assert_eq!(before["test"].dtype, dtype);
+    assert_eq!(sig.describe().await.unwrap()["test"], datakey(&initial));
 
     let mut values = Box::pin(observe_value(
         AsyncSubscribable::subscribe(&sig).await.unwrap(),
@@ -63,12 +71,11 @@ where
     assert_eq!(values.next().await.unwrap().value, json!(put));
     assert_eq!(sig.get().await.unwrap(), put);
     let at = sig.locate().await.unwrap();
-    assert_eq!((at.setpoint, at.readback), (put.clone(), put));
-
+    assert_eq!((at.setpoint, at.readback), (put.clone(), put.clone()));
     assert_eq!(
-        sig.describe().await.unwrap(),
-        before,
-        "a put changes no DataKey"
+        sig.describe().await.unwrap()["test"],
+        datakey(&put),
+        "the DataKey is the current value's"
     );
 }
 
@@ -77,26 +84,58 @@ where
 // test_array_into_softsignal.
 #[tokio::test]
 async fn soft_signal_monitor_starts_at_initial_and_follows_puts() {
-    lifecycle(0_i64, 43, Dtype::Integer).await;
-    lifecycle(0.0_f64, 43.5, Dtype::Number).await;
-    lifecycle(String::new(), "goodbye".into(), Dtype::String).await;
-    lifecycle(true, false, Dtype::Boolean).await;
-    lifecycle(Vec::<f64>::new(), vec![1.0, 2.0], Dtype::Array).await;
+    let np = |s: &str| DtypeNumpy::from(s);
+    lifecycle(0_i64, 43, |_| (Dtype::Integer, vec![]), np("<i8")).await;
+    lifecycle(0.0_f64, 43.5, |_| (Dtype::Number, vec![]), np("<f8")).await;
+    let goodbye = "goodbye".to_string();
+    lifecycle(
+        String::new(),
+        goodbye,
+        |_| (Dtype::String, vec![]),
+        np("|S40"),
+    )
+    .await;
+    lifecycle(true, false, |_| (Dtype::Boolean, vec![]), np("|b1")).await;
+
+    fn waveform<E>(v: &[E]) -> (Dtype, Vec<Option<u64>>) {
+        (Dtype::Array, vec![Some(v.len() as u64)])
+    }
+    lifecycle(vec![], vec![-8_i8, 3, 44], |v| waveform(v), np("|i1")).await;
+    lifecycle(vec![], vec![218_u8], |v| waveform(v), np("|u1")).await;
+    lifecycle(vec![], vec![-855_i16], |v| waveform(v), np("<i2")).await;
+    lifecycle(vec![], vec![5666_u16], |v| waveform(v), np("<u2")).await;
+    lifecycle(vec![], vec![-2_i32], |v| waveform(v), np("<i4")).await;
+    lifecycle(vec![], vec![1022233_u32], |v| waveform(v), np("<u4")).await;
+    lifecycle(vec![], vec![-3_i64], |v| waveform(v), np("<i8")).await;
+    lifecycle(vec![], vec![995444_u64], |v| waveform(v), np("<u8")).await;
+    lifecycle(vec![], vec![1.0_f32], |v| waveform(v), np("<f4")).await;
+    lifecycle(vec![], vec![0.2_f64], |v| waveform(v), np("<f8")).await;
+    let strs = vec!["nine".to_string(), "ten".into()];
+    lifecycle(vec![], strs, |v| waveform(v), np("|S40")).await;
 }
 
 // ophyd-async test_soft_signal_ndarray_can_change_dtype: an `np.ndarray`
-// signal starts empty of float64 and takes each value in its own dtype.
+// signal starts empty of float64 and takes each value in its own dtype,
+// which its DataKey then describes.
 #[tokio::test]
 async fn soft_ndarray_signal_takes_each_value_in_its_own_dtype() {
-    let sig: SignalRW<NdArray, _> =
-        Signal::new(soft(NdArray::default(), Dtype::Array), cfg("test"));
+    let sig: SignalRW<NdArray, _> = Signal::new(soft(NdArray::default()), cfg("test"));
     assert_eq!(sig.get().await.unwrap().data().dtype_numpy(), "<f8");
-    for v in [
-        NdArray::from((0..4).collect::<Vec<i32>>()),
-        NdArray::from(vec![0.0_f64, 1.0, 2.0, 3.0]),
+    for (v, np) in [
+        (
+            NdArray::new(vec![2, 2], (0..4).collect::<Vec<i32>>()).unwrap(),
+            "<i4",
+        ),
+        (NdArray::from(vec![0.0_f64, 1.0, 2.0, 3.0]), "<f8"),
     ] {
         assert!(sig.set(v.clone()).await.success());
         assert_eq!(sig.get().await.unwrap(), v);
+        let dk = &sig.describe().await.unwrap()["test"];
+        let shape: Vec<Option<u64>> = v.shape().iter().map(|&n| Some(n as u64)).collect();
+        assert_eq!(
+            (dk.dtype, &dk.shape, &dk.dtype_numpy),
+            (Dtype::Array, &shape, &Some(np.into()))
+        );
     }
 }
 
@@ -120,20 +159,35 @@ async fn soft_table_signal_monitor_starts_at_initial_and_follows_puts() {
         a_str: vec!["pi".into()],
         a_enum: vec!["Aaa".into()],
     };
-    lifecycle(ExampleTable::default(), put, Dtype::Array).await;
+    let descr = [
+        ("a_bool", "|b1"),
+        ("a_int", "<i4"),
+        ("a_float", "<f8"),
+        ("a_str", "|S40"),
+        ("a_enum", "|S40"),
+    ];
+    let descr = descr.map(|(n, d)| (n.to_string(), d.to_string())).to_vec();
+    let table_d = |t: &ExampleTable| (Dtype::Array, vec![Some(t.a_bool.len() as u64)]);
+    lifecycle(
+        ExampleTable::default(),
+        put,
+        table_d,
+        DtypeNumpy::Structured(descr),
+    )
+    .await;
 }
 
 // ophyd-async SignalW is Movable and SignalRW Locatable, so plans move a
 // signal like a motor (bps.mv / mvr).
 #[tokio::test]
 async fn signals_move_and_locate_through_the_plan_traits() {
-    let wo = soft(0.0_f64, Dtype::Number);
+    let wo = soft(0.0_f64);
     let w: SignalW<f64, _> = Signal::new(wo.clone(), cfg("w"));
     assert!(MovableObj::set_dyn(&w, 2.0).await.success());
     assert_eq!(wo.current_value(), 2.0);
 
     let rw: Arc<dyn LocatableObj> = Arc::new(SignalRW::<f64, _>::new(
-        MockSignalBackend::with_value(1.0, Dtype::Number).into(),
+        MockSignalBackend::with_value(1.0).into(),
         cfg("rw"),
     ));
     assert!(rw.set_dyn(5.0).await.success());
@@ -146,7 +200,7 @@ async fn signals_move_and_locate_through_the_plan_traits() {
 // (a detector, or a `StandardReadable` child) must still be stageable.
 #[tokio::test]
 async fn a_readable_signal_stages_through_its_readable_handle() {
-    let backend = soft(1.0_f64, Dtype::Number);
+    let backend = soft(1.0_f64);
     let sig: Arc<dyn ReadableObj> = Arc::new(SignalR::new(backend.clone(), cfg("x")));
     let stageable = sig.as_stageable().expect("a readable Signal is stageable");
     stageable.stage_dyn().await.unwrap();
@@ -194,7 +248,7 @@ impl Device {
 #[tokio::test]
 async fn soft_getter_supplies_value_and_reading_but_not_setpoint() {
     let dev = Device::new(42.0);
-    let b = SoftSignalBackend::new(0.0, Dtype::Number).with_getter(dev.getter(), None);
+    let b = SoftSignalBackend::new(0.0).with_getter(dev.getter(), None);
     assert_eq!(b.get_value().await.unwrap(), 42.0);
     dev.set(Some(2.0));
     assert_eq!(b.get_reading().await.unwrap().value, json!(2.0));
@@ -211,7 +265,7 @@ async fn soft_getter_supplies_value_and_reading_but_not_setpoint() {
 // _setter_none_without_getter_stores_write_value.
 #[tokio::test]
 async fn soft_setter_runs_on_put_and_settles_the_readback() {
-    let clamp = SoftSignalBackend::new(0.0, Dtype::Number)
+    let clamp = SoftSignalBackend::new(0.0)
         .with_setter(|v: Option<f64>| async move { Ok(v.map(|v| v.clamp(0.0, 10.0))) });
     clamp.put(Some(50.0)).await.unwrap();
     assert_eq!(clamp.get_value().await.unwrap(), 10.0);
@@ -223,11 +277,11 @@ async fn soft_setter_runs_on_put_and_settles_the_readback() {
         log.lock().unwrap().push(v);
         async { Ok(None) }
     };
-    let plain = SoftSignalBackend::new(0.0, Dtype::Number).with_setter(setter.clone());
+    let plain = SoftSignalBackend::new(0.0).with_setter(setter.clone());
     plain.put(Some(6.0)).await.unwrap();
     assert_eq!(plain.current_value(), 6.0);
 
-    let read_back = SoftSignalBackend::new(0.0, Dtype::Number)
+    let read_back = SoftSignalBackend::new(0.0)
         .with_setter(setter)
         .with_getter(Device::new(3.0).getter(), None);
     read_back.put(Some(7.0)).await.unwrap();
@@ -242,7 +296,7 @@ async fn soft_setter_runs_on_put_and_settles_the_readback() {
 async fn soft_getter_is_polled_only_while_subscribed_with_a_poll_period() {
     let period = Duration::from_millis(50);
     let dev = Device::new(0.0);
-    let b = SoftSignalBackend::new(0.0, Dtype::Number).with_getter(dev.getter(), Some(period));
+    let b = SoftSignalBackend::new(0.0).with_getter(dev.getter(), Some(period));
     let seen = Arc::new(Mutex::new(Vec::new()));
     let log = seen.clone();
     let token = b.set_callback(Some(Box::new(move |v: &f64, _, _| {
@@ -263,7 +317,7 @@ async fn soft_getter_is_polled_only_while_subscribed_with_a_poll_period() {
     assert_eq!(dev.reads(), 3, "unsubscribed: no more polls");
 
     let dev = Device::new(0.0);
-    let unpolled = SoftSignalBackend::new(0.0, Dtype::Number).with_getter(dev.getter(), None);
+    let unpolled = SoftSignalBackend::new(0.0).with_getter(dev.getter(), None);
     let _token = unpolled.set_callback(Some(Box::new(|_: &f64, _, _| {})));
     tokio::time::sleep(4 * period).await;
     assert_eq!(dev.reads(), 0, "no poll period: no polls");
@@ -316,7 +370,7 @@ impl SignalBackend<i64> for CountedConnect {
 #[tokio::test(start_paused = true)]
 async fn connect_joins_a_running_or_successful_connect_and_retries_a_failed_one() {
     let backend = Arc::new(CountedConnect {
-        soft: SoftSignalBackend::new(0, Dtype::Integer),
+        soft: SoftSignalBackend::new(0),
         connects: AtomicUsize::new(0),
         fail: AtomicBool::new(true),
     });
@@ -349,15 +403,10 @@ async fn source_and_initial<A: Readable>(sig: Signal<String, SoftSignalBackend<S
 // ophyd-async test_create_soft_signal (SignalR and SignalRW cases).
 #[tokio::test]
 async fn soft_signal_reports_soft_source_and_initial_value() {
-    let r: SignalR<String, _> = Signal::new(
-        soft("INITIAL".to_string(), Dtype::String),
-        cfg("TEST-PREFIX:SIGNAL"),
-    );
+    let r: SignalR<String, _> = Signal::new(soft("INITIAL".to_string()), cfg("TEST-PREFIX:SIGNAL"));
     source_and_initial(r).await;
-    let rw: SignalRW<String, _> = Signal::new(
-        soft("INITIAL".to_string(), Dtype::String),
-        cfg("TEST-PREFIX:SIGNAL"),
-    );
+    let rw: SignalRW<String, _> =
+        Signal::new(soft("INITIAL".to_string()), cfg("TEST-PREFIX:SIGNAL"));
     source_and_initial(rw).await;
 }
 
@@ -383,7 +432,7 @@ async fn describe_carries_units_and_precision_only_when_given() {
         let dk = sig.describe().await.unwrap().remove("").unwrap();
         (dk.units, dk.precision)
     }
-    let plain = || SoftSignalBackend::new(0_i64, Dtype::Integer);
+    let plain = || SoftSignalBackend::new(0_i64);
     assert_eq!(
         meta(Arc::new(plain().with_units("mm").with_precision(0))).await,
         (Some("mm".into()), Some(0))
@@ -419,10 +468,9 @@ fn describe_of(source: &str) -> DataKey {
 #[tokio::test]
 async fn mock_over_soft_keeps_initial_and_metadata_under_a_mock_source() {
     let backend = || {
-        SoftSignalBackend::new(10.0_f64, Dtype::Number)
+        SoftSignalBackend::new(10.0_f64)
             .with_units("mm")
             .with_precision(2)
-            .with_dtype_numpy("<f8")
     };
     let mocked: SignalRW<f64, _> = Signal::new(
         Arc::new(MockSignalBackend::new(backend())),
@@ -452,7 +500,7 @@ async fn mock_over_soft_keeps_initial_and_metadata_under_a_mock_source() {
 // a callback returning a value is pinned by mock_signal's own tests.
 #[tokio::test]
 async fn mock_put_callback_returning_none_keeps_the_put_value() {
-    let backend = Arc::new(MockSignalBackend::with_value(0.0_f64, Dtype::Number));
+    let backend = Arc::new(MockSignalBackend::with_value(0.0_f64));
     let seen = Arc::new(Mutex::new(Vec::new()));
     let log = seen.clone();
     backend.set_put_callback(Some(Box::new(move |v| {
@@ -471,7 +519,7 @@ async fn mock_put_callback_returning_none_keeps_the_put_value() {
 // none_then_readback_is_the_setpoint}.
 #[tokio::test(start_paused = true)]
 async fn async_mock_put_callback_is_awaited_before_the_readback() {
-    let backend = Arc::new(MockSignalBackend::with_value(0_i64, Dtype::Integer));
+    let backend = Arc::new(MockSignalBackend::with_value(0_i64));
     let sig: Arc<SignalRW<i64, _>> = Arc::new(Signal::new(backend.clone(), cfg("m")));
     let calls = Arc::new(Mutex::new(Vec::new()));
     let log = calls.clone();
@@ -500,7 +548,7 @@ async fn async_mock_put_callback_is_awaited_before_the_readback() {
 // ophyd-async test_reset_mock_put_calls.
 #[tokio::test]
 async fn reset_put_calls_forgets_earlier_puts() {
-    let backend = Arc::new(MockSignalBackend::with_value(0.0_f64, Dtype::Number));
+    let backend = Arc::new(MockSignalBackend::with_value(0.0_f64));
     let sig: SignalRW<f64, _> = Signal::new(backend.clone(), cfg("m"));
     assert!(sig.put(1.0).await.success());
     backend.reset_put_calls();
@@ -512,7 +560,7 @@ async fn reset_put_calls_forgets_earlier_puts() {
 // ophyd-async test_set_mock_values{,_exhausted_passes,_exhausted_fails}.
 #[tokio::test]
 async fn set_values_sets_each_value_as_it_is_taken() {
-    let backend = MockSignalBackend::with_value("first".to_string(), Dtype::String);
+    let backend = MockSignalBackend::with_value("first".to_string());
     let values = || vec!["second".to_string(), "third".to_string()];
 
     let mut it = backend.set_values(values(), false);
@@ -540,7 +588,7 @@ async fn set_values_sets_each_value_as_it_is_taken() {
 // test_signal_base (readback callback on put).
 #[tokio::test]
 async fn subscribe_callback_gets_current_then_each_put_until_dropped() {
-    let sig: SignalRW<f64, _> = Signal::new(soft(0.0_f64, Dtype::Number), cfg("x"));
+    let sig: SignalRW<f64, _> = Signal::new(soft(0.0_f64), cfg("x"));
     let seen = Arc::new(Mutex::new(Vec::new()));
     let log = seen.clone();
     let token = sig.subscribe(Box::new(move |v, ts, sev| {
@@ -577,7 +625,7 @@ fn less_than_42(r: &ReadingValue) -> bool {
 // the combinator's own timeout and wake-up are pinned in devices::observe.
 #[tokio::test(start_paused = true)]
 async fn wait_for_value_on_a_signal_sees_its_current_value_and_mock_sets() {
-    let backend = Arc::new(MockSignalBackend::with_value(0.0_f64, Dtype::Number));
+    let backend = Arc::new(MockSignalBackend::with_value(0.0_f64));
     let sig: SignalRW<f64, _> = Signal::new(backend.clone(), cfg("signal"));
     backend.set_value(45.8);
     let mut sub = AsyncSubscribable::subscribe(&sig).await.unwrap();
@@ -613,7 +661,7 @@ async fn wait_for_value_on_a_signal_sees_its_current_value_and_mock_sets() {
 // tagging are pinned on raw channels in devices::observe.
 #[tokio::test]
 async fn observe_signals_value_tags_each_signal_from_its_current_value() {
-    let (b1, b2) = (soft(0.0_f64, Dtype::Number), soft(0.0_f64, Dtype::Number));
+    let (b1, b2) = (soft(0.0_f64), soft(0.0_f64));
     let s1: SignalR<f64, _> = Signal::new(b1.clone(), cfg("s1"));
     let s2: SignalR<f64, _> = Signal::new(b2.clone(), cfg("s2"));
     let mut merged = Box::pin(observe_signals_value([

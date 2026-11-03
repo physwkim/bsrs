@@ -9,7 +9,7 @@ use crate::core::status::{Status, StatusError};
 use crate::core::subscription::Subscription;
 use crate::core::Kind;
 use crate::devices::SignalCache;
-use crate::event_model::{DataKey, Dtype};
+use crate::event_model::DataKey;
 use crate::protocols_async::{
     AsyncMovable, AsyncReadable, Locatable, Location, SignalBackend, Stoppable,
 };
@@ -35,11 +35,7 @@ impl SoftMotor {
     /// Build a soft motor with `initial_pos` at `0.0` if `None`.
     pub fn new(name: impl Into<String>, initial_pos: Option<f64>) -> Self {
         let name = name.into();
-        let backend = Arc::new(
-            SoftSignalBackend::new(initial_pos.unwrap_or(0.0), Dtype::Number)
-                .with_dtype_numpy("<f8")
-                .with_units("mm"),
-        );
+        let backend = Arc::new(SoftSignalBackend::new(initial_pos.unwrap_or(0.0)).with_units("mm"));
         Self {
             cache: SignalCache::new(backend.clone(), &name),
             name,

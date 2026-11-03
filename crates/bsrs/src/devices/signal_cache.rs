@@ -230,12 +230,12 @@ mod tests {
     use super::*;
     use crate::backends::soft::SoftSignalBackend;
     use crate::core::error::Result;
-    use crate::event_model::{DataKey, Dtype};
+    use crate::event_model::DataKey;
     use crate::protocols_async::PutCompletion;
     use std::time::Duration;
 
     fn backend(v: f64) -> Arc<SoftSignalBackend<f64>> {
-        Arc::new(SoftSignalBackend::new(v, Dtype::Number))
+        Arc::new(SoftSignalBackend::new(v))
     }
 
     // INVARIANT boundary: monitor alive iff staged || listeners>0. Walk each

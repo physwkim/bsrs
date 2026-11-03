@@ -10,7 +10,7 @@ use std::time::Duration;
 use bsrs::backends::soft::{SoftDetector, SoftMotor, SoftSignalBackend};
 use bsrs::core::msg::{ConfigurableObj, NamedObj, ReadableObj, StageableObj};
 use bsrs::core::{
-    BsrsError, ConfigureArgs, DataKey, Dtype, Kind, NotConnected, ReadingValue, Result, Status,
+    BsrsError, ConfigureArgs, DataKey, Kind, NotConnected, ReadingValue, Result, Status,
     StatusOutcome, SubToken, WaitError,
 };
 use bsrs::devices::{
@@ -26,7 +26,7 @@ use bsrs::protocols_sync::{Configurable, Movable, Readable, StageableSync};
 type Soft = SoftSignalBackend<f64>;
 
 fn soft_signal(name: &str, kind: Kind, v: f64) -> (Arc<SignalR<f64, Soft>>, Arc<Soft>) {
-    let backend = Arc::new(Soft::new(v, Dtype::Number));
+    let backend = Arc::new(Soft::new(v));
     let sig = Arc::new(Signal::new(
         backend.clone(),
         SignalConfig {
