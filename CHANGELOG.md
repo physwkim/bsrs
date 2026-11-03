@@ -106,6 +106,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   struct of `Vec` fields a typed table, which casts each column to its
   field's type only when no value changes, as ophyd-async's `Table`
   subclass does. `EpicsPvaBackend` reads and writes an NTTable PV as either.
+- `init_devices!` (also `bsrs::devices::init_devices`), ophyd-async's
+  `init_devices`: each `let` it declares names its device after the
+  variable, `let x = Motor(prefix);` building it with that name, and all of
+  them connect in parallel with failures keyed by variable. The
+  `blocking;` form connects from sync code; `timeout = d;` replaces the
+  10 s default.
 
 ### Changed
 

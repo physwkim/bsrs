@@ -13,6 +13,8 @@ pub mod signal_cache;
 pub mod stage_sigs;
 pub mod standard_readable;
 
+/// Re-export of the crate-root [`init_devices!`](crate::init_devices) macro.
+pub use crate::init_devices;
 pub use command::{
     soft_command, Command, CommandBackend, MockCommandBackend, MockExecuteCallback,
     SoftCommandBackend, TriggerableCommand,
