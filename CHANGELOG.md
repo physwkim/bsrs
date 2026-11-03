@@ -81,6 +81,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   directories; bsrs now depends on `chrono` for the local date.
   `AutoMaxIncrementingPathProvider` always numbers one past the highest
   existing directory, where ophyd-async can return that directory again.
+- `Signal` logs at debug what ophyd-async's signals log: each connect
+  started, `get`, `put` and `trigger`, and a monitor's opening, updates and
+  closing, with ophyd-async's message text.
 
 ### Changed
 
@@ -199,6 +202,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `spiral_square_pattern` visits points in bluesky's order.
 - The `mini_beamline_scan` example builds on `ca_devices` and needs the
   `host` feature.
+- **Breaking**: `SignalCache::new` takes the signal's name, for the source
+  its logs name.
 
 ### Removed
 

@@ -33,6 +33,9 @@ pub mod stream;
 #[cfg(feature = "zmq")]
 mod zmq_socket;
 
+#[cfg(test)]
+mod caplog;
+
 #[cfg(feature = "qs")]
 pub mod qs;
 

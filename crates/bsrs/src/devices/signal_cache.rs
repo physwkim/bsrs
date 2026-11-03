@@ -45,9 +45,28 @@ struct CacheState {
     token: Option<SubToken>,
 }
 
+/// Open a monitor of `backend` delivering to `cb`, logging its opening and
+/// closing as ophyd-async `_SignalCache` does; the monitor closes when the
+/// returned token drops.
+pub(crate) fn open_monitor<T, B>(backend: &B, source: &str, cb: ReadingValueCallback<T>) -> SubToken
+where
+    T: Clone + Send + Sync + 'static,
+    B: SignalBackend<T>,
+{
+    tracing::debug!("Making subscription on source {source}");
+    let monitor = backend.set_callback(Some(cb));
+    let source = source.to_owned();
+    SubToken::new(move || {
+        drop(monitor);
+        tracing::debug!("Closing subscription on source {source}");
+    })
+}
+
 /// Shared monitor + latest-value cache for one signal.
 pub struct SignalCache<T, B> {
     backend: Arc<B>,
+    /// `backend.source(name, true)`, which the cache's logs name.
+    source: Arc<str>,
     fanout: Arc<Fanout>,
     // `Arc<Mutex<..>>` (not `Mutex<..>`) so the per-listener drop closure can
     // own a handle to the state + fanout without capturing `Arc<Self>` — that
@@ -62,11 +81,14 @@ where
     T: Clone + Send + Sync + Serialize + 'static,
     B: SignalBackend<T>,
 {
-    /// Build a cache over `backend`. No backend monitor is opened until the
-    /// cache is staged or gains a listener.
-    pub fn new(backend: Arc<B>) -> Arc<Self> {
+    /// Build a cache over `backend` for the signal `name` (the name a
+    /// [`Signal`](crate::devices::Signal) passes its backend: the PV). No
+    /// backend monitor is opened until the cache is staged or gains a
+    /// listener.
+    pub fn new(backend: Arc<B>, name: &str) -> Arc<Self> {
         let (tx, _) = watch::channel(null_reading());
         Arc::new(Self {
+            source: backend.source(name, true).into(),
             backend,
             fanout: Arc::new(Fanout {
                 tx,
@@ -83,17 +105,28 @@ where
 
     fn make_callback(&self) -> ReadingValueCallback<T> {
         let fanout = self.fanout.clone();
+        let source = self.source.clone();
         Box::new(move |v: &T, ts: f64, alarm_severity: Option<i32>| {
             if let Ok(json) = serde_json::to_value(v) {
-                // `send_replace`, not `send`: a staged cache with no listener
-                // has no receiver, and `send` would drop the value while
-                // `cached_reading` keeps serving the initial null.
-                fanout.tx.send_replace(ReadingValue {
+                let reading = ReadingValue {
                     value: json,
                     timestamp: ts,
                     alarm_severity,
                     message: None,
-                });
+                };
+                tracing::debug!(
+                    "Updated subscription: reading of source {source} changed from {} to {}",
+                    if fanout.has_value.load(Ordering::SeqCst) {
+                        serde_json::to_string(&*fanout.tx.borrow()).unwrap_or_default()
+                    } else {
+                        "None".into()
+                    },
+                    serde_json::to_string(&reading).unwrap_or_default(),
+                );
+                // `send_replace`, not `send`: a staged cache with no listener
+                // has no receiver, and `send` would drop the value while
+                // `cached_reading` keeps serving the initial null.
+                fanout.tx.send_replace(reading);
                 fanout.has_value.store(true, Ordering::SeqCst);
             }
         })
@@ -102,7 +135,11 @@ where
     /// Open the backend monitor if not already open. Caller holds `state`.
     fn ensure_token(&self, st: &mut CacheState) {
         if st.token.is_none() {
-            st.token = Some(self.backend.set_callback(Some(self.make_callback())));
+            st.token = Some(open_monitor(
+                &*self.backend,
+                &self.source,
+                self.make_callback(),
+            ));
         }
     }
 
@@ -206,7 +243,7 @@ mod tests {
     #[tokio::test]
     async fn monitor_lifetime_tracks_staged_or_listeners() {
         let be = backend(0.0);
-        let cache = SignalCache::new(be.clone());
+        let cache = SignalCache::new(be.clone(), "x");
         assert!(!cache.is_monitoring(), "idle: no monitor");
         assert_eq!(be.subscriber_count(), 0);
 
@@ -239,7 +276,7 @@ mod tests {
     #[tokio::test]
     async fn listeners_share_one_monitor_and_see_updates() {
         let be = backend(0.0);
-        let cache = SignalCache::new(be.clone());
+        let cache = SignalCache::new(be.clone(), "x");
 
         let (mut rx_a, _ta) = cache.add_listener();
         let (mut rx_b, _tb) = cache.add_listener();
@@ -309,7 +346,7 @@ mod tests {
     #[tokio::test]
     async fn a_listener_added_after_a_reading_starts_with_it_pending() {
         let be = Arc::new(DeferredBackend::default());
-        let cache = SignalCache::new(be.clone());
+        let cache = SignalCache::new(be.clone(), "x");
         let (early, _t0) = cache.add_listener();
         assert!(!early.has_changed().unwrap(), "nothing cached yet");
 
@@ -327,7 +364,7 @@ mod tests {
     #[tokio::test]
     async fn staged_cache_without_listeners_caches_the_update() {
         let be = backend(0.0);
-        let cache = SignalCache::new(be.clone());
+        let cache = SignalCache::new(be.clone(), "x");
         cache.set_staged(true);
         assert_eq!(cache.listener_count(), 0);
 
@@ -346,7 +383,7 @@ mod tests {
     // invoking the callback directly with a known severity.
     #[tokio::test]
     async fn callback_threads_alarm_severity_into_cache() {
-        let cache = SignalCache::new(backend(0.0));
+        let cache = SignalCache::new(backend(0.0), "x");
         // Skip `add_listener` (it installs the backend monitor, which would
         // race its own None-severity updates into the channel).
         let cb = cache.make_callback();

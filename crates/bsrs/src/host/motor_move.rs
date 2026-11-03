@@ -49,8 +49,8 @@ pub(crate) struct Readback<B> {
 }
 
 impl<B: SignalBackend<f64>> Readback<B> {
-    pub(crate) fn new(backend: Arc<B>) -> Self {
-        let cache = SignalCache::new(backend.clone());
+    pub(crate) fn new(backend: Arc<B>, pv: &str) -> Self {
+        let cache = SignalCache::new(backend.clone(), pv);
         Self { backend, cache }
     }
 }
@@ -360,7 +360,7 @@ impl<B: MotorBackend> MotorChannels<B> {
         };
         Ok(Self {
             setpoint,
-            readback: Readback::new(readback),
+            readback: Readback::new(readback, rbv_pv),
             timing,
             button,
             limits,
@@ -656,7 +656,7 @@ mod tests {
     #[tokio::test]
     async fn move_status_sends_puts_in_call_order() {
         let sp = mock(0.0);
-        let rb = Readback::new(Arc::new(mock(0.0)));
+        let rb = Readback::new(Arc::new(mock(0.0)), "rb");
         let blocked = sp.mock_puts_blocked();
 
         // No yield between the two calls: the puts must already be sent when
@@ -680,7 +680,7 @@ mod tests {
     #[tokio::test]
     async fn halt_settles_only_the_move_in_flight() {
         let sp = mock(0.0);
-        let rb = Readback::new(Arc::new(mock(0.0)));
+        let rb = Readback::new(Arc::new(mock(0.0)), "rb");
         let _blocked = sp.mock_puts_blocked();
         let halt = Halt::new();
         let settled = |st: Status| async move {
@@ -719,7 +719,7 @@ mod tests {
         let rb_mock = MockSignalBackend::new(
             crate::backends::soft::SoftSignalBackend::new(0.0, Dtype::Number).with_units("mm"),
         );
-        let rb = Readback::new(Arc::new(rb_mock.clone()));
+        let rb = Readback::new(Arc::new(rb_mock.clone()), "rb");
         // A CA or PVA monitor delivers the current value as it opens; the
         // soft backend does not, so give the cache one through a listener.
         let (_rx, _listener) = rb.cache.add_listener();

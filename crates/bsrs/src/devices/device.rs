@@ -264,21 +264,6 @@ mod tests {
         assert!(v[2].connected.load(Ordering::SeqCst));
     }
 
-    /// Collects what `tracing` logs on this thread into a buffer, as
-    /// pytest's `caplog`.
-    #[derive(Clone, Default)]
-    struct Caplog(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for Caplog {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
     // ophyd-async test_utils::test_error_handling_value_errors: an unexpected
     // child failure is logged at error once, by the device that has the
     // child; a not-connected one, shared signal or nested device, only at
@@ -286,16 +271,7 @@ mod tests {
     #[tokio::test]
     async fn wait_for_connection_logs_only_unexpected_failures() {
         use futures::FutureExt;
-        let caplog = Caplog::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer({
-                let caplog = caplog.clone();
-                move || caplog.clone()
-            })
-            .with_max_level(tracing::Level::DEBUG)
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (caplog, _guard) = crate::caplog::Caplog::start();
         let shared = |e| Err(BsrsError::Connect(Arc::new(e)));
         let sub_device = wait_for_connection([
             (
@@ -324,7 +300,7 @@ mod tests {
              value_error_signal: invalid value: Some ValueError text\n    \
              timeout_signal: not connected: ca://A_NON_EXISTENT_SIGNAL"
         );
-        let text = String::from_utf8(caplog.0.lock().unwrap().clone()).unwrap();
+        let text = caplog.text();
         let logged = |level: &str| -> Vec<String> {
             text.lines()
                 .filter_map(|l| l.split_once(&format!(" {level} ")))

@@ -210,7 +210,7 @@ impl CaPositioner {
         Arc::new(Self {
             name: name.to_string(),
             setpoint: ch.setpoint,
-            readback: Readback::new(ch.readback),
+            readback: Readback::new(ch.readback, rbv_pv),
             done: ch.done,
             done_pv: done_pv.to_string(),
             rbv_pv: rbv_pv.to_string(),
@@ -387,7 +387,7 @@ impl CaDetector {
     fn from_connected(name: &str, value: Arc<EpicsCaBackend<f64>>, value_pv: &str) -> Arc<Self> {
         Arc::new(Self {
             name: name.to_string(),
-            cache: SignalCache::new(value.clone()),
+            cache: SignalCache::new(value.clone(), value_pv),
             value,
             value_pv: value_pv.to_string(),
             seen: AtomicI64::new(0),

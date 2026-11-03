@@ -166,7 +166,7 @@ impl PvaDetector {
             .block_on(async move { v_for_async.connect(Duration::from_secs(5)).await })?;
         Ok(Arc::new(Self {
             name: name.to_string(),
-            cache: SignalCache::new(v.clone()),
+            cache: SignalCache::new(v.clone(), value_pv),
             value: v,
             value_pv: value_pv.to_string(),
             seen: AtomicI64::new(0),
