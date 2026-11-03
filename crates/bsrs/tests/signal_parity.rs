@@ -13,7 +13,7 @@ use bsrs::backends::soft::SoftSignalBackend;
 use bsrs::core::error::BsrsError;
 use bsrs::core::msg::{LocatableObj, MovableObj, ReadableObj};
 use bsrs::core::status::SubToken;
-use bsrs::core::{Kind, NdArray, ReadingValue};
+use bsrs::core::{Kind, NdArray, ReadingValue, Table};
 use bsrs::devices::{
     observe_signals_value, observe_value, wait_for_value, BackendFromPv, Readable, Signal,
     SignalConfig, SignalR, SignalRW, SignalW,
@@ -98,6 +98,29 @@ async fn soft_ndarray_signal_takes_each_value_in_its_own_dtype() {
         assert!(sig.set(v.clone()).await.success());
         assert_eq!(sig.get().await.unwrap(), v);
     }
+}
+
+/// ophyd-async's ExampleTable.
+#[derive(Clone, Debug, Default, PartialEq, Table)]
+struct ExampleTable {
+    a_bool: Vec<bool>,
+    a_int: Vec<i32>,
+    a_float: Vec<f64>,
+    a_str: Vec<String>,
+    a_enum: Vec<String>,
+}
+
+// ophyd-async test_soft_signal_backend_get_put_monitor's ExampleTable case.
+#[tokio::test]
+async fn soft_table_signal_monitor_starts_at_initial_and_follows_puts() {
+    let put = ExampleTable {
+        a_bool: vec![true],
+        a_int: vec![525],
+        a_float: vec![3.25],
+        a_str: vec!["pi".into()],
+        a_enum: vec!["Aaa".into()],
+    };
+    lifecycle(ExampleTable::default(), put, Dtype::Array).await;
 }
 
 // ophyd-async SignalW is Movable and SignalRW Locatable, so plans move a

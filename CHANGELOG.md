@@ -100,6 +100,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   any shape in one numeric or bool dtype, read as nested lists. A soft signal
   holds one, and `EpicsPvaBackend::<NdArray>` reads an NTNDArray PV
   reshaped to its dimensions and refuses a write as ophyd-async does.
+- `Table`, `Column`, `TableElement` and `TypedTable` in `bsrs::core`,
+  ophyd-async's `Table`: named columns of one length, each an array of one
+  numeric or bool dtype or a list of strings. `#[derive(Table)]` makes a
+  struct of `Vec` fields a typed table, which casts each column to its
+  field's type only when no value changes, as ophyd-async's `Table`
+  subclass does. `EpicsPvaBackend` reads and writes an NTTable PV as either.
 
 ### Changed
 

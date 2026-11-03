@@ -577,6 +577,79 @@ fn is_result_type(ty: &Type) -> bool {
     false
 }
 
+/// Derive `bsrs::core::TypedTable`, `Serialize` and `Into<serde_json::Value>`
+/// for a struct of `Vec` columns, ophyd-async's `Table` subclass.
+#[proc_macro_derive(Table)]
+pub fn derive_table(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let name = &input.ident;
+    let (impl_g, ty_g, where_g) = input.generics.split_for_impl();
+    let fields = match &input.data {
+        Data::Struct(s) => match &s.fields {
+            Fields::Named(named) => &named.named,
+            _ => {
+                return syn::Error::new_spanned(
+                    name,
+                    "#[derive(Table)] only supports structs with named fields",
+                )
+                .to_compile_error()
+                .into();
+            }
+        },
+        _ => {
+            return syn::Error::new_spanned(name, "#[derive(Table)] only supports structs")
+                .to_compile_error()
+                .into();
+        }
+    };
+    let idents: Vec<&Ident> = fields.iter().filter_map(|f| f.ident.as_ref()).collect();
+    let columns: Vec<String> = idents
+        .iter()
+        .map(|i| syn::ext::IdentExt::unraw(*i).to_string())
+        .collect();
+    let len = idents.len();
+    let table = quote!(::bsrs::core::table);
+    let support = quote!(#table::__macro_support);
+
+    quote! {
+        impl #impl_g #table::TypedTable for #name #ty_g #where_g {
+            const NAME: &'static str = stringify!(#name);
+
+            fn into_table(self) -> ::bsrs::core::Result<#table::Table> {
+                #table::Table::new::<&'static str>([
+                    #((#columns, #table::Column::from(self.#idents)),)*
+                ])
+            }
+
+            fn from_table(table: #table::Table) -> ::bsrs::core::Result<Self> {
+                let mut fields = #table::TableFields::from(table);
+                let t = Self { #(#idents: fields.take(#columns)?,)* };
+                fields.finish()?;
+                Ok(t)
+            }
+        }
+
+        impl #impl_g #support::serde::Serialize for #name #ty_g #where_g {
+            fn serialize<S: #support::serde::Serializer>(
+                &self,
+                s: S,
+            ) -> ::std::result::Result<S::Ok, S::Error> {
+                use #support::serde::ser::SerializeMap;
+                let mut m = s.serialize_map(Some(#len))?;
+                #(m.serialize_entry(#columns, &self.#idents)?;)*
+                m.end()
+            }
+        }
+
+        impl #impl_g ::std::convert::From<#name #ty_g> for #support::serde_json::Value #where_g {
+            fn from(t: #name #ty_g) -> Self {
+                #support::serde_json::to_value(&t).expect("columns serialize to JSON")
+            }
+        }
+    }
+    .into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::SignalAttr;

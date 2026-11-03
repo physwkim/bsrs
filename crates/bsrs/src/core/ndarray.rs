@@ -80,6 +80,13 @@ impl NdData {
     }
 }
 
+/// The elements as one flat list.
+impl Serialize for NdData {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        each_dtype!(self, v => v.serialize(s))
+    }
+}
+
 macro_rules! nd_data_from {
     ($($t:ty => $v:ident),*) => {$(
         impl From<Vec<$t>> for NdData {
