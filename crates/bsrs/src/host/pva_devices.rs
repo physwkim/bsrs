@@ -35,19 +35,18 @@ use crate::core::msg::{
 use crate::core::reading::ReadingValue;
 use crate::core::status::Status;
 use crate::core::subscription::Subscription;
-use crate::devices::SignalCache;
+use crate::devices::SignalR;
 use crate::event_model::DataKey;
-use crate::host::motor_move::{describe_pv, MotorChannels};
-use crate::protocols_async::SignalBackend;
+use crate::host::motor_move::{describe_device, pv_signal, MotorChannels};
+use crate::protocols_async::AsyncSubscribable;
 
 /// PVA-backed motor: setpoint + readback Signal pair.
 ///
 /// Also a [`MonitorableObj`] over the readback: every PVA update becomes
-/// an Event, through one shared [`SignalCache`] (CP-08 / K2).
+/// an Event, through the readback's one shared monitor (CP-08 / K2).
 pub struct PvaMotor {
     name: String,
     channels: MotorChannels<EpicsPvaBackend<f64>>,
-    rbv_pv: String,
 }
 
 impl PvaMotor {
@@ -59,16 +58,13 @@ impl PvaMotor {
         Ok(Arc::new(Self {
             name: name.to_string(),
             channels,
-            rbv_pv: rbv_pv.to_string(),
         }))
     }
 
     /// ophyd `EpicsMotor.set_current_position`: redefine the user position
     /// as `pos` without moving the motor, past the limits if need be.
     pub async fn set_current_position(&self, pos: f64) -> Result<()> {
-        self.channels
-            .set_current_position("pva_motor", &self.name, pos)
-            .await
+        self.channels.set_current_position("pva_motor", pos).await
     }
 }
 
@@ -87,21 +83,10 @@ impl NamedObj for PvaMotor {
 #[async_trait::async_trait]
 impl ReadableObj for PvaMotor {
     async fn read_dyn(&self) -> Result<HashMap<String, ReadingValue>> {
-        let r = self.channels.readback.backend.get_reading().await?;
-        let mut out = HashMap::new();
-        out.insert(self.name.clone(), r);
-        Ok(out)
+        self.channels.readback.read_cached(Some(false)).await
     }
     async fn describe_dyn(&self) -> Result<HashMap<String, DataKey>> {
-        Ok(HashMap::from([(
-            self.name.clone(),
-            describe_pv(
-                self.channels.readback.backend.as_ref(),
-                &self.rbv_pv,
-                &self.name,
-            )
-            .await?,
-        )]))
+        describe_device(&self.channels.readback, &self.name).await
     }
     /// The readback is the hinted field, as in ophyd's `EpicsMotor`.
     fn hint_fields(&self) -> Option<Vec<String>> {
@@ -112,7 +97,7 @@ impl ReadableObj for PvaMotor {
 #[async_trait::async_trait]
 impl MovableObj for PvaMotor {
     async fn set_dyn(&self, value: f64) -> Status {
-        self.channels.set("pva_motor", &self.name, value).await
+        self.channels.set("pva_motor", value).await
     }
     async fn stop_on_pause(&self, success: bool) -> Result<()> {
         StoppableObj::stop_dyn(self, success).await
@@ -122,8 +107,8 @@ impl MovableObj for PvaMotor {
 #[async_trait::async_trait]
 impl LocatableObj for PvaMotor {
     async fn locate_dyn(&self) -> Result<DynLocation> {
-        let setpoint = self.channels.setpoint.get_value().await?;
-        let readback = self.channels.readback.backend.get_value().await?;
+        let setpoint = self.channels.setpoint.get().await?;
+        let readback = self.channels.readback.get().await?;
         Ok(DynLocation { setpoint, readback })
     }
 }
@@ -140,35 +125,30 @@ impl StoppableObj for PvaMotor {
 #[async_trait::async_trait]
 impl MonitorableObj for PvaMotor {
     async fn subscribe_dyn(&self) -> Result<Subscription> {
-        let (rx, token) = self.channels.readback.cache.add_listener();
-        Ok(Subscription::new(rx, token, self.name.clone()))
+        AsyncSubscribable::subscribe(&self.channels.readback).await
     }
 }
 
-/// PVA-backed scalar detector: one Signal on a `_RBV` PV.
+/// PVA-backed scalar detector: one Signal on a `_RBV` PV, named after the
+/// detector.
 ///
 /// Also a [`MonitorableObj`]: every PVA update of the PV becomes an Event,
-/// through one shared [`SignalCache`] (CP-08 / K2).
+/// through the signal's one shared monitor (CP-08 / K2).
 pub struct PvaDetector {
     name: String,
-    value: Arc<EpicsPvaBackend<f64>>,
-    value_pv: String,
-    cache: Arc<SignalCache<f64, EpicsPvaBackend<f64>>>,
+    value: SignalR<f64, EpicsPvaBackend<f64>>,
     seen: AtomicI64,
 }
 
 impl PvaDetector {
     /// Build + connect.
     pub fn connect_blocking(name: &str, value_pv: &str) -> Result<Arc<Self>> {
-        let v = Arc::new(EpicsPvaBackend::<f64>::new_inferred(value_pv));
-        let v_for_async = v.clone();
-        crate::core::runtime::bsrs_runtime()
-            .block_on(async move { v_for_async.connect(Duration::from_secs(5)).await })?;
+        let backend = EpicsPvaBackend::new_inferred(value_pv);
+        let value = pv_signal(backend, value_pv, name.to_string());
+        crate::core::runtime::bsrs_runtime().block_on(value.connect(Duration::from_secs(5)))?;
         Ok(Arc::new(Self {
             name: name.to_string(),
-            cache: SignalCache::new(v.clone()),
-            value: v,
-            value_pv: value_pv.to_string(),
+            value,
             seen: AtomicI64::new(0),
         }))
     }
@@ -190,17 +170,12 @@ impl NamedObj for PvaDetector {
 #[async_trait::async_trait]
 impl ReadableObj for PvaDetector {
     async fn read_dyn(&self) -> Result<HashMap<String, ReadingValue>> {
-        let r = self.value.get_reading().await?;
+        let r = self.value.read_cached(Some(false)).await?;
         self.seen.fetch_add(1, Ordering::SeqCst);
-        let mut out = HashMap::new();
-        out.insert(self.name.clone(), r);
-        Ok(out)
+        Ok(r)
     }
     async fn describe_dyn(&self) -> Result<HashMap<String, DataKey>> {
-        Ok(HashMap::from([(
-            self.name.clone(),
-            describe_pv(self.value.as_ref(), &self.value_pv, &self.name).await?,
-        )]))
+        describe_device(&self.value, &self.name).await
     }
     /// The value is the hinted field, as in an ophyd `EpicsSignalRO`.
     fn hint_fields(&self) -> Option<Vec<String>> {
@@ -211,7 +186,6 @@ impl ReadableObj for PvaDetector {
 #[async_trait::async_trait]
 impl MonitorableObj for PvaDetector {
     async fn subscribe_dyn(&self) -> Result<Subscription> {
-        let (rx, token) = self.cache.add_listener();
-        Ok(Subscription::new(rx, token, self.name.clone()))
+        AsyncSubscribable::subscribe(&self.value).await
     }
 }

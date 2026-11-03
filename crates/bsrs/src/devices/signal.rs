@@ -7,17 +7,17 @@
 //! time. `A` defaults to [`ReadWrite`] so `Signal<T, B>` keeps the full
 //! surface and existing code is unaffected.
 
-use crate::core::error::{BsrsError, Result};
+use crate::core::error::Result;
 use crate::core::reading::ReadingValue;
 use crate::core::status::{Status, StatusError, SubToken};
 use crate::core::Kind;
+use crate::devices::device::ConnectOnce;
 use crate::event_model::DataKey;
 use crate::protocols_async::{
-    AsyncMovable, AsyncReadable, AsyncSubscribable, Locatable, Location, ReadingValueCallback,
-    SignalBackend, Subscription, Triggerable,
+    AsyncMovable, AsyncReadable, AsyncSubscribable, Locatable, Location, PutCompletion,
+    ReadingValueCallback, SignalBackend, Subscription, Triggerable,
 };
 use async_trait::async_trait;
-use futures::future::{BoxFuture, FutureExt, Shared};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -106,14 +106,82 @@ where
     /// subscribed or staged; afterwards the cache fans one backend monitor out
     /// to every subscriber and holds the latest value.
     cache: std::sync::Mutex<Option<Arc<crate::devices::signal_cache::SignalCache<T, B>>>>,
-    /// The last backend connect started (ophyd-async `Device._connect_task`).
-    connect_task: std::sync::Mutex<Option<ConnectTask>>,
+    connect: ConnectOnce,
     _marker: std::marker::PhantomData<(T, A)>,
 }
 
-/// A spawned backend connect: every caller that joins it gets its one
-/// outcome, and a caller dropped meanwhile does not cancel it.
-type ConnectTask = Shared<BoxFuture<'static, std::result::Result<(), Arc<BsrsError>>>>;
+/// `value` as ophyd-async's log lines show one (`str(value)`): a string
+/// bare, anything else spelled as a Python literal.
+pub(crate) fn shown(value: &impl Serialize) -> String {
+    match serde_json::to_string(value) {
+        Ok(json) => serde_json::from_str::<String>(&json).unwrap_or_else(|_| python_literal(&json)),
+        Err(e) => format!("<{e}>"),
+    }
+}
+
+/// Respell serde_json output token by token, so struct fields keep their
+/// declared order (a `serde_json::Value` would sort them).
+fn python_literal(json: &str) -> String {
+    let mut out = String::with_capacity(json.len());
+    let mut rest = json;
+    while let Some(c) = rest.chars().next() {
+        let (text, len) = match c {
+            '"' => {
+                let len = json_string_len(rest);
+                let s = serde_json::from_str::<String>(&rest[..len]).unwrap_or_default();
+                (python_repr(&s), len)
+            }
+            ':' | ',' => (format!("{c} "), 1),
+            't' if rest.starts_with("true") => ("True".into(), 4),
+            'f' if rest.starts_with("false") => ("False".into(), 5),
+            'n' if rest.starts_with("null") => ("None".into(), 4),
+            _ => (c.to_string(), c.len_utf8()),
+        };
+        out.push_str(&text);
+        rest = &rest[len..];
+    }
+    out
+}
+
+/// Byte length of the JSON string literal `s` starts with.
+fn json_string_len(s: &str) -> usize {
+    let mut escaped = false;
+    for (i, b) in s.bytes().enumerate().skip(1) {
+        match b {
+            _ if escaped => escaped = false,
+            b'\\' => escaped = true,
+            b'"' => return i + 1,
+            _ => {}
+        }
+    }
+    s.len()
+}
+
+/// Python `repr(s)`.
+fn python_repr(s: &str) -> String {
+    let quote = if s.contains('\'') && !s.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
+    let mut out = String::from(quote);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c);
+            }
+            c if c < ' ' || c == '\x7f' => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push(quote);
+    out
+}
 
 // -- Available for every access role ----------------------------------------
 
@@ -129,7 +197,7 @@ where
             backend,
             config,
             cache: std::sync::Mutex::new(None),
-            connect_task: std::sync::Mutex::new(None),
+            connect: ConnectOnce::default(),
             _marker: std::marker::PhantomData,
         }
     }
@@ -174,28 +242,13 @@ where
     }
 
     async fn join_connect(&self, timeout: Duration, force: bool) -> Result<()> {
-        let task = {
-            let mut slot = self.connect_task.lock().unwrap();
-            match slot.as_ref() {
-                Some(task) if !force && !matches!(task.peek(), Some(Err(_))) => task.clone(),
-                _ => {
-                    let backend = self.backend.clone();
-                    let run = tokio::spawn(async move { backend.connect(timeout).await });
-                    let task = async move {
-                        match run.await {
-                            Ok(outcome) => outcome.map_err(Arc::new),
-                            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-                            Err(_) => Err(Arc::new(BsrsError::Cancelled)),
-                        }
-                    }
-                    .boxed()
-                    .shared();
-                    *slot = Some(task.clone());
-                    task
-                }
-            }
-        };
-        task.await.map_err(BsrsError::Connect)
+        self.connect
+            .join(force, || {
+                tracing::debug!("Connecting to {}", self.source());
+                let backend = self.backend.clone();
+                async move { backend.connect(timeout).await }
+            })
+            .await
     }
 }
 
@@ -209,7 +262,13 @@ where
 {
     /// Read the typed value.
     pub async fn get(&self) -> Result<T> {
-        self.backend.get_value().await
+        let value = self.backend.get_value().await?;
+        tracing::debug!(
+            "get_value() on source {} returned {}",
+            self.source(),
+            shown(&value)
+        );
+        Ok(value)
     }
 
     /// Get (or lazily create) the shared monitor cache for this signal (CP-08).
@@ -218,7 +277,10 @@ where
         if let Some(c) = g.as_ref() {
             return c.clone();
         }
-        let c = crate::devices::signal_cache::SignalCache::new(self.backend.clone());
+        let c = crate::devices::signal_cache::SignalCache::new(
+            self.backend.clone(),
+            &self.config.source,
+        );
         *g = Some(c.clone());
         c
     }
@@ -279,7 +341,7 @@ where
 
     /// Subscribe to value changes.
     pub fn subscribe(&self, cb: ReadingValueCallback<T>) -> SubToken {
-        self.backend.set_callback(Some(cb))
+        crate::devices::signal_cache::open_monitor(&*self.backend, &self.source(), cb)
     }
 }
 
@@ -296,10 +358,41 @@ where
     /// completion (CP-11); a per-call timeout, when needed, is applied by
     /// the caller (mirrors `SignalW::set(value, timeout)`).
     pub async fn put(&self, value: T) -> Status {
+        let (source, shown) = self.putting(&value);
         match self.backend.put(Some(value)).await {
-            Ok(()) => Status::done(),
+            Ok(()) => {
+                tracing::debug!("Successfully put value {shown} to backend at source {source}");
+                Status::done()
+            }
             Err(e) => Status::fail(StatusError::Failed(e.to_string())),
         }
+    }
+
+    /// Send a put and return its completion, logged as [`put`](Self::put)
+    /// logs. The request is on the wire when this returns
+    /// ([`SignalBackend::put_start`]); the completion has no deadline.
+    pub async fn put_start(&self, value: T) -> Result<PutCompletion> {
+        let (source, shown) = self.putting(&value);
+        let done = self.backend.put_start(Some(value)).await?;
+        Ok(Box::pin(async move {
+            done.await?;
+            tracing::debug!("Successfully put value {shown} to backend at source {source}");
+            Ok(())
+        }))
+    }
+
+    /// Log the put of `value` about to start; returns the write source and
+    /// the value as shown, for the line logged once it completes.
+    fn putting(&self, value: &T) -> (String, String) {
+        let source = self.backend.source(&self.config.source, false);
+        // Rendered only for DEBUG: a put may carry a whole waveform.
+        let shown = if tracing::enabled!(tracing::Level::DEBUG) {
+            shown(value)
+        } else {
+            String::new()
+        };
+        tracing::debug!("Putting value {shown} to backend at source {source}");
+        (source, shown)
     }
 }
 
@@ -385,8 +478,13 @@ where
     /// `SignalX::trigger` (`core/_signal.py:330`), where `None` is the
     /// put-default sentinel (CP-11).
     pub async fn trigger(&self) -> Status {
+        let source = self.backend.source(&self.config.source, false);
+        tracing::debug!("Putting default value to backend at source {source}");
         match self.backend.put(None).await {
-            Ok(()) => Status::done(),
+            Ok(()) => {
+                tracing::debug!("Successfully put default value to backend at source {source}");
+                Status::done()
+            }
             Err(e) => Status::fail(StatusError::Failed(e.to_string())),
         }
     }
@@ -556,8 +654,6 @@ mod tests {
     // both. (A `SignalR::put` / `SignalW::get` call would not compile.)
     #[tokio::test]
     async fn access_roles_expose_the_right_surface() {
-        use crate::event_model::Dtype;
-
         fn cfg(name: &str) -> SignalConfig {
             SignalConfig {
                 source: name.into(),
@@ -566,12 +662,7 @@ mod tests {
             }
         }
 
-        let backend = || {
-            Arc::new(crate::backends::soft::SoftSignalBackend::new(
-                0.0_f64,
-                Dtype::Number,
-            ))
-        };
+        let backend = || Arc::new(crate::backends::soft::SoftSignalBackend::new(0.0_f64));
 
         let r: SignalR<f64, _> = Signal::new(backend(), cfg("ro"));
         let w: SignalW<f64, _> = Signal::new(backend(), cfg("wo"));
@@ -592,15 +683,10 @@ mod tests {
     // not compile.)
     #[tokio::test]
     async fn signal_x_trigger_writes_backend_default() {
-        use crate::event_model::Dtype;
-
         // Soft backend's `put(None)` writes the configured initial value
         // (`_soft_signal_backend.py:164`); seed a non-default initial so the
         // trigger is observable through a separate read handle.
-        let backend = Arc::new(crate::backends::soft::SoftSignalBackend::new(
-            42.0_f64,
-            Dtype::Number,
-        ));
+        let backend = Arc::new(crate::backends::soft::SoftSignalBackend::new(42.0_f64));
         let x: SignalX<f64, _> = Signal::new(
             backend.clone(),
             SignalConfig {
@@ -625,12 +711,7 @@ mod tests {
     // forces a backend read; unstaging with no listeners tears the monitor down.
     #[tokio::test]
     async fn staged_signal_caches_reads_and_shares_one_monitor() {
-        use crate::event_model::Dtype;
-
-        let backend = Arc::new(crate::backends::soft::SoftSignalBackend::new(
-            1.0_f64,
-            Dtype::Number,
-        ));
+        let backend = Arc::new(crate::backends::soft::SoftSignalBackend::new(1.0_f64));
         let s: SignalR<f64, _> = Signal::new(
             backend.clone(),
             SignalConfig {
@@ -678,12 +759,8 @@ mod tests {
     #[tokio::test]
     async fn signal_is_monitorable_through_the_shared_monitor() {
         use crate::core::msg::MonitorableObj;
-        use crate::event_model::Dtype;
 
-        let backend = Arc::new(crate::backends::soft::SoftSignalBackend::new(
-            1.0_f64,
-            Dtype::Number,
-        ));
+        let backend = Arc::new(crate::backends::soft::SoftSignalBackend::new(1.0_f64));
         let s: Arc<SignalR<f64, _>> = Arc::new(Signal::new(
             backend.clone(),
             SignalConfig {
@@ -713,6 +790,132 @@ mod tests {
             backend.subscriber_count(),
             0,
             "last subscription dropped: monitor torn down"
+        );
+    }
+
+    fn logged(name: &str) -> SignalConfig {
+        SignalConfig {
+            source: name.into(),
+            kind: Kind::Normal,
+            name: name.into(),
+        }
+    }
+
+    // ophyd-async test_signal_connects_to_previous_backend and
+    // test_signal_connects_with_force_reconnect: "Connecting to" is logged
+    // per backend connect started, not per connect joined.
+    #[tokio::test]
+    async fn connect_is_logged_once_per_backend_connect() {
+        let (caplog, _guard) = crate::caplog::Caplog::start();
+        let backend = crate::backends::soft::SoftSignalBackend::new(0_i64);
+        let sig: SignalRW<i64, _> = Signal::new(Arc::new(backend), logged("x"));
+        let connecting = || caplog.text().matches("Connecting to soft://x").count();
+        let t = Duration::from_secs(1);
+
+        sig.connect(t).await.unwrap();
+        assert_eq!(connecting(), 1);
+        let (a, b, c) = tokio::join!(sig.connect(t), sig.connect(t), sig.connect(t));
+        a.and(b).and(c).unwrap();
+        assert_eq!(connecting(), 1, "joined connects are not logged");
+        sig.reconnect(t).await.unwrap();
+        assert_eq!(connecting(), 2);
+    }
+
+    // ophyd-async test_signal_get_and_set_logging, and SignalX.trigger's
+    // put-default lines.
+    #[tokio::test]
+    async fn put_get_and_trigger_are_logged() {
+        let (caplog, _guard) = crate::caplog::Caplog::start();
+        let backend = crate::backends::mock::MockSignalBackend::with_value(0_i64);
+        let sig: SignalRW<i64, _> = Signal::new(Arc::new(backend), logged("mock_signal"));
+        sig.connect(Duration::from_secs(1)).await.unwrap();
+
+        assert!(sig.put(0).await.await.is_ok());
+        let text = caplog.text();
+        assert!(text.contains("Putting value 0 to backend at source mock+soft://mock_signal"));
+        assert!(
+            text.contains("Successfully put value 0 to backend at source mock+soft://mock_signal")
+        );
+        sig.get().await.unwrap();
+        assert!(caplog
+            .text()
+            .contains("get_value() on source mock+soft://mock_signal returned 0"));
+
+        let x: SignalX<i64, _> = Signal::new(
+            Arc::new(crate::backends::soft::SoftSignalBackend::new(0)),
+            logged("proc"),
+        );
+        assert!(x.trigger().await.await.is_ok());
+        let text = caplog.text();
+        assert!(text.contains("Putting default value to backend at source soft://proc"));
+        assert!(text.contains("Successfully put default value to backend at source soft://proc"));
+    }
+
+    // Log lines spell values as ophyd-async's do, Python `str(value)`.
+    #[test]
+    fn logged_values_are_spelled_as_python_str() {
+        assert_eq!(shown(&"it's"), "it's");
+        assert_eq!(shown(&true), "True");
+        assert_eq!(shown(&None::<i64>), "None");
+        assert_eq!(shown(&1.5), "1.5");
+        assert_eq!(shown(&vec![1, 2]), "[1, 2]");
+        assert_eq!(
+            shown(&vec!["a", "it's", "\\\n"]),
+            r#"['a', "it's", '\\\n']"#
+        );
+        let reading = ReadingValue {
+            value: serde_json::json!(false),
+            timestamp: 2.0,
+            alarm_severity: Some(0),
+            message: None,
+        };
+        assert_eq!(
+            shown(&reading),
+            "{'value': False, 'timestamp': 2.0, 'alarm_severity': 0}"
+        );
+    }
+
+    // ophyd-async test_subscription_logs: subscribing opens the shared
+    // monitor and dropping the last subscription closes it, each logged, as
+    // is every reading the monitor delivers.
+    #[tokio::test]
+    async fn subscription_is_logged_from_opening_to_closing() {
+        let (caplog, _guard) = crate::caplog::Caplog::start();
+        let backend = Arc::new(crate::backends::soft::SoftSignalBackend::new(
+            "a".to_string(),
+        ));
+        let sig: SignalR<String, _> = Signal::new(backend.clone(), logged("x"));
+
+        let sub = AsyncSubscribable::subscribe(&sig).await.unwrap();
+        assert!(caplog
+            .text()
+            .contains("Making subscription on source soft://x"));
+        backend.write_now("b".to_string());
+        let text = caplog.text();
+        assert!(text.contains(
+            "Updated subscription: reading of source soft://x changed from None to {'value': 'a', "
+        ));
+        assert!(text.contains(
+            "Updated subscription: reading of source soft://x changed from {'value': 'a', "
+        ));
+        drop(sub);
+        assert!(caplog
+            .text()
+            .contains("Closing subscription on source soft://x"));
+
+        // A callback subscription opens and closes its own monitor.
+        let token = sig.subscribe(Box::new(|_, _, _| {}));
+        drop(token);
+        let text = caplog.text();
+        assert_eq!(
+            text.matches("Making subscription on source soft://x")
+                .count(),
+            2
+        );
+        assert_eq!(
+            text.matches("Closing subscription on source soft://x")
+                .count(),
+            2
         );
     }
 }

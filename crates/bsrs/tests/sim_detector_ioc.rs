@@ -1,8 +1,8 @@
 //! `StandardDetector` against the sim-detector example IOC's real
-//! areaDetector records (`SIM1:cam1:` and its commonPlugins), checking what
-//! ophyd-async's detector tests check. `cargo test` runs these against one
-//! shared IOC, so every test that drives the cam or reconfigures its plugins
-//! holds `CAM_LOCK`.
+//! areaDetector records (`SIM1:cam1:`, its commonPlugins and `HDF2:`),
+//! checking what ophyd-async's detector tests check. `cargo test` runs these
+//! against one shared IOC, so every test that drives the cam or reconfigures
+//! its plugins holds `CAM_LOCK`.
 #![cfg(all(feature = "ca", feature = "host"))]
 
 mod example_ioc;
@@ -22,15 +22,14 @@ use bsrs::devices::{
 };
 use bsrs::event_model::{DataKey, Dtype, DtypeNumpy, StreamDatum, StreamResource};
 use bsrs::host::areadetector::{
-    area_detector_hdf, num_rois, AdHdfWriter, AdMultipartWriter, AreaDetectorCam, AreaDetectorHdf,
-    NdArrayDescription, NdFile, NdFileHdf5, NdFileIo, NdPluginFileIo, NdRoi, NdStats,
-    PluginSignalDataLogic, AD_COLOR_MODE_MONO, AD_COLOR_MODE_RGB1, AD_IMAGE_MODE_CONTINUOUS,
-    AD_IMAGE_MODE_MULTIPLE, AD_IMAGE_MODE_SINGLE,
+    area_detector_hdf, num_rois, AdHdfWriter, AreaDetectorCam, AreaDetectorHdf, NdArrayDescription,
+    NdFile, NdFileHdf5, NdFileIo, NdRoi, NdStats, PluginSignalDataLogic, AD_COLOR_MODE_MONO,
+    AD_COLOR_MODE_RGB1, AD_IMAGE_MODE_CONTINUOUS, AD_IMAGE_MODE_MULTIPLE, AD_IMAGE_MODE_SINGLE,
 };
 use bsrs::prelude::*;
 use bsrs::protocols_async::{
-    DetectorControl, DetectorWriter, Flyable, Preparable, SignalBackend, Stageable, StreamAsset,
-    Triggerable, WritesStreamAssets,
+    DetectorControl, Flyable, Preparable, SignalBackend, Stageable, StreamAsset, Triggerable,
+    WritesStreamAssets,
 };
 use futures::StreamExt;
 use serde_json::json;
@@ -40,6 +39,7 @@ use tokio::time::timeout;
 const CAM: &str = "SIM1:cam1:";
 const PORT: &str = "SIM1";
 const HDF: &str = "SIM1:HDF1:";
+const HDF2: &str = "SIM1:HDF2:";
 const TIFF: &str = "SIM1:TIFF1:";
 const JPEG: &str = "SIM1:JPEG1:";
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -101,7 +101,7 @@ async fn file_plugin(prefix: &str) -> NdFile {
 /// `feed` holds an array, which a capture in Stream mode needs.
 async fn ready_cam(cam: &AreaDetectorCam, feed: &str) {
     DetectorControl::disarm(cam).await.expect("disarm");
-    for prefix in [HDF, TIFF, JPEG] {
+    for prefix in [HDF, HDF2, TIFF, JPEG] {
         let f = file_plugin(prefix).await;
         f.stop_capture().await.expect("stop capture");
         if prefix == feed {
@@ -138,10 +138,9 @@ async fn ready_cam(cam: &AreaDetectorCam, feed: &str) {
     put::<bool>(&format!("{CAM}ArrayCallbacks"), true).await;
     put::<f64>(&format!("{CAM}AcquireTime"), EXPOSURE).await;
     put::<f64>(&format!("{CAM}AcquirePeriod"), EXPOSURE).await;
-    timeout(
-        TIMEOUT,
-        SignalBackend::put(cam.nd_attributes_file.as_ref(), Some(String::new())),
-    )
+    timeout(TIMEOUT, async {
+        cam.nd_attributes_file.put(String::new()).await.await
+    })
     .await
     .expect("NDAttributesFile put timed out")
     .expect("clear NDAttributesFile");
@@ -919,11 +918,7 @@ async fn num_rois_enables_the_first_rois_while_staged() {
     async fn enabled(rois: &[NdRoi]) -> Vec<bool> {
         let mut out = Vec::new();
         for roi in rois {
-            out.push(
-                SignalBackend::<bool>::get_value(roi.plugin.enable_callbacks.as_ref())
-                    .await
-                    .unwrap(),
-            );
+            out.push(roi.plugin.enable_callbacks.get().await.unwrap());
         }
         out
     }
@@ -939,10 +934,9 @@ async fn num_rois_enables_the_first_rois_while_staged() {
     rois[3].plugin.set_enabled(false).await.unwrap();
 }
 
-/// ophyd-async `test_use_cases.py:404` `test_2_rois_with_hdf`, with TIFF1 as
-/// the second writer since the IOC has one HDF plugin: a writer fed from an
-/// ROI describes the ROI's frame, and the hints and asset documents follow
-/// the writers' order.
+/// ophyd-async `test_use_cases.py:404` `test_2_rois_with_hdf`: a writer fed
+/// from an ROI describes the ROI's frame, and the hints and asset documents
+/// follow the writers' order.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
 async fn writers_fed_from_rois_describe_the_roi_frames() {
@@ -960,27 +954,21 @@ async fn writers_fed_from_rois_describe_the_roi_frames() {
             vec![roi.size_y_rbv.clone(), roi.size_x_rbv.clone()],
         ))
     };
-    let hdf: Arc<dyn DetectorWriter> = Arc::new(
-        AdHdfWriter::new(
-            Arc::new(NdFileIo::new(Arc::new(NdFileHdf5::new(HDF)))),
-            shape_of(&rois[0]),
-            Arc::new(provider(dir.path(), "roi1")),
-        )
-        .with_datakey_suffix("-roi1"),
-    );
-    let tiff: Arc<dyn DetectorWriter> = Arc::new(
-        AdMultipartWriter::tiff(
-            Arc::new(NdPluginFileIo::new(Arc::new(NdFile::new(TIFF)))),
-            shape_of(&rois[1]),
-            Arc::new(provider(dir.path(), "roi2")),
-        )
-        .with_datakey_suffix("-roi2"),
-    );
-    let mut det = StandardDetector::with_data_logics(
-        "det",
-        cam,
-        vec![DataLogic::Unbounded(hdf), DataLogic::Unbounded(tiff)],
-    );
+    let writer = |prefix: &str, roi: &NdRoi, name: &str| -> DataLogic {
+        DataLogic::Unbounded(Arc::new(
+            AdHdfWriter::new(
+                Arc::new(NdFileIo::new(Arc::new(NdFileHdf5::new(prefix)))),
+                shape_of(roi),
+                Arc::new(provider(dir.path(), name)),
+            )
+            .with_datakey_suffix(format!("-{name}")),
+        ))
+    };
+    let logics = vec![
+        writer(HDF, &rois[0], "roi1"),
+        writer(HDF2, &rois[1], "roi2"),
+    ];
+    let mut det = StandardDetector::with_data_logics("det", cam, logics);
     for roi in &rois {
         det.add_plugin(roi.clone());
     }
@@ -996,13 +984,13 @@ async fn writers_fed_from_rois_describe_the_roi_frames() {
         roi.plugin.set_blocking(true).await.unwrap();
         roi.plugin.set_enabled(true).await.unwrap();
     }
-    for (prefix, port) in [(HDF, "ROI1"), (TIFF, "ROI2")] {
+    for (prefix, port) in [(HDF, "ROI1"), (HDF2, "ROI2")] {
         let f = file_plugin(prefix).await;
         f.plugin.set_source_port(port).await.unwrap();
         f.plugin.set_blocking(true).await.unwrap();
         f.plugin.set_enabled(true).await.unwrap();
+        put::<i64>(&format!("{prefix}NumFramesChunks"), 1).await;
     }
-    put::<i64>(&format!("{HDF}NumFramesChunks"), 1).await;
     // A frame through the ROIs sets their SizeX/Y_RBV.
     cam.warmup().await.expect("warmup");
 
@@ -1020,7 +1008,7 @@ async fn writers_fed_from_rois_describe_the_roi_frames() {
         }
     }
     let _ = Stageable::unstage(&det).await;
-    for (prefix, _) in [(HDF, "ROI1"), (TIFF, "ROI2")] {
+    for prefix in [HDF, HDF2] {
         let f = file_plugin(prefix).await;
         f.plugin.set_source_port(PORT).await.unwrap();
         f.plugin.set_enabled(false).await.unwrap();
@@ -1037,10 +1025,10 @@ async fn writers_fed_from_rois_describe_the_roi_frames() {
         assert_eq!(numpy(&keys[key]), Some("|u1"), "{key}");
         assert_eq!(keys[key].external.as_deref(), Some("STREAM:"), "{key}");
     }
-    assert_eq!(
-        keys["det-roi1"].source,
-        file_uri(&dir.path().join("roi1.h5"))
-    );
+    for name in ["roi1", "roi2"] {
+        let file = dir.path().join(format!("{name}.h5"));
+        assert_eq!(keys[&format!("det-{name}")].source, file_uri(&file));
+    }
     assert_eq!(
         hints,
         Some(vec!["det-roi1".to_string(), "det-roi2".to_string()])
@@ -1061,7 +1049,10 @@ async fn writers_fed_from_rois_describe_the_roi_frames() {
             "datum 0..1"
         ]
     );
-    for (i, chunk) in [[1, 30, 40], [1, 10, 14]].iter().enumerate() {
+    for (i, (name, chunk)) in [("roi1", [1, 30, 40]), ("roi2", [1, 10, 14])]
+        .iter()
+        .enumerate()
+    {
         let StreamAsset::Resource(r) = &docs[2 * i] else {
             unreachable!()
         };
@@ -1069,15 +1060,13 @@ async fn writers_fed_from_rois_describe_the_roi_frames() {
             unreachable!()
         };
         assert_eq!(d.stream_resource, r.uid);
-        if i == 0 {
-            assert_eq!(r.parameters["chunk_shape"], json!(chunk));
-        }
+        assert_eq!(r.parameters["chunk_shape"], json!(chunk));
+        assert_eq!(r.mimetype, "application/x-hdf5");
+        let file = dir.path().join(format!("{name}.h5"));
+        assert_eq!(r.uri, file_uri(&file));
+        #[cfg(feature = "hdf5")]
+        assert_eq!(h5_shape(&file, "entry/data/data"), chunk);
     }
-    #[cfg(feature = "hdf5")]
-    assert_eq!(
-        h5_shape(&dir.path().join("roi1.h5"), "entry/data/data"),
-        [1, 30, 40]
-    );
 }
 
 /// ophyd-async `AreaDetector(plugins=...)`: the detector connects its
@@ -1141,7 +1130,7 @@ async fn plugin_signal_is_read_after_the_driver_waits_for_plugins() {
     let cam = AreaDetectorCam::new(CAM);
     let stats = Arc::new(NdStats::new("SIM1:Stats1:"));
     let total = Arc::new(SignalR::new(
-        stats.total.clone(),
+        Arc::new(EpicsCaBackend::<f64>::new("SIM1:Stats1:Total_RBV")),
         SignalConfig {
             source: "SIM1:Stats1:Total_RBV".into(),
             kind: Kind::Normal,

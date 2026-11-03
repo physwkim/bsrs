@@ -81,6 +81,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   directories; bsrs now depends on `chrono` for the local date.
   `AutoMaxIncrementingPathProvider` always numbers one past the highest
   existing directory, where ophyd-async can return that directory again.
+- `Signal` logs at debug what ophyd-async's signals log: each connect
+  started, `get`, `put` and `trigger`, and a monitor's opening, updates and
+  closing, with ophyd-async's message text and values spelled as Python's
+  `str()` spells them.
+- `Command` and `TriggerableCommand` in `bsrs::devices`, ophyd-async's
+  typed commands: a `CommandBackend` executes them, `SoftCommandBackend` and
+  `soft_command` run a callback one call at a time, and `MockCommandBackend`
+  records calls and runs a test's callback. A command with no arguments and
+  no result is `Triggerable`.
+- `CaCommandBackend` and `PvaCommandBackend`, ophyd-async's EPICS command
+  backends: executing writes 1 (or `with_execute_value`) to the PV and
+  waits for the record to process, and `connect` refuses a PV that is not
+  a scalar integer, boolean or enum with ophyd-async's `TypeError` text.
+- `#[derive(Device)]` builds a `#[command("{prefix}...")]` field as a
+  `Command` over that PV and connects it with the device.
+- `NdArray` and `NdData` in `bsrs::core`, numpy's `np.ndarray`: an array of
+  any shape in one numeric or bool dtype, read as nested lists. A soft signal
+  holds one, and `EpicsPvaBackend::<NdArray>` reads an NTNDArray PV
+  reshaped to its dimensions and refuses a write as ophyd-async does.
+- `Table`, `Column`, `TableElement` and `TypedTable` in `bsrs::core`,
+  ophyd-async's `Table`: named columns of one length, each an array of one
+  numeric or bool dtype or a list of strings. `#[derive(Table)]` makes a
+  struct of `Vec` fields a typed table, which casts each column to its
+  field's type only when no value changes, as ophyd-async's `Table`
+  subclass does. `EpicsPvaBackend` reads and writes an NTTable PV as either.
+- `init_devices!` (also `bsrs::devices::init_devices`), ophyd-async's
+  `init_devices`: each `let` it declares names its device after the
+  variable, `let x = Motor(prefix);` building it with that name, and all of
+  them connect in parallel with failures keyed by variable. The
+  `blocking;` form connects from sync code; `timeout = d;` replaces the
+  10 s default.
 
 ### Changed
 
@@ -120,6 +151,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `make_converter`: `Vec<f64>` on a LONG waveform, `bool` on an enum without
   two choices, `i64` on a float record with a nonzero PREC. Generic code
   builds a backend with `BackendFromPv::from_pv`.
+- **Breaking**: `SoftSignalBackend::new(initial)` and
+  `MockSignalBackend::with_value(initial)` drop the `Dtype` argument, and
+  `with_dtype_numpy` is gone: a soft, mock or `MockBackend` signal's
+  DataKey is its current value's, as ophyd-async's `make_datakey`, with
+  `dtype_numpy` always set and an array's shape following its puts. The
+  value type must implement `core::SignalDatatype`: `bool`, `i64`, `f64`,
+  `String`, `()`, a `Vec` of `bool`, `i8` through `u64`, `f32`, `f64` or
+  `String`, `NdArray`, or a `Table`/`#[derive(Table)]` struct.
+- **Breaking**: the areaDetector cam and plugin fields are
+  `Arc<SignalRW<T, EpicsCaBackend<T>>>` (`SignalR` for `*_rbv` and
+  `NdStats::total`) named for their PV, and the CA and PVA motors,
+  positioners, detectors and suspenders read and write through such
+  signals, so their connects, gets, puts and monitors are logged as
+  ophyd-async's are. `NdArrayDescription::new` takes signals,
+  `StageSigs::set` takes the signal, and `NdAttributeXmlSource` is
+  implemented for the `String` signal. `put_nowait` is replaced by
+  `with_wait` on the CA and PVA backends (ophyd-async
+  `EpicsOptions(wait=...)`): `Acquire` and `Capture` put 0 without a
+  callback, and `Signal::put_start` sends a put and returns its completion,
+  so `Capture=1` now goes with a callback whose completion is not awaited.
 - **Breaking**: areaDetector enum fields (`image_mode`, `detector_state_rbv`,
   `data_type`, `color_mode`, `file_write_mode`) are `String` labels, as are
   the `AD_STATE_*`, `AD_IMAGE_MODE_*`, `AD_COLOR_MODE_*` and
@@ -186,7 +237,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   uri is the provider's `directory_uri` plus `{filename}.h5`, not
   `FullFileName_RBV`. Paths are `PurePath`s, posix or Windows whatever
   the host (pathlib `PurePosixPath`/`PureWindowsPath`); `&str`, `&Path`
-  and `PathBuf` convert to the host's flavor. An IOC on Windows gets a
+  and `PathBuf` convert to the host's flavor. Windows paths compare
+  case-insensitively, and `\\?\UNC\server\share` is a drive, as in
+  pathlib. An IOC on Windows gets a
   `FilePath` ending in `\` and a `file://localhost/C:/...` URI.
 - `AreaDetectorCam::arm` resolves once the cam is acquiring, and its
   configuration is described from `AcquireTime_RBV`/`AcquirePeriod_RBV`.
@@ -197,6 +250,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `spiral_square_pattern` visits points in bluesky's order.
 - The `mini_beamline_scan` example builds on `ca_devices` and needs the
   `host` feature.
+- **Breaking**: `SignalCache::new` takes the signal's name, for the source
+  its logs name.
+- `StandardDetector`'s errors no longer start with the detector's name, so
+  they read as ophyd-async's; `complete` without a kickoff fails with
+  `complete: Kickoff not called`.
 
 ### Removed
 

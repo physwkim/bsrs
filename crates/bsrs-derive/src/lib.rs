@@ -3,10 +3,11 @@
 //! Generates from a struct definition:
 //!
 //! - `MyDevice::new(prefix: &str) -> Arc<Self>` — walks `#[signal(...)]`
-//!   fields, builds each `Signal<T, B>` with the resolved PV name, and
+//!   fields, builds each `Signal<T, B>` with the resolved PV name,
+//!   `#[command("...")]` fields as a `Command<B>` writing that PV, and
 //!   `#[device("subprefix")]` fields by recursively calling `Sub::new`.
 //! - `MyDevice::connect_all(timeout) -> Result<()>` — concurrently connects
-//!   every signal and sub-device via `wait_for_connection`.
+//!   every signal, command and sub-device via `wait_for_connection`.
 //! - `MyDevice::name() -> &str` — the prefix passed to `new`.
 //!
 //! Field attribute syntax:
@@ -15,11 +16,12 @@
 //! #[signal(rw, "{prefix}.VAL")]                   pub setpoint: Signal<f64, B>,
 //! #[signal(ro, "{prefix}.RBV", kind = hinted)]    pub readback: Signal<f64, B>,
 //! #[signal(rw, "{prefix}.VELO", kind = config)]   pub velocity: Signal<f64, B>,
+//! #[command("{prefix}.PROC")]                     pub process: Command<B>,
 //! #[device("{prefix}:x")]                         pub x: Arc<Motor>,
 //! ```
 //!
-//! `#[signal(...)]` and `#[device(...)]` are *helper attributes* of the
-//! derive — they have no standalone proc_macro_attribute and are resolved
+//! `#[signal(...)]`, `#[command(...)]` and `#[device(...)]` are *helper
+//! attributes* of the derive — they have no standalone proc_macro_attribute and are resolved
 //! through `#[derive(Device)]`.
 
 #![deny(missing_docs)]
@@ -33,7 +35,7 @@ use syn::parse::{Parse, ParseStream};
 use syn::{parse_macro_input, Data, DeriveInput, Field, Fields, Ident, LitStr, Token};
 
 /// Derive `Device` for a struct.
-#[proc_macro_derive(Device, attributes(signal, device))]
+#[proc_macro_derive(Device, attributes(signal, command, device))]
 pub fn derive_device(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident;
@@ -125,6 +127,35 @@ pub fn derive_device(input: TokenStream) -> TokenStream {
             walk_pushes.push(quote! {
                 out.push((::std::format!("{}{}", prefix, #id_str), self.#id.source()));
             });
+            continue;
+        }
+
+        let command = match field_attr::<LitStr>(field, "command") {
+            Ok(v) => v,
+            Err(e) => return e.to_compile_error().into(),
+        };
+        if let Some(template) = command {
+            let backend = quote! {
+                ::std::sync::Arc::new(::bsrs::devices::__derive::default_backend(
+                    &::bsrs::devices::__derive::expand(#template, prefix),
+                ))
+            };
+            field_inits.push(quote! {
+                #id: ::bsrs::devices::Command::new(
+                    #backend,
+                    ::bsrs::devices::__derive::expand(#template, prefix),
+                ),
+            });
+            field_inits_named.push(quote! {
+                #id: ::bsrs::devices::Command::new(
+                    #backend,
+                    ::std::format!("{}-{}", dev_name, #id_str),
+                ),
+            });
+            connect_calls.push(quote! {
+                ::bsrs::devices::Device::connect_all_boxed(&self.#id, timeout)
+            });
+            connect_names.push(id_str.clone());
             continue;
         }
 
@@ -544,6 +575,79 @@ fn is_result_type(ty: &Type) -> bool {
         }
     }
     false
+}
+
+/// Derive `bsrs::core::TypedTable`, `Serialize` and `Into<serde_json::Value>`
+/// for a struct of `Vec` columns, ophyd-async's `Table` subclass.
+#[proc_macro_derive(Table)]
+pub fn derive_table(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let name = &input.ident;
+    let (impl_g, ty_g, where_g) = input.generics.split_for_impl();
+    let fields = match &input.data {
+        Data::Struct(s) => match &s.fields {
+            Fields::Named(named) => &named.named,
+            _ => {
+                return syn::Error::new_spanned(
+                    name,
+                    "#[derive(Table)] only supports structs with named fields",
+                )
+                .to_compile_error()
+                .into();
+            }
+        },
+        _ => {
+            return syn::Error::new_spanned(name, "#[derive(Table)] only supports structs")
+                .to_compile_error()
+                .into();
+        }
+    };
+    let idents: Vec<&Ident> = fields.iter().filter_map(|f| f.ident.as_ref()).collect();
+    let columns: Vec<String> = idents
+        .iter()
+        .map(|i| syn::ext::IdentExt::unraw(*i).to_string())
+        .collect();
+    let len = idents.len();
+    let table = quote!(::bsrs::core::table);
+    let support = quote!(#table::__macro_support);
+
+    quote! {
+        impl #impl_g #table::TypedTable for #name #ty_g #where_g {
+            const NAME: &'static str = stringify!(#name);
+
+            fn into_table(self) -> ::bsrs::core::Result<#table::Table> {
+                #table::Table::new::<&'static str>([
+                    #((#columns, #table::Column::from(self.#idents)),)*
+                ])
+            }
+
+            fn from_table(table: #table::Table) -> ::bsrs::core::Result<Self> {
+                let mut fields = #table::TableFields::from(table);
+                let t = Self { #(#idents: fields.take(#columns)?,)* };
+                fields.finish()?;
+                Ok(t)
+            }
+        }
+
+        impl #impl_g #support::serde::Serialize for #name #ty_g #where_g {
+            fn serialize<S: #support::serde::Serializer>(
+                &self,
+                s: S,
+            ) -> ::std::result::Result<S::Ok, S::Error> {
+                use #support::serde::ser::SerializeMap;
+                let mut m = s.serialize_map(Some(#len))?;
+                #(m.serialize_entry(#columns, &self.#idents)?;)*
+                m.end()
+            }
+        }
+
+        impl #impl_g ::std::convert::From<#name #ty_g> for #support::serde_json::Value #where_g {
+            fn from(t: #name #ty_g) -> Self {
+                #support::serde_json::to_value(&t).expect("columns serialize to JSON")
+            }
+        }
+    }
+    .into()
 }
 
 #[cfg(test)]

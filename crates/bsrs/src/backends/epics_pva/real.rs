@@ -1,15 +1,17 @@
 //! Real PVA backend wired to `epics-pva-rs::PvaClient`.
 
 use crate::core::error::{BsrsError, Result};
+use crate::core::ndarray::{NdArray, NdData};
 use crate::core::reading::ReadingValue;
 use crate::core::status::SubToken;
+use crate::core::table::{Column, Table, TypedTable};
 use crate::event_model::{make_datakey, DataKey, Dtype, Limits, LimitsRange, SignalMetadata};
 use crate::protocols_async::{PutCompletion, ReadingValueCallback, SignalBackend};
 use async_trait::async_trait;
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::client_native::ops_v2::{effective_typed_put_path, PutLeaf};
 use epics_pva_rs::pv_request::{PvRequestBuilder, PvRequestExpr};
-use epics_pva_rs::pvdata::{FieldDesc, ScalarType, TypedScalarArray};
+use epics_pva_rs::pvdata::{FieldDesc, PvStructure, ScalarType, TypedScalarArray};
 use epics_pva_rs::{PvField, PvaError, ScalarValue};
 use futures::FutureExt;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -45,6 +47,9 @@ pub struct EpicsPvaBackend<T: Clone + Send + Sync + 'static> {
     /// ophyd-async's `initial_values`: what `connect` read, which
     /// `put(None)` writes.
     initial: Mutex<Option<T>>,
+    /// ophyd-async's `EpicsOptions.wait`: whether a put of a value waits
+    /// for the record to process.
+    wait: fn(&T) -> bool,
 }
 
 impl<T: PvaType> EpicsPvaBackend<T> {
@@ -55,7 +60,8 @@ impl<T: PvaType> EpicsPvaBackend<T> {
     /// `String` a string NTScalar, an NTEnum's labels or an int8 array's
     /// text, and a `Vec` an NTScalarArray of its element's type: `bool`,
     /// `i8`, `u8`, `i16`, `u16`, `i32`, `u32`, `i64`, `u64`, `f32`, `f64` or
-    /// `String`.
+    /// `String`, an [`NdArray`] an NTNDArray, which is never written, and a
+    /// [`Table`] or a [`TypedTable`] an NTTable.
     pub fn new(pv: impl Into<String>) -> Self {
         Self::reading_as(pv.into(), T::DATATYPE)
     }
@@ -67,21 +73,22 @@ impl<T: PvaType> EpicsPvaBackend<T> {
             want,
             converter: Mutex::new(None),
             initial: Mutex::new(None),
+            wait: |_| true,
         }
     }
 
-    /// `connect`: wait for the channel, then make the converter from a full
-    /// read whose value is the one `put(None)` writes, both within
-    /// `timeout`, as ophyd-async's connect-time `pvget` and `make_converter`.
+    /// Put the values `wait` refuses with `record[block=false]`, as
+    /// ophyd-async's `EpicsOptions(wait=...)`: a put to `.STOP` that blocks
+    /// would queue behind the move it is meant to stop.
+    pub fn with_wait(self, wait: fn(&T) -> bool) -> Self {
+        Self { wait, ..self }
+    }
+
+    /// `connect`: make the converter from a [`connect_read`] whose value is
+    /// the one `put(None)` writes, as ophyd-async's connect-time `pvget` and
+    /// `make_converter`.
     async fn connect_reading(&self, timeout: Duration) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        pva_connect(&self.client, &self.pv, timeout).await?;
-        let top = tokio::time::timeout_at(deadline, pvget(&self.client, &self.pv))
-            .await
-            .map_err(|_| {
-                let why = format_args!("no value in {timeout:?}");
-                BsrsError::not_connected(format!("pva://{}", self.pv), why)
-            })??;
+        let top = connect_read(&self.client, &self.pv, timeout).await?;
         let conv = make_converter(&self.pv, self.want, &top)?;
         let v = T::decode(&conv, &top).ok_or_else(|| undecodable(&top))?;
         *self.converter.lock().unwrap() = Some(Arc::new(conv));
@@ -128,7 +135,8 @@ impl<T: PvaType> EpicsPvaBackend<T> {
             Some(conv) => conv,
             None => self.read().await?.0,
         };
-        put_block(&self.client, &self.pv, T::encode(&conv, value)).await
+        let block = (self.wait)(&value);
+        put_block(&self.client, &self.pv, T::encode(&conv, value)?, block).await
     }
 }
 
@@ -183,18 +191,31 @@ async fn pva_connect(client: &PvaClient, pv: &str, timeout: Duration) -> Result<
         })
 }
 
-/// PVA put of `f` with `record[block=true]`: QSRV answers it once the record
-/// has processed (`dbProcessNotify`), as rsrv does a put-callback, so the
-/// completion is that of the move or acquisition the put starts, with no
-/// deadline of its own. Returns once DATA is queued on the circuit, so puts
-/// are sent in call order.
-async fn put_block(client: &PvaClient, pv: &str, f: PvField) -> Result<PutCompletion> {
+/// Wait for `pv`'s channel, then read it in full, both within `timeout`, as
+/// ophyd-async's connect-time `pvget_with_timeout`.
+async fn connect_read(client: &PvaClient, pv: &str, timeout: Duration) -> Result<PvField> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    pva_connect(client, pv, timeout).await?;
+    tokio::time::timeout_at(deadline, pvget(client, pv))
+        .await
+        .map_err(|_| {
+            let why = format_args!("no value in {timeout:?}");
+            BsrsError::not_connected(format!("pva://{pv}"), why)
+        })?
+}
+
+/// PVA put of `f` with `record[block=...]`. Blocking, QSRV answers it once
+/// the record has processed (`dbProcessNotify`), as rsrv does a
+/// put-callback, so the completion is that of the move or acquisition the
+/// put starts, with no deadline of its own. Returns once DATA is queued on
+/// the circuit, so puts are sent in call order.
+async fn put_block(client: &PvaClient, pv: &str, f: PvField, block: bool) -> Result<PutCompletion> {
     fn put_err(e: PvaError) -> BsrsError {
         BsrsError::Backend(format!("pva put: {e}"))
     }
     let req = PvRequestBuilder::new()
         .field("value")
-        .record("block", true)
+        .record("block", block)
         .build();
     // A string may name an enum choice, which only the readback lists.
     let fetch_present = matches!(f, PvField::Scalar(ScalarValue::String(_)));
@@ -458,6 +479,10 @@ pub enum Datatype {
     /// `datatype=None`, read as a number: whatever numeric or bool scalar
     /// the PV is, an NTEnum as its index (ophyd `EpicsSignalRO`).
     Number,
+    /// `np.ndarray`.
+    NdArray,
+    /// `Table` or the named subclass of it.
+    Table(&'static str),
 }
 
 impl Datatype {
@@ -480,6 +505,8 @@ impl Datatype {
             Self::Array(S::Float) => "Array1D[np.float32]",
             Self::Array(S::Double) => "Array1D[np.float64]",
             Self::Array(S::String) => "Sequence[str]",
+            Self::NdArray => "ndarray",
+            Self::Table(name) => name,
         }
     }
 }
@@ -496,6 +523,22 @@ pub enum PvaConverter {
     Enum,
     /// A `str` on an int8 array, NUL-terminated (`PvaLongStringConverter`).
     LongStr,
+    /// An NTNDArray's `value` shaped by its `dimension`
+    /// (`PvaNDArrayConverter`).
+    NdArray,
+    /// An NTTable's `value` columns (`PvaTableConverter`).
+    Table,
+}
+
+impl PvaConverter {
+    /// The fields a monitor asks for: the converter's `value_fields`, then
+    /// `alarm` and `timeStamp`.
+    fn monitor_request(&self) -> &'static str {
+        match self {
+            Self::NdArray => "field(value,dimension,alarm,timeStamp)",
+            _ => "field(value,alarm,timeStamp)",
+        }
+    }
 }
 
 const NT_SCALAR: &str = "epics:nt/NTScalar:1.0";
@@ -548,12 +591,11 @@ fn specifier(value: Option<&PvField>) -> String {
 }
 
 /// The datatype ophyd-async infers from a PV's typeid and specifier
-/// (`_datatype_converter_from_typeid`): its name in a refusal, and the
-/// [`Datatype`] it is, if bsrs has one.
-fn inferred(typeid: &str, spec: &str) -> Option<(&'static str, Option<Datatype>)> {
+/// (`_datatype_converter_from_typeid`).
+fn inferred(typeid: &str, spec: &str) -> Option<Datatype> {
     use Datatype as D;
     use ScalarType as S;
-    let datatype = match (typeid, spec) {
+    Some(match (typeid, spec) {
         (NT_SCALAR, "?") => D::Bool,
         (NT_SCALAR, "b" | "B" | "h" | "H" | "i" | "I" | "l" | "L") => D::Int,
         (NT_SCALAR, "f" | "d") => D::Float,
@@ -570,11 +612,10 @@ fn inferred(typeid: &str, spec: &str) -> Option<(&'static str, Option<Datatype>)
         (NT_SCALAR_ARRAY, "af") => D::Array(S::Float),
         (NT_SCALAR_ARRAY, "ad") => D::Array(S::Double),
         (NT_SCALAR_ARRAY, "as") => D::Array(S::String),
-        ("epics:nt/NTTable:1.0", "S") => return Some(("Table", None)),
-        ("epics:nt/NTNDArray:1.0", "v" | "U") => return Some(("ndarray", None)),
+        ("epics:nt/NTTable:1.0", "S") => D::Table("Table"),
+        ("epics:nt/NTNDArray:1.0", "v" | "U") => D::NdArray,
         _ => return None,
-    };
-    Some((datatype.name(), Some(datatype)))
+    })
 }
 
 /// ophyd-async `make_converter`: the converter that reads `pv`, whose full
@@ -586,7 +627,7 @@ fn make_converter(pv: &str, want: Datatype, top: &PvField) -> Result<PvaConverte
         _ => "",
     };
     let spec = specifier(field(top_fields(top), "value"));
-    let Some((name, inferred)) = inferred(typeid, &spec) else {
+    let Some(inferred) = inferred(typeid, &spec) else {
         // ophyd-async's lookup raises a bare `KeyError` here.
         return Err(BsrsError::Datatype(format!(
             "{pv} has no datatype for typeid='{typeid}' specifier='{spec}'"
@@ -613,7 +654,7 @@ fn make_converter(pv: &str, want: Datatype, top: &PvField) -> Result<PvaConverte
         _ if is_enum => matches!(want, D::Str | D::Number).then_some(PvaConverter::Enum),
         // An int on a float record whose precision shows no fraction.
         D::Int
-            if inferred == Some(D::Float)
+            if inferred == D::Float
                 && sub_fields(top_fields(top), "display")
                     .and_then(|d| field(d, "precision"))
                     .and_then(pv_field_to_i64)
@@ -621,17 +662,18 @@ fn make_converter(pv: &str, want: Datatype, top: &PvField) -> Result<PvaConverte
         {
             Some(PvaConverter::Value)
         }
-        D::Number if matches!(inferred, Some(D::Float | D::Int | D::Bool)) => {
-            Some(PvaConverter::Value)
-        }
-        _ if inferred == Some(want) => Some(PvaConverter::Value),
-        D::Str if inferred == Some(D::Array(ScalarType::Byte)) => Some(PvaConverter::LongStr),
+        D::Number if matches!(inferred, D::Float | D::Int | D::Bool) => Some(PvaConverter::Value),
+        D::NdArray if inferred == D::NdArray => Some(PvaConverter::NdArray),
+        D::Table(_) if matches!(inferred, D::Table(_)) => Some(PvaConverter::Table),
+        _ if inferred == want => Some(PvaConverter::Value),
+        D::Str if inferred == D::Array(ScalarType::Byte) => Some(PvaConverter::LongStr),
         _ => None,
     };
     conv.ok_or_else(|| {
         BsrsError::Datatype(format!(
-            "{pv} with inferred datatype {name} from typeid='{typeid}' \
+            "{pv} with inferred datatype {} from typeid='{typeid}' \
              specifier='{spec}' cannot be coerced to {}",
+            inferred.name(),
             want.name()
         ))
     })
@@ -745,8 +787,9 @@ mod sealed {
         /// `None` when `top` is not a read of the PV `conv` was made for.
         #[doc(hidden)]
         fn decode(conv: &PvaConverter, top: &PvField) -> Option<Self>;
+        /// The `TypeError` of a type the PV cannot be written as.
         #[doc(hidden)]
-        fn encode(conv: &PvaConverter, v: Self) -> PvField;
+        fn encode(conv: &PvaConverter, v: Self) -> Result<PvField>;
         /// ophyd-async `get_datakey` from a full read `top`.
         #[doc(hidden)]
         fn datakey(source: String, conv: &PvaConverter, top: &PvField) -> Result<DataKey>;
@@ -797,8 +840,8 @@ impl PvaType for f64 {
             _ => None,
         }
     }
-    fn encode(_: &PvaConverter, v: Self) -> PvField {
-        PvField::Scalar(ScalarValue::Double(v))
+    fn encode(_: &PvaConverter, v: Self) -> Result<PvField> {
+        Ok(PvField::Scalar(ScalarValue::Double(v)))
     }
     fn datakey(source: String, _: &PvaConverter, top: &PvField) -> Result<DataKey> {
         let meta = pv_field_to_metadata(top, Datatype::Float);
@@ -811,8 +854,8 @@ impl PvaType for i64 {
     fn decode(_: &PvaConverter, top: &PvField) -> Option<Self> {
         field(top_fields(top), "value").and_then(pv_field_to_i64)
     }
-    fn encode(_: &PvaConverter, v: Self) -> PvField {
-        PvField::Scalar(ScalarValue::Long(v))
+    fn encode(_: &PvaConverter, v: Self) -> Result<PvField> {
+        Ok(PvField::Scalar(ScalarValue::Long(v)))
     }
     fn datakey(source: String, _: &PvaConverter, top: &PvField) -> Result<DataKey> {
         let meta = pv_field_to_metadata(top, Datatype::Int);
@@ -829,8 +872,8 @@ impl PvaType for bool {
         }
         .map(|i| i != 0)
     }
-    fn encode(_: &PvaConverter, v: Self) -> PvField {
-        PvField::Scalar(ScalarValue::Boolean(v))
+    fn encode(_: &PvaConverter, v: Self) -> Result<PvField> {
+        Ok(PvField::Scalar(ScalarValue::Boolean(v)))
     }
     fn datakey(source: String, _: &PvaConverter, top: &PvField) -> Result<DataKey> {
         let meta = pv_field_to_metadata(top, Datatype::Bool);
@@ -852,8 +895,8 @@ impl PvaType for String {
             _ => None,
         }
     }
-    fn encode(conv: &PvaConverter, v: Self) -> PvField {
-        match conv {
+    fn encode(conv: &PvaConverter, v: Self) -> Result<PvField> {
+        Ok(match conv {
             // NUL-terminated, as `PvaLongStringConverter` writes it.
             PvaConverter::LongStr => {
                 let mut chars: Vec<i8> = v.bytes().map(|b| b as i8).collect();
@@ -861,7 +904,7 @@ impl PvaType for String {
                 PvField::ScalarArrayTyped(TypedScalarArray::Byte(chars.into()))
             }
             _ => PvField::Scalar(ScalarValue::String(v.into())),
-        }
+        })
     }
     fn datakey(source: String, _: &PvaConverter, top: &PvField) -> Result<DataKey> {
         let meta = pv_field_to_metadata(top, Datatype::Str);
@@ -878,8 +921,8 @@ impl<E: PvaElement> PvaType for Vec<E> {
             _ => None,
         }
     }
-    fn encode(_: &PvaConverter, v: Self) -> PvField {
-        PvField::ScalarArrayTyped(E::to_array(v))
+    fn encode(_: &PvaConverter, v: Self) -> Result<PvField> {
+        Ok(PvField::ScalarArrayTyped(E::to_array(v)))
     }
     fn datakey(source: String, conv: &PvaConverter, top: &PvField) -> Result<DataKey> {
         let v = Self::decode(conv, top).ok_or_else(|| undecodable(top))?;
@@ -948,16 +991,154 @@ impl PvaElement for String {
     }
 }
 
+/// The elements of an NTNDArray's `value`, an `any` or a union of arrays;
+/// none for a string array, which numpy holds as no numeric dtype.
+fn nd_data(value: &PvField) -> Option<NdData> {
+    let a = match value {
+        PvField::Variant(v) => &v.value,
+        PvField::Union { value, .. } => value,
+        _ => return None,
+    };
+    let PvField::ScalarArrayTyped(a) = a else {
+        return None;
+    };
+    typed_nd_data(a)
+}
+
+/// A numeric or bool array's elements; none for a string array.
+fn typed_nd_data(a: &TypedScalarArray) -> Option<NdData> {
+    Some(match a {
+        TypedScalarArray::Boolean(a) => a.to_vec().into(),
+        TypedScalarArray::Byte(a) => a.to_vec().into(),
+        TypedScalarArray::UByte(a) => a.to_vec().into(),
+        TypedScalarArray::Short(a) => a.to_vec().into(),
+        TypedScalarArray::UShort(a) => a.to_vec().into(),
+        TypedScalarArray::Int(a) => a.to_vec().into(),
+        TypedScalarArray::UInt(a) => a.to_vec().into(),
+        TypedScalarArray::Long(a) => a.to_vec().into(),
+        TypedScalarArray::ULong(a) => a.to_vec().into(),
+        TypedScalarArray::Float(a) => a.to_vec().into(),
+        TypedScalarArray::Double(a) => a.to_vec().into(),
+        TypedScalarArray::String(_) => return None,
+    })
+}
+
+/// `np.ndarray`: `value` reshaped to the `dimension` sizes, reversed from
+/// NTNDArray's first-fastest order to C order.
+impl PvaType for NdArray {
+    const DATATYPE: Datatype = Datatype::NdArray;
+    fn decode(_: &PvaConverter, top: &PvField) -> Option<Self> {
+        let fields = top_fields(top);
+        let PvField::StructureArray(dims) = field(fields, "dimension")? else {
+            return None;
+        };
+        let mut shape = dims
+            .iter()
+            .map(|d| {
+                let size = field(&d.as_ref()?.fields, "size").and_then(pv_field_to_i64)?;
+                usize::try_from(size).ok()
+            })
+            .collect::<Option<Vec<_>>>()?;
+        shape.reverse();
+        NdArray::new(shape, nd_data(field(fields, "value")?)?).ok()
+    }
+    fn encode(_: &PvaConverter, _: Self) -> Result<PvField> {
+        Err(BsrsError::Datatype(
+            "Writing to NDArray not supported".into(),
+        ))
+    }
+    fn datakey(source: String, conv: &PvaConverter, top: &PvField) -> Result<DataKey> {
+        let v = Self::decode(conv, top).ok_or_else(|| undecodable(top))?;
+        let shape = v.shape().iter().map(|&n| Some(n as u64)).collect();
+        let dtype_numpy = Some(v.data().dtype_numpy().into());
+        let meta = pv_field_to_metadata(top, Self::DATATYPE);
+        Ok(make_datakey(source, Dtype::Array, shape, dtype_numpy, meta))
+    }
+}
+
+/// An NTTable's `value` columns, in order.
+fn table(top: &PvField) -> Option<Table> {
+    let columns = sub_fields(top_fields(top), "value")?
+        .iter()
+        .map(|(name, c)| {
+            let PvField::ScalarArrayTyped(a) = c else {
+                return None;
+            };
+            let column = match a {
+                TypedScalarArray::String(_) => Column::Str(String::from_array(a)?),
+                _ => Column::Array(typed_nd_data(a)?),
+            };
+            Some((name.as_str(), column))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Table::new(columns).ok()
+}
+
+/// `t` as an NTTable's `value`, each column an array the put coerces to
+/// the PV's element type.
+fn table_value(t: Table) -> PvField {
+    let mut value = PvStructure::new("");
+    value.fields = t
+        .into_columns()
+        .into_iter()
+        .map(|(name, c)| {
+            let a = match c {
+                Column::Str(v) => String::to_array(v),
+                Column::Array(NdData::Bool(v)) => bool::to_array(v),
+                Column::Array(NdData::I8(v)) => i8::to_array(v),
+                Column::Array(NdData::U8(v)) => u8::to_array(v),
+                Column::Array(NdData::I16(v)) => i16::to_array(v),
+                Column::Array(NdData::U16(v)) => u16::to_array(v),
+                Column::Array(NdData::I32(v)) => i32::to_array(v),
+                Column::Array(NdData::U32(v)) => u32::to_array(v),
+                Column::Array(NdData::I64(v)) => i64::to_array(v),
+                Column::Array(NdData::U64(v)) => u64::to_array(v),
+                Column::Array(NdData::F32(v)) => f32::to_array(v),
+                Column::Array(NdData::F64(v)) => f64::to_array(v),
+            };
+            (name, PvField::ScalarArrayTyped(a))
+        })
+        .collect();
+    PvField::Structure(value)
+}
+
+/// `Table` or a subclass: the NTTable's columns, cast to the subclass's as
+/// its validation casts them.
+impl<T: TypedTable> PvaType for T {
+    const DATATYPE: Datatype = Datatype::Table(T::NAME);
+    fn decode(_: &PvaConverter, top: &PvField) -> Option<Self> {
+        T::from_table(table(top)?).ok()
+    }
+    fn encode(_: &PvaConverter, v: Self) -> Result<PvField> {
+        Ok(table_value(v.into_table()?))
+    }
+    fn datakey(source: String, conv: &PvaConverter, top: &PvField) -> Result<DataKey> {
+        let t = Self::decode(conv, top)
+            .ok_or_else(|| undecodable(top))?
+            .into_table()?;
+        let shape = vec![Some(t.len() as u64)];
+        let meta = pv_field_to_metadata(top, Self::DATATYPE);
+        Ok(make_datakey(
+            source,
+            Dtype::Array,
+            shape,
+            Some(t.dtype_numpy()),
+            meta,
+        ))
+    }
+}
+
 /// Feed `cb` each update of `pv`'s monitor that `decode` accepts. Only
-/// `value`, `alarm` and `timeStamp` are asked for; a server that publishes
-/// no `timeStamp` is stamped by the local clock, warned of once.
+/// `conv`'s fields are asked for; a server that publishes no `timeStamp` is
+/// stamped by the local clock, warned of once.
 async fn forward_monitor<T>(
     client: &PvaClient,
     pv: &str,
+    conv: &PvaConverter,
     decode: impl Fn(&PvField) -> Option<T> + Send,
     cb: ReadingValueCallback<T>,
 ) {
-    let request = PvRequestExpr::parse("field(value,alarm,timeStamp)").unwrap_or_default();
+    let request = PvRequestExpr::parse(conv.monitor_request()).unwrap_or_default();
     let mut warned = false;
     let res = client
         .pvmonitor_with_request(pv, &request, move |f: &PvField| {
@@ -1040,7 +1221,7 @@ impl<T: PvaType> SignalBackend<T> for EpicsPvaBackend<T> {
                     }
                 }
             };
-            forward_monitor(&client, &pv, |f| T::decode(&conv, f), cb).await;
+            forward_monitor(&client, &pv, &conv, |f| T::decode(&conv, f), cb).await;
         });
         let abort = handle.abort_handle();
         SubToken::new(move || abort.abort())
@@ -1050,10 +1231,87 @@ impl<T: PvaType> SignalBackend<T> for EpicsPvaBackend<T> {
     }
 }
 
+/// [`Command`](crate::devices::Command) backend over PVA: ophyd-async
+/// `PvaCommandBackend`. Executing puts `execute_value` to the PV's `value`
+/// with `record[block=true]`, so a `.PROC` field's command completes when the
+/// record has processed.
+pub struct PvaCommandBackend {
+    pv: String,
+    execute_value: i64,
+    client: Arc<PvaClient>,
+}
+
+impl PvaCommandBackend {
+    /// Put 1 to `write_pv` on each execute.
+    pub fn new(write_pv: impl Into<String>) -> Self {
+        Self {
+            pv: write_pv.into(),
+            execute_value: 1,
+            client: pva_context(),
+        }
+    }
+
+    /// Put `execute_value` instead of 1.
+    pub fn with_execute_value(mut self, execute_value: i64) -> Self {
+        self.execute_value = execute_value;
+        self
+    }
+
+    /// The PV written.
+    pub fn write_pv(&self) -> &str {
+        &self.pv
+    }
+}
+
+impl crate::devices::BackendFromPv for PvaCommandBackend {
+    fn from_pv(pv: &str) -> Self {
+        Self::new(pv)
+    }
+}
+
+#[async_trait]
+impl crate::devices::CommandBackend for PvaCommandBackend {
+    type Args = ();
+    type Output = ();
+    fn source(&self, _name: &str) -> String {
+        format!("pva://{}", self.pv)
+    }
+    /// Refuses all but a boolean or integer NTScalar and an NTEnum.
+    async fn connect(&self, timeout: Duration) -> Result<()> {
+        let top = connect_read(&self.client, &self.pv, timeout).await?;
+        let typeid = match &top {
+            PvField::Structure(s) => s.struct_id.as_str(),
+            _ => "",
+        };
+        let spec = specifier(field(top_fields(&top), "value"));
+        let accepted = match typeid {
+            NT_SCALAR => matches!(
+                spec.as_str(),
+                "?" | "b" | "B" | "h" | "H" | "i" | "I" | "l" | "L"
+            ),
+            NT_ENUM => true,
+            _ => false,
+        };
+        if !accepted {
+            return Err(BsrsError::Datatype(format!(
+                "pva://{} is not a scalar boolean, scalar numeric, or enum PV \
+                 (typeid='{typeid}', specifier='{spec}'); PvaCommandBackend requires a \
+                 scalar boolean, scalar numeric, or enum PV",
+                self.pv
+            )));
+        }
+        Ok(())
+    }
+    async fn execute(&self, _args: ()) -> Result<()> {
+        let v = PvField::Scalar(ScalarValue::Long(self.execute_value));
+        put_block(&self.client, &self.pv, v, true).await?.await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_pva_rs::pvdata::PvStructure;
+    use epics_pva_rs::pvdata::{PvStructure, VariantValue};
 
     fn ntscalar_with_ts(value: f64, secs: i64, nanos: i32) -> PvField {
         let mut ts = PvStructure::new("time_t");
@@ -1261,7 +1519,7 @@ mod tests {
     #[test]
     fn arrays_round_trip_their_own_scalar_array() {
         fn round_trip<E: PvaElement + PartialEq + std::fmt::Debug>(v: Vec<E>) {
-            let top = ntscalararray(Vec::<E>::encode(&PvaConverter::Value, v.clone()));
+            let top = ntscalararray(Vec::<E>::encode(&PvaConverter::Value, v.clone()).unwrap());
             let conv = make_converter("WF", Vec::<E>::DATATYPE, &top).unwrap();
             assert_eq!(Vec::<E>::decode(&conv, &top), Some(v));
         }
@@ -1340,21 +1598,20 @@ mod tests {
                 .push(("display".into(), PvField::Structure(display)));
             PvField::Structure(nt)
         };
-        let ints = with_display(Vec::<i32>::encode(&PvaConverter::Value, vec![1, 2, 3]));
+        let ints = with_display(Vec::<i32>::encode(&PvaConverter::Value, vec![1, 2, 3]).unwrap());
         let dk = Vec::<i32>::datakey("pva://WF".into(), &PvaConverter::Value, &ints).unwrap();
         assert_eq!(dk.dtype, Dtype::Array);
         assert_eq!(dk.shape, vec![Some(3)]);
         assert_eq!(dk.dtype_numpy, Some("<i4".into()));
         assert_eq!(dk.units.as_deref(), Some("mm"));
         assert_eq!(dk.precision, None);
-        let floats = with_display(Vec::<f32>::encode(&PvaConverter::Value, vec![1.0]));
+        let floats = with_display(Vec::<f32>::encode(&PvaConverter::Value, vec![1.0]).unwrap());
         let dk = Vec::<f32>::datakey("pva://WF".into(), &PvaConverter::Value, &floats).unwrap();
         assert_eq!(dk.dtype_numpy, Some("<f4".into()));
         assert_eq!(dk.precision, Some(3));
-        let strs = with_display(Vec::<String>::encode(
-            &PvaConverter::Value,
-            vec!["a".into(), "b".into()],
-        ));
+        let strs = with_display(
+            Vec::<String>::encode(&PvaConverter::Value, vec!["a".into(), "b".into()]).unwrap(),
+        );
         let dk = Vec::<String>::datakey("pva://WF".into(), &PvaConverter::Value, &strs).unwrap();
         assert_eq!(dk.shape, vec![Some(2)]);
         assert_eq!(dk.dtype_numpy, Some("|S40".into()));
@@ -1635,7 +1892,7 @@ mod tests {
         assert_eq!(conv, PvaConverter::LongStr);
         assert_eq!(String::decode(&conv, &top), Some("hi".into()));
         let PvField::ScalarArrayTyped(TypedScalarArray::Byte(written)) =
-            String::encode(&conv, "hi".into())
+            String::encode(&conv, "hi".into()).unwrap()
         else {
             unreachable!()
         };
@@ -1724,5 +1981,263 @@ mod tests {
             pv_field_to_metadata(&bare, Datatype::Float),
             SignalMetadata::default()
         );
+    }
+
+    /// An NTNDArray of `value` whose `dimension` sizes are `dims`, first
+    /// fastest, as QSRV and areaDetector publish one.
+    fn ntndarray(value: PvField, dims: &[i32]) -> PvField {
+        let dims = dims
+            .iter()
+            .map(|&n| {
+                let mut d = PvStructure::new("dimension_t");
+                d.fields
+                    .push(("size".into(), PvField::Scalar(ScalarValue::Int(n))));
+                Some(d)
+            })
+            .collect();
+        let mut nt = PvStructure::new("epics:nt/NTNDArray:1.0");
+        nt.fields.push(("value".into(), value));
+        nt.fields
+            .push(("dimension".into(), PvField::StructureArray(dims)));
+        PvField::Structure(nt)
+    }
+
+    /// QSRV's `+type:"any"` value.
+    fn any(a: TypedScalarArray) -> PvField {
+        let value = PvField::ScalarArrayTyped(a);
+        PvField::Variant(Box::new(VariantValue { desc: None, value }))
+    }
+
+    fn longs(n: i64) -> TypedScalarArray {
+        TypedScalarArray::Long((0..n).collect::<Vec<_>>().into())
+    }
+
+    /// ophyd-async `PvaNDArrayConverter`: three columns and two rows are
+    /// `dimension` sizes [3, 2], shape (2, 3).
+    #[test]
+    fn an_ntndarray_reads_reshaped_to_its_dimensions_reversed() {
+        let top = ntndarray(any(longs(6)), &[3, 2]);
+        let conv = make_converter("ND", Datatype::NdArray, &top).unwrap();
+        assert_eq!(conv, PvaConverter::NdArray);
+        let want = NdArray::new(vec![2, 3], (0..6_i64).collect::<Vec<_>>()).unwrap();
+        assert_eq!(NdArray::decode(&conv, &top), Some(want));
+
+        let floats = TypedScalarArray::Float(vec![1.0_f32, 2.0].into());
+        let union = PvField::Union {
+            selector: 9,
+            variant_name: "floatValue".into(),
+            value: Box::new(PvField::ScalarArrayTyped(floats)),
+        };
+        let top = ntndarray(union, &[2]);
+        assert_eq!(
+            make_converter("ND", Datatype::NdArray, &top).unwrap(),
+            PvaConverter::NdArray
+        );
+        let want = NdArray::from(vec![1.0_f32, 2.0]);
+        assert_eq!(NdArray::decode(&conv, &top), Some(want));
+
+        let short = ntndarray(any(longs(5)), &[3, 2]);
+        assert_eq!(NdArray::decode(&conv, &short), None);
+    }
+
+    /// test_writing_to_ndarray_raises_typeerror, and an NTNDArray read as
+    /// anything else is ophyd-async's `TypeError`.
+    #[test]
+    fn an_ntndarray_is_read_only_an_ndarray() {
+        let top = ntndarray(any(longs(6)), &[3, 2]);
+        let conv = make_converter("ND", Datatype::NdArray, &top).unwrap();
+        let v = NdArray::decode(&conv, &top).unwrap();
+        match NdArray::encode(&conv, v) {
+            Err(BsrsError::Datatype(why)) => assert_eq!(why, "Writing to NDArray not supported"),
+            other => panic!("written: {other:?}"),
+        }
+        assert_eq!(
+            make_converter("ND", Datatype::Float, &top)
+                .unwrap_err()
+                .to_string(),
+            "ND with inferred datatype ndarray from typeid='epics:nt/NTNDArray:1.0' \
+             specifier='v' cannot be coerced to float"
+        );
+        let wf = ntscalararray(PvField::ScalarArrayTyped(longs(6)));
+        assert_eq!(
+            make_converter("WF", Datatype::NdArray, &wf)
+                .unwrap_err()
+                .to_string(),
+            "WF with inferred datatype Array1D[np.int64] from \
+             typeid='epics:nt/NTScalarArray:1.0' specifier='al' cannot be coerced to ndarray"
+        );
+    }
+
+    /// test_ntndarray_lifecycle's describe: the reshaped value's shape and
+    /// dtype, and no metadata.
+    #[test]
+    fn an_ntndarray_datakey_is_its_shape_and_dtype() {
+        let top = ntndarray(any(longs(6)), &[3, 2]);
+        let dk = NdArray::datakey("pva://ND".into(), &PvaConverter::NdArray, &top).unwrap();
+        assert_eq!(dk.dtype, Dtype::Array);
+        assert_eq!(dk.shape, vec![Some(2), Some(3)]);
+        assert_eq!(dk.dtype_numpy, Some("<i8".into()));
+        assert_eq!(dk.units, None);
+        assert_eq!(dk.precision, None);
+        assert_eq!(dk.limits, None);
+        assert_eq!(dk.choices, None);
+    }
+
+    /// `PvaNDArrayConverter.value_fields` ask for `dimension` too.
+    #[test]
+    fn an_ndarray_monitor_asks_for_its_dimensions() {
+        assert_eq!(
+            PvaConverter::NdArray.monitor_request(),
+            "field(value,dimension,alarm,timeStamp)"
+        );
+        assert_eq!(
+            PvaConverter::Value.monitor_request(),
+            "field(value,alarm,timeStamp)"
+        );
+    }
+
+    /// ophyd-async's EpicsTestTable.
+    #[derive(Clone, Debug, PartialEq, crate::core::Table)]
+    struct EpicsTestTable {
+        a_bool: Vec<bool>,
+        a_int: Vec<i32>,
+        a_float: Vec<f64>,
+        a_str: Vec<String>,
+        a_enum: Vec<String>,
+    }
+
+    fn strings(v: &[&str]) -> TypedScalarArray {
+        TypedScalarArray::String(v.iter().map(|s| (*s).into()).collect())
+    }
+
+    /// QSRV's NTTable of `_epics_test_pva_records.db`, `a_bool` a uint8.
+    fn nttable() -> PvField {
+        let mut value = PvStructure::new("");
+        for (name, a) in [
+            ("a_bool", TypedScalarArray::UByte(vec![0, 1].into())),
+            ("a_int", TypedScalarArray::Int(vec![1, -9].into())),
+            ("a_float", TypedScalarArray::Double(vec![1.8, -6.0].into())),
+            ("a_str", strings(&["Hello", "World"])),
+            ("a_enum", strings(&["Aaa", "Ccc"])),
+        ] {
+            value
+                .fields
+                .push((name.into(), PvField::ScalarArrayTyped(a)));
+        }
+        let mut nt = PvStructure::new("epics:nt/NTTable:1.0");
+        nt.fields
+            .push(("labels".into(), PvField::ScalarArrayTyped(strings(&[]))));
+        nt.fields.push(("value".into(), PvField::Structure(value)));
+        PvField::Structure(nt)
+    }
+
+    /// `PvaTableConverter`: a plain Table keeps each column's PV dtype, a
+    /// subclass casts it to its field's.
+    #[test]
+    fn an_nttable_reads_as_a_table_or_a_typed_one() {
+        let top = nttable();
+        let conv = make_converter("T", Datatype::Table("Table"), &top).unwrap();
+        assert_eq!(conv, PvaConverter::Table);
+        let plain = Table::decode(&conv, &top).unwrap();
+        assert_eq!(
+            plain
+                .columns()
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>(),
+            ["a_bool", "a_int", "a_float", "a_str", "a_enum"]
+        );
+        assert_eq!(plain.column("a_bool"), Some(&Column::from(vec![0_u8, 1])));
+        assert_eq!(
+            plain.column("a_enum"),
+            Some(&Column::from(vec!["Aaa".to_string(), "Ccc".into()]))
+        );
+
+        let conv = make_converter("T", EpicsTestTable::DATATYPE, &top).unwrap();
+        let want = EpicsTestTable {
+            a_bool: vec![false, true],
+            a_int: vec![1, -9],
+            a_float: vec![1.8, -6.0],
+            a_str: vec!["Hello".into(), "World".into()],
+            a_enum: vec!["Aaa".into(), "Ccc".into()],
+        };
+        assert_eq!(EpicsTestTable::decode(&conv, &top), Some(want.clone()));
+
+        let PvField::Structure(value) = EpicsTestTable::encode(&conv, want).unwrap() else {
+            panic!("not a structure");
+        };
+        assert_eq!(
+            value.fields[0],
+            (
+                "a_bool".into(),
+                PvField::ScalarArrayTyped(TypedScalarArray::Boolean(vec![false, true].into()))
+            )
+        );
+        assert_eq!(
+            value.fields[4],
+            (
+                "a_enum".into(),
+                PvField::ScalarArrayTyped(strings(&["Aaa", "Ccc"]))
+            )
+        );
+    }
+
+    /// test_table_lifecycle's describe: one row per element, the columns'
+    /// structured dtype, as each type casts them.
+    #[test]
+    fn an_nttable_datakey_is_its_length_and_columns() {
+        let top = nttable();
+        let dk = EpicsTestTable::datakey("pva://T".into(), &PvaConverter::Table, &top).unwrap();
+        assert_eq!(dk.dtype, Dtype::Array);
+        assert_eq!(dk.shape, vec![Some(2)]);
+        let numpy = |b: &str| {
+            crate::event_model::DtypeNumpy::Structured(
+                [
+                    ("a_bool", b),
+                    ("a_int", "<i4"),
+                    ("a_float", "<f8"),
+                    ("a_str", "|S40"),
+                    ("a_enum", "|S40"),
+                ]
+                .map(|(n, d)| (n.to_string(), d.to_string()))
+                .to_vec(),
+            )
+        };
+        assert_eq!(dk.dtype_numpy, Some(numpy("|b1")));
+        let dk = Table::datakey("pva://T".into(), &PvaConverter::Table, &top).unwrap();
+        assert_eq!(dk.dtype_numpy, Some(numpy("|u1")));
+    }
+
+    /// A table is only an NTTable, named in a refusal by its type's name.
+    #[test]
+    fn an_nttable_is_read_only_as_a_table() {
+        assert_eq!(
+            make_converter("T", Datatype::Float, &nttable())
+                .unwrap_err()
+                .to_string(),
+            "T with inferred datatype Table from typeid='epics:nt/NTTable:1.0' \
+             specifier='S' cannot be coerced to float"
+        );
+        let wf = ntscalararray(PvField::ScalarArrayTyped(longs(6)));
+        assert_eq!(
+            make_converter("WF", EpicsTestTable::DATATYPE, &wf).unwrap_err().to_string(),
+            "WF with inferred datatype Array1D[np.int64] from \
+             typeid='epics:nt/NTScalarArray:1.0' specifier='al' cannot be coerced to EpicsTestTable"
+        );
+    }
+
+    /// A column the subclass cannot cast is a read it does not decode.
+    #[test]
+    fn a_typed_table_does_not_decode_a_column_it_cannot_cast() {
+        let PvField::Structure(mut nt) = nttable() else {
+            unreachable!()
+        };
+        let PvField::Structure(value) = &mut nt.fields[1].1 else {
+            unreachable!()
+        };
+        value.fields[0].1 = PvField::ScalarArrayTyped(TypedScalarArray::UByte(vec![0, 2].into()));
+        let top = PvField::Structure(nt);
+        assert_eq!(EpicsTestTable::decode(&PvaConverter::Table, &top), None);
+        assert!(Table::decode(&PvaConverter::Table, &top).is_some());
     }
 }

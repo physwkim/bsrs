@@ -23,4 +23,4 @@ mod channel;
 #[cfg(feature = "ca")]
 mod real;
 #[cfg(feature = "ca")]
-pub use real::{ca_context, CaEnumBackend, EpicsCaBackend};
+pub use real::{ca_context, CaCommandBackend, CaEnumBackend, EpicsCaBackend};

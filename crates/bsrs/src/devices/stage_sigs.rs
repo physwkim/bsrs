@@ -25,7 +25,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::core::error::{BsrsError, Result};
 use crate::core::status::StatusError;
+use crate::devices::signal::{Access, Readable, Signal, Writable};
 use crate::protocols_async::SignalBackend;
+use serde::Serialize;
 
 /// One staged setting. Object-safe so heterogeneously-typed settings share a
 /// single list.
@@ -44,9 +46,14 @@ pub trait StageSetting: Send + Sync {
     fn key(&self) -> &str;
 }
 
-/// A [`StageSetting`] over a typed [`SignalBackend<T>`].
-struct TypedStageSetting<T: Clone + Send + Sync + 'static> {
-    signal: Arc<dyn SignalBackend<T>>,
+/// A [`StageSetting`] over a readable and writable [`Signal`].
+struct TypedStageSetting<T, B, A>
+where
+    T: Clone + Send + Sync + 'static,
+    B: SignalBackend<T>,
+    A: Access,
+{
+    signal: Arc<Signal<T, B, A>>,
     desired: T,
     /// The captured pre-stage value, present only between a successful `apply`
     /// and its `restore`.
@@ -55,13 +62,18 @@ struct TypedStageSetting<T: Clone + Send + Sync + 'static> {
 }
 
 #[async_trait::async_trait]
-impl<T: Clone + Send + Sync + 'static> StageSetting for TypedStageSetting<T> {
+impl<T, B, A> StageSetting for TypedStageSetting<T, B, A>
+where
+    T: Clone + Send + Sync + Serialize + 'static,
+    B: SignalBackend<T> + 'static,
+    A: Readable + Writable,
+{
     async fn apply(&self) -> Result<()> {
         // Capture BEFORE mutating; record the original only after the write
         // succeeds, so a failed apply leaves nothing for restore() to undo on
         // this signal (ophyd records into `_original_vals` post-set).
-        let current = self.signal.get_value().await?;
-        self.signal.put(Some(self.desired.clone())).await?;
+        let current = self.signal.get().await?;
+        self.signal.put(self.desired.clone()).await.await?;
         *self.original.lock().unwrap() = Some(current);
         Ok(())
     }
@@ -69,7 +81,7 @@ impl<T: Clone + Send + Sync + 'static> StageSetting for TypedStageSetting<T> {
     async fn restore(&self) -> Result<()> {
         let original = self.original.lock().unwrap().take();
         if let Some(v) = original {
-            self.signal.put(Some(v)).await?;
+            self.signal.put(v).await.await?;
         }
         Ok(())
     }
@@ -93,23 +105,22 @@ impl StageSigs {
         Self::default()
     }
 
-    /// Record `signal → desired`, keyed by `key` (the signal's PV / source
-    /// name). If a setting with the same `key` already exists it is replaced,
-    /// mirroring ophyd's `stage_sigs[sig] = val`.
-    pub fn set<T: Clone + Send + Sync + 'static>(
-        &self,
-        signal: Arc<dyn SignalBackend<T>>,
-        desired: T,
-        key: impl Into<String>,
-    ) {
-        let key = key.into();
-        let setting: Arc<dyn StageSetting> = Arc::new(TypedStageSetting {
+    /// Record `signal → desired`, keyed by the signal's source. A setting
+    /// for the same signal is replaced, mirroring ophyd's
+    /// `stage_sigs[sig] = val`.
+    pub fn set<T, B, A>(&self, signal: Arc<Signal<T, B, A>>, desired: T)
+    where
+        T: Clone + Send + Sync + Serialize + 'static,
+        B: SignalBackend<T> + 'static,
+        A: Readable + Writable,
+    {
+        let key = signal.source();
+        self.push(Arc::new(TypedStageSetting {
             signal,
             desired,
             original: Mutex::new(None),
-            key: key.clone(),
-        });
-        self.push(setting);
+            key,
+        }));
     }
 
     /// Add a pre-built setting, replacing any existing setting with the same
@@ -198,25 +209,32 @@ impl StageSigs {
 mod tests {
     use super::*;
     use crate::backends::soft::SoftSignalBackend;
-    use crate::event_model::Dtype;
+    use crate::devices::signal::{SignalConfig, SignalRW};
 
-    fn soft(initial: f64) -> Arc<dyn SignalBackend<f64>> {
-        Arc::new(SoftSignalBackend::new(initial, Dtype::Number))
+    fn soft(initial: f64) -> Arc<SignalRW<f64, SoftSignalBackend<f64>>> {
+        let config = SignalConfig {
+            source: "pv".into(),
+            ..Default::default()
+        };
+        Arc::new(Signal::new(
+            Arc::new(SoftSignalBackend::new(initial)),
+            config,
+        ))
     }
 
     #[tokio::test]
     async fn stage_applies_and_unstage_restores() {
         let sig = soft(1.0);
         let ss = StageSigs::new();
-        ss.set(sig.clone(), 5.0, "pv");
-        assert_eq!(sig.get_value().await.unwrap(), 1.0);
+        ss.set(sig.clone(), 5.0);
+        assert_eq!(sig.get().await.unwrap(), 1.0);
 
         ss.stage().await.unwrap();
-        assert_eq!(sig.get_value().await.unwrap(), 5.0);
+        assert_eq!(sig.get().await.unwrap(), 5.0);
         assert!(ss.is_staged());
 
         ss.unstage().await.unwrap();
-        assert_eq!(sig.get_value().await.unwrap(), 1.0);
+        assert_eq!(sig.get().await.unwrap(), 1.0);
         assert!(!ss.is_staged());
     }
 
@@ -226,49 +244,49 @@ mod tests {
         // and stage() is the one restored.
         let sig = soft(1.0);
         let ss = StageSigs::new();
-        ss.set(sig.clone(), 5.0, "pv");
-        sig.put(Some(2.0)).await.unwrap(); // changes the "current" value
+        ss.set(sig.clone(), 5.0);
+        sig.put(2.0).await.await.unwrap(); // changes the "current" value
 
         ss.stage().await.unwrap();
-        assert_eq!(sig.get_value().await.unwrap(), 5.0);
+        assert_eq!(sig.get().await.unwrap(), 5.0);
         ss.unstage().await.unwrap();
-        assert_eq!(sig.get_value().await.unwrap(), 2.0); // restored to 2.0, not 1.0
+        assert_eq!(sig.get().await.unwrap(), 2.0); // restored to 2.0, not 1.0
     }
 
     #[tokio::test]
     async fn unstage_is_idempotent() {
         let sig = soft(1.0);
         let ss = StageSigs::new();
-        ss.set(sig.clone(), 5.0, "pv");
+        ss.set(sig.clone(), 5.0);
         ss.stage().await.unwrap();
         ss.unstage().await.unwrap();
         // Change the value, then unstage again: with nothing captured it must
         // be a no-op, so the value is left untouched.
-        sig.put(Some(9.0)).await.unwrap();
+        sig.put(9.0).await.await.unwrap();
         ss.unstage().await.unwrap();
-        assert_eq!(sig.get_value().await.unwrap(), 9.0);
+        assert_eq!(sig.get().await.unwrap(), 9.0);
     }
 
     #[tokio::test]
     async fn redundant_stage_is_rejected() {
         let sig = soft(1.0);
         let ss = StageSigs::new();
-        ss.set(sig.clone(), 5.0, "pv");
+        ss.set(sig.clone(), 5.0);
         ss.stage().await.unwrap();
         assert!(ss.stage().await.is_err());
         // The rejected second stage must not have disturbed the value.
-        assert_eq!(sig.get_value().await.unwrap(), 5.0);
+        assert_eq!(sig.get().await.unwrap(), 5.0);
     }
 
     #[tokio::test]
     async fn set_replaces_by_key() {
         let sig = soft(1.0);
         let ss = StageSigs::new();
-        ss.set(sig.clone(), 5.0, "pv");
-        ss.set(sig.clone(), 7.0, "pv"); // same key → replaces
+        ss.set(sig.clone(), 5.0);
+        ss.set(sig.clone(), 7.0); // same signal → replaces
         assert_eq!(ss.len(), 1);
         ss.stage().await.unwrap();
-        assert_eq!(sig.get_value().await.unwrap(), 7.0);
+        assert_eq!(sig.get().await.unwrap(), 7.0);
     }
 
     // Records apply/restore ordering to prove reverse-order restoration and

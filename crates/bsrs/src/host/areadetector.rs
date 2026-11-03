@@ -38,8 +38,9 @@ use crate::core::msg::{NamedObj, StageableObj};
 use crate::core::reading::ReadingValue;
 use crate::core::status::{Status, StatusError, SubToken};
 use crate::devices::device::Device;
-use crate::devices::signal::{Read, Readable, Signal};
+use crate::devices::signal::{Access, Read, Readable, Signal, SignalR, SignalRW};
 use crate::devices::stage_sigs::StageSigs;
+use crate::devices::BackendFromPv;
 use crate::devices::{wait_for_connection, PathInfo, PathProvider, PurePath, StandardDetector};
 use crate::event_model::{DataKey, Dtype, StreamDatum, StreamRange, StreamResource};
 use crate::protocols_async::{
@@ -53,6 +54,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
+
+use super::motor_move::{describe_one, pv_signal};
 
 const PUT_TIMEOUT: Duration = Duration::from_secs(10);
 const WARMUP_IDLE_POLL: Duration = Duration::from_millis(100);
@@ -115,14 +118,33 @@ fn file_path_pv(directory: &PurePath) -> String {
     format!("{directory}{}", directory.separator())
 }
 
-/// Run a backend `put` to completion, bounding it with [`PUT_TIMEOUT`].
+/// `{prefix}{suffix}`'s signal, named by that PV.
+fn ca_signal<T, A>(prefix: &str, suffix: &str) -> Arc<Signal<T, EpicsCaBackend<T>, A>>
+where
+    T: Clone + Send + Sync + serde::Serialize + 'static,
+    EpicsCaBackend<T>: SignalBackend<T> + BackendFromPv,
+    A: Access,
+{
+    let pv = join(prefix, suffix);
+    Arc::new(pv_signal(EpicsCaBackend::from_pv(&pv), &pv, pv.clone()))
+}
+
+/// [`ca_signal`] of a busy record, whose put of `false` is sent without a
+/// put-callback: ophyd-async's `EpicsOptions(wait=non_zero)`.
+fn busy_signal(prefix: &str, suffix: &str) -> Arc<SignalRW<bool, EpicsCaBackend<bool>>> {
+    let pv = join(prefix, suffix);
+    let backend = EpicsCaBackend::new(&pv).with_wait(|on| *on);
+    Arc::new(pv_signal(backend, &pv, pv.clone()))
+}
+
+/// Run a signal `put` to completion, bounding it with [`PUT_TIMEOUT`].
 /// The backend `put` always waits for completion (CP-11); the per-put
 /// timeout lives here, at the call layer, not in the backend.
 async fn await_put<F>(put: F, what: &str) -> Result<()>
 where
-    F: std::future::Future<Output = Result<()>>,
+    F: std::future::Future<Output = Status>,
 {
-    match tokio::time::timeout(PUT_TIMEOUT, put).await {
+    match tokio::time::timeout(PUT_TIMEOUT, async { put.await.await }).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(BsrsError::Backend(format!("{what}: {e}"))),
         Err(_) => Err(BsrsError::Backend(format!(
@@ -139,18 +161,15 @@ where
 /// before `set` runs, so a transition back out of `want` (a 1 ms
 /// acquisition's Acquire_RBV pulse) is still seen.
 async fn set_and_wait_for_bool<R>(
-    rbv: &EpicsCaBackend<bool>,
+    rbv: &SignalR<bool, EpicsCaBackend<bool>>,
     want: bool,
     set: impl std::future::Future<Output = Result<R>>,
     what: &str,
 ) -> Result<R> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let _sub = SignalBackend::<bool>::set_callback(
-        rbv,
-        Some(Box::new(move |v: &bool, _, _| {
-            let _ = tx.send(*v);
-        })),
-    );
+    let _sub = rbv.subscribe(Box::new(move |v: &bool, _, _| {
+        let _ = tx.send(*v);
+    }));
     let deadline = tokio::time::Instant::now() + PUT_TIMEOUT;
     let mut last = match tokio::time::timeout_at(deadline, rx.recv()).await {
         Ok(Some(v)) => v,
@@ -180,36 +199,36 @@ pub struct AreaDetectorCam {
     /// PV prefix, e.g. `"13SIM1:cam1:"`.
     pub prefix: String,
     /// `ImageMode` (mbbo: Single, Multiple, Continuous).
-    pub image_mode: Arc<EpicsCaBackend<String>>,
+    pub image_mode: Arc<SignalRW<String, EpicsCaBackend<String>>>,
     /// `NumImages` (longout) — how many frames to acquire in
     /// `Multiple` mode.
-    pub num_images: Arc<EpicsCaBackend<i64>>,
+    pub num_images: Arc<SignalRW<i64, EpicsCaBackend<i64>>>,
     /// `Acquire` (busy) — true to start, false to stop. A put-callback for
     /// `1` completes when the whole acquisition ends, so arming watches
     /// [`acquire_rbv`](Self::acquire_rbv) instead of the callback.
-    pub acquire: Arc<EpicsCaBackend<bool>>,
+    pub acquire: Arc<SignalRW<bool, EpicsCaBackend<bool>>>,
     /// `Acquire_RBV` (bi) — whether the driver is acquiring.
-    pub acquire_rbv: Arc<EpicsCaBackend<bool>>,
+    pub acquire_rbv: Arc<SignalR<bool, EpicsCaBackend<bool>>>,
     /// `AcquireTime` (ao) — exposure time, seconds.
-    pub acquire_time: Arc<EpicsCaBackend<f64>>,
+    pub acquire_time: Arc<SignalRW<f64, EpicsCaBackend<f64>>>,
     /// `AcquirePeriod` (ao) — seconds from one exposure start to the next
     /// (exposure + dead time).
-    pub acquire_period: Arc<EpicsCaBackend<f64>>,
+    pub acquire_period: Arc<SignalRW<f64, EpicsCaBackend<f64>>>,
     /// `AcquireTime_RBV` (ai) — the exposure time the driver applied.
-    pub acquire_time_rbv: Arc<EpicsCaBackend<f64>>,
+    pub acquire_time_rbv: Arc<SignalR<f64, EpicsCaBackend<f64>>>,
     /// `AcquirePeriod_RBV` (ai) — the period the driver applied.
-    pub acquire_period_rbv: Arc<EpicsCaBackend<f64>>,
+    pub acquire_period_rbv: Arc<SignalR<f64, EpicsCaBackend<f64>>>,
     /// `ArrayCounter_RBV` (longin) — total frames produced.
-    pub array_counter_rbv: Arc<EpicsCaBackend<i64>>,
+    pub array_counter_rbv: Arc<SignalR<i64, EpicsCaBackend<i64>>>,
     /// `DetectorState_RBV` (mbbi).
-    pub detector_state_rbv: Arc<EpicsCaBackend<String>>,
+    pub detector_state_rbv: Arc<SignalR<String, EpicsCaBackend<String>>>,
     /// `NDAttributesFile` (waveform) — per-frame attribute config, either
     /// inline XML or a filename on the IOC host. Read at `open()` to discover
     /// NDAttribute datasets for the emitted stream documents.
-    pub nd_attributes_file: Arc<EpicsCaBackend<String>>,
+    pub nd_attributes_file: Arc<SignalRW<String, EpicsCaBackend<String>>>,
     /// `WaitForPlugins` (bo) — whether `Acquire` completes only once the
     /// plugins have processed the frames.
-    pub wait_for_plugins: Arc<EpicsCaBackend<bool>>,
+    pub wait_for_plugins: Arc<SignalRW<bool, EpicsCaBackend<bool>>>,
     /// Frame description readbacks (`ArraySizeZ/Y/X_RBV`, `DataType_RBV`,
     /// `ColorMode_RBV`) — the shape/dtype source for the emitted `DataKey`,
     /// read from the driver as in ophyd-async's `ADWriterFactory` default.
@@ -224,24 +243,21 @@ pub struct AreaDetectorCam {
 /// `DataType_RBV` and `ColorMode_RBV`. A cheap `Arc` handle so the writer
 /// reads it after the cam has been moved into a `StandardDetector`.
 pub struct NdArrayDescription {
-    /// The driver's prefix, naming `DataType_RBV`/`ColorMode_RBV` in errors.
-    prefix: String,
-    shape: Vec<Arc<EpicsCaBackend<i64>>>,
-    data_type: Arc<EpicsCaBackend<String>>,
-    color_mode: Arc<EpicsCaBackend<String>>,
+    shape: Vec<Arc<SignalR<i64, EpicsCaBackend<i64>>>>,
+    data_type: Arc<SignalR<String, EpicsCaBackend<String>>>,
+    color_mode: Arc<SignalR<String, EpicsCaBackend<String>>>,
 }
 
 impl NdArrayDescription {
     /// The driver's own frame, `ArraySizeZ/Y/X_RBV`: ophyd-async's default.
     fn of_driver(prefix: &str) -> Self {
         Self {
-            prefix: prefix.to_string(),
             shape: ["ArraySizeZ_RBV", "ArraySizeY_RBV", "ArraySizeX_RBV"]
                 .into_iter()
-                .map(|s| Arc::new(EpicsCaBackend::<i64>::new(join(prefix, s))))
+                .map(|s| ca_signal(prefix, s))
                 .collect(),
-            data_type: Arc::new(EpicsCaBackend::<String>::new(join(prefix, "DataType_RBV"))),
-            color_mode: Arc::new(EpicsCaBackend::<String>::new(join(prefix, "ColorMode_RBV"))),
+            data_type: ca_signal(prefix, "DataType_RBV"),
+            color_mode: ca_signal(prefix, "ColorMode_RBV"),
         }
     }
 
@@ -250,10 +266,12 @@ impl NdArrayDescription {
     /// ROI. Zero dims are dropped. The writer does not connect `shape`; the
     /// detector does once the ROI is added with
     /// [`StandardDetector::add_plugin`].
-    pub fn new(driver: &AreaDetectorCam, shape: Vec<Arc<EpicsCaBackend<i64>>>) -> Self {
+    pub fn new(
+        driver: &AreaDetectorCam,
+        shape: Vec<Arc<SignalR<i64, EpicsCaBackend<i64>>>>,
+    ) -> Self {
         let own = &driver.frame_info;
         Self {
-            prefix: own.prefix.clone(),
             shape,
             data_type: own.data_type.clone(),
             color_mode: own.color_mode.clone(),
@@ -262,11 +280,11 @@ impl NdArrayDescription {
 
     async fn connect(&self, timeout: Duration) -> Result<()> {
         let shape = self.shape.iter().enumerate().map(|(i, s)| {
-            let connect = SignalBackend::<i64>::connect(s.as_ref(), timeout);
+            let connect = futures::FutureExt::boxed(s.connect(timeout));
             (format!("shape[{i}]"), connect)
         });
-        let data_type = SignalBackend::<String>::connect(self.data_type.as_ref(), timeout);
-        let color_mode = SignalBackend::<String>::connect(self.color_mode.as_ref(), timeout);
+        let data_type = futures::FutureExt::boxed(self.data_type.connect(timeout));
+        let color_mode = futures::FutureExt::boxed(self.color_mode.connect(timeout));
         wait_for_connection(shape.chain([
             ("data_type".to_string(), data_type),
             ("color_mode".to_string(), color_mode),
@@ -329,20 +347,11 @@ fn ndarray_frame_info(
 impl AdFrameInfoSource for NdArrayDescription {
     async fn frame_info(&self) -> Result<(Vec<u64>, String)> {
         let (dims, dt, cm) = tokio::join!(
-            futures::future::try_join_all(
-                self.shape
-                    .iter()
-                    .map(|s| SignalBackend::<i64>::get_value(s.as_ref())),
-            ),
-            SignalBackend::<String>::get_value(self.data_type.as_ref()),
-            SignalBackend::<String>::get_value(self.color_mode.as_ref()),
+            futures::future::try_join_all(self.shape.iter().map(|s| s.get()),),
+            self.data_type.get(),
+            self.color_mode.get(),
         );
-        let source = SignalBackend::<String>::source(
-            self.data_type.as_ref(),
-            &join(&self.prefix, "DataType_RBV"),
-            true,
-        );
-        ndarray_frame_info(&dims?, &dt?, &cm?, &source)
+        ndarray_frame_info(&dims?, &dt?, &cm?, &self.data_type.source())
     }
 }
 
@@ -351,33 +360,18 @@ impl AreaDetectorCam {
     pub fn new(prefix: impl Into<String>) -> Self {
         let prefix = prefix.into();
         Self {
-            image_mode: Arc::new(EpicsCaBackend::<String>::new(join(&prefix, "ImageMode"))),
-            num_images: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "NumImages"))),
-            acquire: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "Acquire"))),
-            acquire_rbv: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "Acquire_RBV"))),
-            acquire_time: Arc::new(EpicsCaBackend::<f64>::new(join(&prefix, "AcquireTime"))),
-            acquire_period: Arc::new(EpicsCaBackend::<f64>::new(join(&prefix, "AcquirePeriod"))),
-            acquire_time_rbv: Arc::new(EpicsCaBackend::<f64>::new(join(&prefix, ACQUIRE_TIME_RBV))),
-            acquire_period_rbv: Arc::new(EpicsCaBackend::<f64>::new(join(
-                &prefix,
-                ACQUIRE_PERIOD_RBV,
-            ))),
-            array_counter_rbv: Arc::new(EpicsCaBackend::<i64>::new(join(
-                &prefix,
-                "ArrayCounter_RBV",
-            ))),
-            detector_state_rbv: Arc::new(EpicsCaBackend::<String>::new(join(
-                &prefix,
-                "DetectorState_RBV",
-            ))),
-            nd_attributes_file: Arc::new(EpicsCaBackend::<String>::new(join(
-                &prefix,
-                "NDAttributesFile",
-            ))),
-            wait_for_plugins: Arc::new(EpicsCaBackend::<bool>::new(join(
-                &prefix,
-                "WaitForPlugins",
-            ))),
+            image_mode: ca_signal(&prefix, "ImageMode"),
+            num_images: ca_signal(&prefix, "NumImages"),
+            acquire: busy_signal(&prefix, "Acquire"),
+            acquire_rbv: ca_signal(&prefix, "Acquire_RBV"),
+            acquire_time: ca_signal(&prefix, "AcquireTime"),
+            acquire_period: ca_signal(&prefix, "AcquirePeriod"),
+            acquire_time_rbv: ca_signal(&prefix, ACQUIRE_TIME_RBV),
+            acquire_period_rbv: ca_signal(&prefix, ACQUIRE_PERIOD_RBV),
+            array_counter_rbv: ca_signal(&prefix, "ArrayCounter_RBV"),
+            detector_state_rbv: ca_signal(&prefix, "DetectorState_RBV"),
+            nd_attributes_file: ca_signal(&prefix, "NDAttributesFile"),
+            wait_for_plugins: ca_signal(&prefix, "WaitForPlugins"),
             frame_info: Arc::new(NdArrayDescription::of_driver(&prefix)),
             acquire_status: std::sync::Mutex::new(None),
             prefix,
@@ -389,51 +383,51 @@ impl AreaDetectorCam {
         wait_for_connection([
             (
                 "image_mode",
-                SignalBackend::<String>::connect(self.image_mode.as_ref(), timeout),
+                futures::FutureExt::boxed(self.image_mode.connect(timeout)),
             ),
             (
                 "num_images",
-                SignalBackend::<i64>::connect(self.num_images.as_ref(), timeout),
+                futures::FutureExt::boxed(self.num_images.connect(timeout)),
             ),
             (
                 "acquire",
-                SignalBackend::<bool>::connect(self.acquire.as_ref(), timeout),
+                futures::FutureExt::boxed(self.acquire.connect(timeout)),
             ),
             (
                 "acquire_rbv",
-                SignalBackend::<bool>::connect(self.acquire_rbv.as_ref(), timeout),
+                futures::FutureExt::boxed(self.acquire_rbv.connect(timeout)),
             ),
             (
                 "acquire_time",
-                SignalBackend::<f64>::connect(self.acquire_time.as_ref(), timeout),
+                futures::FutureExt::boxed(self.acquire_time.connect(timeout)),
             ),
             (
                 "acquire_period",
-                SignalBackend::<f64>::connect(self.acquire_period.as_ref(), timeout),
+                futures::FutureExt::boxed(self.acquire_period.connect(timeout)),
             ),
             (
                 "acquire_time_rbv",
-                SignalBackend::<f64>::connect(self.acquire_time_rbv.as_ref(), timeout),
+                futures::FutureExt::boxed(self.acquire_time_rbv.connect(timeout)),
             ),
             (
                 "acquire_period_rbv",
-                SignalBackend::<f64>::connect(self.acquire_period_rbv.as_ref(), timeout),
+                futures::FutureExt::boxed(self.acquire_period_rbv.connect(timeout)),
             ),
             (
                 "array_counter_rbv",
-                SignalBackend::<i64>::connect(self.array_counter_rbv.as_ref(), timeout),
+                futures::FutureExt::boxed(self.array_counter_rbv.connect(timeout)),
             ),
             (
                 "detector_state_rbv",
-                SignalBackend::<String>::connect(self.detector_state_rbv.as_ref(), timeout),
+                futures::FutureExt::boxed(self.detector_state_rbv.connect(timeout)),
             ),
             (
                 "nd_attributes_file",
-                SignalBackend::<String>::connect(self.nd_attributes_file.as_ref(), timeout),
+                futures::FutureExt::boxed(self.nd_attributes_file.connect(timeout)),
             ),
             (
                 "wait_for_plugins",
-                SignalBackend::<bool>::connect(self.wait_for_plugins.as_ref(), timeout),
+                futures::FutureExt::boxed(self.wait_for_plugins.connect(timeout)),
             ),
             (
                 "frame_info",
@@ -446,18 +440,10 @@ impl AreaDetectorCam {
     /// The descriptor `configuration` signals, as ophyd-async `AreaDetector`
     /// registers them (`driver.acquire_time`, `driver.acquire_period`): read
     /// from their `_RBV` PVs, which are also the `DataKey` source.
-    fn config_signals(&self) -> [(&'static str, &EpicsCaBackend<f64>, String); 2] {
+    fn config_signals(&self) -> [(&'static str, &SignalR<f64, EpicsCaBackend<f64>>); 2] {
         [
-            (
-                "acquire_time",
-                self.acquire_time_rbv.as_ref(),
-                join(&self.prefix, ACQUIRE_TIME_RBV),
-            ),
-            (
-                "acquire_period",
-                self.acquire_period_rbv.as_ref(),
-                join(&self.prefix, ACQUIRE_PERIOD_RBV),
-            ),
+            ("acquire_time", &self.acquire_time_rbv),
+            ("acquire_period", &self.acquire_period_rbv),
         ]
     }
 
@@ -467,8 +453,7 @@ impl AreaDetectorCam {
     pub async fn wait_for_idle(&self, timeout: Duration) -> Result<()> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            let state =
-                SignalBackend::<String>::get_value(self.detector_state_rbv.as_ref()).await?;
+            let state = self.detector_state_rbv.get().await?;
             if state == AD_STATE_IDLE || state == AD_STATE_ABORTED {
                 return Ok(());
             }
@@ -488,22 +473,15 @@ impl AreaDetectorCam {
     /// `Single`+1, fires Acquire, waits for `DetectorState_RBV=Idle`,
     /// then restores the original values.
     pub async fn warmup(&self) -> Result<()> {
-        let prev_image_mode = SignalBackend::<String>::get_value(self.image_mode.as_ref()).await?;
-        let prev_num_images = SignalBackend::<i64>::get_value(self.num_images.as_ref()).await?;
+        let prev_image_mode = self.image_mode.get().await?;
+        let prev_num_images = self.num_images.get().await?;
 
         await_put(
-            SignalBackend::<String>::put(
-                self.image_mode.as_ref(),
-                Some(AD_IMAGE_MODE_SINGLE.to_string()),
-            ),
+            self.image_mode.put(AD_IMAGE_MODE_SINGLE.to_string()),
             "warmup: set ImageMode=Single",
         )
         .await?;
-        await_put(
-            SignalBackend::<i64>::put(self.num_images.as_ref(), Some(1)),
-            "warmup: set NumImages=1",
-        )
-        .await?;
+        await_put(self.num_images.put(1), "warmup: set NumImages=1").await?;
         // `wait = true` is critical here: with put-callback semantics
         // the bo record's processing chain (acquisition busy) only
         // releases when the IOC reports Idle again. Without it, a
@@ -511,11 +489,7 @@ impl AreaDetectorCam {
         // has even transitioned to Acquire, and `wait_for_idle` then
         // samples a stale Idle and returns immediately — the test
         // sees zero frames acquired.
-        await_put(
-            SignalBackend::<bool>::put(self.acquire.as_ref(), Some(true)),
-            "warmup: trigger Acquire",
-        )
-        .await?;
+        await_put(self.acquire.put(true), "warmup: trigger Acquire").await?;
 
         // Belt-and-braces: even with put-callback, some sim drivers
         // don't tie the busy flag to DetectorState. Poll the RBV.
@@ -524,12 +498,12 @@ impl AreaDetectorCam {
         // Restore. Failures here are best-effort: log via Err in the
         // outer Result so callers see them.
         await_put(
-            SignalBackend::<String>::put(self.image_mode.as_ref(), Some(prev_image_mode)),
+            self.image_mode.put(prev_image_mode),
             "warmup: restore ImageMode",
         )
         .await?;
         await_put(
-            SignalBackend::<i64>::put(self.num_images.as_ref(), Some(prev_num_images)),
+            self.num_images.put(prev_num_images),
             "warmup: restore NumImages",
         )
         .await?;
@@ -544,14 +518,14 @@ pub struct NdPlugin {
     /// PV prefix, e.g. `"13SIM1:Stats1:"`.
     pub prefix: String,
     /// `EnableCallbacks` (bo: 0=Disable, 1=Enable).
-    pub enable_callbacks: Arc<EpicsCaBackend<bool>>,
+    pub enable_callbacks: Arc<SignalRW<bool, EpicsCaBackend<bool>>>,
     /// `BlockingCallbacks` (bo: 0=No, 1=Yes).
-    pub blocking_callbacks: Arc<EpicsCaBackend<bool>>,
+    pub blocking_callbacks: Arc<SignalRW<bool, EpicsCaBackend<bool>>>,
     /// `NDArrayPort` (stringout) — name of the upstream port from
     /// which this plugin consumes NDArrays.
-    pub nd_array_port: Arc<EpicsCaBackend<String>>,
+    pub nd_array_port: Arc<SignalRW<String, EpicsCaBackend<String>>>,
     /// `QueueSize` (longout).
-    pub queue_size: Arc<EpicsCaBackend<i64>>,
+    pub queue_size: Arc<SignalRW<i64, EpicsCaBackend<i64>>>,
     /// Staged configuration (ophyd `stage_sigs`): values applied when this
     /// plugin is staged and reverted on unstage. Populated via
     /// [`NdPlugin::stage_enabled`] / [`NdPlugin::stage_source_port`] and by
@@ -564,17 +538,11 @@ impl NdPlugin {
     pub fn new(prefix: impl Into<String>) -> Self {
         let prefix = prefix.into();
         Self {
-            enable_callbacks: Arc::new(EpicsCaBackend::<bool>::new(join(
-                &prefix,
-                "EnableCallbacks",
-            ))),
-            blocking_callbacks: Arc::new(EpicsCaBackend::<bool>::new(join(
-                &prefix,
-                "BlockingCallbacks",
-            ))),
+            enable_callbacks: ca_signal(&prefix, "EnableCallbacks"),
+            blocking_callbacks: ca_signal(&prefix, "BlockingCallbacks"),
             // NDArrayPort is a port name (short string) — DBR_STRING is fine.
-            nd_array_port: Arc::new(EpicsCaBackend::<String>::new(join(&prefix, "NDArrayPort"))),
-            queue_size: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "QueueSize"))),
+            nd_array_port: ca_signal(&prefix, "NDArrayPort"),
+            queue_size: ca_signal(&prefix, "QueueSize"),
             stage_sigs: StageSigs::new(),
             prefix,
         }
@@ -583,21 +551,13 @@ impl NdPlugin {
     /// Record `EnableCallbacks = enabled` into this plugin's `stage_sigs`, so
     /// it is applied on stage and reverted on unstage.
     pub fn stage_enabled(&self, enabled: bool) {
-        self.stage_sigs.set(
-            self.enable_callbacks.clone() as Arc<dyn SignalBackend<bool>>,
-            enabled,
-            join(&self.prefix, "EnableCallbacks"),
-        );
+        self.stage_sigs.set(self.enable_callbacks.clone(), enabled);
     }
 
     /// Record `NDArrayPort = port` into this plugin's `stage_sigs`, so the
     /// re-route is applied on stage and reverted on unstage.
     pub fn stage_source_port(&self, port: impl Into<String>) {
-        self.stage_sigs.set(
-            self.nd_array_port.clone() as Arc<dyn SignalBackend<String>>,
-            port.into(),
-            join(&self.prefix, "NDArrayPort"),
-        );
+        self.stage_sigs.set(self.nd_array_port.clone(), port.into());
     }
 
     /// Connect all four channels.
@@ -605,19 +565,19 @@ impl NdPlugin {
         wait_for_connection([
             (
                 "enable_callbacks",
-                SignalBackend::<bool>::connect(self.enable_callbacks.as_ref(), timeout),
+                futures::FutureExt::boxed(self.enable_callbacks.connect(timeout)),
             ),
             (
                 "blocking_callbacks",
-                SignalBackend::<bool>::connect(self.blocking_callbacks.as_ref(), timeout),
+                futures::FutureExt::boxed(self.blocking_callbacks.connect(timeout)),
             ),
             (
                 "nd_array_port",
-                SignalBackend::<String>::connect(self.nd_array_port.as_ref(), timeout),
+                futures::FutureExt::boxed(self.nd_array_port.connect(timeout)),
             ),
             (
                 "queue_size",
-                SignalBackend::<i64>::connect(self.queue_size.as_ref(), timeout),
+                futures::FutureExt::boxed(self.queue_size.connect(timeout)),
             ),
         ])
         .await
@@ -625,17 +585,13 @@ impl NdPlugin {
 
     /// Set `EnableCallbacks`.
     pub async fn set_enabled(&self, enabled: bool) -> Result<()> {
-        await_put(
-            SignalBackend::<bool>::put(self.enable_callbacks.as_ref(), Some(enabled)),
-            "NdPlugin::set_enabled",
-        )
-        .await
+        await_put(self.enable_callbacks.put(enabled), "NdPlugin::set_enabled").await
     }
 
     /// Set `BlockingCallbacks`.
     pub async fn set_blocking(&self, blocking: bool) -> Result<()> {
         await_put(
-            SignalBackend::<bool>::put(self.blocking_callbacks.as_ref(), Some(blocking)),
+            self.blocking_callbacks.put(blocking),
             "NdPlugin::set_blocking",
         )
         .await
@@ -645,7 +601,7 @@ impl NdPlugin {
     /// from a different upstream.
     pub async fn set_source_port(&self, port: &str) -> Result<()> {
         await_put(
-            SignalBackend::<String>::put(self.nd_array_port.as_ref(), Some(port.to_string())),
+            self.nd_array_port.put(port.to_string()),
             "NdPlugin::set_source_port",
         )
         .await
@@ -676,42 +632,42 @@ pub struct NdFile {
     /// Embedded plugin-base handle.
     pub plugin: NdPlugin,
     /// `FilePath` (CHAR waveform) — directory.
-    pub file_path: Arc<EpicsCaBackend<String>>,
+    pub file_path: Arc<SignalRW<String, EpicsCaBackend<String>>>,
     /// `FileName` (CHAR waveform) — file basename.
-    pub file_name: Arc<EpicsCaBackend<String>>,
+    pub file_name: Arc<SignalRW<String, EpicsCaBackend<String>>>,
     /// `FileTemplate` (CHAR waveform) — printf-style template
     /// applied to FilePath/FileName/FileNumber.
-    pub file_template: Arc<EpicsCaBackend<String>>,
+    pub file_template: Arc<SignalRW<String, EpicsCaBackend<String>>>,
     /// `AutoIncrement` (bo).
-    pub auto_increment: Arc<EpicsCaBackend<bool>>,
+    pub auto_increment: Arc<SignalRW<bool, EpicsCaBackend<bool>>>,
     /// `FileWriteMode` (mbbo: Single, Capture, Stream).
-    pub file_write_mode: Arc<EpicsCaBackend<String>>,
+    pub file_write_mode: Arc<SignalRW<String, EpicsCaBackend<String>>>,
     /// `Capture` (busy) — start/stop capture in Capture/Stream mode. A
     /// put-callback for `1` completes only when capture ENDS, so
     /// start/stop watch [`capture_rbv`](Self::capture_rbv) instead.
-    pub capture: Arc<EpicsCaBackend<bool>>,
+    pub capture: Arc<SignalRW<bool, EpicsCaBackend<bool>>>,
     /// `Capture_RBV` (bi) — whether the plugin is capturing.
-    pub capture_rbv: Arc<EpicsCaBackend<bool>>,
+    pub capture_rbv: Arc<SignalR<bool, EpicsCaBackend<bool>>>,
     /// `NumCapture` (longout) — number of frames to capture in
     /// Capture/Stream mode (`0` = capture until `Capture` is cleared).
-    pub num_capture: Arc<EpicsCaBackend<i64>>,
+    pub num_capture: Arc<SignalRW<i64, EpicsCaBackend<i64>>>,
     /// `NumCaptured_RBV` (longin) — frames written to the file so far.
     /// This is the per-frame write index the `DetectorWriter` reports.
-    pub num_captured_rbv: Arc<EpicsCaBackend<i64>>,
+    pub num_captured_rbv: Arc<SignalR<i64, EpicsCaBackend<i64>>>,
     /// `FullFileName_RBV` (CHAR waveform) — absolute path the IOC
     /// resolved from `FilePath`/`FileName`/`FileTemplate`/`FileNumber`.
     /// The `StreamResource` URI is built from this readback so it points
     /// at the file the IOC actually wrote, not at a re-derived guess.
-    pub full_file_name_rbv: Arc<EpicsCaBackend<String>>,
+    pub full_file_name_rbv: Arc<SignalR<String, EpicsCaBackend<String>>>,
     /// `FileNumber` (longout) — next file's sequence number, substituted
     /// into `FileTemplate`.
-    pub file_number: Arc<EpicsCaBackend<i64>>,
+    pub file_number: Arc<SignalRW<i64, EpicsCaBackend<i64>>>,
     /// `FilePathExists_RBV` (bi) — whether the IOC can see (and write)
     /// `FilePath`. Checked after configuring the paths.
-    pub file_path_exists_rbv: Arc<EpicsCaBackend<bool>>,
+    pub file_path_exists_rbv: Arc<SignalR<bool, EpicsCaBackend<bool>>>,
     /// `CreateDirectory` (longout) — how many missing trailing path levels
     /// the IOC may create when `FilePath` is processed (`0` = none).
-    pub create_directory: Arc<EpicsCaBackend<i64>>,
+    pub create_directory: Arc<SignalRW<i64, EpicsCaBackend<i64>>>,
 }
 
 impl NdFile {
@@ -720,34 +676,19 @@ impl NdFile {
         let prefix = prefix.into();
         let plugin = NdPlugin::new(prefix.clone());
         Self {
-            file_path: Arc::new(EpicsCaBackend::<String>::new(join(&prefix, "FilePath"))),
-            file_name: Arc::new(EpicsCaBackend::<String>::new(join(&prefix, "FileName"))),
-            file_template: Arc::new(EpicsCaBackend::<String>::new(join(&prefix, "FileTemplate"))),
-            auto_increment: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "AutoIncrement"))),
-            file_write_mode: Arc::new(EpicsCaBackend::<String>::new(join(
-                &prefix,
-                "FileWriteMode",
-            ))),
-            capture: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "Capture"))),
-            capture_rbv: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "Capture_RBV"))),
-            num_capture: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "NumCapture"))),
-            num_captured_rbv: Arc::new(EpicsCaBackend::<i64>::new(join(
-                &prefix,
-                "NumCaptured_RBV",
-            ))),
-            full_file_name_rbv: Arc::new(EpicsCaBackend::<String>::new(join(
-                &prefix,
-                "FullFileName_RBV",
-            ))),
-            file_number: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "FileNumber"))),
-            file_path_exists_rbv: Arc::new(EpicsCaBackend::<bool>::new(join(
-                &prefix,
-                "FilePathExists_RBV",
-            ))),
-            create_directory: Arc::new(EpicsCaBackend::<i64>::new(join(
-                &prefix,
-                "CreateDirectory",
-            ))),
+            file_path: ca_signal(&prefix, "FilePath"),
+            file_name: ca_signal(&prefix, "FileName"),
+            file_template: ca_signal(&prefix, "FileTemplate"),
+            auto_increment: ca_signal(&prefix, "AutoIncrement"),
+            file_write_mode: ca_signal(&prefix, "FileWriteMode"),
+            capture: busy_signal(&prefix, "Capture"),
+            capture_rbv: ca_signal(&prefix, "Capture_RBV"),
+            num_capture: ca_signal(&prefix, "NumCapture"),
+            num_captured_rbv: ca_signal(&prefix, "NumCaptured_RBV"),
+            full_file_name_rbv: ca_signal(&prefix, "FullFileName_RBV"),
+            file_number: ca_signal(&prefix, "FileNumber"),
+            file_path_exists_rbv: ca_signal(&prefix, "FilePathExists_RBV"),
+            create_directory: ca_signal(&prefix, "CreateDirectory"),
             plugin,
         }
     }
@@ -761,55 +702,55 @@ impl NdFile {
             ),
             (
                 "file_path",
-                SignalBackend::<String>::connect(self.file_path.as_ref(), timeout),
+                futures::FutureExt::boxed(self.file_path.connect(timeout)),
             ),
             (
                 "file_name",
-                SignalBackend::<String>::connect(self.file_name.as_ref(), timeout),
+                futures::FutureExt::boxed(self.file_name.connect(timeout)),
             ),
             (
                 "file_template",
-                SignalBackend::<String>::connect(self.file_template.as_ref(), timeout),
+                futures::FutureExt::boxed(self.file_template.connect(timeout)),
             ),
             (
                 "auto_increment",
-                SignalBackend::<bool>::connect(self.auto_increment.as_ref(), timeout),
+                futures::FutureExt::boxed(self.auto_increment.connect(timeout)),
             ),
             (
                 "file_write_mode",
-                SignalBackend::<String>::connect(self.file_write_mode.as_ref(), timeout),
+                futures::FutureExt::boxed(self.file_write_mode.connect(timeout)),
             ),
             (
                 "capture",
-                SignalBackend::<bool>::connect(self.capture.as_ref(), timeout),
+                futures::FutureExt::boxed(self.capture.connect(timeout)),
             ),
             (
                 "num_capture",
-                SignalBackend::<i64>::connect(self.num_capture.as_ref(), timeout),
+                futures::FutureExt::boxed(self.num_capture.connect(timeout)),
             ),
             (
                 "num_captured_rbv",
-                SignalBackend::<i64>::connect(self.num_captured_rbv.as_ref(), timeout),
+                futures::FutureExt::boxed(self.num_captured_rbv.connect(timeout)),
             ),
             (
                 "full_file_name_rbv",
-                SignalBackend::<String>::connect(self.full_file_name_rbv.as_ref(), timeout),
+                futures::FutureExt::boxed(self.full_file_name_rbv.connect(timeout)),
             ),
             (
                 "file_number",
-                SignalBackend::<i64>::connect(self.file_number.as_ref(), timeout),
+                futures::FutureExt::boxed(self.file_number.connect(timeout)),
             ),
             (
                 "file_path_exists_rbv",
-                SignalBackend::<bool>::connect(self.file_path_exists_rbv.as_ref(), timeout),
+                futures::FutureExt::boxed(self.file_path_exists_rbv.connect(timeout)),
             ),
             (
                 "create_directory",
-                SignalBackend::<i64>::connect(self.create_directory.as_ref(), timeout),
+                futures::FutureExt::boxed(self.create_directory.connect(timeout)),
             ),
             (
                 "capture_rbv",
-                SignalBackend::<bool>::connect(self.capture_rbv.as_ref(), timeout),
+                futures::FutureExt::boxed(self.capture_rbv.connect(timeout)),
             ),
         ])
         .await
@@ -817,26 +758,18 @@ impl NdFile {
 
     /// Set `FilePath` — directory the writer drops files into.
     pub async fn set_path(&self, path: &str) -> Result<()> {
-        await_put(
-            SignalBackend::<String>::put(self.file_path.as_ref(), Some(path.to_string())),
-            "NdFile::set_path",
-        )
-        .await
+        await_put(self.file_path.put(path.to_string()), "NdFile::set_path").await
     }
 
     /// Set `FileName` — basename pre-template.
     pub async fn set_name(&self, name: &str) -> Result<()> {
-        await_put(
-            SignalBackend::<String>::put(self.file_name.as_ref(), Some(name.to_string())),
-            "NdFile::set_name",
-        )
-        .await
+        await_put(self.file_name.put(name.to_string()), "NdFile::set_name").await
     }
 
     /// Set `FileTemplate` — typical value `"%s%s_%6.6d.h5"`.
     pub async fn set_template(&self, template: &str) -> Result<()> {
         await_put(
-            SignalBackend::<String>::put(self.file_template.as_ref(), Some(template.to_string())),
+            self.file_template.put(template.to_string()),
             "NdFile::set_template",
         )
         .await
@@ -845,7 +778,7 @@ impl NdFile {
     /// Set `FileWriteMode` by label (`Single`, `Capture`, `Stream`).
     pub async fn set_write_mode(&self, mode: &str) -> Result<()> {
         await_put(
-            SignalBackend::<String>::put(self.file_write_mode.as_ref(), Some(mode.to_string())),
+            self.file_write_mode.put(mode.to_string()),
             "NdFile::set_write_mode",
         )
         .await
@@ -853,29 +786,17 @@ impl NdFile {
 
     /// Set `NumCapture` — frames to capture (`0` = until `Capture` cleared).
     pub async fn set_num_capture(&self, n: i64) -> Result<()> {
-        await_put(
-            SignalBackend::<i64>::put(self.num_capture.as_ref(), Some(n)),
-            "NdFile::set_num_capture",
-        )
-        .await
+        await_put(self.num_capture.put(n), "NdFile::set_num_capture").await
     }
 
     /// Set `AutoIncrement` — bump `FileNumber` after each file.
     pub async fn set_auto_increment(&self, on: bool) -> Result<()> {
-        await_put(
-            SignalBackend::<bool>::put(self.auto_increment.as_ref(), Some(on)),
-            "NdFile::set_auto_increment",
-        )
-        .await
+        await_put(self.auto_increment.put(on), "NdFile::set_auto_increment").await
     }
 
     /// Set `FileNumber` — the next file's sequence number.
     pub async fn set_file_number(&self, n: i64) -> Result<()> {
-        await_put(
-            SignalBackend::<i64>::put(self.file_number.as_ref(), Some(n)),
-            "NdFile::set_file_number",
-        )
-        .await
+        await_put(self.file_number.put(n), "NdFile::set_file_number").await
     }
 
     /// Set `CreateDirectory` — missing trailing path levels the IOC may
@@ -884,7 +805,7 @@ impl NdFile {
     /// `prepare_file_paths`, `_data_logic.py:127`).
     pub async fn set_create_directory(&self, depth: i64) -> Result<()> {
         await_put(
-            SignalBackend::<i64>::put(self.create_directory.as_ref(), Some(depth)),
+            self.create_directory.put(depth),
             "NdFile::set_create_directory",
         )
         .await
@@ -893,33 +814,38 @@ impl NdFile {
     /// Read `FilePathExists_RBV` — whether the IOC can see the configured
     /// `FilePath`.
     pub async fn file_path_exists(&self) -> Result<bool> {
-        SignalBackend::<bool>::get_value(self.file_path_exists_rbv.as_ref()).await
+        self.file_path_exists_rbv.get().await
     }
 
     /// Start capture (`Capture=1`). In Stream mode the file opens on this
     /// transition (or on the first frame when `LazyOpen` is set). `Capture`
-    /// is a busy record — its put-callback would complete only when capture
-    /// ENDS — so the put is fire-and-forget and completion is
+    /// is a busy record — its put-callback completes only when capture
+    /// ENDS — so that completion is left running unawaited and completion is
     /// `Capture_RBV=1` (ophyd-async `set_and_wait_for_value(capture, True,
     /// wait_for_set_completion=False)`).
     pub async fn start_capture(&self) -> Result<()> {
+        let put = async {
+            tokio::spawn(self.capture.put_start(true).await?);
+            Ok(())
+        };
         set_and_wait_for_bool(
-            self.capture_rbv.as_ref(),
+            &self.capture_rbv,
             true,
-            self.capture.put_nowait(true),
+            put,
             "NdFile::start_capture: Capture_RBV",
         )
         .await
     }
 
     /// Stop capture (`Capture=0`) — flushes and closes the file. Same busy
-    /// record: fire-and-forget the put, wait for `Capture_RBV=0`
-    /// (ophyd-async `stop_busy_record`).
+    /// record: the put of `false` has no put-callback, wait for
+    /// `Capture_RBV=0` (ophyd-async `stop_busy_record`).
     pub async fn stop_capture(&self) -> Result<()> {
+        let put = async { Ok(self.capture.put(false).await.await?) };
         set_and_wait_for_bool(
-            self.capture_rbv.as_ref(),
+            &self.capture_rbv,
             false,
-            self.capture.put_nowait(false),
+            put,
             "NdFile::stop_capture: Capture_RBV",
         )
         .await
@@ -927,14 +853,14 @@ impl NdFile {
 
     /// Read `NumCaptured_RBV` — frames written so far (clamped to `>= 0`).
     pub async fn num_captured(&self) -> Result<u64> {
-        let n = SignalBackend::<i64>::get_value(self.num_captured_rbv.as_ref()).await?;
+        let n = self.num_captured_rbv.get().await?;
         Ok(n.max(0) as u64)
     }
 
     /// Read `FullFileName_RBV` — the absolute path the IOC resolved, with any
     /// trailing NUL padding from the CHAR waveform stripped.
     pub async fn full_file_name(&self) -> Result<String> {
-        let s = SignalBackend::<String>::get_value(self.full_file_name_rbv.as_ref()).await?;
+        let s = self.full_file_name_rbv.get().await?;
         Ok(s.trim_end_matches('\0').to_string())
     }
 
@@ -980,26 +906,26 @@ pub struct NdFileHdf5 {
     pub file: NdFile,
     /// `NumFramesChunks` (longout) — frames per HDF chunk, written back when
     /// the readback reports 0 (fresh IOC startup).
-    pub num_frames_chunks: Arc<EpicsCaBackend<i64>>,
+    pub num_frames_chunks: Arc<SignalRW<i64, EpicsCaBackend<i64>>>,
     /// `NumFramesChunks_RBV` (longin).
-    pub num_frames_chunks_rbv: Arc<EpicsCaBackend<i64>>,
+    pub num_frames_chunks_rbv: Arc<SignalR<i64, EpicsCaBackend<i64>>>,
     /// `ChunkSizeAuto` (bo) — let the plugin derive chunking from the frame.
-    pub chunk_size_auto: Arc<EpicsCaBackend<bool>>,
+    pub chunk_size_auto: Arc<SignalRW<bool, EpicsCaBackend<bool>>>,
     /// `LazyOpen` (bo) — open the file on the first frame instead of on
     /// `Capture=1`, so no warmup frame is needed to size the dataset.
-    pub lazy_open: Arc<EpicsCaBackend<bool>>,
+    pub lazy_open: Arc<SignalRW<bool, EpicsCaBackend<bool>>>,
     /// `SWMRMode` (bo) — single-writer/multiple-reader, so consumers can
     /// read the file while the IOC is still writing it.
-    pub swmr_mode: Arc<EpicsCaBackend<bool>>,
+    pub swmr_mode: Arc<SignalRW<bool, EpicsCaBackend<bool>>>,
     /// `NumExtraDims` (longout) — extra virtual dimensions (unused here).
-    pub num_extra_dims: Arc<EpicsCaBackend<i64>>,
+    pub num_extra_dims: Arc<SignalRW<i64, EpicsCaBackend<i64>>>,
     /// `XMLFileName` (CHAR waveform) — custom HDF5 layout XML; cleared so
     /// the default `/entry/data/data` layout applies.
-    pub xml_file_name: Arc<EpicsCaBackend<String>>,
+    pub xml_file_name: Arc<SignalRW<String, EpicsCaBackend<String>>>,
     /// `FlushNow` (busy) — force the plugin to flush buffered frames to the
     /// file for SWMR readers. An `NDFileHDF5`-only record; the JPEG/TIFF
     /// plugins do not have it.
-    pub flush_now: Arc<EpicsCaBackend<bool>>,
+    pub flush_now: Arc<SignalRW<bool, EpicsCaBackend<bool>>>,
 }
 
 impl NdFileHdf5 {
@@ -1007,20 +933,14 @@ impl NdFileHdf5 {
     pub fn new(prefix: impl Into<String>) -> Self {
         let prefix = prefix.into();
         Self {
-            num_frames_chunks: Arc::new(EpicsCaBackend::<i64>::new(join(
-                &prefix,
-                "NumFramesChunks",
-            ))),
-            num_frames_chunks_rbv: Arc::new(EpicsCaBackend::<i64>::new(join(
-                &prefix,
-                "NumFramesChunks_RBV",
-            ))),
-            chunk_size_auto: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "ChunkSizeAuto"))),
-            lazy_open: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "LazyOpen"))),
-            swmr_mode: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "SWMRMode"))),
-            num_extra_dims: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "NumExtraDims"))),
-            xml_file_name: Arc::new(EpicsCaBackend::<String>::new(join(&prefix, "XMLFileName"))),
-            flush_now: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "FlushNow"))),
+            num_frames_chunks: ca_signal(&prefix, "NumFramesChunks"),
+            num_frames_chunks_rbv: ca_signal(&prefix, "NumFramesChunks_RBV"),
+            chunk_size_auto: ca_signal(&prefix, "ChunkSizeAuto"),
+            lazy_open: ca_signal(&prefix, "LazyOpen"),
+            swmr_mode: ca_signal(&prefix, "SWMRMode"),
+            num_extra_dims: ca_signal(&prefix, "NumExtraDims"),
+            xml_file_name: ca_signal(&prefix, "XMLFileName"),
+            flush_now: ca_signal(&prefix, "FlushNow"),
             file: NdFile::new(prefix),
         }
     }
@@ -1034,35 +954,35 @@ impl NdFileHdf5 {
             ),
             (
                 "num_frames_chunks",
-                SignalBackend::<i64>::connect(self.num_frames_chunks.as_ref(), timeout),
+                futures::FutureExt::boxed(self.num_frames_chunks.connect(timeout)),
             ),
             (
                 "num_frames_chunks_rbv",
-                SignalBackend::<i64>::connect(self.num_frames_chunks_rbv.as_ref(), timeout),
+                futures::FutureExt::boxed(self.num_frames_chunks_rbv.connect(timeout)),
             ),
             (
                 "chunk_size_auto",
-                SignalBackend::<bool>::connect(self.chunk_size_auto.as_ref(), timeout),
+                futures::FutureExt::boxed(self.chunk_size_auto.connect(timeout)),
             ),
             (
                 "lazy_open",
-                SignalBackend::<bool>::connect(self.lazy_open.as_ref(), timeout),
+                futures::FutureExt::boxed(self.lazy_open.connect(timeout)),
             ),
             (
                 "swmr_mode",
-                SignalBackend::<bool>::connect(self.swmr_mode.as_ref(), timeout),
+                futures::FutureExt::boxed(self.swmr_mode.connect(timeout)),
             ),
             (
                 "num_extra_dims",
-                SignalBackend::<i64>::connect(self.num_extra_dims.as_ref(), timeout),
+                futures::FutureExt::boxed(self.num_extra_dims.connect(timeout)),
             ),
             (
                 "xml_file_name",
-                SignalBackend::<String>::connect(self.xml_file_name.as_ref(), timeout),
+                futures::FutureExt::boxed(self.xml_file_name.connect(timeout)),
             ),
             (
                 "flush_now",
-                SignalBackend::<bool>::connect(self.flush_now.as_ref(), timeout),
+                futures::FutureExt::boxed(self.flush_now.connect(timeout)),
             ),
         ])
         .await
@@ -1075,19 +995,13 @@ impl NdFileHdf5 {
     pub async fn setup_hdf_writer(&self) -> Result<()> {
         let (a, b, c, d) = tokio::join!(
             await_put(
-                SignalBackend::<i64>::put(self.num_extra_dims.as_ref(), Some(0)),
+                self.num_extra_dims.put(0),
                 "NdFileHdf5::setup: NumExtraDims=0",
             ),
+            await_put(self.lazy_open.put(true), "NdFileHdf5::setup: LazyOpen=1",),
+            await_put(self.swmr_mode.put(true), "NdFileHdf5::setup: SWMRMode=1",),
             await_put(
-                SignalBackend::<bool>::put(self.lazy_open.as_ref(), Some(true)),
-                "NdFileHdf5::setup: LazyOpen=1",
-            ),
-            await_put(
-                SignalBackend::<bool>::put(self.swmr_mode.as_ref(), Some(true)),
-                "NdFileHdf5::setup: SWMRMode=1",
-            ),
-            await_put(
-                SignalBackend::<String>::put(self.xml_file_name.as_ref(), Some(String::new())),
+                self.xml_file_name.put(String::new()),
                 "NdFileHdf5::setup: XMLFileName=\"\"",
             ),
         );
@@ -1102,10 +1016,10 @@ impl NdFileHdf5 {
     /// first capture; ophyd-async writes 1 back to the plugin in that case
     /// and uses 1 (`prepare_unbounded`, `_data_logic.py:180`).
     pub async fn frames_per_chunk(&self) -> Result<u64> {
-        let n = SignalBackend::<i64>::get_value(self.num_frames_chunks_rbv.as_ref()).await?;
+        let n = self.num_frames_chunks_rbv.get().await?;
         if n <= 0 {
             await_put(
-                SignalBackend::<i64>::put(self.num_frames_chunks.as_ref(), Some(1)),
+                self.num_frames_chunks.put(1),
                 "NdFileHdf5::frames_per_chunk: NumFramesChunks=1",
             )
             .await?;
@@ -1117,7 +1031,7 @@ impl NdFileHdf5 {
     /// Set `ChunkSizeAuto`.
     pub async fn set_chunk_size_auto(&self, on: bool) -> Result<()> {
         await_put(
-            SignalBackend::<bool>::put(self.chunk_size_auto.as_ref(), Some(on)),
+            self.chunk_size_auto.put(on),
             "NdFileHdf5::set_chunk_size_auto",
         )
         .await
@@ -1126,11 +1040,7 @@ impl NdFileHdf5 {
     /// Force a flush (`FlushNow=1`) so SWMR readers see the frames written
     /// so far.
     pub async fn flush(&self) -> Result<()> {
-        await_put(
-            SignalBackend::<bool>::put(self.flush_now.as_ref(), Some(true)),
-            "NdFileHdf5::flush",
-        )
-        .await
+        await_put(self.flush_now.put(true), "NdFileHdf5::flush").await
     }
 }
 
@@ -1156,15 +1066,15 @@ pub struct NdStats {
     /// Embedded plugin-base handle.
     pub plugin: NdPlugin,
     /// `ComputeStatistics` (bo).
-    pub compute_statistics: Arc<EpicsCaBackend<bool>>,
+    pub compute_statistics: Arc<SignalRW<bool, EpicsCaBackend<bool>>>,
     /// `ComputeCentroid` (bo).
-    pub compute_centroid: Arc<EpicsCaBackend<bool>>,
+    pub compute_centroid: Arc<SignalRW<bool, EpicsCaBackend<bool>>>,
     /// `ComputeProfiles` (bo).
-    pub compute_profiles: Arc<EpicsCaBackend<bool>>,
+    pub compute_profiles: Arc<SignalRW<bool, EpicsCaBackend<bool>>>,
     /// `ComputeHistogram` (bo).
-    pub compute_histogram: Arc<EpicsCaBackend<bool>>,
+    pub compute_histogram: Arc<SignalRW<bool, EpicsCaBackend<bool>>>,
     /// `Total_RBV` (ai) — the sum of the last frame's pixels.
-    pub total: Arc<EpicsCaBackend<f64>>,
+    pub total: Arc<SignalR<f64, EpicsCaBackend<f64>>>,
 }
 
 impl NdStats {
@@ -1173,23 +1083,11 @@ impl NdStats {
         let prefix = prefix.into();
         let plugin = NdPlugin::new(prefix.clone());
         Self {
-            compute_statistics: Arc::new(EpicsCaBackend::<bool>::new(join(
-                &prefix,
-                "ComputeStatistics",
-            ))),
-            compute_centroid: Arc::new(EpicsCaBackend::<bool>::new(join(
-                &prefix,
-                "ComputeCentroid",
-            ))),
-            compute_profiles: Arc::new(EpicsCaBackend::<bool>::new(join(
-                &prefix,
-                "ComputeProfiles",
-            ))),
-            compute_histogram: Arc::new(EpicsCaBackend::<bool>::new(join(
-                &prefix,
-                "ComputeHistogram",
-            ))),
-            total: Arc::new(EpicsCaBackend::<f64>::new(join(&prefix, "Total_RBV"))),
+            compute_statistics: ca_signal(&prefix, "ComputeStatistics"),
+            compute_centroid: ca_signal(&prefix, "ComputeCentroid"),
+            compute_profiles: ca_signal(&prefix, "ComputeProfiles"),
+            compute_histogram: ca_signal(&prefix, "ComputeHistogram"),
+            total: ca_signal(&prefix, "Total_RBV"),
             plugin,
         }
     }
@@ -1203,23 +1101,23 @@ impl NdStats {
             ),
             (
                 "compute_statistics",
-                SignalBackend::<bool>::connect(self.compute_statistics.as_ref(), timeout),
+                futures::FutureExt::boxed(self.compute_statistics.connect(timeout)),
             ),
             (
                 "compute_centroid",
-                SignalBackend::<bool>::connect(self.compute_centroid.as_ref(), timeout),
+                futures::FutureExt::boxed(self.compute_centroid.connect(timeout)),
             ),
             (
                 "compute_profiles",
-                SignalBackend::<bool>::connect(self.compute_profiles.as_ref(), timeout),
+                futures::FutureExt::boxed(self.compute_profiles.connect(timeout)),
             ),
             (
                 "compute_histogram",
-                SignalBackend::<bool>::connect(self.compute_histogram.as_ref(), timeout),
+                futures::FutureExt::boxed(self.compute_histogram.connect(timeout)),
             ),
             (
                 "total",
-                SignalBackend::<f64>::connect(self.total.as_ref(), timeout),
+                futures::FutureExt::boxed(self.total.connect(timeout)),
             ),
         ])
         .await
@@ -1230,7 +1128,7 @@ impl NdStats {
     pub async fn force_enable_stats(&self) -> Result<()> {
         self.plugin.set_enabled(true).await?;
         await_put(
-            SignalBackend::<bool>::put(self.compute_statistics.as_ref(), Some(true)),
+            self.compute_statistics.put(true),
             "NdStats::force_enable_stats",
         )
         .await
@@ -1258,22 +1156,22 @@ pub struct NdRoi {
     /// Embedded plugin-base handle.
     pub plugin: NdPlugin,
     /// `MinX` (longout).
-    pub min_x: Arc<EpicsCaBackend<i64>>,
+    pub min_x: Arc<SignalRW<i64, EpicsCaBackend<i64>>>,
     /// `MinY` (longout).
-    pub min_y: Arc<EpicsCaBackend<i64>>,
+    pub min_y: Arc<SignalRW<i64, EpicsCaBackend<i64>>>,
     /// `SizeX` (longout).
-    pub size_x: Arc<EpicsCaBackend<i64>>,
+    pub size_x: Arc<SignalRW<i64, EpicsCaBackend<i64>>>,
     /// `SizeY` (longout).
-    pub size_y: Arc<EpicsCaBackend<i64>>,
+    pub size_y: Arc<SignalRW<i64, EpicsCaBackend<i64>>>,
     /// `SizeX_RBV` (longin): the output width, `SizeX` clipped to the input
     /// frame, set as a frame passes.
-    pub size_x_rbv: Arc<EpicsCaBackend<i64>>,
+    pub size_x_rbv: Arc<SignalR<i64, EpicsCaBackend<i64>>>,
     /// `SizeY_RBV` (longin): the output height, as `size_x_rbv`.
-    pub size_y_rbv: Arc<EpicsCaBackend<i64>>,
+    pub size_y_rbv: Arc<SignalR<i64, EpicsCaBackend<i64>>>,
     /// `EnableX` (bo).
-    pub enable_x: Arc<EpicsCaBackend<bool>>,
+    pub enable_x: Arc<SignalRW<bool, EpicsCaBackend<bool>>>,
     /// `EnableY` (bo).
-    pub enable_y: Arc<EpicsCaBackend<bool>>,
+    pub enable_y: Arc<SignalRW<bool, EpicsCaBackend<bool>>>,
 }
 
 impl NdRoi {
@@ -1282,14 +1180,14 @@ impl NdRoi {
         let prefix = prefix.into();
         let plugin = NdPlugin::new(prefix.clone());
         Self {
-            min_x: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "MinX"))),
-            min_y: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "MinY"))),
-            size_x: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "SizeX"))),
-            size_y: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "SizeY"))),
-            size_x_rbv: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "SizeX_RBV"))),
-            size_y_rbv: Arc::new(EpicsCaBackend::<i64>::new(join(&prefix, "SizeY_RBV"))),
-            enable_x: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "EnableX"))),
-            enable_y: Arc::new(EpicsCaBackend::<bool>::new(join(&prefix, "EnableY"))),
+            min_x: ca_signal(&prefix, "MinX"),
+            min_y: ca_signal(&prefix, "MinY"),
+            size_x: ca_signal(&prefix, "SizeX"),
+            size_y: ca_signal(&prefix, "SizeY"),
+            size_x_rbv: ca_signal(&prefix, "SizeX_RBV"),
+            size_y_rbv: ca_signal(&prefix, "SizeY_RBV"),
+            enable_x: ca_signal(&prefix, "EnableX"),
+            enable_y: ca_signal(&prefix, "EnableY"),
             plugin,
         }
     }
@@ -1303,35 +1201,35 @@ impl NdRoi {
             ),
             (
                 "min_x",
-                SignalBackend::<i64>::connect(self.min_x.as_ref(), timeout),
+                futures::FutureExt::boxed(self.min_x.connect(timeout)),
             ),
             (
                 "min_y",
-                SignalBackend::<i64>::connect(self.min_y.as_ref(), timeout),
+                futures::FutureExt::boxed(self.min_y.connect(timeout)),
             ),
             (
                 "size_x",
-                SignalBackend::<i64>::connect(self.size_x.as_ref(), timeout),
+                futures::FutureExt::boxed(self.size_x.connect(timeout)),
             ),
             (
                 "size_y",
-                SignalBackend::<i64>::connect(self.size_y.as_ref(), timeout),
+                futures::FutureExt::boxed(self.size_y.connect(timeout)),
             ),
             (
                 "size_x_rbv",
-                SignalBackend::<i64>::connect(self.size_x_rbv.as_ref(), timeout),
+                futures::FutureExt::boxed(self.size_x_rbv.connect(timeout)),
             ),
             (
                 "size_y_rbv",
-                SignalBackend::<i64>::connect(self.size_y_rbv.as_ref(), timeout),
+                futures::FutureExt::boxed(self.size_y_rbv.connect(timeout)),
             ),
             (
                 "enable_x",
-                SignalBackend::<bool>::connect(self.enable_x.as_ref(), timeout),
+                futures::FutureExt::boxed(self.enable_x.connect(timeout)),
             ),
             (
                 "enable_y",
-                SignalBackend::<bool>::connect(self.enable_y.as_ref(), timeout),
+                futures::FutureExt::boxed(self.enable_y.connect(timeout)),
             ),
         ])
         .await
@@ -1339,41 +1237,17 @@ impl NdRoi {
 
     /// Set the four ROI bounds at once.
     pub async fn set_bounds(&self, min_x: i64, min_y: i64, size_x: i64, size_y: i64) -> Result<()> {
-        await_put(
-            SignalBackend::<i64>::put(self.min_x.as_ref(), Some(min_x)),
-            "NdRoi::set_bounds: MinX",
-        )
-        .await?;
-        await_put(
-            SignalBackend::<i64>::put(self.min_y.as_ref(), Some(min_y)),
-            "NdRoi::set_bounds: MinY",
-        )
-        .await?;
-        await_put(
-            SignalBackend::<i64>::put(self.size_x.as_ref(), Some(size_x)),
-            "NdRoi::set_bounds: SizeX",
-        )
-        .await?;
-        await_put(
-            SignalBackend::<i64>::put(self.size_y.as_ref(), Some(size_y)),
-            "NdRoi::set_bounds: SizeY",
-        )
-        .await?;
+        await_put(self.min_x.put(min_x), "NdRoi::set_bounds: MinX").await?;
+        await_put(self.min_y.put(min_y), "NdRoi::set_bounds: MinY").await?;
+        await_put(self.size_x.put(size_x), "NdRoi::set_bounds: SizeX").await?;
+        await_put(self.size_y.put(size_y), "NdRoi::set_bounds: SizeY").await?;
         Ok(())
     }
 
     /// Set per-axis enable flags.
     pub async fn set_enabled_xy(&self, x: bool, y: bool) -> Result<()> {
-        await_put(
-            SignalBackend::<bool>::put(self.enable_x.as_ref(), Some(x)),
-            "NdRoi::set_enabled_xy: EnableX",
-        )
-        .await?;
-        await_put(
-            SignalBackend::<bool>::put(self.enable_y.as_ref(), Some(y)),
-            "NdRoi::set_enabled_xy: EnableY",
-        )
-        .await
+        await_put(self.enable_x.put(x), "NdRoi::set_enabled_xy: EnableX").await?;
+        await_put(self.enable_y.put(y), "NdRoi::set_enabled_xy: EnableY").await
     }
 }
 
@@ -1552,12 +1426,13 @@ impl AdFileIo for NdFileIo {
     async fn connect(&self, timeout: Duration) -> Result<()> {
         self.file.connect(timeout).await?;
         let tx = self.index_tx.clone();
-        let token = SignalBackend::<i64>::set_callback(
-            self.file.file.num_captured_rbv.as_ref(),
-            Some(Box::new(move |v: &i64, _ts, _alarm| {
-                let _ = tx.send((*v).max(0) as u64);
-            })),
-        );
+        let token =
+            self.file
+                .file
+                .num_captured_rbv
+                .subscribe(Box::new(move |v: &i64, _ts, _alarm| {
+                    let _ = tx.send((*v).max(0) as u64);
+                }));
         *self.token.lock().unwrap() = Some(token);
         Ok(())
     }
@@ -1635,12 +1510,12 @@ impl AdFileIo for NdPluginFileIo {
     async fn connect(&self, timeout: Duration) -> Result<()> {
         self.file.connect(timeout).await?;
         let tx = self.index_tx.clone();
-        let token = SignalBackend::<i64>::set_callback(
-            self.file.num_captured_rbv.as_ref(),
-            Some(Box::new(move |v: &i64, _ts, _alarm| {
+        let token = self
+            .file
+            .num_captured_rbv
+            .subscribe(Box::new(move |v: &i64, _ts, _alarm| {
                 let _ = tx.send((*v).max(0) as u64);
-            })),
-        );
+            }));
         *self.token.lock().unwrap() = Some(token);
         Ok(())
     }
@@ -1799,9 +1674,9 @@ pub trait NdAttributeXmlSource: Send + Sync {
 }
 
 #[async_trait::async_trait]
-impl NdAttributeXmlSource for EpicsCaBackend<String> {
+impl<A: Readable> NdAttributeXmlSource for Signal<String, EpicsCaBackend<String>, A> {
     async fn nd_attributes_xml(&self) -> Result<String> {
-        let v = SignalBackend::<String>::get_value(self).await?;
+        let v = self.get().await?;
         Ok(v.trim_end_matches('\0').to_string())
     }
 }
@@ -2478,31 +2353,16 @@ impl DetectorControl for AreaDetectorCam {
         // skipped, mirroring ophyd-async's conditional sets.
         let plan = ExposurePlan::from_trigger_info(&info)?;
         await_put(
-            SignalBackend::<String>::put(
-                self.image_mode.as_ref(),
-                Some(plan.image_mode.to_string()),
-            ),
+            self.image_mode.put(plan.image_mode.to_string()),
             "prepare: ImageMode",
         )
         .await?;
-        await_put(
-            SignalBackend::<i64>::put(self.num_images.as_ref(), Some(plan.num_images)),
-            "prepare: NumImages",
-        )
-        .await?;
+        await_put(self.num_images.put(plan.num_images), "prepare: NumImages").await?;
         if let Some(t) = plan.acquire_time {
-            await_put(
-                SignalBackend::<f64>::put(self.acquire_time.as_ref(), Some(t)),
-                "prepare: AcquireTime",
-            )
-            .await?;
+            await_put(self.acquire_time.put(t), "prepare: AcquireTime").await?;
         }
         if let Some(p) = plan.acquire_period {
-            await_put(
-                SignalBackend::<f64>::put(self.acquire_period.as_ref(), Some(p)),
-                "prepare: AcquirePeriod",
-            )
-            .await?;
+            await_put(self.acquire_period.put(p), "prepare: AcquirePeriod").await?;
         }
         Ok(())
     }
@@ -2514,9 +2374,9 @@ impl DetectorControl for AreaDetectorCam {
         // Acquire=1 is sent here, not in the spawned task, so a later
         // disarm's Acquire=0 cannot overtake it on the wire.
         match set_and_wait_for_bool(
-            self.acquire_rbv.as_ref(),
+            &self.acquire_rbv,
             true,
-            SignalBackend::<bool>::put_start(self.acquire.as_ref(), Some(true)),
+            self.acquire.put_start(true),
             "arm: Acquire_RBV",
         )
         .await
@@ -2550,32 +2410,29 @@ impl DetectorControl for AreaDetectorCam {
     }
     async fn disarm(&self) -> Result<()> {
         // stop_busy_record: a put-callback for Acquire=0 can deadlock on a
-        // busy record, so fire-and-forget then wait for the readback.
+        // busy record, so `acquire` sends it without one; then wait for the
+        // readback.
         set_and_wait_for_bool(
-            self.acquire_rbv.as_ref(),
+            &self.acquire_rbv,
             false,
-            self.acquire.put_nowait(false),
+            async { Ok(self.acquire.put(false).await.await?) },
             "disarm: Acquire_RBV",
         )
         .await
     }
     async fn read_configuration(&self, name: &str) -> Result<HashMap<String, ReadingValue>> {
-        futures::future::try_join_all(self.config_signals().map(|(key, sig, _)| async move {
-            Ok::<_, BsrsError>((
-                format!("{name}_{key}"),
-                SignalBackend::<f64>::get_reading(sig).await?,
-            ))
+        futures::future::try_join_all(self.config_signals().map(|(key, sig)| async move {
+            let reading = sig.read().await?.remove(sig.name());
+            let reading =
+                reading.ok_or_else(|| BsrsError::Backend(format!("{}: no reading", sig.name())))?;
+            Ok::<_, BsrsError>((format!("{name}_{key}"), reading))
         }))
         .await
         .map(HashMap::from_iter)
     }
     async fn describe_configuration(&self, name: &str) -> Result<HashMap<String, DataKey>> {
-        // `get_datakey` takes the bare PV and adds the `ca://` scheme itself.
-        futures::future::try_join_all(self.config_signals().map(|(key, sig, pv)| async move {
-            Ok::<_, BsrsError>((
-                format!("{name}_{key}"),
-                SignalBackend::<f64>::get_datakey(sig, &pv).await?,
-            ))
+        futures::future::try_join_all(self.config_signals().map(|(key, sig)| async move {
+            Ok::<_, BsrsError>((format!("{name}_{key}"), describe_one(sig).await?))
         }))
         .await
         .map(HashMap::from_iter)
@@ -2594,7 +2451,7 @@ where
     B: SignalBackend<T> + 'static,
     A: Readable,
 {
-    wait_for_plugins: Arc<EpicsCaBackend<bool>>,
+    wait_for_plugins: Arc<SignalRW<bool, EpicsCaBackend<bool>>>,
     signal: Arc<Signal<T, B, A>>,
     hinted: bool,
 }
@@ -2630,7 +2487,7 @@ where
 {
     async fn prepare_single(&self, _datakey_name: &str) -> Result<()> {
         await_put(
-            SignalBackend::<bool>::put(self.wait_for_plugins.as_ref(), Some(true)),
+            self.wait_for_plugins.put(true),
             "PluginSignalDataLogic::prepare_single",
         )
         .await
@@ -2924,30 +2781,28 @@ pub(crate) mod tests {
             .await
             .expect("connect cam1");
 
-        let prev_mode = SignalBackend::<String>::get_value(cam.image_mode.as_ref())
-            .await
-            .expect("read ImageMode");
-        let prev_num = SignalBackend::<i64>::get_value(cam.num_images.as_ref())
-            .await
-            .expect("read NumImages");
-        let c0 = SignalBackend::<i64>::get_value(cam.array_counter_rbv.as_ref())
+        let prev_mode = cam.image_mode.get().await.expect("read ImageMode");
+        let prev_num = cam.num_images.get().await.expect("read NumImages");
+        let c0 = cam
+            .array_counter_rbv
+            .get()
             .await
             .expect("read ArrayCounter_RBV pre");
 
         cam.warmup().await.expect("warmup");
 
-        let c1 = SignalBackend::<i64>::get_value(cam.array_counter_rbv.as_ref())
+        let c1 = cam
+            .array_counter_rbv
+            .get()
             .await
             .expect("read ArrayCounter_RBV post");
-        let state = SignalBackend::<String>::get_value(cam.detector_state_rbv.as_ref())
+        let state = cam
+            .detector_state_rbv
+            .get()
             .await
             .expect("read DetectorState_RBV post");
-        let restored_mode = SignalBackend::<String>::get_value(cam.image_mode.as_ref())
-            .await
-            .expect("read ImageMode post");
-        let restored_num = SignalBackend::<i64>::get_value(cam.num_images.as_ref())
-            .await
-            .expect("read NumImages post");
+        let restored_mode = cam.image_mode.get().await.expect("read ImageMode post");
+        let restored_num = cam.num_images.get().await.expect("read NumImages post");
 
         eprintln!(
             "warmup smoke: counter {c0} -> {c1}, state={state}, \
@@ -2963,6 +2818,38 @@ pub(crate) mod tests {
         );
         assert_eq!(restored_mode, prev_mode, "warmup did not restore ImageMode");
         assert_eq!(restored_num, prev_num, "warmup did not restore NumImages");
+    }
+
+    // ophyd-async test_signal_get_and_set_logging, on a cam's PV signals:
+    // its connect, get and put are logged with the PV as the source.
+    #[tokio::test]
+    #[ignore]
+    async fn ad_cam_signals_log_connect_get_and_put() {
+        let _ioc = lock_live_ioc();
+        let (caplog, _guard) = crate::caplog::Caplog::start();
+        let prefix = ad_prefix();
+        let cam = AreaDetectorCam::new(format!("{prefix}cam1:"));
+        cam.connect(Duration::from_secs(5))
+            .await
+            .expect("connect cam1");
+        let set = format!("ca://{prefix}cam1:AcquireTime");
+        let rbv = format!("ca://{prefix}cam1:AcquireTime_RBV");
+        assert!(caplog.text().contains(&format!("Connecting to {set}\n")));
+
+        let t = cam.acquire_time_rbv.get().await.expect("read AcquireTime");
+        assert!(caplog
+            .text()
+            .contains(&format!("get_value() on source {rbv} returned ")));
+        await_put(cam.acquire_time.put(t), "AcquireTime")
+            .await
+            .expect("rewrite AcquireTime");
+        let text = caplog.text();
+        let logged = |head: &str| {
+            text.lines()
+                .any(|l| l.contains(head) && l.ends_with(&format!(" to backend at source {set}")))
+        };
+        assert!(logged("Putting value "), "{text}");
+        assert!(logged("Successfully put value "), "{text}");
     }
 
     /// `stage_sigs` lifecycle smoke: `select_save_plugin(hdf1, <port>, [jpeg1,
@@ -2981,12 +2868,16 @@ pub(crate) mod tests {
     async fn ad_select_save_plugin_against_sim_detector() {
         let _ioc = lock_live_ioc();
         async fn en(f: &NdFile) -> bool {
-            SignalBackend::<bool>::get_value(f.plugin.enable_callbacks.as_ref())
+            f.plugin
+                .enable_callbacks
+                .get()
                 .await
                 .expect("read EnableCallbacks")
         }
         async fn port_of(f: &NdFile) -> String {
-            SignalBackend::<String>::get_value(f.plugin.nd_array_port.as_ref())
+            f.plugin
+                .nd_array_port
+                .get()
                 .await
                 .expect("read NDArrayPort")
         }
@@ -3008,14 +2899,10 @@ pub(crate) mod tests {
 
         // (1) Long-string round-trip on FilePath (CHAR waveform),
         // capturing and restoring the original so the IOC is untouched.
-        let orig_path = SignalBackend::<String>::get_value(hdf1.file_path.as_ref())
-            .await
-            .expect("read HDF1.FilePath orig");
+        let orig_path = hdf1.file_path.get().await.expect("read HDF1.FilePath orig");
         let path = "/tmp/bsrs_smoke/";
         hdf1.set_path(path).await.expect("HDF1.set_path");
-        let read_back = SignalBackend::<String>::get_value(hdf1.file_path.as_ref())
-            .await
-            .expect("read HDF1.FilePath");
+        let read_back = hdf1.file_path.get().await.expect("read HDF1.FilePath");
         eprintln!("file_path round-trip: {path:?} -> {read_back:?}");
         assert_eq!(
             read_back.trim_end_matches('\0'),

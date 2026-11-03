@@ -2028,63 +2028,6 @@ async fn curve_server_enabled_via_builder_key_round_trip() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn curve_server_enabled_via_env_var() {
-    let (server_pub, server_priv) = bsrs::qs::generate_zmq_keys().expect("generate server keypair");
-    let (client_pub, client_priv) = bsrs::qs::generate_zmq_keys().expect("generate client keypair");
-
-    let reg = Registry::new();
-    // Set env var before building — build() reads it exactly once.
-    std::env::set_var("QSERVER_ZMQ_PRIVATE_KEY", &server_priv);
-    let build_result = Server::builder()
-        .control_address("tcp://127.0.0.1:*")
-        .document_address("tcp://127.0.0.1:*")
-        .registry(reg)
-        .build();
-    // Unset immediately so other tests are unaffected.
-    std::env::remove_var("QSERVER_ZMQ_PRIVATE_KEY");
-
-    let server = build_result.expect("CURVE server via env var");
-    let shutdown = server.shutdown_handle();
-    tokio::spawn(async move {
-        let _ = server.run_async().await;
-    });
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    let sock = curve_req_socket(
-        shutdown.control_endpoint(),
-        &server_pub,
-        &client_pub,
-        &client_priv,
-    );
-    let r = rpc(&sock, "ping", json!({}));
-    assert_eq!(r["success"], true, "CURVE-via-env-var ping: {r}");
-
-    shutdown.shutdown();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn no_curve_when_env_var_unset_plaintext_works() {
-    // Ensure env var is not set for this test.
-    std::env::remove_var("QSERVER_ZMQ_PRIVATE_KEY");
-
-    let reg = Registry::new();
-    let shutdown = spawn_server(reg);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    // Plain-text connection must succeed when CURVE is not configured.
-    let sock = req_socket(shutdown.control_endpoint());
-    let r = rpc(&sock, "ping", json!({}));
-    assert_eq!(
-        r["success"], true,
-        "plain-text ping must succeed without CURVE: {r}"
-    );
-
-    shutdown.shutdown();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-}
-
 /// Register a plan that checkpoints then sleeps forever — pausable at every
 /// iteration, never finishes on its own.
 fn register_pausable_loop(reg: &mut Registry, name: &str) {

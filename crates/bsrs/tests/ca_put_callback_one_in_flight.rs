@@ -41,7 +41,7 @@ async fn puts_during_a_put_callback_neither_stall_the_circuit_nor_reorder() {
         std::env::set_var("EPICS_CA_AUTO_ADDR_LIST", "NO");
     }
     let slow = EpicsCaBackend::<f64>::new("SLOW.A");
-    let arm = EpicsCaBackend::<bool>::new("ARM");
+    let arm = EpicsCaBackend::<bool>::new("ARM").with_wait(|on| *on);
     let other = EpicsCaBackend::<f64>::new("OTHER");
     slow.connect(Duration::from_secs(10)).await.unwrap();
     arm.connect(Duration::from_secs(10)).await.unwrap();
@@ -56,7 +56,7 @@ async fn puts_during_a_put_callback_neither_stall_the_circuit_nor_reorder() {
     let rearmed = arm.put_start(Some(true)).await.unwrap();
     // A stop after a re-arm that is still to be sent as the trailing
     // put-callback: that put-callback must carry the stop.
-    arm.put_nowait(false).await.unwrap();
+    arm.put(Some(false)).await.unwrap();
 
     let read = Instant::now();
     other.get_value().await.unwrap();

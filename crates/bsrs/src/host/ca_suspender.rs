@@ -24,10 +24,11 @@ use std::time::Duration;
 
 use crate::backends::epics_ca::EpicsCaBackend;
 use crate::core::error::Result;
+use crate::devices::SignalR;
 use crate::engine::{
     RunEngine, SuspendBoolHigh, SuspendBoolLow, SuspendThreshold, ThresholdDirection,
 };
-use crate::protocols_async::SignalBackend;
+use crate::host::motor_move::pv_signal;
 use tokio::sync::watch;
 
 /// Subscribe to `pv` and pump every monitor update into a fresh
@@ -35,18 +36,19 @@ use tokio::sync::watch;
 /// (a `SubToken` with RAII unsubscribe) is leaked to the heap so
 /// the pump survives this fn returning.
 pub async fn ca_watch_f64(pv: &str) -> Result<watch::Receiver<f64>> {
-    let backend = Arc::new(EpicsCaBackend::<f64>::new_inferred(pv));
-    backend.connect(Duration::from_secs(5)).await?;
-    let initial: f64 = backend.get_value().await.unwrap_or(0.0);
+    let signal: SignalR<f64, EpicsCaBackend<f64>> =
+        pv_signal(EpicsCaBackend::new_inferred(pv), pv, pv.to_string());
+    signal.connect(Duration::from_secs(5)).await?;
+    let initial: f64 = signal.get().await.unwrap_or(0.0);
     let (tx, rx) = watch::channel(initial);
     let cb: crate::protocols_async::ReadingValueCallback<f64> =
         Box::new(move |v: &f64, _ts, _sev| {
             let _ = tx.send(*v);
         });
-    let sub_token = backend.set_callback(Some(cb));
+    let sub_token = signal.subscribe(cb);
     Box::leak(Box::new(sub_token));
-    // Pin the backend too — once dropped, the channel goes idle.
-    Box::leak(Box::new(backend));
+    // Pin the signal too — once dropped, the channel goes idle.
+    Box::leak(Box::new(signal));
     Ok(rx)
 }
 

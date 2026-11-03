@@ -3,6 +3,7 @@
 
 #![deny(missing_docs)]
 
+pub mod command;
 pub mod detector;
 pub mod device;
 pub mod observe;
@@ -12,6 +13,12 @@ pub mod signal_cache;
 pub mod stage_sigs;
 pub mod standard_readable;
 
+/// Re-export of the crate-root [`init_devices!`](crate::init_devices) macro.
+pub use crate::init_devices;
+pub use command::{
+    soft_command, Command, CommandBackend, MockCommandBackend, MockExecuteCallback,
+    SoftCommandBackend, TriggerableCommand,
+};
 pub use detector::{DataLogic, DetectorTrigger, StandardDetector, TriggerInfo};
 pub use device::{wait_for_connection, walk_signal_sources, Device, DeviceVector};
 pub use observe::{observe_signals_value, observe_value, wait_for_value};
