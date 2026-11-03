@@ -5,13 +5,18 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::FutureExt;
+use serde::Serialize;
 use tokio::sync::watch;
 
 use crate::core::error::{BsrsError, Result};
 use crate::core::status::{Status, StatusError, WatcherUpdate};
-use crate::devices::{wait_for_connection, BackendFromPv, SignalCache};
+use crate::devices::{
+    wait_for_connection, Access, BackendFromPv, Readable, Signal, SignalConfig, SignalR, SignalRW,
+    SignalW,
+};
 use crate::event_model::{DataKey, LimitsRange};
-use crate::protocols_async::{PutCompletion, SignalBackend};
+use crate::protocols_async::{AsyncSubscribable, PutCompletion, SignalBackend};
 
 /// ophyd-async `DEFAULT_TIMEOUT`, the fixed term of
 /// `Motor.calculate_timeout`.
@@ -41,47 +46,53 @@ impl Halt {
     }
 }
 
-/// A readback PV and the one monitor of it that its subscribers and the
-/// watchers of its moves share.
-pub(crate) struct Readback<B> {
-    pub(crate) backend: Arc<B>,
-    pub(crate) cache: Arc<SignalCache<f64, B>>,
+/// A host device's signal on `pv`, named `name` as the derive names a
+/// device's children; a readback is named after its device, as
+/// ophyd-async's `Motor.set_name` names `user_readback`.
+pub(crate) fn pv_signal<T, B, A>(backend: B, pv: &str, name: String) -> Signal<T, B, A>
+where
+    T: Clone + Send + Sync + Serialize + 'static,
+    B: SignalBackend<T>,
+    A: Access,
+{
+    let config = SignalConfig {
+        source: pv.to_string(),
+        name,
+        ..Default::default()
+    };
+    Signal::new(Arc::new(backend), config)
 }
 
-impl<B: SignalBackend<f64>> Readback<B> {
-    pub(crate) fn new(backend: Arc<B>, pv: &str) -> Self {
-        let cache = SignalCache::new(backend.clone(), pv);
-        Self { backend, cache }
-    }
-}
-
-/// What [`move_status`] moves and reports on.
-pub(crate) struct Axis<'a, B> {
-    /// The device name the watcher updates carry.
-    pub(crate) name: &'a str,
-    pub(crate) setpoint: &'a B,
-    pub(crate) readback: &'a Readback<B>,
+/// What [`move_status`] moves and reports on. The watcher updates carry the
+/// readback's name, the device's.
+pub(crate) struct Axis<'a, B: SignalBackend<f64>> {
+    pub(crate) setpoint: &'a SignalRW<f64, B>,
+    pub(crate) readback: &'a SignalR<f64, B>,
     pub(crate) limits: Limits<'a, B>,
     pub(crate) halt: &'a Halt,
 }
 
 /// The check a move passes before [`move_status`] sends it, as the Python
 /// class the device ports makes it.
-pub(crate) enum Limits<'a, B> {
+pub(crate) enum Limits<'a, B: SignalBackend<f64>> {
     /// ophyd-async `Motor.check_move`, on the motor record's fields.
     MotorRecord(&'a MotorLimits<B>),
     /// The setpoint's control limits.
     Control(ControlRule),
 }
 
-impl<B: SignalBackend<f64>> Limits<'_, B> {
+impl<B: SignalBackend<f64> + 'static> Limits<'_, B> {
     /// Check a move from `from` to `target`, on limits read now.
-    async fn check(&self, setpoint: &B, from: f64, target: f64) -> std::result::Result<(), String> {
+    async fn check(
+        &self,
+        setpoint: &SignalRW<f64, B>,
+        from: f64,
+        target: f64,
+    ) -> std::result::Result<(), String> {
         match self {
             Self::MotorRecord(fields) => fields.check(from, target).await,
             Self::Control(rule) => {
-                let key = setpoint
-                    .get_datakey("")
+                let key = describe_one(setpoint)
                     .await
                     .map_err(|e| format!("limits: {e}"))?;
                 rule.check(key.limits.and_then(|l| l.control).as_ref(), target)
@@ -120,20 +131,20 @@ impl ControlRule {
 }
 
 /// The motor record's `.LLM`, `.HLM`, `.DLLM` and `.DHLM`.
-pub(crate) struct MotorLimits<B> {
-    llm: B,
-    hlm: B,
-    dllm: B,
-    dhlm: B,
+pub(crate) struct MotorLimits<B: SignalBackend<f64>> {
+    llm: SignalRW<f64, B>,
+    hlm: SignalRW<f64, B>,
+    dllm: SignalRW<f64, B>,
+    dhlm: SignalRW<f64, B>,
 }
 
 impl<B: SignalBackend<f64>> MotorLimits<B> {
     async fn check(&self, from: f64, target: f64) -> std::result::Result<(), String> {
         let (llm, hlm, dllm, dhlm) = tokio::try_join!(
-            self.llm.get_value(),
-            self.hlm.get_value(),
-            self.dllm.get_value(),
-            self.dhlm.get_value(),
+            self.llm.get(),
+            self.hlm.get(),
+            self.dllm.get(),
+            self.dhlm.get(),
         )
         .map_err(|e| format!("limits: {e}"))?;
         check_motor_move([llm, hlm], [dllm, dhlm], from, target)
@@ -157,104 +168,54 @@ fn check_motor_move(
     ))
 }
 
-/// A motor record's `.STOP` or `.SET`, written as 0 or 1.
-#[async_trait::async_trait]
-pub(crate) trait SwitchField: Send + Sync + Sized + 'static {
-    fn from_pv(pv: &str) -> Self;
-    async fn connect(&self, timeout: Duration) -> Result<()>;
-    /// Write 1 with a plain put: a put-callback to `.STOP` queues behind the
-    /// move's own (dbNotify) and would press it only once the move is over.
-    async fn press(&self) -> Result<()>;
-    /// Write `on` and wait for the put to complete.
-    async fn put(&self, on: bool) -> Result<()>;
-}
-
-/// A backend for the motor record's numeric fields, with its kind of
-/// [`SwitchField`] and of integer field (`.DMOV`, a SHORT).
-pub(crate) trait MotorBackend: SignalBackend<f64> + BackendFromPv {
-    type Switch: SwitchField;
-    type Int: SignalBackend<i64> + BackendFromPv;
-}
-
-#[cfg(feature = "ca")]
-#[async_trait::async_trait]
-impl SwitchField for crate::backends::epics_ca::EpicsCaBackend<bool> {
-    fn from_pv(pv: &str) -> Self {
-        Self::new(pv)
-    }
-    async fn connect(&self, timeout: Duration) -> Result<()> {
-        SignalBackend::connect(self, timeout).await
-    }
-    async fn press(&self) -> Result<()> {
-        self.put_nowait(true).await
-    }
-    async fn put(&self, on: bool) -> Result<()> {
-        SignalBackend::put(self, Some(on)).await
-    }
+/// A backend for the motor record's numeric fields, with its kinds of
+/// boolean field (`.SET`, a two-choice enum) and integer field (`.DMOV` and
+/// `.STOP`, SHORTs).
+pub(crate) trait MotorBackend: SignalBackend<f64> + BackendFromPv + 'static {
+    type Bool: SignalBackend<bool> + BackendFromPv + 'static;
+    type Int: SignalBackend<i64> + BackendFromPv + 'static;
+    /// `.STOP`, ophyd-async's `epics_signal_w(int, wait=False)`: a put that
+    /// waited would queue behind the move's own and press it only once the
+    /// move is over.
+    fn stop_field(pv: &str) -> Self::Int;
 }
 
 #[cfg(feature = "ca")]
 impl MotorBackend for crate::backends::epics_ca::EpicsCaBackend<f64> {
-    type Switch = crate::backends::epics_ca::EpicsCaBackend<bool>;
+    type Bool = crate::backends::epics_ca::EpicsCaBackend<bool>;
     type Int = crate::backends::epics_ca::EpicsCaBackend<i64>;
-}
-
-/// A PVA `.STOP` or `.SET`: a put with the default pvRequest, which QSRV
-/// answers without `block`, so pressing and putting are one write. Its
-/// tokens are resolved against the PV's type, so `.SET` (an NTEnum) gets
-/// its `value.index`.
-#[cfg(feature = "pva")]
-pub(crate) struct PvaSwitch(String);
-
-#[cfg(feature = "pva")]
-#[async_trait::async_trait]
-impl SwitchField for PvaSwitch {
-    fn from_pv(pv: &str) -> Self {
-        Self(pv.to_string())
-    }
-    async fn connect(&self, _timeout: Duration) -> Result<()> {
-        crate::backends::epics_pva::pva_context()
-            .pvconnect(&self.0)
-            .await
-            .map(|_| ())
-            .map_err(|e| BsrsError::Backend(format!("pva connect {}: {e}", self.0)))
-    }
-    async fn press(&self) -> Result<()> {
-        self.put(true).await
-    }
-    async fn put(&self, on: bool) -> Result<()> {
-        let token = if on { "1" } else { "0" };
-        crate::backends::epics_pva::pva_context()
-            .pvput_tokens(&self.0, &[token.to_string()], None)
-            .await
-            .map_err(|e| BsrsError::Backend(format!("pva put {}: {e}", self.0)))
+    fn stop_field(pv: &str) -> Self::Int {
+        Self::Int::new(pv).with_wait(|_| false)
     }
 }
 
 #[cfg(feature = "pva")]
 impl MotorBackend for crate::backends::epics_pva::EpicsPvaBackend<f64> {
-    type Switch = PvaSwitch;
+    type Bool = crate::backends::epics_pva::EpicsPvaBackend<bool>;
     type Int = crate::backends::epics_pva::EpicsPvaBackend<i64>;
+    fn stop_field(pv: &str) -> Self::Int {
+        Self::Int::new(pv).with_wait(|_| false)
+    }
 }
 
 /// The motor record's `.VELO` and `.ACCL`, read at each move for its
 /// deadline.
-struct MoveTiming<B> {
-    velo: Arc<B>,
-    accl: Arc<B>,
+struct MoveTiming<B: SignalBackend<f64>> {
+    velo: SignalRW<f64, B>,
+    accl: SignalRW<f64, B>,
 }
 
 /// The motor record's `.DMOV` and `.STOP`.
 struct StopButton<B: MotorBackend> {
-    dmov: B::Int,
-    stop: B::Switch,
+    dmov: SignalR<i64, B::Int>,
+    stop: SignalW<i64, B::Int>,
 }
 
 impl<B: MotorBackend> StopButton<B> {
     /// ophyd-async `Motor.stop`: press `.STOP` only while the motor moves.
     async fn press_if_moving(&self) -> Result<()> {
-        if self.dmov.get_value().await? == 0 {
-            self.stop.press().await?;
+        if self.dmov.get().await? == 0 {
+            self.stop.put(1).await.await?;
         }
         Ok(())
     }
@@ -263,8 +224,9 @@ impl<B: MotorBackend> StopButton<B> {
 /// A motor's setpoint and readback, the fields of the setpoint's record that
 /// its moves and stop use, connected, and the [`Halt`] of its moves.
 pub(crate) struct MotorChannels<B: MotorBackend> {
-    pub(crate) setpoint: Arc<B>,
-    pub(crate) readback: Readback<B>,
+    pub(crate) setpoint: Arc<SignalRW<f64, B>>,
+    /// Named after the device.
+    pub(crate) readback: SignalR<f64, B>,
     /// `None` when the setpoint's record has no `.VELO`/`.ACCL` (not a
     /// motor record); its moves then have no deadline.
     timing: Option<MoveTiming<B>>,
@@ -276,7 +238,7 @@ pub(crate) struct MotorChannels<B: MotorBackend> {
     /// them, by [`ControlRule::Signal`].
     limits: Option<MotorLimits<B>>,
     /// The setpoint record's `.SET`; `None` when it has none.
-    set_use: Option<Arc<B::Switch>>,
+    set_use: Option<Arc<SignalRW<bool, B::Bool>>>,
     halt: Halt,
 }
 
@@ -288,7 +250,8 @@ impl<B: MotorBackend> MotorChannels<B> {
     /// the stop without a press; a `.SET` that does not, no
     /// `set_current_position`; a limit that does not, the moves checked on
     /// the setpoint's control limits in place of ophyd-async's
-    /// `Motor.check_move`. `kind` and `name` label the motor in messages.
+    /// `Motor.check_move`. `kind` labels the motor in messages; its signals
+    /// are named after ophyd-async `Motor`'s, under `name`.
     pub(crate) async fn connect(
         kind: &str,
         name: &str,
@@ -296,33 +259,52 @@ impl<B: MotorBackend> MotorChannels<B> {
         rbv_pv: &str,
     ) -> Result<Self> {
         let record = val_pv.split_once('.').map_or(val_pv, |(r, _)| r);
-        let setpoint = Arc::new(B::from_pv(val_pv));
-        let readback = Arc::new(B::from_pv(rbv_pv));
+        let field = |f: &str| format!("{record}.{f}");
+        let child = |c: &str| format!("{name}-{c}");
+        let setpoint = Arc::new(pv_signal(
+            B::from_pv(val_pv),
+            val_pv,
+            child("user_setpoint"),
+        ));
+        let readback = pv_signal(B::from_pv(rbv_pv), rbv_pv, name.to_string());
+        let f64_field = |f: &str, c: &str| pv_signal(B::from_pv(&field(f)), &field(f), child(c));
         let timing = MoveTiming {
-            velo: Arc::new(B::from_pv(&format!("{record}.VELO"))),
-            accl: Arc::new(B::from_pv(&format!("{record}.ACCL"))),
+            velo: f64_field("VELO", "velocity"),
+            accl: f64_field("ACCL", "acceleration_time"),
         };
-        let button = StopButton {
-            dmov: <B::Int as BackendFromPv>::from_pv(&format!("{record}.DMOV")),
-            stop: <B::Switch as SwitchField>::from_pv(&format!("{record}.STOP")),
+        let button = StopButton::<B> {
+            dmov: pv_signal(
+                B::Int::from_pv(&field("DMOV")),
+                &field("DMOV"),
+                child("motor_done_move"),
+            ),
+            stop: pv_signal(
+                B::stop_field(&field("STOP")),
+                &field("STOP"),
+                child("motor_stop"),
+            ),
         };
-        let set_use = <B::Switch as SwitchField>::from_pv(&format!("{record}.SET"));
+        let set_use: SignalRW<bool, B::Bool> = pv_signal(
+            B::Bool::from_pv(&field("SET")),
+            &field("SET"),
+            child("set_use_switch"),
+        );
         let limits = MotorLimits {
-            llm: B::from_pv(&format!("{record}.LLM")),
-            hlm: B::from_pv(&format!("{record}.HLM")),
-            dllm: B::from_pv(&format!("{record}.DLLM")),
-            dhlm: B::from_pv(&format!("{record}.DHLM")),
+            llm: f64_field("LLM", "low_limit_travel"),
+            hlm: f64_field("HLM", "high_limit_travel"),
+            dllm: f64_field("DLLM", "dial_low_limit_travel"),
+            dhlm: f64_field("DHLM", "dial_high_limit_travel"),
         };
         let t = Duration::from_secs(5);
         let (required, velo, accl, dmov, stop, set, llm, hlm, dllm, dhlm) = tokio::join!(
             wait_for_connection([
-                ("setpoint", setpoint.connect(t)),
-                ("readback", readback.connect(t)),
+                ("setpoint", setpoint.connect(t).boxed()),
+                ("readback", readback.connect(t).boxed()),
             ]),
             timing.velo.connect(t),
             timing.accl.connect(t),
-            SignalBackend::<i64>::connect(&button.dmov, t),
-            SwitchField::connect(&button.stop, t),
+            button.dmov.connect(t),
+            button.stop.connect(t),
             set_use.connect(t),
             limits.llm.connect(t),
             limits.hlm.connect(t),
@@ -360,7 +342,7 @@ impl<B: MotorBackend> MotorChannels<B> {
         };
         Ok(Self {
             setpoint,
-            readback: Readback::new(readback, rbv_pv),
+            readback,
             timing,
             button,
             limits,
@@ -371,9 +353,9 @@ impl<B: MotorBackend> MotorChannels<B> {
 
     /// Move to `target`. The put completion is the motor settle, bounded by
     /// the move's own deadline as ophyd-async's `Motor.set` bounds it.
-    pub(crate) async fn set(&self, kind: &str, name: &str, target: f64) -> Status {
+    pub(crate) async fn set(&self, kind: &str, target: f64) -> Status {
         let what = format!("{kind} set");
-        let deadline = match self.deadline(kind, name, target).await {
+        let deadline = match self.deadline(kind, target).await {
             Ok(d) => d,
             Err(e) => return Status::fail(StatusError::Failed(format!("{what}: {e}"))),
         };
@@ -389,8 +371,7 @@ impl<B: MotorBackend> MotorChannels<B> {
             }
         };
         let axis = Axis {
-            name,
-            setpoint: self.setpoint.as_ref(),
+            setpoint: &self.setpoint,
             readback: &self.readback,
             limits: self
                 .limits
@@ -405,10 +386,8 @@ impl<B: MotorBackend> MotorChannels<B> {
     /// setpoint with no limits check (`force=True`), then `.SET` back to Use
     /// whatever that put did. Spawned so that a dropped caller still restores
     /// `.SET`: a motor left in Set recalibrates on its next move.
-    pub(crate) async fn set_current_position(&self, kind: &str, name: &str, pos: f64) -> Result<()>
-    where
-        B: 'static,
-    {
+    pub(crate) async fn set_current_position(&self, kind: &str, pos: f64) -> Result<()> {
+        let name = self.readback.name();
         let Some(switch) = self.set_use.clone() else {
             return Err(BsrsError::Backend(format!(
                 "{kind} {name}: set_current_position: no .SET"
@@ -416,10 +395,10 @@ impl<B: MotorBackend> MotorChannels<B> {
         };
         let setpoint = self.setpoint.clone();
         tokio::spawn(async move {
-            switch.put(true).await?;
-            let put = setpoint.put(Some(pos)).await;
-            let restored = switch.put(false).await;
-            put.and(restored)
+            switch.put(true).await.await?;
+            let put = setpoint.put(pos).await.await;
+            let restored = switch.put(false).await.await;
+            Ok(put.and(restored)?)
         })
         .await
         .map_err(|e| BsrsError::Backend(format!("{kind} {name}: set_current_position: {e}")))?
@@ -444,17 +423,13 @@ impl<B: MotorBackend> MotorChannels<B> {
     async fn deadline(
         &self,
         kind: &str,
-        name: &str,
         target: f64,
     ) -> std::result::Result<Option<Duration>, String> {
+        let name = self.readback.name();
         let Some(timing) = &self.timing else {
             return Ok(None);
         };
-        let read = tokio::try_join!(
-            self.readback.backend.get_value(),
-            timing.velo.get_value(),
-            timing.accl.get_value(),
-        );
+        let read = tokio::try_join!(self.readback.get(), timing.velo.get(), timing.accl.get());
         let (old, velo, accl) = match read {
             Ok(v) => v,
             Err(e) => {
@@ -492,40 +467,39 @@ pub(crate) async fn move_status<B, F, Fut>(
     finish: F,
 ) -> Status
 where
-    B: SignalBackend<f64>,
+    B: SignalBackend<f64> + 'static,
     F: FnOnce(PutCompletion) -> Fut,
     Fut: std::future::Future<Output = std::result::Result<(), String>> + Send + 'static,
 {
     let (status, setter) = Status::new();
     let mut halted = axis.halt.0.subscribe();
     let started = async {
-        let (initial, key) = tokio::try_join!(
-            axis.readback.backend.get_value(),
-            axis.readback.backend.get_datakey(""),
-        )
-        .map_err(|e| e.to_string())?;
+        let (initial, key) = tokio::try_join!(axis.readback.get(), describe_one(axis.readback))
+            .map_err(|e| e.to_string())?;
         axis.limits.check(axis.setpoint, initial, value).await?;
-        let (readings, monitor) = axis.readback.cache.add_listener();
+        let monitor = AsyncSubscribable::subscribe(axis.readback)
+            .await
+            .map_err(|e| e.to_string())?;
         let done = axis
             .setpoint
-            .put_start(Some(value))
+            .put_start(value)
             .await
             .map_err(|e| e.to_string())?;
         let update = WatcherUpdate {
-            name: Some(axis.name.to_string()),
+            name: Some(axis.readback.name().to_string()),
             unit: key.units,
             precision: key.precision.and_then(|p| i32::try_from(p).ok()),
             ..WatcherUpdate::new(initial, initial, value)
         };
-        Ok::<_, String>((done, readings, monitor, update))
+        Ok::<_, String>((done, monitor, update))
     }
     .await;
     match started {
-        Ok((done, mut readings, monitor, update)) => {
+        Ok((done, mut monitor, update)) => {
             let mv = finish(done);
             let stopped = format!("{what}: stopped");
             tokio::spawn(async move {
-                let _monitor = monitor;
+                let readings = monitor.rx_mut();
                 tokio::pin!(mv);
                 let end = loop {
                     tokio::select! {
@@ -553,17 +527,38 @@ where
     status
 }
 
-/// The data key of one `f64` PV as `object_name` reports it: the backend's
-/// `get_datakey` reads the PV's units, precision and limit ranges — what
-/// ophyd's `EpicsSignal.describe()` carries — and sources it from the PV.
-pub(crate) async fn describe_pv<B: SignalBackend<f64>>(
-    backend: &B,
-    pv: &str,
+/// The one data key of `signal`'s description.
+pub(crate) async fn describe_one<T, B, A>(signal: &Signal<T, B, A>) -> Result<DataKey>
+where
+    T: Clone + Send + Sync + Serialize + 'static,
+    B: SignalBackend<T>,
+    A: Readable,
+{
+    signal
+        .describe()
+        .await?
+        .into_values()
+        .next()
+        .ok_or_else(|| BsrsError::Backend(format!("{}: no data key", signal.name())))
+}
+
+/// A host device's description: its one signal's data key, with the
+/// device as its `object_name`, as ophyd's `EpicsSignal.describe()` carries
+/// the PV's units, precision and limit ranges.
+pub(crate) async fn describe_device<T, B, A>(
+    signal: &Signal<T, B, A>,
     object_name: &str,
-) -> Result<DataKey> {
-    let mut key = backend.get_datakey(pv).await?;
-    key.object_name = Some(object_name.to_string());
-    Ok(key)
+) -> Result<std::collections::HashMap<String, DataKey>>
+where
+    T: Clone + Send + Sync + Serialize + 'static,
+    B: SignalBackend<T>,
+    A: Readable,
+{
+    let mut keys = signal.describe().await?;
+    for key in keys.values_mut() {
+        key.object_name = Some(object_name.to_string());
+    }
+    Ok(keys)
 }
 
 #[cfg(test)]
@@ -642,9 +637,20 @@ mod tests {
         MockSignalBackend::with_value(value)
     }
 
-    fn axis<'a, B>(setpoint: &'a B, readback: &'a Readback<B>, halt: &'a Halt) -> Axis<'a, B> {
+    /// A signal over a clone of `backend`, which shares its state.
+    fn signal<A: Access>(
+        backend: &MockSignalBackend<f64>,
+        name: &str,
+    ) -> Signal<f64, MockSignalBackend<f64>, A> {
+        pv_signal(backend.clone(), "pv", name.to_string())
+    }
+
+    fn axis<'a, B: SignalBackend<f64>>(
+        setpoint: &'a SignalRW<f64, B>,
+        readback: &'a SignalR<f64, B>,
+        halt: &'a Halt,
+    ) -> Axis<'a, B> {
         Axis {
-            name: "motor",
             setpoint,
             readback,
             limits: Limits::Control(ControlRule::Signal),
@@ -654,17 +660,17 @@ mod tests {
 
     #[tokio::test]
     async fn move_status_sends_puts_in_call_order() {
-        let sp = mock(0.0);
-        let rb = Readback::new(Arc::new(mock(0.0)), "rb");
-        let blocked = sp.mock_puts_blocked();
+        let sp_mock = mock(0.0);
+        let (sp, rb) = (signal(&sp_mock, "sp"), signal(&mock(0.0), "motor"));
+        let blocked = sp_mock.mock_puts_blocked();
 
         // No yield between the two calls: the puts must already be sent when
         // `move_status` returns, not left to spawned tasks.
         let halt = Halt::new();
         let a = move_status(axis(&sp, &rb, &halt), 1.0, "t", put_done).await;
-        assert_eq!(sp.put_calls(), vec![Some(1.0)]);
+        assert_eq!(sp_mock.put_calls(), vec![Some(1.0)]);
         let b = move_status(axis(&sp, &rb, &halt), 2.0, "t", put_done).await;
-        assert_eq!(sp.put_calls(), vec![Some(1.0), Some(2.0)]);
+        assert_eq!(sp_mock.put_calls(), vec![Some(1.0), Some(2.0)]);
         assert!(!a.done_state() && !b.done_state());
 
         drop(blocked);
@@ -678,9 +684,9 @@ mod tests {
 
     #[tokio::test]
     async fn halt_settles_only_the_move_in_flight() {
-        let sp = mock(0.0);
-        let rb = Readback::new(Arc::new(mock(0.0)), "rb");
-        let _blocked = sp.mock_puts_blocked();
+        let sp_mock = mock(0.0);
+        let (sp, rb) = (signal(&sp_mock, "sp"), signal(&mock(0.0), "motor"));
+        let _blocked = sp_mock.mock_puts_blocked();
         let halt = Halt::new();
         let settled = |st: Status| async move {
             tokio::time::timeout(Duration::from_secs(1), st)
@@ -714,17 +720,17 @@ mod tests {
     /// the time elapsed, while the put is pending.
     #[tokio::test]
     async fn a_move_reports_each_readback_until_it_settles() {
-        let sp = mock(0.0);
+        let sp_mock = mock(0.0);
         let rb_mock = MockSignalBackend::new(
             crate::backends::soft::SoftSignalBackend::new(0.0).with_units("mm"),
         );
-        let rb = Readback::new(Arc::new(rb_mock.clone()), "rb");
+        let (sp, rb) = (signal(&sp_mock, "sp"), signal(&rb_mock, "motor"));
         // A CA or PVA monitor delivers the current value as it opens; the
         // soft backend does not, so give the cache one through a listener.
-        let (_rx, _listener) = rb.cache.add_listener();
+        let _listener = AsyncSubscribable::subscribe(&rb).await.unwrap();
         rb_mock.set_value(0.0);
         let halt = Halt::new();
-        let blocked = sp.mock_puts_blocked();
+        let blocked = sp_mock.mock_puts_blocked();
 
         let st = move_status(axis(&sp, &rb, &halt), 0.55, "t", put_done).await;
         let mut rx = st.watch_updates();
@@ -742,7 +748,7 @@ mod tests {
             },
             expected(0.0)
         );
-        assert_eq!(sp.put_calls(), vec![Some(0.55)]);
+        assert_eq!(sp_mock.put_calls(), vec![Some(0.55)]);
         assert!(!st.done_state());
 
         tokio::time::sleep(Duration::from_millis(200)).await;

@@ -138,10 +138,9 @@ async fn ready_cam(cam: &AreaDetectorCam, feed: &str) {
     put::<bool>(&format!("{CAM}ArrayCallbacks"), true).await;
     put::<f64>(&format!("{CAM}AcquireTime"), EXPOSURE).await;
     put::<f64>(&format!("{CAM}AcquirePeriod"), EXPOSURE).await;
-    timeout(
-        TIMEOUT,
-        SignalBackend::put(cam.nd_attributes_file.as_ref(), Some(String::new())),
-    )
+    timeout(TIMEOUT, async {
+        cam.nd_attributes_file.put(String::new()).await.await
+    })
     .await
     .expect("NDAttributesFile put timed out")
     .expect("clear NDAttributesFile");
@@ -919,11 +918,7 @@ async fn num_rois_enables_the_first_rois_while_staged() {
     async fn enabled(rois: &[NdRoi]) -> Vec<bool> {
         let mut out = Vec::new();
         for roi in rois {
-            out.push(
-                SignalBackend::<bool>::get_value(roi.plugin.enable_callbacks.as_ref())
-                    .await
-                    .unwrap(),
-            );
+            out.push(roi.plugin.enable_callbacks.get().await.unwrap());
         }
         out
     }
@@ -1135,7 +1130,7 @@ async fn plugin_signal_is_read_after_the_driver_waits_for_plugins() {
     let cam = AreaDetectorCam::new(CAM);
     let stats = Arc::new(NdStats::new("SIM1:Stats1:"));
     let total = Arc::new(SignalR::new(
-        stats.total.clone(),
+        Arc::new(EpicsCaBackend::<f64>::new("SIM1:Stats1:Total_RBV")),
         SignalConfig {
             source: "SIM1:Stats1:Total_RBV".into(),
             kind: Kind::Normal,

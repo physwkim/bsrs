@@ -3882,7 +3882,6 @@ pub struct LuaAdCam(Arc<crate::host::areadetector::AreaDetectorCam>);
 #[cfg(feature = "ca")]
 impl UserData for LuaAdCam {
     fn add_methods<M: UserDataMethods<Self>>(m: &mut M) {
-        use crate::protocols_async::SignalBackend;
         m.add_method("prefix", |_, this, ()| Ok(this.0.prefix.clone()));
         m.add_method("warmup", |_, this, ()| {
             ad_block("ad_cam:warmup", this.0.warmup())
@@ -3895,40 +3894,30 @@ impl UserData for LuaAdCam {
             )
         });
         m.add_method("state", |_, this, ()| {
-            ad_block(
-                "ad_cam:state",
-                SignalBackend::<String>::get_value(this.0.detector_state_rbv.as_ref()),
-            )
+            ad_block("ad_cam:state", this.0.detector_state_rbv.get())
         });
         m.add_method("array_counter", |_, this, ()| {
-            ad_block(
-                "ad_cam:array_counter",
-                SignalBackend::<i64>::get_value(this.0.array_counter_rbv.as_ref()),
-            )
+            ad_block("ad_cam:array_counter", this.0.array_counter_rbv.get())
         });
         m.add_method("set_image_mode", |_, this, mode: String| {
-            ad_block(
-                "ad_cam:set_image_mode",
-                SignalBackend::<String>::put(this.0.image_mode.as_ref(), Some(mode)),
-            )
+            ad_block("ad_cam:set_image_mode", async {
+                Ok(this.0.image_mode.put(mode).await.await?)
+            })
         });
         m.add_method("set_num_images", |_, this, n: i64| {
-            ad_block(
-                "ad_cam:set_num_images",
-                SignalBackend::<i64>::put(this.0.num_images.as_ref(), Some(n)),
-            )
+            ad_block("ad_cam:set_num_images", async {
+                Ok(this.0.num_images.put(n).await.await?)
+            })
         });
         m.add_method("set_acquire", |_, this, b: bool| {
-            ad_block(
-                "ad_cam:set_acquire",
-                SignalBackend::<bool>::put(this.0.acquire.as_ref(), Some(b)),
-            )
+            ad_block("ad_cam:set_acquire", async {
+                Ok(this.0.acquire.put(b).await.await?)
+            })
         });
         m.add_method("set_acquire_time", |_, this, t: f64| {
-            ad_block(
-                "ad_cam:set_acquire_time",
-                SignalBackend::<f64>::put(this.0.acquire_time.as_ref(), Some(t)),
-            )
+            ad_block("ad_cam:set_acquire_time", async {
+                Ok(this.0.acquire_time.put(t).await.await?)
+            })
         });
     }
 }
@@ -3982,7 +3971,6 @@ pub struct LuaAdStats(Arc<crate::host::areadetector::NdStats>);
 #[cfg(feature = "ca")]
 impl UserData for LuaAdStats {
     fn add_methods<M: UserDataMethods<Self>>(m: &mut M) {
-        use crate::protocols_async::SignalBackend;
         m.add_method("prefix", |_, this, ()| Ok(this.0.plugin.prefix.clone()));
         m.add_method("set_enabled", |_, this, b: bool| {
             ad_block("ad_stats:set_enabled", this.0.plugin.set_enabled(b))
@@ -4000,22 +3988,19 @@ impl UserData for LuaAdStats {
             ad_block("ad_stats:force_enable_stats", this.0.force_enable_stats())
         });
         m.add_method("set_compute_centroid", |_, this, b: bool| {
-            ad_block(
-                "ad_stats:set_compute_centroid",
-                SignalBackend::<bool>::put(this.0.compute_centroid.as_ref(), Some(b)),
-            )
+            ad_block("ad_stats:set_compute_centroid", async {
+                Ok(this.0.compute_centroid.put(b).await.await?)
+            })
         });
         m.add_method("set_compute_profiles", |_, this, b: bool| {
-            ad_block(
-                "ad_stats:set_compute_profiles",
-                SignalBackend::<bool>::put(this.0.compute_profiles.as_ref(), Some(b)),
-            )
+            ad_block("ad_stats:set_compute_profiles", async {
+                Ok(this.0.compute_profiles.put(b).await.await?)
+            })
         });
         m.add_method("set_compute_histogram", |_, this, b: bool| {
-            ad_block(
-                "ad_stats:set_compute_histogram",
-                SignalBackend::<bool>::put(this.0.compute_histogram.as_ref(), Some(b)),
-            )
+            ad_block("ad_stats:set_compute_histogram", async {
+                Ok(this.0.compute_histogram.put(b).await.await?)
+            })
         });
         m.add_method("stage", |_, this, ()| {
             ad_block("ad_stats:stage", this.0.plugin.stage_sigs.stage())

@@ -159,6 +159,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   value type must implement `core::SignalDatatype`: `bool`, `i64`, `f64`,
   `String`, `()`, a `Vec` of `bool`, `i8` through `u64`, `f32`, `f64` or
   `String`, `NdArray`, or a `Table`/`#[derive(Table)]` struct.
+- **Breaking**: the areaDetector cam and plugin fields are
+  `Arc<SignalRW<T, EpicsCaBackend<T>>>` (`SignalR` for `*_rbv` and
+  `NdStats::total`) named for their PV, and the CA and PVA motors,
+  positioners, detectors and suspenders read and write through such
+  signals, so their connects, gets, puts and monitors are logged as
+  ophyd-async's are. `NdArrayDescription::new` takes signals,
+  `StageSigs::set` takes the signal, and `NdAttributeXmlSource` is
+  implemented for the `String` signal. `put_nowait` is replaced by
+  `with_wait` on the CA and PVA backends (ophyd-async
+  `EpicsOptions(wait=...)`): `Acquire` and `Capture` put 0 without a
+  callback, and `Signal::put_start` sends a put and returns its completion,
+  so `Capture=1` now goes with a callback whose completion is not awaited.
 - **Breaking**: areaDetector enum fields (`image_mode`, `detector_state_rbv`,
   `data_type`, `color_mode`, `file_write_mode`) are `String` labels, as are
   the `AD_STATE_*`, `AD_IMAGE_MODE_*`, `AD_COLOR_MODE_*` and

@@ -47,6 +47,9 @@ pub struct EpicsPvaBackend<T: Clone + Send + Sync + 'static> {
     /// ophyd-async's `initial_values`: what `connect` read, which
     /// `put(None)` writes.
     initial: Mutex<Option<T>>,
+    /// ophyd-async's `EpicsOptions.wait`: whether a put of a value waits
+    /// for the record to process.
+    wait: fn(&T) -> bool,
 }
 
 impl<T: PvaType> EpicsPvaBackend<T> {
@@ -70,7 +73,15 @@ impl<T: PvaType> EpicsPvaBackend<T> {
             want,
             converter: Mutex::new(None),
             initial: Mutex::new(None),
+            wait: |_| true,
         }
+    }
+
+    /// Put the values `wait` refuses with `record[block=false]`, as
+    /// ophyd-async's `EpicsOptions(wait=...)`: a put to `.STOP` that blocks
+    /// would queue behind the move it is meant to stop.
+    pub fn with_wait(self, wait: fn(&T) -> bool) -> Self {
+        Self { wait, ..self }
     }
 
     /// `connect`: make the converter from a [`connect_read`] whose value is
@@ -124,7 +135,8 @@ impl<T: PvaType> EpicsPvaBackend<T> {
             Some(conv) => conv,
             None => self.read().await?.0,
         };
-        put_block(&self.client, &self.pv, T::encode(&conv, value)?).await
+        let block = (self.wait)(&value);
+        put_block(&self.client, &self.pv, T::encode(&conv, value)?, block).await
     }
 }
 
@@ -192,18 +204,18 @@ async fn connect_read(client: &PvaClient, pv: &str, timeout: Duration) -> Result
         })?
 }
 
-/// PVA put of `f` with `record[block=true]`: QSRV answers it once the record
-/// has processed (`dbProcessNotify`), as rsrv does a put-callback, so the
-/// completion is that of the move or acquisition the put starts, with no
-/// deadline of its own. Returns once DATA is queued on the circuit, so puts
-/// are sent in call order.
-async fn put_block(client: &PvaClient, pv: &str, f: PvField) -> Result<PutCompletion> {
+/// PVA put of `f` with `record[block=...]`. Blocking, QSRV answers it once
+/// the record has processed (`dbProcessNotify`), as rsrv does a
+/// put-callback, so the completion is that of the move or acquisition the
+/// put starts, with no deadline of its own. Returns once DATA is queued on
+/// the circuit, so puts are sent in call order.
+async fn put_block(client: &PvaClient, pv: &str, f: PvField, block: bool) -> Result<PutCompletion> {
     fn put_err(e: PvaError) -> BsrsError {
         BsrsError::Backend(format!("pva put: {e}"))
     }
     let req = PvRequestBuilder::new()
         .field("value")
-        .record("block", true)
+        .record("block", block)
         .build();
     // A string may name an enum choice, which only the readback lists.
     let fetch_present = matches!(f, PvField::Scalar(ScalarValue::String(_)));
@@ -1292,7 +1304,7 @@ impl crate::devices::CommandBackend for PvaCommandBackend {
     }
     async fn execute(&self, _args: ()) -> Result<()> {
         let v = PvField::Scalar(ScalarValue::Long(self.execute_value));
-        put_block(&self.client, &self.pv, v).await?.await
+        put_block(&self.client, &self.pv, v, true).await?.await
     }
 }
 

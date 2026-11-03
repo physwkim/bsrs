@@ -14,8 +14,8 @@ use crate::core::Kind;
 use crate::devices::device::ConnectOnce;
 use crate::event_model::DataKey;
 use crate::protocols_async::{
-    AsyncMovable, AsyncReadable, AsyncSubscribable, Locatable, Location, ReadingValueCallback,
-    SignalBackend, Subscription, Triggerable,
+    AsyncMovable, AsyncReadable, AsyncSubscribable, Locatable, Location, PutCompletion,
+    ReadingValueCallback, SignalBackend, Subscription, Triggerable,
 };
 use async_trait::async_trait;
 use serde::Serialize;
@@ -358,14 +358,7 @@ where
     /// completion (CP-11); a per-call timeout, when needed, is applied by
     /// the caller (mirrors `SignalW::set(value, timeout)`).
     pub async fn put(&self, value: T) -> Status {
-        let source = self.backend.source(&self.config.source, false);
-        // Rendered only for DEBUG: a put may carry a whole waveform.
-        let shown = if tracing::enabled!(tracing::Level::DEBUG) {
-            shown(&value)
-        } else {
-            String::new()
-        };
-        tracing::debug!("Putting value {shown} to backend at source {source}");
+        let (source, shown) = self.putting(&value);
         match self.backend.put(Some(value)).await {
             Ok(()) => {
                 tracing::debug!("Successfully put value {shown} to backend at source {source}");
@@ -373,6 +366,33 @@ where
             }
             Err(e) => Status::fail(StatusError::Failed(e.to_string())),
         }
+    }
+
+    /// Send a put and return its completion, logged as [`put`](Self::put)
+    /// logs. The request is on the wire when this returns
+    /// ([`SignalBackend::put_start`]); the completion has no deadline.
+    pub async fn put_start(&self, value: T) -> Result<PutCompletion> {
+        let (source, shown) = self.putting(&value);
+        let done = self.backend.put_start(Some(value)).await?;
+        Ok(Box::pin(async move {
+            done.await?;
+            tracing::debug!("Successfully put value {shown} to backend at source {source}");
+            Ok(())
+        }))
+    }
+
+    /// Log the put of `value` about to start; returns the write source and
+    /// the value as shown, for the line logged once it completes.
+    fn putting(&self, value: &T) -> (String, String) {
+        let source = self.backend.source(&self.config.source, false);
+        // Rendered only for DEBUG: a put may carry a whole waveform.
+        let shown = if tracing::enabled!(tracing::Level::DEBUG) {
+            shown(value)
+        } else {
+            String::new()
+        };
+        tracing::debug!("Putting value {shown} to backend at source {source}");
+        (source, shown)
     }
 }
 

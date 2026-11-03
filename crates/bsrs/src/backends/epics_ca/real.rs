@@ -470,6 +470,9 @@ pub struct EpicsCaBackend<T: Clone + Send + Sync + 'static> {
     /// ophyd-async's `initial_values`: what `connect` read, which
     /// `put(None)` writes.
     initial: Mutex<Option<T>>,
+    /// ophyd-async's `EpicsOptions.wait`: whether a put of a value waits
+    /// for the record to process.
+    wait: fn(&T) -> bool,
 }
 
 impl<T: CaType> EpicsCaBackend<T> {
@@ -492,7 +495,16 @@ impl<T: CaType> EpicsCaBackend<T> {
             want,
             converter: Mutex::new(None),
             initial: Mutex::new(None),
+            wait: |_| true,
         }
+    }
+
+    /// Put the values `wait` refuses without a put-callback, completing once
+    /// sent, as ophyd-async's `EpicsOptions(wait=...)`: a busy record's
+    /// callback lasts the whole operation, and one for `.STOP` would queue
+    /// behind the move it is meant to stop.
+    pub fn with_wait(self, wait: fn(&T) -> bool) -> Self {
+        Self { wait, ..self }
     }
 }
 
@@ -569,9 +581,15 @@ impl<T: CaType> EpicsCaBackend<T> {
 
     async fn put_value(&self, value: Option<T>) -> Result<PutCompletion> {
         let value = self.or_initial(value).await?;
+        let wait = (self.wait)(&value);
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
         let v = T::encode(&*self.converter(&ch).await?, value)?;
-        put_callback(&ch, &v, "ca put")
+        if wait {
+            return put_callback(&ch, &v, "ca put");
+        }
+        ch.put_no_callback(&v)
+            .map_err(|e| BsrsError::Backend(format!("ca put: {e}")))?;
+        Ok(Box::pin(futures::future::ready(Ok(()))))
     }
 
     async fn value(&self) -> Result<T> {
@@ -939,21 +957,6 @@ impl<T: CaType> SignalBackend<T> for EpicsCaBackend<T> {
     }
     fn source(&self, name: &str, _read: bool) -> String {
         format!("ca://{name}")
-    }
-}
-
-impl EpicsCaBackend<bool> {
-    /// Fire-and-forget put (`CA_PROTO_WRITE`, no put-callback). For busy
-    /// records (areaDetector `Acquire`/`Capture`) a put-callback completes
-    /// only when the *operation* ends — and a `0` put's callback can
-    /// deadlock outright — so callers that just need the value written use
-    /// this and watch the readback instead (the ophyd-async
-    /// `EpicsOptions(wait=non_zero)` convention).
-    pub async fn put_nowait(&self, value: bool) -> Result<()> {
-        let ch = self.ensure_channel(Duration::from_secs(2)).await?;
-        let v = bool::encode(&*self.converter(&ch).await?, value)?;
-        ch.put_no_callback(&v)
-            .map_err(|e| BsrsError::Backend(format!("ca put_nowait: {e}")))
     }
 }
 

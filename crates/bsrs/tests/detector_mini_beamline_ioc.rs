@@ -255,10 +255,9 @@ async fn moving_dot_frames_are_described_from_the_driver_readbacks() {
     put::<f64>("mini:dot:cam1:AcquireTime", 0.01).await;
     put::<f64>("mini:dot:cam1:AcquirePeriod", 0.01).await;
     put::<i64>("mini:dot:HDF1:NumFramesChunks", 1).await;
-    timeout(
-        TIMEOUT,
-        SignalBackend::put(cam.nd_attributes_file.as_ref(), Some(String::new())),
-    )
+    timeout(TIMEOUT, async {
+        cam.nd_attributes_file.put(String::new()).await.await
+    })
     .await
     .expect("NDAttributesFile put timed out")
     .expect("clear NDAttributesFile");
