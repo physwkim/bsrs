@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::core::reading::ReadingValue;
 use crate::core::status::SubToken;
+use crate::devices::signal::shown;
 use crate::protocols_async::{ReadingValueCallback, SignalBackend};
 use serde::Serialize;
 use serde_json::Value;
@@ -117,11 +118,11 @@ where
                 tracing::debug!(
                     "Updated subscription: reading of source {source} changed from {} to {}",
                     if fanout.has_value.load(Ordering::SeqCst) {
-                        serde_json::to_string(&*fanout.tx.borrow()).unwrap_or_default()
+                        shown(&*fanout.tx.borrow())
                     } else {
                         "None".into()
                     },
-                    serde_json::to_string(&reading).unwrap_or_default(),
+                    shown(&reading),
                 );
                 // `send_replace`, not `send`: a staged cache with no listener
                 // has no receiver, and `send` would drop the value while

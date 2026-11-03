@@ -83,7 +83,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   existing directory, where ophyd-async can return that directory again.
 - `Signal` logs at debug what ophyd-async's signals log: each connect
   started, `get`, `put` and `trigger`, and a monitor's opening, updates and
-  closing, with ophyd-async's message text.
+  closing, with ophyd-async's message text and values spelled as Python's
+  `str()` spells them.
 
 ### Changed
 

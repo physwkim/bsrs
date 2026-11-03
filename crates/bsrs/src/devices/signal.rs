@@ -116,13 +116,76 @@ where
 type ConnectTask = Shared<BoxFuture<'static, std::result::Result<(), Arc<BsrsError>>>>;
 
 /// `value` as ophyd-async's log lines show one (`str(value)`): a string
-/// bare, anything else as JSON.
-fn shown(value: &impl Serialize) -> String {
-    match serde_json::to_value(value) {
-        Ok(serde_json::Value::String(s)) => s,
-        Ok(v) => v.to_string(),
+/// bare, anything else spelled as a Python literal.
+pub(crate) fn shown(value: &impl Serialize) -> String {
+    match serde_json::to_string(value) {
+        Ok(json) => serde_json::from_str::<String>(&json).unwrap_or_else(|_| python_literal(&json)),
         Err(e) => format!("<{e}>"),
     }
+}
+
+/// Respell serde_json output token by token, so struct fields keep their
+/// declared order (a `serde_json::Value` would sort them).
+fn python_literal(json: &str) -> String {
+    let mut out = String::with_capacity(json.len());
+    let mut rest = json;
+    while let Some(c) = rest.chars().next() {
+        let (text, len) = match c {
+            '"' => {
+                let len = json_string_len(rest);
+                let s = serde_json::from_str::<String>(&rest[..len]).unwrap_or_default();
+                (python_repr(&s), len)
+            }
+            ':' | ',' => (format!("{c} "), 1),
+            't' if rest.starts_with("true") => ("True".into(), 4),
+            'f' if rest.starts_with("false") => ("False".into(), 5),
+            'n' if rest.starts_with("null") => ("None".into(), 4),
+            _ => (c.to_string(), c.len_utf8()),
+        };
+        out.push_str(&text);
+        rest = &rest[len..];
+    }
+    out
+}
+
+/// Byte length of the JSON string literal `s` starts with.
+fn json_string_len(s: &str) -> usize {
+    let mut escaped = false;
+    for (i, b) in s.bytes().enumerate().skip(1) {
+        match b {
+            _ if escaped => escaped = false,
+            b'\\' => escaped = true,
+            b'"' => return i + 1,
+            _ => {}
+        }
+    }
+    s.len()
+}
+
+/// Python `repr(s)`.
+fn python_repr(s: &str) -> String {
+    let quote = if s.contains('\'') && !s.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
+    let mut out = String::from(quote);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c);
+            }
+            c if c < ' ' || c == '\x7f' => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push(quote);
+    out
 }
 
 // -- Available for every access role ----------------------------------------
@@ -814,6 +877,30 @@ mod tests {
         assert!(text.contains("Successfully put default value to backend at source soft://proc"));
     }
 
+    // Log lines spell values as ophyd-async's do, Python `str(value)`.
+    #[test]
+    fn logged_values_are_spelled_as_python_str() {
+        assert_eq!(shown(&"it's"), "it's");
+        assert_eq!(shown(&true), "True");
+        assert_eq!(shown(&None::<i64>), "None");
+        assert_eq!(shown(&1.5), "1.5");
+        assert_eq!(shown(&vec![1, 2]), "[1, 2]");
+        assert_eq!(
+            shown(&vec!["a", "it's", "\\\n"]),
+            r#"['a', "it's", '\\\n']"#
+        );
+        let reading = ReadingValue {
+            value: serde_json::json!(false),
+            timestamp: 2.0,
+            alarm_severity: Some(0),
+            message: None,
+        };
+        assert_eq!(
+            shown(&reading),
+            "{'value': False, 'timestamp': 2.0, 'alarm_severity': 0}"
+        );
+    }
+
     // ophyd-async test_subscription_logs: subscribing opens the shared
     // monitor and dropping the last subscription closes it, each logged, as
     // is every reading the monitor delivers.
@@ -833,10 +920,10 @@ mod tests {
         backend.write_now("b".to_string());
         let text = caplog.text();
         assert!(text.contains(
-            "Updated subscription: reading of source soft://x changed from None to {\"value\":\"a\""
+            "Updated subscription: reading of source soft://x changed from None to {'value': 'a', "
         ));
         assert!(text.contains(
-            "Updated subscription: reading of source soft://x changed from {\"value\":\"a\""
+            "Updated subscription: reading of source soft://x changed from {'value': 'a', "
         ));
         drop(sub);
         assert!(caplog
