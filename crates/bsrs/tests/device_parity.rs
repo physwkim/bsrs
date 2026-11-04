@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bsrs::backends::soft::{SoftDetector, SoftMotor, SoftSignalBackend};
-use bsrs::core::msg::{ConfigurableObj, NamedObj, ReadableObj, StageableObj};
+use bsrs::core::msg::{ConfigurableObj, MonitorableObj, NamedObj, ReadableObj, StageableObj};
 use bsrs::core::{
     BsrsError, ConfigureArgs, DataKey, Kind, NotConnected, ReadingValue, Result, Status,
     StatusOutcome, SubToken, WaitError,
@@ -753,6 +753,20 @@ async fn soft_motor_stop_holds_position_and_allows_the_next_move() {
     stop(&motor, true).await;
     let loc = motor.locate().await.unwrap();
     assert_eq!((loc.setpoint, loc.readback), (5.0, 5.0));
+}
+
+// ophyd-async test_sim_motor::test_sim_motor_move_mode[instant]: an instant
+// move publishes the start and the target and nothing in between.
+#[tokio::test]
+async fn soft_motor_instant_move_publishes_only_start_and_target() {
+    let motor = SoftMotor::new("motor", Some(600.0));
+    let mut sub = MonitorableObj::subscribe_dyn(&motor).await.unwrap();
+    AsyncMovable::set(&motor, 600.05).await.await.unwrap();
+    let mut readbacks = Vec::new();
+    while let Some(r) = sub.try_recv() {
+        readbacks.push(r.value.as_f64().unwrap());
+    }
+    assert_eq!(readbacks, [600.0, 600.05]);
 }
 
 // ophyd test_device::test_device_state and test_status_wait through the
