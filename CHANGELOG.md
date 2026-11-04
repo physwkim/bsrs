@@ -115,6 +115,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `devices::set_and_wait_for_other_value`, exported as ophyd-async exports
   it: wait for a subscription's first value, run a set, then wait for a
   value that matches, all within one timeout.
+- `host::areadetector::wait_for_good_state`, ophyd-async's: wait until a
+  state signal is one of the good states, with its `message_signal` as an
+  optional signal whose value ends the not-in-a-good-state error.
 
 ### Changed
 

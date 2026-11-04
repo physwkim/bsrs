@@ -39,7 +39,7 @@ use crate::core::reading::ReadingValue;
 use crate::core::status::{Status, StatusError, SubToken};
 use crate::devices::device::Device;
 use crate::devices::observe::{set_and_wait_for_other_value, wait_for_value};
-use crate::devices::signal::{Access, Read, Readable, Signal, SignalR, SignalRW};
+use crate::devices::signal::{repr, Access, Read, Readable, Signal, SignalR, SignalRW};
 use crate::devices::stage_sigs::StageSigs;
 use crate::devices::BackendFromPv;
 use crate::devices::{wait_for_connection, PathInfo, PathProvider, PurePath, StandardDetector};
@@ -166,11 +166,13 @@ async fn set_and_wait_for_bool<R>(
 }
 
 /// Wait until `state` is one of `good`. Port of ophyd-async
-/// `wait_for_good_state` without its `message_signal`: a state that never
-/// arrives and one that is never good each fail with its text.
-async fn wait_for_good_state<B: SignalBackend<String>>(
+/// `wait_for_good_state`: a state that never arrives and one that is never
+/// good each fail with its text, the latter ending in `message`'s value
+/// when given, else in the good states.
+pub async fn wait_for_good_state<B: SignalBackend<String>>(
     state: &SignalR<String, B>,
     good: &[&str],
+    message: Option<&SignalR<String, B>>,
     timeout: Duration,
 ) -> Result<()> {
     let sub = AsyncSubscribable::subscribe(state).await?;
@@ -181,11 +183,20 @@ async fn wait_for_good_state<B: SignalBackend<String>>(
             "Could not monitor state: {}",
             state.source()
         ))),
-        Err(BsrsError::ValueTimeout { last: Some(v), .. }) => Err(BsrsError::Other(format!(
-            "{} not in a good state: {}: expected one of {good:?}",
-            state.source(),
-            v.as_str().unwrap_or_default()
-        ))),
+        Err(BsrsError::ValueTimeout { last: Some(v), .. }) => {
+            let why = match message {
+                Some(message) => message.get().await?,
+                None => {
+                    let good: Vec<_> = good.iter().map(repr).collect();
+                    format!("expected one of {{{}}}", good.join(", "))
+                }
+            };
+            Err(BsrsError::Other(format!(
+                "{} not in a good state: {}: {why}",
+                state.source(),
+                v.as_str().unwrap_or_default()
+            )))
+        }
         Err(e) => Err(e),
     }
 }
@@ -449,7 +460,7 @@ impl AreaDetectorCam {
     /// `timeout` elapses.
     pub async fn wait_for_idle(&self, timeout: Duration) -> Result<()> {
         let good = [AD_STATE_IDLE, AD_STATE_ABORTED];
-        wait_for_good_state(&self.detector_state, &good, timeout).await
+        wait_for_good_state(&self.detector_state, &good, None, timeout).await
     }
 
     /// ophyd-async-style warmup: acquire exactly one frame so the
@@ -2639,10 +2650,13 @@ mod tests {
     }
 
     fn detector_state<B: SignalBackend<String>>(backend: Arc<B>) -> SignalR<String, B> {
-        let source = "PREFIX:DRV:DetectorState_RBV";
+        driver_signal(backend, "PREFIX:DRV:DetectorState_RBV")
+    }
+
+    fn driver_signal<B: SignalBackend<String>>(backend: Arc<B>, pv: &str) -> SignalR<String, B> {
         let config = crate::devices::signal::SignalConfig {
-            source: source.into(),
-            name: source.into(),
+            source: pv.into(),
+            name: pv.into(),
             ..Default::default()
         };
         Signal::new(backend, config)
@@ -2654,13 +2668,32 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_state_that_is_never_good_is_named() {
         let state = detector_state(Arc::new(MockSignalBackend::with_value("Error".to_string())));
-        let err = wait_for_good_state(&state, &GOOD, Duration::from_millis(50))
+        let err = wait_for_good_state(&state, &GOOD, None, Duration::from_millis(50))
             .await
             .unwrap_err();
         assert_eq!(
             err.to_string(),
             "mock+soft://PREFIX:DRV:DetectorState_RBV not in a good state: Error: \
-             expected one of [\"Idle\", \"Aborted\"]"
+             expected one of {'Idle', 'Aborted'}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_state_that_is_never_good_is_explained_by_its_message() {
+        let state = detector_state(Arc::new(MockSignalBackend::with_value("Error".to_string())));
+        let message = driver_signal(
+            Arc::new(MockSignalBackend::with_value(
+                "Temperature too high".to_string(),
+            )),
+            "PREFIX:DRV:StatusMessage_RBV",
+        );
+        let err = wait_for_good_state(&state, &GOOD, Some(&message), Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "mock+soft://PREFIX:DRV:DetectorState_RBV not in a good state: Error: \
+             Temperature too high"
         );
     }
 
@@ -2705,7 +2738,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_state_that_never_arrives_cannot_be_monitored() {
         let state = detector_state(Arc::new(NoMonitor(MockBackend::new(String::new()))));
-        let err = wait_for_good_state(&state, &GOOD, Duration::from_millis(50))
+        let err = wait_for_good_state(&state, &GOOD, None, Duration::from_millis(50))
             .await
             .unwrap_err();
         assert_eq!(
@@ -2724,7 +2757,7 @@ mod tests {
             backend.set_value(AD_STATE_IDLE.to_string());
         };
         let (waited, ()) = tokio::join!(
-            wait_for_good_state(&state, &GOOD, Duration::from_secs(10)),
+            wait_for_good_state(&state, &GOOD, None, Duration::from_secs(10)),
             idle_later
         );
         waited.unwrap();
