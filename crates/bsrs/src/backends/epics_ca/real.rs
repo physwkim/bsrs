@@ -85,7 +85,7 @@ impl CaContext {
         if let Some(ch) = shard.get(pv) {
             return ch.clone();
         }
-        let ch = Arc::new(SharedChannel::new(self.client.create_channel(pv)));
+        let ch = Arc::new(SharedChannel::new(pv, self.client.create_channel(pv)));
         shard.insert(pv.to_string(), ch.clone());
         ch
     }
@@ -256,10 +256,7 @@ async fn converter_for(
     ch: &SharedChannel,
 ) -> Result<(CaConverter, Snapshot)> {
     let snap = ctrl_get(ch).await?;
-    let info = ch
-        .info()
-        .await
-        .map_err(|e| BsrsError::Backend(format!("ca info {pv}: {e}")))?;
+    let info = ch.info().await.map_err(|e| ca_failed("info", pv, e))?;
     let conv = make_converter(pv, want, info.native_type, info.element_count, &snap)?;
     Ok((conv, snap))
 }
@@ -394,7 +391,7 @@ impl<E: CaElement> CaType for Vec<E> {
         Ok(E::encode_array(v))
     }
     fn datakey(source: String, conv: &CaConverter, snap: &Snapshot) -> Result<DataKey> {
-        let v = Self::decode(conv, &snap.value).ok_or_else(|| undecodable(&snap.value))?;
+        let v = Self::decode(conv, &snap.value).ok_or_else(|| undecodable(&source, &snap.value))?;
         let float = matches!(E::DBR, DbFieldType::Float | DbFieldType::Double);
         let meta = ctrl_metadata(snap, true, float);
         Ok(array_datakey(source, v.len(), E::DTYPE_NUMPY, meta))
@@ -453,8 +450,16 @@ impl CaElement for String {
 
 /// A read whose value is not of the type the converter was made for: the PV
 /// changed type since the connect.
-fn undecodable(v: &EpicsValue) -> BsrsError {
-    BsrsError::Backend(format!("ca: {v:?} is not of the PV's connect-time type"))
+fn undecodable(source: &str, v: &EpicsValue) -> BsrsError {
+    BsrsError::Backend(format!(
+        "{source}: {v:?} is not of the PV's connect-time type"
+    ))
+}
+
+/// CA's `op` on `pv` failed with `e`; the PV is named, as aioca's
+/// `CANothing` names it.
+fn ca_failed(op: &str, pv: &str, e: impl std::fmt::Display) -> BsrsError {
+    BsrsError::Backend(format!("ca {op} {pv}: {e}"))
 }
 
 /// CA backend for a single PV.
@@ -536,7 +541,7 @@ impl<T: CaType> EpicsCaBackend<T> {
         let ch = self.channel();
         ch.wait_connected(timeout)
             .await
-            .map_err(|e| BsrsError::Backend(format!("ca connect {}: {e}", self.pv)))?;
+            .map_err(|e| ca_failed("connect", &self.pv, e))?;
         Ok(ch.clone())
     }
 
@@ -552,7 +557,7 @@ impl<T: CaType> EpicsCaBackend<T> {
             info.element_count,
             &snap,
         )?;
-        let v = T::decode(&conv, &snap.value).ok_or_else(|| undecodable(&snap.value))?;
+        let v = T::decode(&conv, &snap.value).ok_or_else(|| self.undecodable(&snap.value))?;
         *self.converter.lock().unwrap() = Some(Arc::new(conv));
         *self.initial.lock().unwrap() = Some(v);
         Ok(())
@@ -585,10 +590,10 @@ impl<T: CaType> EpicsCaBackend<T> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
         let v = T::encode(&*self.converter(&ch).await?, value)?;
         if wait {
-            return put_callback(&ch, &v, "ca put");
+            return put_callback(&ch, &v);
         }
         ch.put_no_callback(&v)
-            .map_err(|e| BsrsError::Backend(format!("ca put: {e}")))?;
+            .map_err(|e| ca_failed("put", &self.pv, e))?;
         Ok(Box::pin(futures::future::ready(Ok(()))))
     }
 
@@ -598,8 +603,12 @@ impl<T: CaType> EpicsCaBackend<T> {
         let (_ty, v) = ch
             .get_with_timeout(CA_IO_TIMEOUT)
             .await
-            .map_err(|e| BsrsError::Backend(format!("ca get: {e}")))?;
-        T::decode(&conv, &v).ok_or_else(|| undecodable(&v))
+            .map_err(|e| ca_failed("get", &self.pv, e))?;
+        T::decode(&conv, &v).ok_or_else(|| self.undecodable(&v))
+    }
+
+    fn undecodable(&self, v: &EpicsValue) -> BsrsError {
+        undecodable(&format!("ca://{}", self.pv), v)
     }
 }
 
@@ -630,27 +639,22 @@ async fn connect_read(
 /// circuit, in call order, when this returns. The completion has no deadline
 /// of its own: a busy record's callback lasts as long as its operation, so
 /// whoever awaits it bounds it.
-fn put_callback(
-    ch: &Arc<SharedChannel>,
-    v: &EpicsValue,
-    what: &'static str,
-) -> Result<PutCompletion> {
-    let done = ch
-        .put_callback(v)
-        .map_err(|e| BsrsError::Backend(format!("{what}: {e}")))?;
+fn put_callback(ch: &Arc<SharedChannel>, v: &EpicsValue) -> Result<PutCompletion> {
+    let pv = ch.pv().clone();
+    let done = ch.put_callback(v).map_err(|e| ca_failed("put", &pv, e))?;
     Ok(Box::pin(async move {
         done.await
             .unwrap_or_else(|_| Err("put-callback driver gone".into()))
-            .map_err(|e| BsrsError::Backend(format!("{what}: {e}")))
+            .map_err(|e| ca_failed("put", &pv, e))
     }))
 }
 
 /// `put`'s wait on `done`, bounded by [`ca_put_timeout`]: a plain put has no
 /// caller deadline to defer to.
-async fn await_put(done: PutCompletion, what: &'static str) -> Result<()> {
+async fn await_put(done: PutCompletion, pv: &str) -> Result<()> {
     tokio::time::timeout(ca_put_timeout(), done)
         .await
-        .unwrap_or_else(|_| Err(BsrsError::Backend(format!("{what}: {}", CaError::Timeout))))
+        .unwrap_or_else(|_| Err(ca_failed("put", pv, CaError::Timeout)))
 }
 
 /// Map a CA wire alarm severity (`DBR_STS_*` `severity`, a `u16`) to the
@@ -763,7 +767,7 @@ fn array_datakey(source: String, len: usize, dtype_numpy: &str, meta: SignalMeta
 async fn ctrl_get(ch: &SharedChannel) -> Result<Snapshot> {
     ctrl_read(ch)
         .await
-        .map_err(|e| BsrsError::Backend(format!("ca ctrl get: {e}")))
+        .map_err(|e| ca_failed("ctrl get", ch.pv(), e))
 }
 
 /// [`ctrl_get`] with the CA error kept, for `connect` to report it as
@@ -893,7 +897,7 @@ impl<T: CaType> SignalBackend<T> for EpicsCaBackend<T> {
         self.put_value(value).await
     }
     async fn put(&self, value: Option<T>) -> Result<()> {
-        await_put(self.put_value(value).await?, "ca put").await
+        await_put(self.put_value(value).await?, &self.pv).await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
         let ch = self.ensure_channel(Duration::from_secs(2)).await?;
@@ -906,8 +910,8 @@ impl<T: CaType> SignalBackend<T> for EpicsCaBackend<T> {
         let snap = ch
             .get_with_metadata(DbrClass::Time, CA_IO_TIMEOUT)
             .await
-            .map_err(|e| BsrsError::Backend(format!("ca get: {e}")))?;
-        let v = T::decode(&conv, &snap.value).ok_or_else(|| undecodable(&snap.value))?;
+            .map_err(|e| ca_failed("get", &self.pv, e))?;
+        let v = T::decode(&conv, &snap.value).ok_or_else(|| self.undecodable(&snap.value))?;
         Ok(ReadingValue {
             value: v.into(),
             timestamp: ts_to_f64(snap.timestamp),
@@ -1103,23 +1107,19 @@ impl crate::devices::CommandBackend for CaCommandBackend {
         let ch = self.channel();
         ch.wait_connected(Duration::MAX)
             .await
-            .map_err(|e| BsrsError::Backend(format!("ca connect {}: {e}", self.pv)))?;
+            .map_err(|e| ca_failed("connect", &self.pv, e))?;
         let info = ch
             .info()
             .await
-            .map_err(|e| BsrsError::Backend(format!("ca connect {}: {e}", self.pv)))?;
-        let done = put_callback(
-            ch,
-            &i64_to_wire(info.native_type, self.execute_value),
-            "ca put",
-        )?;
+            .map_err(|e| ca_failed("connect", &self.pv, e))?;
+        let done = put_callback(ch, &i64_to_wire(info.native_type, self.execute_value))?;
         tokio::spawn(async move {
             let r = done.await;
             drop(serial);
             r
         })
         .await
-        .map_err(|e| BsrsError::Backend(format!("ca put: {e}")))?
+        .map_err(|e| ca_failed("put", &self.pv, e))?
     }
 }
 

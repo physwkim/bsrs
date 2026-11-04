@@ -3,6 +3,7 @@
 //! a calcout with a 6 s ODLY whose output is "On Change": a put that changes
 //! it waits the delay out, as a motor's put waits out the move, and a put of
 //! the value it holds processes at once, as a move to where the motor stands.
+//! LOCKED is disabled (DISP=1), so a put to it fails, naming the PV.
 //!
 //! The only test in this binary: the PVA client is resolved once per
 //! process, after the environment below is set.
@@ -18,6 +19,7 @@ use tokio::sync::watch;
 
 const DB: &str = r#"
 record(calcout, "SLOW") { field(ODLY, "6") field(CALC, "A") field(OOPT, "On Change") }
+record(ao, "LOCKED") { field(DISP, "1") }
 "#;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -66,4 +68,13 @@ async fn a_put_completes_when_the_record_has_processed() {
     assert!(moved_t >= Duration::from_millis(5_900), "{moved_t:?}");
     assert!(still_t < Duration::from_secs(1), "{still_t:?}");
     assert_eq!(slow.get_value().await.unwrap(), 1.0);
+
+    let locked = EpicsPvaBackend::<f64>::new("LOCKED");
+    locked.connect(Duration::from_secs(10)).await.unwrap();
+    let err = locked.put(Some(1.0)).await.expect_err("DISP refuses a put");
+    assert!(
+        err.to_string()
+            .starts_with("backend error: pva put LOCKED: "),
+        "{err}"
+    );
 }

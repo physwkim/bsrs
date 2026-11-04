@@ -2,7 +2,8 @@
 //! applies `EPICS_CA_PUT_TIMEOUT`, while `put_start`'s completion lasts as
 //! long as the record's processing, as an areaDetector `arm` needs for its
 //! busy Acquire. T's FLNK is a calcout with a 1 s ODLY, so its callback
-//! outlives the 0.2 s `EPICS_CA_PUT_TIMEOUT` set here.
+//! outlives the 0.2 s `EPICS_CA_PUT_TIMEOUT` set here. Either failure names
+//! the PV: that timeout, and LOCKED's refusal, as it is disabled (DISP=1).
 //!
 //! The only test in this binary: the CA client and `EPICS_CA_PUT_TIMEOUT`
 //! are resolved once per process, after the environment below is set.
@@ -18,6 +19,7 @@ use epics_ca_rs::server::CaServer;
 const DB: &str = r#"
 record(ao, "T") { field(FLNK, "D") }
 record(calcout, "D") { field(ODLY, "1") field(CALC, "1") }
+record(ao, "LOCKED") { field(DISP, "1") }
 "#;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -49,4 +51,17 @@ async fn put_is_bounded_and_a_put_start_completion_is_not() {
     let started = Instant::now();
     let err = t.put(Some(2.0)).await.expect_err("put is bounded");
     assert!(started.elapsed() < Duration::from_millis(900), "{err}");
+    assert_eq!(
+        err.to_string(),
+        "backend error: ca put T: timeout waiting for response"
+    );
+
+    let locked = EpicsCaBackend::<f64>::new("LOCKED");
+    locked.connect(Duration::from_secs(10)).await.unwrap();
+    let err = locked.put(Some(1.0)).await.expect_err("DISP refuses a put");
+    assert!(
+        err.to_string()
+            .starts_with("backend error: ca put LOCKED: "),
+        "{err}"
+    );
 }

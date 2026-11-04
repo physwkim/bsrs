@@ -27,6 +27,7 @@ type Completion = Pin<Box<dyn Future<Output = CaResult<()>> + Send>>;
 /// A PV's channel. Reads go straight through; puts only through
 /// [`Self::put_callback`] and [`Self::put_no_callback`].
 pub(super) struct SharedChannel {
+    pv: Arc<str>,
     ca: CaChannel,
     puts: Mutex<PutSlot>,
 }
@@ -47,11 +48,16 @@ struct Trailing {
 }
 
 impl SharedChannel {
-    pub(super) fn new(ca: CaChannel) -> Self {
+    pub(super) fn new(pv: &str, ca: CaChannel) -> Self {
         Self {
+            pv: pv.into(),
             ca,
             puts: Mutex::new(PutSlot::Idle),
         }
+    }
+
+    pub(super) fn pv(&self) -> &Arc<str> {
+        &self.pv
     }
 
     /// Resolves once the channel is connected, at once if it is. Any number

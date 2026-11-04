@@ -278,6 +278,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   predicate, as ophyd-async's `match` does; a closure needs its argument
   typed, `|r: &ReadingValue|`. A `ValueTimeout` names a value matcher and
   shows the last value by Python `repr` (`'blah'`, `True`, `None`).
+- A CA or PVA get, put or decode error names its PV, as aioca's `CANothing`
+  does: `ca put X:cam1:Acquire: …`, not `ca put: …`. An areaDetector arm
+  failure is that error alone, without an `…arm: Acquire:` prefix.
 
 ### Removed
 

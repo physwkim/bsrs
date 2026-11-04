@@ -90,7 +90,7 @@ impl<T: PvaType> EpicsPvaBackend<T> {
     async fn connect_reading(&self, timeout: Duration) -> Result<()> {
         let top = connect_read(&self.client, &self.pv, timeout).await?;
         let conv = make_converter(&self.pv, self.want, &top)?;
-        let v = T::decode(&conv, &top).ok_or_else(|| undecodable(&top))?;
+        let v = T::decode(&conv, &top).ok_or_else(|| self.undecodable(&top))?;
         *self.converter.lock().unwrap() = Some(Arc::new(conv));
         *self.initial.lock().unwrap() = Some(v);
         Ok(())
@@ -114,7 +114,11 @@ impl<T: PvaType> EpicsPvaBackend<T> {
 
     async fn value(&self) -> Result<T> {
         let (conv, top) = self.read().await?;
-        T::decode(&conv, &top).ok_or_else(|| undecodable(&top))
+        T::decode(&conv, &top).ok_or_else(|| self.undecodable(&top))
+    }
+
+    fn undecodable(&self, top: &PvField) -> BsrsError {
+        undecodable(&format!("pva://{}", self.pv), top)
     }
 
     /// `value`, or for `None` the value `connect` read, read now if no
@@ -158,16 +162,20 @@ impl<T: PvaType> crate::devices::BackendFromPv for EpicsPvaBackend<T> {
 
 /// A full read of `pv`.
 async fn pvget(client: &PvaClient, pv: &str) -> Result<PvField> {
-    client
-        .pvget(pv)
-        .await
-        .map_err(|e| BsrsError::Backend(format!("pva get: {e}")))
+    client.pvget(pv).await.map_err(|e| pva_failed("get", pv, e))
 }
 
 /// A read whose value is not of the type the converter was made for: the PV
 /// changed type since the connect.
-fn undecodable(top: &PvField) -> BsrsError {
-    BsrsError::Backend(format!("pva: {top:?} is not of the PV's connect-time type"))
+fn undecodable(source: &str, top: &PvField) -> BsrsError {
+    BsrsError::Backend(format!(
+        "{source}: {top:?} is not of the PV's connect-time type"
+    ))
+}
+
+/// PVA's `op` on `pv` failed with `e`, naming the PV as `ca_failed` does.
+fn pva_failed(op: &str, pv: &str, e: impl std::fmt::Display) -> BsrsError {
+    BsrsError::Backend(format!("pva {op} {pv}: {e}"))
 }
 
 /// Wait up to `timeout` for `pv` to connect. `pvconnect` is bounded by the
@@ -182,7 +190,7 @@ async fn pva_connect(client: &PvaClient, pv: &str, timeout: Duration) -> Result<
         .on_connect(move || on_connect.notify_one())
         .exec()
         .await
-        .map_err(|e| BsrsError::Backend(format!("pva connect {pv}: {e}")))?;
+        .map_err(|e| pva_failed("connect", pv, e))?;
     tokio::time::timeout(timeout, connected.notified())
         .await
         .map_err(|_| {
@@ -210,9 +218,7 @@ async fn connect_read(client: &PvaClient, pv: &str, timeout: Duration) -> Result
 /// put starts, with no deadline of its own. Returns once DATA is queued on
 /// the circuit, so puts are sent in call order.
 async fn put_block(client: &PvaClient, pv: &str, f: PvField, block: bool) -> Result<PutCompletion> {
-    fn put_err(e: PvaError) -> BsrsError {
-        BsrsError::Backend(format!("pva put: {e}"))
-    }
+    let put_err = |e: PvaError| pva_failed("put", pv, e);
     let req = PvRequestBuilder::new()
         .field("value")
         .record("block", block)
@@ -230,7 +236,8 @@ async fn put_block(client: &PvaClient, pv: &str, f: PvField, block: bool) -> Res
         .send_fields_typed(&[(path, PutLeaf::Typed(leaf))])
         .await
         .map_err(put_err)?;
-    Ok(async move { sent.wait().await.map_err(put_err) }.boxed())
+    let pv = pv.to_string();
+    Ok(async move { sent.wait().await.map_err(|e| pva_failed("put", &pv, e)) }.boxed())
 }
 
 /// Where a put of `f` lands in a PV of shape `intro`, and what it writes
@@ -925,7 +932,7 @@ impl<E: PvaElement> PvaType for Vec<E> {
         Ok(PvField::ScalarArrayTyped(E::to_array(v)))
     }
     fn datakey(source: String, conv: &PvaConverter, top: &PvField) -> Result<DataKey> {
-        let v = Self::decode(conv, top).ok_or_else(|| undecodable(top))?;
+        let v = Self::decode(conv, top).ok_or_else(|| undecodable(&source, top))?;
         let meta = pv_field_to_metadata(top, Self::DATATYPE);
         Ok(array_datakey(source, v.len(), E::DTYPE_NUMPY, meta))
     }
@@ -1048,7 +1055,7 @@ impl PvaType for NdArray {
         ))
     }
     fn datakey(source: String, conv: &PvaConverter, top: &PvField) -> Result<DataKey> {
-        let v = Self::decode(conv, top).ok_or_else(|| undecodable(top))?;
+        let v = Self::decode(conv, top).ok_or_else(|| undecodable(&source, top))?;
         let shape = v.shape().iter().map(|&n| Some(n as u64)).collect();
         let dtype_numpy = Some(v.data().dtype_numpy().into());
         let meta = pv_field_to_metadata(top, Self::DATATYPE);
@@ -1114,7 +1121,7 @@ impl<T: TypedTable> PvaType for T {
     }
     fn datakey(source: String, conv: &PvaConverter, top: &PvField) -> Result<DataKey> {
         let t = Self::decode(conv, top)
-            .ok_or_else(|| undecodable(top))?
+            .ok_or_else(|| undecodable(&source, top))?
             .into_table()?;
         let shape = vec![Some(t.len() as u64)];
         let meta = pv_field_to_metadata(top, Self::DATATYPE);
@@ -1179,7 +1186,7 @@ impl<T: PvaType> SignalBackend<T> for EpicsPvaBackend<T> {
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
         let (conv, top) = self.read().await?;
-        let v = T::decode(&conv, &top).ok_or_else(|| undecodable(&top))?;
+        let v = T::decode(&conv, &top).ok_or_else(|| self.undecodable(&top))?;
         Ok(ReadingValue {
             value: v.into(),
             timestamp: pv_field_to_ts(&top).unwrap_or_else(now_ts),

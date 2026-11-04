@@ -2349,13 +2349,10 @@ impl DetectorControl for AreaDetectorCam {
         match set_and_wait_for_bool(&self.acquire_rbv, true, self.acquire.put_start(true)).await {
             Ok(done) => {
                 let (acquired, setter) = Status::new();
-                let prefix = self.prefix.clone();
                 tokio::spawn(async move {
                     match done.await {
                         Ok(()) => setter.success(),
-                        Err(e) => {
-                            setter.fail(StatusError::Failed(format!("{prefix}arm: Acquire: {e}")))
-                        }
+                        Err(e) => setter.fail(StatusError::Failed(e.to_string())),
                     }
                 });
                 *self.acquire_status.lock().unwrap() = Some(acquired);
