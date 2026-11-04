@@ -985,7 +985,7 @@ async fn writers_fed_from_rois_describe_the_roi_frames() {
     let shape_of = |roi: &NdRoi| {
         Arc::new(NdArrayDescription::new(
             &cam,
-            vec![roi.size_y_rbv.clone(), roi.size_x_rbv.clone()],
+            vec![roi.size_y.clone(), roi.size_x.clone()],
         ))
     };
     let writer = |prefix: &str, roi: &NdRoi, name: &str| -> DataLogic {
@@ -1370,9 +1370,9 @@ async fn cam_signals_log_connect_get_and_put() {
     cam.connect(TIMEOUT).await.expect("connect cam1");
     let set = format!("ca://{CAM}AcquireTime");
     let rbv = format!("ca://{CAM}AcquireTime_RBV");
-    assert!(caplog.text().contains(&format!("Connecting to {set}\n")));
+    assert!(caplog.text().contains(&format!("Connecting to {rbv}\n")));
 
-    let t = cam.acquire_time_rbv.get().await.expect("read AcquireTime");
+    let t = cam.acquire_time.get().await.expect("read AcquireTime");
     assert!(caplog
         .text()
         .contains(&format!("get_value() on source {rbv} returned ")));

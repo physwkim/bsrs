@@ -341,7 +341,8 @@ mod sealed {
         fn encode_array(v: Vec<Self>) -> EpicsValue;
     }
 }
-use sealed::{CaElement, CaType};
+use sealed::CaElement;
+pub(crate) use sealed::CaType;
 
 impl CaType for f64 {
     const DATATYPE: Datatype = Datatype::Float;

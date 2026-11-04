@@ -23,4 +23,6 @@ mod channel;
 #[cfg(feature = "ca")]
 mod real;
 #[cfg(feature = "ca")]
+pub(crate) use real::CaType;
+#[cfg(feature = "ca")]
 pub use real::{ca_context, CaCommandBackend, CaEnumBackend, EpicsCaBackend};

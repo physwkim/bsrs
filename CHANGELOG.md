@@ -55,16 +55,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `CaMotor::set_current_position` and `PvaMotor::set_current_position`
   (ophyd `EpicsMotor.set_current_position`).
 - `StandardDetector::events_to_kickoff` / `set_events_to_kickoff`,
-  `TriggerInfo::effective_exposure_timeout`, `DetectorWriter::hinted_fields`
-  and `AreaDetectorCam::acquire_time_rbv` / `acquire_period_rbv`.
+  `TriggerInfo::effective_exposure_timeout` and
+  `DetectorWriter::hinted_fields`.
 - `host::areadetector::PluginSignalDataLogic` (ophyd-async
   `PluginSignalDataLogic`), a `SingleDataLogic` that reads a plugin signal
   with each event after setting the new `AreaDetectorCam::wait_for_plugins`;
   and `NdStats::total`.
 - `host::areadetector::NdArrayDescription::new` (ophyd-async
   `NDArrayDescription`) describes a writer's frame from any shape signals,
-  such as the new `NdRoi::size_y_rbv` / `size_x_rbv` for a writer fed from
-  an ROI.
+  such as an `NdRoi`'s `size_y` / `size_x` for a writer fed from that ROI.
 - `StandardDetector::add_plugin` (ophyd-async `AreaDetector(plugins=...)`)
   and `StandardDetector::connect`, which connects the control (the new
   `DetectorControl::connect`), every writer and every plugin, so a plugin
@@ -294,11 +293,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Breaking**: the areaDetector readbacks without a setpoint drop `_rbv`,
   as ophyd-async names them: `AreaDetectorCam::{array_counter,
   detector_state}` and `NdFile::{num_captured, full_file_name,
-  file_path_exists}`. A readback paired with a setpoint field
-  (`acquire_rbv`, `capture_rbv`, `size_x_rbv`, …) keeps it.
+  file_path_exists}`.
 - **Breaking**: `AreaDetectorCam::array_counter` is a `SignalRW` that
   writes `ArrayCounter` and reads `ArrayCounter_RBV`, as ophyd-async's
   `PvSuffix.rbv("ArrayCounter")`.
+- **Breaking**: the areaDetector setpoints ophyd-async declares with
+  `PvSuffix.rbv` read their `_RBV` record and are named by it, while puts
+  still go to the setpoint; so do `NdPlugin::blocking_callbacks` and
+  `NdRoi::{min_x, min_y, enable_x, enable_y}`, as ophyd declares them.
+  `AreaDetectorCam::acquire_rbv`, `NdFile::capture_rbv` and
+  `NdFileHdf5::num_frames_chunks_rbv` are removed; read `acquire`,
+  `capture` and `num_frames_chunks`.
 
 ### Removed
 

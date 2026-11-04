@@ -32,7 +32,7 @@
 //!   `EpicsCaBackend::<String>` reads and writes as a long string.
 //! - `NDArrayPort`: `stringout` (DBR_STRING).
 
-use crate::backends::epics_ca::EpicsCaBackend;
+use crate::backends::epics_ca::{CaType, EpicsCaBackend};
 use crate::core::error::{BsrsError, Result};
 use crate::core::msg::{NamedObj, StageableObj};
 use crate::core::reading::ReadingValue;
@@ -60,8 +60,6 @@ use super::motor_move::{describe_one, pv_signal};
 
 const PUT_TIMEOUT: Duration = Duration::from_secs(10);
 const WARMUP_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
-const ACQUIRE_TIME_RBV: &str = "AcquireTime_RBV";
-const ACQUIRE_PERIOD_RBV: &str = "AcquirePeriod_RBV";
 
 /// `DetectorState_RBV` label for the idle state (ophyd-async `ADState.IDLE`).
 pub const AD_STATE_IDLE: &str = "Idle";
@@ -129,12 +127,23 @@ where
     Arc::new(pv_signal(EpicsCaBackend::from_pv(&pv), &pv, pv.clone()))
 }
 
-/// [`ca_signal`] of a busy record, whose put of `false` is sent without a
+/// `{prefix}{suffix}`'s signal, read from its `_RBV` record, which names
+/// it: ophyd-async `PvSuffix.rbv(suffix)`.
+fn rbv_signal<T: CaType + serde::Serialize>(
+    prefix: &str,
+    suffix: &str,
+) -> Arc<SignalRW<T, EpicsCaBackend<T>>> {
+    let rbv = join(prefix, &format!("{suffix}_RBV"));
+    let backend = EpicsCaBackend::new_rw(&rbv, join(prefix, suffix));
+    Arc::new(pv_signal(backend, &rbv, rbv.clone()))
+}
+
+/// [`rbv_signal`] of a busy record, whose put of `false` is sent without a
 /// put-callback: ophyd-async's `EpicsOptions(wait=non_zero)`.
 fn busy_signal(prefix: &str, suffix: &str) -> Arc<SignalRW<bool, EpicsCaBackend<bool>>> {
-    let pv = join(prefix, suffix);
-    let backend = EpicsCaBackend::new(&pv).with_wait(|on| *on);
-    Arc::new(pv_signal(backend, &pv, pv.clone()))
+    let rbv = join(prefix, &format!("{suffix}_RBV"));
+    let backend = EpicsCaBackend::new_rw(&rbv, join(prefix, suffix)).with_wait(|on| *on);
+    Arc::new(pv_signal(backend, &rbv, rbv.clone()))
 }
 
 /// Run a signal `put` to completion, bounding it with [`PUT_TIMEOUT`].
@@ -153,15 +162,15 @@ where
     }
 }
 
-/// Run `set`, then wait until the bool readback `rbv` has been `want`,
-/// bounded by [`PUT_TIMEOUT`]; returns what `set` returned. Used for busy
-/// records whose put-callback tracks the operation, not the value.
+/// Run `set`, then wait until `busy` has read `want`, bounded by
+/// [`PUT_TIMEOUT`]; returns what `set` returned. A busy record's
+/// put-callback tracks the operation, not the value.
 async fn set_and_wait_for_bool<R>(
-    rbv: &SignalR<bool, EpicsCaBackend<bool>>,
+    busy: &SignalRW<bool, EpicsCaBackend<bool>>,
     want: bool,
     set: impl std::future::Future<Output = Result<R>>,
 ) -> Result<R> {
-    let sub = AsyncSubscribable::subscribe(rbv).await?;
+    let sub = AsyncSubscribable::subscribe(busy).await?;
     set_and_wait_for_other_value(sub, set, want, PUT_TIMEOUT).await
 }
 
@@ -206,26 +215,22 @@ pub async fn wait_for_good_state<B: SignalBackend<String>>(
 pub struct AreaDetectorCam {
     /// PV prefix, e.g. `"13SIM1:cam1:"`.
     pub prefix: String,
-    /// `ImageMode` (mbbo: Single, Multiple, Continuous).
+    /// `ImageMode` (mbbo: Single, Multiple, Continuous), read from
+    /// `ImageMode_RBV`.
     pub image_mode: Arc<SignalRW<String, EpicsCaBackend<String>>>,
-    /// `NumImages` (longout) — how many frames to acquire in
-    /// `Multiple` mode.
+    /// `NumImages` (longout), read from `NumImages_RBV` — how many frames
+    /// to acquire in `Multiple` mode.
     pub num_images: Arc<SignalRW<i64, EpicsCaBackend<i64>>>,
-    /// `Acquire` (busy) — true to start, false to stop. A put-callback for
-    /// `1` completes when the whole acquisition ends, so arming watches
-    /// [`acquire_rbv`](Self::acquire_rbv) instead of the callback.
+    /// `Acquire` (busy), read from `Acquire_RBV` (bi) — true to start,
+    /// false to stop. A put-callback for `1` completes when the whole
+    /// acquisition ends, so arming waits for the readback instead.
     pub acquire: Arc<SignalRW<bool, EpicsCaBackend<bool>>>,
-    /// `Acquire_RBV` (bi) — whether the driver is acquiring.
-    pub acquire_rbv: Arc<SignalR<bool, EpicsCaBackend<bool>>>,
-    /// `AcquireTime` (ao) — exposure time, seconds.
+    /// `AcquireTime` (ao), read from `AcquireTime_RBV` (ai) — exposure
+    /// time, seconds.
     pub acquire_time: Arc<SignalRW<f64, EpicsCaBackend<f64>>>,
-    /// `AcquirePeriod` (ao) — seconds from one exposure start to the next
-    /// (exposure + dead time).
+    /// `AcquirePeriod` (ao), read from `AcquirePeriod_RBV` (ai) — seconds
+    /// from one exposure start to the next (exposure + dead time).
     pub acquire_period: Arc<SignalRW<f64, EpicsCaBackend<f64>>>,
-    /// `AcquireTime_RBV` (ai) — the exposure time the driver applied.
-    pub acquire_time_rbv: Arc<SignalR<f64, EpicsCaBackend<f64>>>,
-    /// `AcquirePeriod_RBV` (ai) — the period the driver applied.
-    pub acquire_period_rbv: Arc<SignalR<f64, EpicsCaBackend<f64>>>,
     /// `ArrayCounter` (longout), read from `ArrayCounter_RBV` (longin) —
     /// total frames produced.
     pub array_counter: Arc<SignalRW<i64, EpicsCaBackend<i64>>>,
@@ -251,8 +256,8 @@ pub struct AreaDetectorCam {
 /// frame's shape is read from, slowest first, and the driver's
 /// `DataType_RBV` and `ColorMode_RBV`. A cheap `Arc` handle so the writer
 /// reads it after the cam has been moved into a `StandardDetector`.
-pub struct NdArrayDescription {
-    shape: Vec<Arc<SignalR<i64, EpicsCaBackend<i64>>>>,
+pub struct NdArrayDescription<A: Readable = Read> {
+    shape: Vec<Arc<Signal<i64, EpicsCaBackend<i64>, A>>>,
     data_type: Arc<SignalR<String, EpicsCaBackend<String>>>,
     color_mode: Arc<SignalR<String, EpicsCaBackend<String>>>,
 }
@@ -269,15 +274,17 @@ impl NdArrayDescription {
             color_mode: ca_signal(prefix, "ColorMode_RBV"),
         }
     }
+}
 
+impl<A: Readable> NdArrayDescription<A> {
     /// `driver`'s data type and colour mode over a frame of `shape`, e.g. an
-    /// [`NdRoi`]'s `size_y_rbv` and `size_x_rbv` for a writer fed from that
-    /// ROI. Zero dims are dropped. The writer does not connect `shape`; the
+    /// [`NdRoi`]'s `size_y` and `size_x` for a writer fed from that ROI.
+    /// Zero dims are dropped. The writer does not connect `shape`; the
     /// detector does once the ROI is added with
     /// [`StandardDetector::add_plugin`].
     pub fn new(
         driver: &AreaDetectorCam,
-        shape: Vec<Arc<SignalR<i64, EpicsCaBackend<i64>>>>,
+        shape: Vec<Arc<Signal<i64, EpicsCaBackend<i64>, A>>>,
     ) -> Self {
         let own = &driver.frame_info;
         Self {
@@ -353,7 +360,7 @@ fn ndarray_frame_info(
 }
 
 #[async_trait::async_trait]
-impl AdFrameInfoSource for NdArrayDescription {
+impl<A: Readable> AdFrameInfoSource for NdArrayDescription<A> {
     async fn frame_info(&self) -> Result<(Vec<u64>, String)> {
         let (dims, dt, cm) = tokio::join!(
             futures::future::try_join_all(self.shape.iter().map(|s| s.get()),),
@@ -369,19 +376,12 @@ impl AreaDetectorCam {
     pub fn new(prefix: impl Into<String>) -> Self {
         let prefix = prefix.into();
         Self {
-            image_mode: ca_signal(&prefix, "ImageMode"),
-            num_images: ca_signal(&prefix, "NumImages"),
+            image_mode: rbv_signal(&prefix, "ImageMode"),
+            num_images: rbv_signal(&prefix, "NumImages"),
             acquire: busy_signal(&prefix, "Acquire"),
-            acquire_rbv: ca_signal(&prefix, "Acquire_RBV"),
-            acquire_time: ca_signal(&prefix, "AcquireTime"),
-            acquire_period: ca_signal(&prefix, "AcquirePeriod"),
-            acquire_time_rbv: ca_signal(&prefix, ACQUIRE_TIME_RBV),
-            acquire_period_rbv: ca_signal(&prefix, ACQUIRE_PERIOD_RBV),
-            array_counter: {
-                let rbv = join(&prefix, "ArrayCounter_RBV");
-                let backend = EpicsCaBackend::new_rw(&rbv, join(&prefix, "ArrayCounter"));
-                Arc::new(pv_signal(backend, &rbv, rbv.clone()))
-            },
+            acquire_time: rbv_signal(&prefix, "AcquireTime"),
+            acquire_period: rbv_signal(&prefix, "AcquirePeriod"),
+            array_counter: rbv_signal(&prefix, "ArrayCounter"),
             detector_state: ca_signal(&prefix, "DetectorState_RBV"),
             nd_attributes_file: ca_signal(&prefix, "NDAttributesFile"),
             wait_for_plugins: ca_signal(&prefix, "WaitForPlugins"),
@@ -407,24 +407,12 @@ impl AreaDetectorCam {
                 futures::FutureExt::boxed(self.acquire.connect(timeout)),
             ),
             (
-                "acquire_rbv",
-                futures::FutureExt::boxed(self.acquire_rbv.connect(timeout)),
-            ),
-            (
                 "acquire_time",
                 futures::FutureExt::boxed(self.acquire_time.connect(timeout)),
             ),
             (
                 "acquire_period",
                 futures::FutureExt::boxed(self.acquire_period.connect(timeout)),
-            ),
-            (
-                "acquire_time_rbv",
-                futures::FutureExt::boxed(self.acquire_time_rbv.connect(timeout)),
-            ),
-            (
-                "acquire_period_rbv",
-                futures::FutureExt::boxed(self.acquire_period_rbv.connect(timeout)),
             ),
             (
                 "array_counter",
@@ -453,10 +441,10 @@ impl AreaDetectorCam {
     /// The descriptor `configuration` signals, as ophyd-async `AreaDetector`
     /// registers them (`driver.acquire_time`, `driver.acquire_period`): read
     /// from their `_RBV` PVs, which are also the `DataKey` source.
-    fn config_signals(&self) -> [(&'static str, &SignalR<f64, EpicsCaBackend<f64>>); 2] {
+    fn config_signals(&self) -> [(&'static str, &SignalRW<f64, EpicsCaBackend<f64>>); 2] {
         [
-            ("acquire_time", &self.acquire_time_rbv),
-            ("acquire_period", &self.acquire_period_rbv),
+            ("acquire_time", &self.acquire_time),
+            ("acquire_period", &self.acquire_period),
         ]
     }
 
@@ -518,14 +506,16 @@ impl AreaDetectorCam {
 pub struct NdPlugin {
     /// PV prefix, e.g. `"13SIM1:Stats1:"`.
     pub prefix: String,
-    /// `EnableCallbacks` (bo: 0=Disable, 1=Enable).
+    /// `EnableCallbacks` (bo: 0=Disable, 1=Enable), read from
+    /// `EnableCallbacks_RBV`.
     pub enable_callbacks: Arc<SignalRW<bool, EpicsCaBackend<bool>>>,
-    /// `BlockingCallbacks` (bo: 0=No, 1=Yes).
+    /// `BlockingCallbacks` (bo: 0=No, 1=Yes), read from
+    /// `BlockingCallbacks_RBV`.
     pub blocking_callbacks: Arc<SignalRW<bool, EpicsCaBackend<bool>>>,
-    /// `NDArrayPort` (stringout) — name of the upstream port from
-    /// which this plugin consumes NDArrays.
+    /// `NDArrayPort` (stringout), read from `NDArrayPort_RBV` — name of
+    /// the upstream port from which this plugin consumes NDArrays.
     pub nd_array_port: Arc<SignalRW<String, EpicsCaBackend<String>>>,
-    /// `QueueSize` (longout).
+    /// `QueueSize` (longout), read from `QueueSize_RBV`.
     pub queue_size: Arc<SignalRW<i64, EpicsCaBackend<i64>>>,
     /// Staged configuration (ophyd `stage_sigs`): values applied when this
     /// plugin is staged and reverted on unstage. Populated via
@@ -539,11 +529,11 @@ impl NdPlugin {
     pub fn new(prefix: impl Into<String>) -> Self {
         let prefix = prefix.into();
         Self {
-            enable_callbacks: ca_signal(&prefix, "EnableCallbacks"),
-            blocking_callbacks: ca_signal(&prefix, "BlockingCallbacks"),
+            enable_callbacks: rbv_signal(&prefix, "EnableCallbacks"),
+            blocking_callbacks: rbv_signal(&prefix, "BlockingCallbacks"),
             // NDArrayPort is a port name (short string) — DBR_STRING is fine.
-            nd_array_port: ca_signal(&prefix, "NDArrayPort"),
-            queue_size: ca_signal(&prefix, "QueueSize"),
+            nd_array_port: rbv_signal(&prefix, "NDArrayPort"),
+            queue_size: rbv_signal(&prefix, "QueueSize"),
             stage_sigs: StageSigs::new(),
             prefix,
         }
@@ -632,25 +622,26 @@ impl StageableObj for NdPlugin {
 pub struct NdFile {
     /// Embedded plugin-base handle.
     pub plugin: NdPlugin,
-    /// `FilePath` (CHAR waveform) — directory.
+    /// `FilePath` (CHAR waveform), read from `FilePath_RBV` — directory.
     pub file_path: Arc<SignalRW<String, EpicsCaBackend<String>>>,
-    /// `FileName` (CHAR waveform) — file basename.
+    /// `FileName` (CHAR waveform), read from `FileName_RBV` — file
+    /// basename.
     pub file_name: Arc<SignalRW<String, EpicsCaBackend<String>>>,
-    /// `FileTemplate` (CHAR waveform) — printf-style template
-    /// applied to FilePath/FileName/FileNumber.
+    /// `FileTemplate` (CHAR waveform), read from `FileTemplate_RBV` —
+    /// printf-style template applied to FilePath/FileName/FileNumber.
     pub file_template: Arc<SignalRW<String, EpicsCaBackend<String>>>,
     /// `AutoIncrement` (bo).
     pub auto_increment: Arc<SignalRW<bool, EpicsCaBackend<bool>>>,
-    /// `FileWriteMode` (mbbo: Single, Capture, Stream).
+    /// `FileWriteMode` (mbbo: Single, Capture, Stream), read from
+    /// `FileWriteMode_RBV`.
     pub file_write_mode: Arc<SignalRW<String, EpicsCaBackend<String>>>,
-    /// `Capture` (busy) — start/stop capture in Capture/Stream mode. A
-    /// put-callback for `1` completes only when capture ENDS, so
-    /// start/stop watch [`capture_rbv`](Self::capture_rbv) instead.
+    /// `Capture` (busy), read from `Capture_RBV` (bi) — start/stop capture
+    /// in Capture/Stream mode. A put-callback for `1` completes only when
+    /// capture ENDS, so start/stop wait for the readback instead.
     pub capture: Arc<SignalRW<bool, EpicsCaBackend<bool>>>,
-    /// `Capture_RBV` (bi) — whether the plugin is capturing.
-    pub capture_rbv: Arc<SignalR<bool, EpicsCaBackend<bool>>>,
-    /// `NumCapture` (longout) — number of frames to capture in
-    /// Capture/Stream mode (`0` = capture until `Capture` is cleared).
+    /// `NumCapture` (longout), read from `NumCapture_RBV` — number of
+    /// frames to capture in Capture/Stream mode (`0` = capture until
+    /// `Capture` is cleared).
     pub num_capture: Arc<SignalRW<i64, EpicsCaBackend<i64>>>,
     /// `NumCaptured_RBV` (longin) — frames written to the file so far.
     /// This is the per-frame write index the `DetectorWriter` reports.
@@ -677,14 +668,13 @@ impl NdFile {
         let prefix = prefix.into();
         let plugin = NdPlugin::new(prefix.clone());
         Self {
-            file_path: ca_signal(&prefix, "FilePath"),
-            file_name: ca_signal(&prefix, "FileName"),
-            file_template: ca_signal(&prefix, "FileTemplate"),
+            file_path: rbv_signal(&prefix, "FilePath"),
+            file_name: rbv_signal(&prefix, "FileName"),
+            file_template: rbv_signal(&prefix, "FileTemplate"),
             auto_increment: ca_signal(&prefix, "AutoIncrement"),
-            file_write_mode: ca_signal(&prefix, "FileWriteMode"),
+            file_write_mode: rbv_signal(&prefix, "FileWriteMode"),
             capture: busy_signal(&prefix, "Capture"),
-            capture_rbv: ca_signal(&prefix, "Capture_RBV"),
-            num_capture: ca_signal(&prefix, "NumCapture"),
+            num_capture: rbv_signal(&prefix, "NumCapture"),
             num_captured: ca_signal(&prefix, "NumCaptured_RBV"),
             full_file_name: ca_signal(&prefix, "FullFileName_RBV"),
             file_number: ca_signal(&prefix, "FileNumber"),
@@ -748,10 +738,6 @@ impl NdFile {
             (
                 "create_directory",
                 futures::FutureExt::boxed(self.create_directory.connect(timeout)),
-            ),
-            (
-                "capture_rbv",
-                futures::FutureExt::boxed(self.capture_rbv.connect(timeout)),
             ),
         ])
         .await
@@ -829,7 +815,7 @@ impl NdFile {
             tokio::spawn(self.capture.put_start(true).await?);
             Ok(())
         };
-        set_and_wait_for_bool(&self.capture_rbv, true, put).await
+        set_and_wait_for_bool(&self.capture, true, put).await
     }
 
     /// Stop capture (`Capture=0`) — flushes and closes the file. Same busy
@@ -837,7 +823,7 @@ impl NdFile {
     /// `Capture_RBV=0` (ophyd-async `stop_busy_record`).
     pub async fn stop_capture(&self) -> Result<()> {
         let put = async { Ok(self.capture.put(false).await.await?) };
-        set_and_wait_for_bool(&self.capture_rbv, false, put).await
+        set_and_wait_for_bool(&self.capture, false, put).await
     }
 
     /// Read `NumCaptured_RBV` — frames written so far (clamped to `>= 0`).
@@ -893,23 +879,27 @@ impl NdFile {
 pub struct NdFileHdf5 {
     /// Embedded generic file-plugin handle.
     pub file: NdFile,
-    /// `NumFramesChunks` (longout) — frames per HDF chunk, written back when
-    /// the readback reports 0 (fresh IOC startup).
+    /// `NumFramesChunks` (longout), read from `NumFramesChunks_RBV`
+    /// (longin) — frames per HDF chunk, written back when the readback
+    /// reports 0 (fresh IOC startup).
     pub num_frames_chunks: Arc<SignalRW<i64, EpicsCaBackend<i64>>>,
-    /// `NumFramesChunks_RBV` (longin).
-    pub num_frames_chunks_rbv: Arc<SignalR<i64, EpicsCaBackend<i64>>>,
-    /// `ChunkSizeAuto` (bo) — let the plugin derive chunking from the frame.
+    /// `ChunkSizeAuto` (bo), read from `ChunkSizeAuto_RBV` — let the plugin
+    /// derive chunking from the frame.
     pub chunk_size_auto: Arc<SignalRW<bool, EpicsCaBackend<bool>>>,
-    /// `LazyOpen` (bo) — open the file on the first frame instead of on
-    /// `Capture=1`, so no warmup frame is needed to size the dataset.
+    /// `LazyOpen` (bo), read from `LazyOpen_RBV` — open the file on the
+    /// first frame instead of on `Capture=1`, so no warmup frame is needed
+    /// to size the dataset.
     pub lazy_open: Arc<SignalRW<bool, EpicsCaBackend<bool>>>,
-    /// `SWMRMode` (bo) — single-writer/multiple-reader, so consumers can
-    /// read the file while the IOC is still writing it.
+    /// `SWMRMode` (bo), read from `SWMRMode_RBV` — single-writer/
+    /// multiple-reader, so consumers can read the file while the IOC is
+    /// still writing it.
     pub swmr_mode: Arc<SignalRW<bool, EpicsCaBackend<bool>>>,
-    /// `NumExtraDims` (longout) — extra virtual dimensions (unused here).
+    /// `NumExtraDims` (longout), read from `NumExtraDims_RBV` — extra
+    /// virtual dimensions (unused here).
     pub num_extra_dims: Arc<SignalRW<i64, EpicsCaBackend<i64>>>,
-    /// `XMLFileName` (CHAR waveform) — custom HDF5 layout XML; cleared so
-    /// the default `/entry/data/data` layout applies.
+    /// `XMLFileName` (CHAR waveform), read from `XMLFileName_RBV` — custom
+    /// HDF5 layout XML; cleared so the default `/entry/data/data` layout
+    /// applies.
     pub xml_file_name: Arc<SignalRW<String, EpicsCaBackend<String>>>,
     /// `FlushNow` (busy) — force the plugin to flush buffered frames to the
     /// file for SWMR readers. An `NDFileHDF5`-only record; the JPEG/TIFF
@@ -922,13 +912,12 @@ impl NdFileHdf5 {
     pub fn new(prefix: impl Into<String>) -> Self {
         let prefix = prefix.into();
         Self {
-            num_frames_chunks: ca_signal(&prefix, "NumFramesChunks"),
-            num_frames_chunks_rbv: ca_signal(&prefix, "NumFramesChunks_RBV"),
-            chunk_size_auto: ca_signal(&prefix, "ChunkSizeAuto"),
-            lazy_open: ca_signal(&prefix, "LazyOpen"),
-            swmr_mode: ca_signal(&prefix, "SWMRMode"),
-            num_extra_dims: ca_signal(&prefix, "NumExtraDims"),
-            xml_file_name: ca_signal(&prefix, "XMLFileName"),
+            num_frames_chunks: rbv_signal(&prefix, "NumFramesChunks"),
+            chunk_size_auto: rbv_signal(&prefix, "ChunkSizeAuto"),
+            lazy_open: rbv_signal(&prefix, "LazyOpen"),
+            swmr_mode: rbv_signal(&prefix, "SWMRMode"),
+            num_extra_dims: rbv_signal(&prefix, "NumExtraDims"),
+            xml_file_name: rbv_signal(&prefix, "XMLFileName"),
             flush_now: ca_signal(&prefix, "FlushNow"),
             file: NdFile::new(prefix),
         }
@@ -944,10 +933,6 @@ impl NdFileHdf5 {
             (
                 "num_frames_chunks",
                 futures::FutureExt::boxed(self.num_frames_chunks.connect(timeout)),
-            ),
-            (
-                "num_frames_chunks_rbv",
-                futures::FutureExt::boxed(self.num_frames_chunks_rbv.connect(timeout)),
             ),
             (
                 "chunk_size_auto",
@@ -1005,7 +990,7 @@ impl NdFileHdf5 {
     /// first capture; ophyd-async writes 1 back to the plugin in that case
     /// and uses 1 (`prepare_unbounded`, `_data_logic.py:180`).
     pub async fn frames_per_chunk(&self) -> Result<u64> {
-        let n = self.num_frames_chunks_rbv.get().await?;
+        let n = self.num_frames_chunks.get().await?;
         if n <= 0 {
             await_put(
                 self.num_frames_chunks.put(1),
@@ -1054,13 +1039,13 @@ impl StageableObj for NdFile {
 pub struct NdStats {
     /// Embedded plugin-base handle.
     pub plugin: NdPlugin,
-    /// `ComputeStatistics` (bo).
+    /// `ComputeStatistics` (bo), read from `ComputeStatistics_RBV`.
     pub compute_statistics: Arc<SignalRW<bool, EpicsCaBackend<bool>>>,
-    /// `ComputeCentroid` (bo).
+    /// `ComputeCentroid` (bo), read from `ComputeCentroid_RBV`.
     pub compute_centroid: Arc<SignalRW<bool, EpicsCaBackend<bool>>>,
-    /// `ComputeProfiles` (bo).
+    /// `ComputeProfiles` (bo), read from `ComputeProfiles_RBV`.
     pub compute_profiles: Arc<SignalRW<bool, EpicsCaBackend<bool>>>,
-    /// `ComputeHistogram` (bo).
+    /// `ComputeHistogram` (bo), read from `ComputeHistogram_RBV`.
     pub compute_histogram: Arc<SignalRW<bool, EpicsCaBackend<bool>>>,
     /// `Total_RBV` (ai) — the sum of the last frame's pixels.
     pub total: Arc<SignalR<f64, EpicsCaBackend<f64>>>,
@@ -1072,10 +1057,10 @@ impl NdStats {
         let prefix = prefix.into();
         let plugin = NdPlugin::new(prefix.clone());
         Self {
-            compute_statistics: ca_signal(&prefix, "ComputeStatistics"),
-            compute_centroid: ca_signal(&prefix, "ComputeCentroid"),
-            compute_profiles: ca_signal(&prefix, "ComputeProfiles"),
-            compute_histogram: ca_signal(&prefix, "ComputeHistogram"),
+            compute_statistics: rbv_signal(&prefix, "ComputeStatistics"),
+            compute_centroid: rbv_signal(&prefix, "ComputeCentroid"),
+            compute_profiles: rbv_signal(&prefix, "ComputeProfiles"),
+            compute_histogram: rbv_signal(&prefix, "ComputeHistogram"),
             total: ca_signal(&prefix, "Total_RBV"),
             plugin,
         }
@@ -1144,22 +1129,19 @@ impl StageableObj for NdStats {
 pub struct NdRoi {
     /// Embedded plugin-base handle.
     pub plugin: NdPlugin,
-    /// `MinX` (longout).
+    /// `MinX` (longout), read from `MinX_RBV`.
     pub min_x: Arc<SignalRW<i64, EpicsCaBackend<i64>>>,
-    /// `MinY` (longout).
+    /// `MinY` (longout), read from `MinY_RBV`.
     pub min_y: Arc<SignalRW<i64, EpicsCaBackend<i64>>>,
-    /// `SizeX` (longout).
+    /// `SizeX` (longout), read from `SizeX_RBV` (longin): the output
+    /// width, `SizeX` clipped to the input frame, set as a frame passes.
     pub size_x: Arc<SignalRW<i64, EpicsCaBackend<i64>>>,
-    /// `SizeY` (longout).
+    /// `SizeY` (longout), read from `SizeY_RBV` (longin): the output
+    /// height, as `size_x`.
     pub size_y: Arc<SignalRW<i64, EpicsCaBackend<i64>>>,
-    /// `SizeX_RBV` (longin): the output width, `SizeX` clipped to the input
-    /// frame, set as a frame passes.
-    pub size_x_rbv: Arc<SignalR<i64, EpicsCaBackend<i64>>>,
-    /// `SizeY_RBV` (longin): the output height, as `size_x_rbv`.
-    pub size_y_rbv: Arc<SignalR<i64, EpicsCaBackend<i64>>>,
-    /// `EnableX` (bo).
+    /// `EnableX` (bo), read from `EnableX_RBV`.
     pub enable_x: Arc<SignalRW<bool, EpicsCaBackend<bool>>>,
-    /// `EnableY` (bo).
+    /// `EnableY` (bo), read from `EnableY_RBV`.
     pub enable_y: Arc<SignalRW<bool, EpicsCaBackend<bool>>>,
 }
 
@@ -1169,14 +1151,12 @@ impl NdRoi {
         let prefix = prefix.into();
         let plugin = NdPlugin::new(prefix.clone());
         Self {
-            min_x: ca_signal(&prefix, "MinX"),
-            min_y: ca_signal(&prefix, "MinY"),
-            size_x: ca_signal(&prefix, "SizeX"),
-            size_y: ca_signal(&prefix, "SizeY"),
-            size_x_rbv: ca_signal(&prefix, "SizeX_RBV"),
-            size_y_rbv: ca_signal(&prefix, "SizeY_RBV"),
-            enable_x: ca_signal(&prefix, "EnableX"),
-            enable_y: ca_signal(&prefix, "EnableY"),
+            min_x: rbv_signal(&prefix, "MinX"),
+            min_y: rbv_signal(&prefix, "MinY"),
+            size_x: rbv_signal(&prefix, "SizeX"),
+            size_y: rbv_signal(&prefix, "SizeY"),
+            enable_x: rbv_signal(&prefix, "EnableX"),
+            enable_y: rbv_signal(&prefix, "EnableY"),
             plugin,
         }
     }
@@ -1203,14 +1183,6 @@ impl NdRoi {
             (
                 "size_y",
                 futures::FutureExt::boxed(self.size_y.connect(timeout)),
-            ),
-            (
-                "size_x_rbv",
-                futures::FutureExt::boxed(self.size_x_rbv.connect(timeout)),
-            ),
-            (
-                "size_y_rbv",
-                futures::FutureExt::boxed(self.size_y_rbv.connect(timeout)),
             ),
             (
                 "enable_x",
@@ -2362,7 +2334,7 @@ impl DetectorControl for AreaDetectorCam {
         // completion is stashed for `wait_for_idle`, deliberately unbounded.
         // Acquire=1 is sent here, not in the spawned task, so a later
         // disarm's Acquire=0 cannot overtake it on the wire.
-        match set_and_wait_for_bool(&self.acquire_rbv, true, self.acquire.put_start(true)).await {
+        match set_and_wait_for_bool(&self.acquire, true, self.acquire.put_start(true)).await {
             Ok(done) => {
                 let (acquired, setter) = Status::new();
                 tokio::spawn(async move {
@@ -2391,7 +2363,7 @@ impl DetectorControl for AreaDetectorCam {
         // stop_busy_record: a put-callback for Acquire=0 can deadlock on a
         // busy record, so `acquire` sends it without one; then wait for the
         // readback.
-        set_and_wait_for_bool(&self.acquire_rbv, false, async {
+        set_and_wait_for_bool(&self.acquire, false, async {
             Ok(self.acquire.put(false).await.await?)
         })
         .await
@@ -2628,29 +2600,30 @@ mod tests {
     }
 
     /// A signal field is the last part of its PV in snake case, `_RBV`
-    /// dropped. bsrs keeps a readback apart from its setpoint, so a readback
-    /// whose setpoint is among the device's `fields` keeps `_rbv`.
-    fn assert_regularly_named(field: &str, source: &str, fields: &[&str]) {
+    /// dropped; `rbv` is whether the field reads an `_RBV` record.
+    fn assert_regularly_named(field: &str, source: &str, rbv: bool) {
         let pv = source.strip_prefix("ca://").unwrap();
         let pv = pv.rsplit(':').next().unwrap();
-        let (pv, rbv) = match pv.strip_suffix("_RBV") {
-            Some(pv) => (pv, true),
-            None => (pv, false),
-        };
-        let base = match field.strip_suffix("_rbv") {
-            Some(base) if rbv && fields.contains(&base) => base,
-            _ => field,
-        };
-        assert_eq!(base, underscore(pv), "{field} reads {source}");
+        let base = pv.strip_suffix("_RBV");
+        assert_eq!(base.is_some(), rbv, "{field} reads {source}");
+        assert_eq!(
+            field,
+            underscore(base.unwrap_or(pv)),
+            "{field} reads {source}"
+        );
     }
 
     /// The pattern has no `..`, so a field added to `$ty` stops this
     /// compiling until it is listed, as ophyd-async walks `children()`.
+    /// The signals before the first `;` read an `_RBV` record, as
+    /// ophyd-async declares them with `PvSuffix.rbv` or `PvSuffix("…_RBV")`.
     macro_rules! assert_signals_regularly_named {
-        ($dev:expr => $ty:ident { $($signal:ident),+ ; $($other:ident),* }) => {{
-            let $ty { $($signal,)+ $($other: _,)* } = &$dev;
-            let fields = [$(stringify!($signal)),+];
-            $(assert_regularly_named(stringify!($signal), &$signal.source(), &fields);)+
+        ($dev:expr => $ty:ident {
+            $($rbv:ident),* ; $($plain:ident),* ; $($other:ident),*
+        }) => {{
+            let $ty { $($rbv,)* $($plain,)* $($other: _,)* } = &$dev;
+            $(assert_regularly_named(stringify!($rbv), &$rbv.source(), true);)*
+            $(assert_regularly_named(stringify!($plain), &$plain.source(), false);)*
         }};
     }
 
@@ -2773,38 +2746,36 @@ mod tests {
     fn signal_fields_are_named_after_their_pvs() {
         let cam = AreaDetectorCam::new("P:cam1:");
         assert_signals_regularly_named!(cam => AreaDetectorCam {
-            image_mode, num_images, acquire, acquire_rbv, acquire_time,
-            acquire_period, acquire_time_rbv, acquire_period_rbv,
-            array_counter, detector_state, nd_attributes_file,
-            wait_for_plugins; prefix, frame_info, acquire_status
+            image_mode, num_images, acquire, acquire_time, acquire_period,
+            array_counter, detector_state;
+            nd_attributes_file, wait_for_plugins;
+            prefix, frame_info, acquire_status
         });
         assert_signals_regularly_named!(*cam.frame_info => NdArrayDescription {
-            data_type, color_mode; shape
+            data_type, color_mode; ; shape
         });
         let hdf = NdFileHdf5::new("P:HDF1:");
         assert_signals_regularly_named!(hdf => NdFileHdf5 {
-            num_frames_chunks, num_frames_chunks_rbv, chunk_size_auto,
-            lazy_open, swmr_mode, num_extra_dims, xml_file_name, flush_now; file
+            num_frames_chunks, chunk_size_auto,
+            lazy_open, swmr_mode, num_extra_dims, xml_file_name; flush_now; file
         });
         assert_signals_regularly_named!(hdf.file => NdFile {
-            file_path, file_name, file_template, auto_increment,
-            file_write_mode, capture, capture_rbv, num_capture,
-            num_captured, full_file_name, file_number,
-            file_path_exists, create_directory; plugin
+            file_path, file_name, file_template, file_write_mode, capture,
+            num_capture, num_captured, full_file_name, file_path_exists;
+            auto_increment, file_number, create_directory; plugin
         });
         assert_signals_regularly_named!(hdf.file.plugin => NdPlugin {
-            enable_callbacks, blocking_callbacks, nd_array_port, queue_size;
+            enable_callbacks, blocking_callbacks, nd_array_port, queue_size; ;
             prefix, stage_sigs
         });
         let stats = NdStats::new("P:STATS1:");
         assert_signals_regularly_named!(stats => NdStats {
             compute_statistics, compute_centroid, compute_profiles,
-            compute_histogram, total; plugin
+            compute_histogram, total; ; plugin
         });
         let roi = NdRoi::new("P:ROI1:");
         assert_signals_regularly_named!(roi => NdRoi {
-            min_x, min_y, size_x, size_y, size_x_rbv, size_y_rbv, enable_x,
-            enable_y; plugin
+            min_x, min_y, size_x, size_y, enable_x, enable_y; ; plugin
         });
     }
 
