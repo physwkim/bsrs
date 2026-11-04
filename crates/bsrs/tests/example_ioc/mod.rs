@@ -132,6 +132,11 @@ pub fn try_start(bin: &str, example: &str, ca: u16, pva: u16) -> Option<Child> {
         .env("EPICS_PVAS_SERVER_PORT", pva.to_string())
         .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1:1")
         .env("EPICS_CAS_AUTO_BEACON_ADDR_LIST", "NO")
+        // A new server's beacon pokes every PVA client on the host into a
+        // fast search before its name server is up, which then holds its
+        // first searches back past the connect timeout.
+        .env("EPICS_PVAS_BEACON_ADDR_LIST", "127.0.0.1:1")
+        .env("EPICS_PVAS_AUTO_BEACON_ADDR_LIST", "NO")
         .env("EPICS_CA_MAX_ARRAY_BYTES", MAX_ARRAY_BYTES)
         .stdin(Stdio::piped())
         // One pipe, so a port warning is read before the marker it precedes.
