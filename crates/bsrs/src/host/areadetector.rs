@@ -2630,6 +2630,92 @@ mod tests {
         let _ = f.file_template.clone();
     }
 
+    /// ophyd-async `inflection.underscore`.
+    fn underscore(word: &str) -> String {
+        let chars: Vec<char> = word.chars().collect();
+        let mut out = String::new();
+        for (i, &c) in chars.iter().enumerate() {
+            if i > 0 && c.is_ascii_uppercase() {
+                let prev = chars[i - 1];
+                let next_lower = chars.get(i + 1).is_some_and(char::is_ascii_lowercase);
+                if prev.is_ascii_lowercase()
+                    || prev.is_ascii_digit()
+                    || (prev.is_ascii_uppercase() && next_lower)
+                {
+                    out.push('_');
+                }
+            }
+            out.push(c.to_ascii_lowercase());
+        }
+        out
+    }
+
+    /// A signal field is the last part of its PV in snake case, `_RBV`
+    /// dropped. bsrs keeps a readback apart from its setpoint, so the field
+    /// may keep `_rbv` where the PV has `_RBV`.
+    fn assert_regularly_named(field: &str, source: &str) {
+        let pv = source.strip_prefix("ca://").unwrap();
+        let pv = pv.rsplit(':').next().unwrap();
+        let (pv, rbv) = match pv.strip_suffix("_RBV") {
+            Some(pv) => (pv, true),
+            None => (pv, false),
+        };
+        let base = match field.strip_suffix("_rbv") {
+            Some(base) if rbv => base,
+            _ => field,
+        };
+        assert_eq!(base, underscore(pv), "{field} reads {source}");
+    }
+
+    /// The pattern has no `..`, so a field added to `$ty` stops this
+    /// compiling until it is listed, as ophyd-async walks `children()`.
+    macro_rules! assert_signals_regularly_named {
+        ($dev:expr => $ty:ident { $($signal:ident),+ ; $($other:ident),* }) => {{
+            let $ty { $($signal,)+ $($other: _,)* } = &$dev;
+            $(assert_regularly_named(stringify!($signal), &$signal.source());)+
+        }};
+    }
+
+    // ophyd-async test_areadetector_subclass_naming::test_regularly_named_attributes
+    #[test]
+    fn signal_fields_are_named_after_their_pvs() {
+        let cam = AreaDetectorCam::new("P:cam1:");
+        assert_signals_regularly_named!(cam => AreaDetectorCam {
+            image_mode, num_images, acquire, acquire_rbv, acquire_time,
+            acquire_period, acquire_time_rbv, acquire_period_rbv,
+            array_counter_rbv, detector_state_rbv, nd_attributes_file,
+            wait_for_plugins; prefix, frame_info, acquire_status
+        });
+        assert_signals_regularly_named!(*cam.frame_info => NdArrayDescription {
+            data_type, color_mode; shape
+        });
+        let hdf = NdFileHdf5::new("P:HDF1:");
+        assert_signals_regularly_named!(hdf => NdFileHdf5 {
+            num_frames_chunks, num_frames_chunks_rbv, chunk_size_auto,
+            lazy_open, swmr_mode, num_extra_dims, xml_file_name, flush_now; file
+        });
+        assert_signals_regularly_named!(hdf.file => NdFile {
+            file_path, file_name, file_template, auto_increment,
+            file_write_mode, capture, capture_rbv, num_capture,
+            num_captured_rbv, full_file_name_rbv, file_number,
+            file_path_exists_rbv, create_directory; plugin
+        });
+        assert_signals_regularly_named!(hdf.file.plugin => NdPlugin {
+            enable_callbacks, blocking_callbacks, nd_array_port, queue_size;
+            prefix, stage_sigs
+        });
+        let stats = NdStats::new("P:STATS1:");
+        assert_signals_regularly_named!(stats => NdStats {
+            compute_statistics, compute_centroid, compute_profiles,
+            compute_histogram, total; plugin
+        });
+        let roi = NdRoi::new("P:ROI1:");
+        assert_signals_regularly_named!(roi => NdRoi {
+            min_x, min_y, size_x, size_y, size_x_rbv, size_y_rbv, enable_x,
+            enable_y; plugin
+        });
+    }
+
     #[test]
     fn ad_state_idle_matches_template() {
         // The mbbi/mbbo labels in ADBase.template (DetectorState_RBV ZRST,
