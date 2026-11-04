@@ -460,6 +460,35 @@ async fn kickoff_resolves_once_the_detector_is_acquiring() {
     completed.unwrap();
 }
 
+/// ophyd-async `test_acquire_logic.py:123` `test_acquire_logic_disarm`:
+/// unstage puts Acquire=0, which stops an acquisition in progress.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+async fn unstage_stops_an_acquisition_in_progress() {
+    boot();
+    let _cam = CAM_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let det = hdf_det("det", dir.path(), "disarm").await;
+    Stageable::stage(&det).await.expect("stage");
+    let info = TriggerInfo {
+        number_of_events: 1000,
+        livetime: Some(Duration::from_millis(100)),
+        deadtime: Some(Duration::ZERO),
+        ..TriggerInfo::default()
+    };
+    finish(Preparable::prepare(&det, info).await, "prepare")
+        .await
+        .unwrap();
+    finish(Flyable::kickoff(&det).await, "kickoff")
+        .await
+        .unwrap();
+    let acquiring = get::<bool>(&format!("{CAM}Acquire_RBV")).await;
+    Stageable::unstage(&det).await.expect("unstage");
+    assert!(acquiring, "kickoff left the cam idle");
+    assert!(!get::<bool>(&format!("{CAM}Acquire")).await);
+    assert!(!get::<bool>(&format!("{CAM}Acquire_RBV")).await);
+}
+
 /// ophyd-async `_detector.py:616` `trigger` prepares `TriggerInfo()` when
 /// nothing was prepared since stage, so a trigger takes exactly one frame
 /// whatever image mode the cam was left in.
