@@ -87,7 +87,7 @@ async fn ready_point_detectors() -> Vec<Arc<CaDetector>> {
         let sub = MonitorableObj::subscribe_dyn(det.as_ref())
             .await
             .expect("subscribe");
-        bsrs::devices::wait_for_value(sub, |r| r.value == json!(expected), Some(TIMEOUT))
+        bsrs::devices::wait_for_value(sub, expected, Some(TIMEOUT))
             .await
             .unwrap_or_else(|e| panic!("DetValue_RBV never reached {expected}: {e}"));
         dets.push(det);

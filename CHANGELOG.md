@@ -274,6 +274,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `AreaDetectorCam::wait_for_idle` monitors `DetectorState_RBV` instead of
   polling it, and fails as ophyd-async `wait_for_good_state` does, with
   `Could not monitor state: …` or `… not in a good state: …`.
+- **Breaking**: `wait_for_value` takes a `Matcher`, a value to equal or a
+  predicate, as ophyd-async's `match` does; a closure needs its argument
+  typed, `|r: &ReadingValue|`. A `ValueTimeout` names a value matcher and
+  shows the last value by Python `repr` (`'blah'`, `True`, `None`).
 
 ### Removed
 

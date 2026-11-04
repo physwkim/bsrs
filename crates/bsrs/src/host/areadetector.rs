@@ -162,8 +162,7 @@ async fn set_and_wait_for_bool<R>(
     set: impl std::future::Future<Output = Result<R>>,
 ) -> Result<R> {
     let sub = AsyncSubscribable::subscribe(rbv).await?;
-    let want = serde_json::json!(want);
-    set_and_wait_for_other_value(sub, set, |r| r.value == want, PUT_TIMEOUT).await
+    set_and_wait_for_other_value(sub, set, want, PUT_TIMEOUT).await
 }
 
 /// Wait until `state` is one of `good`. Port of ophyd-async

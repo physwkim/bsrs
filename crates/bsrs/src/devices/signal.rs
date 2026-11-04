@@ -119,6 +119,14 @@ pub(crate) fn shown(value: &impl Serialize) -> String {
     }
 }
 
+/// `repr(value)`, as ophyd-async's messages show one with `!r`.
+pub(crate) fn repr(value: &impl Serialize) -> String {
+    match serde_json::to_string(value) {
+        Ok(json) => python_literal(&json),
+        Err(e) => format!("<{e}>"),
+    }
+}
+
 /// Respell serde_json output token by token, so struct fields keep their
 /// declared order (a `serde_json::Value` would sort them).
 fn python_literal(json: &str) -> String {

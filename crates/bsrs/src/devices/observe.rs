@@ -11,8 +11,10 @@
 use crate::core::error::BsrsError;
 use crate::core::reading::ReadingValue;
 use crate::core::Subscription;
+use crate::devices::signal::repr;
 use futures::stream::{select_all, BoxStream};
 use futures::{Stream, StreamExt};
+use serde_json::Value;
 use std::time::Duration;
 
 /// Stream each value from `sub`, starting with the current one and then every
@@ -60,53 +62,102 @@ pub fn observe_signals_value(
     select_all(streams)
 }
 
-/// Wait until `sub`'s value satisfies `predicate`, returning the matching
+/// What [`wait_for_value`] waits for, as ophyd-async's `match`: a value the
+/// reading equals as Python `==` has it (`1` matches `1.0`), or a predicate
+/// over the reading. A closure needs its argument typed,
+/// `|r: &ReadingValue| ...`, as this bound does not infer it.
+pub trait Matcher {
+    /// Whether `r` matches.
+    fn matches(&mut self, r: &ReadingValue) -> bool;
+    /// How a timeout names the matcher: a value's `repr`, a predicate's fn
+    /// name, or `<closure>`.
+    fn name(&self) -> String;
+}
+
+impl<F: FnMut(&ReadingValue) -> bool> Matcher for F {
+    fn matches(&mut self, r: &ReadingValue) -> bool {
+        self(r)
+    }
+    fn name(&self) -> String {
+        matcher_name::<F>()
+    }
+}
+
+macro_rules! value_matcher {
+    ($($t:ty),*) => {$(
+        impl Matcher for $t {
+            fn matches(&mut self, r: &ReadingValue) -> bool {
+                serde_json::to_value(&*self).is_ok_and(|v| py_eq(&r.value, &v))
+            }
+            fn name(&self) -> String {
+                repr(self)
+            }
+        }
+    )*};
+}
+
+value_matcher!(bool, i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, String, &str, Value);
+
+/// Python `==` over JSON: numbers by value, containers item by item.
+fn py_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) if x.is_f64() || y.is_f64() => {
+            x.as_f64() == y.as_f64()
+        }
+        (Value::Number(x), Value::Number(y)) => {
+            x.as_i64() == y.as_i64() && x.as_u64() == y.as_u64()
+        }
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(x, y)| py_eq(x, y))
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| py_eq(v, w)))
+        }
+        _ => a == b,
+    }
+}
+
+/// Wait until `sub`'s value matches `matcher`, returning the matching
 /// reading. The current value is checked first, then each subsequent update.
 /// `sub` is consumed, as ophyd-async subscribes afresh for every wait: a
 /// reused one would start from whatever it queued before.
 ///
 /// Returns [`BsrsError::ValueTimeout`] if `timeout` elapses before a match,
-/// carrying the last value seen (`None` if none arrived) and the predicate's
-/// name (its fn name, or `<closure>`) as ophyd-async's `TimeoutError` does,
-/// or [`BsrsError::Backend`] if the channel closes first. With
+/// carrying the last value seen (`None` if none arrived) and the
+/// [`Matcher::name`] as ophyd-async's `TimeoutError` does, or
+/// [`BsrsError::Backend`] if the channel closes first. With
 /// `timeout = None` it waits indefinitely.
-pub async fn wait_for_value<F>(
+pub async fn wait_for_value(
     mut sub: Subscription,
-    mut predicate: F,
+    mut matcher: impl Matcher,
     timeout: Option<Duration>,
-) -> Result<ReadingValue, BsrsError>
-where
-    F: FnMut(&ReadingValue) -> bool,
-{
+) -> Result<ReadingValue, BsrsError> {
     // The timer covers the first value too (ophyd-async wraps the whole
     // `observe_value` in `asyncio.timeout`).
     let mut last = None;
-    let fut = next_match(&mut sub, &mut predicate, &mut last);
+    let fut = next_match(&mut sub, &mut matcher, &mut last);
     match timeout {
         Some(d) => match tokio::time::timeout(d, fut).await {
             Ok(r) => r,
-            Err(_) => Err(value_timeout::<F>(&sub, d, last)),
+            Err(_) => Err(value_timeout(&sub, &matcher, d, last)),
         },
         None => fut.await,
     }
 }
 
 /// Wait for `sub`'s first value, run `set`, then wait until a value
-/// satisfies `predicate`, all within `timeout`; returns what `set` returned.
+/// matches `matcher`, all within `timeout`; returns what `set` returned.
 /// Port of ophyd-async `set_and_wait_for_other_value(...,
 /// wait_for_set_completion=False)`: the first value is in hand before `set`
 /// runs, so a change `set` causes, even one already undone, is queued
 /// behind it. With no first value it fails with ophyd-async's
 /// "didn't provide an initial value" text, else as [`wait_for_value`].
-pub(crate) async fn set_and_wait_for_other_value<F, R>(
+pub(crate) async fn set_and_wait_for_other_value<R>(
     mut sub: Subscription,
     set: impl std::future::Future<Output = Result<R, BsrsError>>,
-    mut predicate: F,
+    mut matcher: impl Matcher,
     timeout: Duration,
-) -> Result<R, BsrsError>
-where
-    F: FnMut(&ReadingValue) -> bool,
-{
+) -> Result<R, BsrsError> {
     let deadline = tokio::time::Instant::now() + timeout;
     let Ok(first) = tokio::time::timeout_at(deadline, sub.recv()).await else {
         return Err(BsrsError::Other(format!(
@@ -117,32 +168,29 @@ where
     };
     let first = first.ok_or_else(closed)?;
     let out = set.await?;
-    if !predicate(&first) {
+    if !matcher.matches(&first) {
         let mut last = Some(first);
-        let fut = next_match(&mut sub, &mut predicate, &mut last);
+        let fut = next_match(&mut sub, &mut matcher, &mut last);
         match tokio::time::timeout_at(deadline, fut).await {
             Ok(r) => {
                 r?;
             }
-            Err(_) => return Err(value_timeout::<F>(&sub, timeout, last)),
+            Err(_) => return Err(value_timeout(&sub, &matcher, timeout, last)),
         }
     }
     Ok(out)
 }
 
-/// The next value from `sub` that satisfies `predicate`, keeping each one
-/// that does not in `last`.
-async fn next_match<F>(
+/// The next value from `sub` that `matcher` matches, keeping each one that
+/// does not in `last`.
+async fn next_match(
     sub: &mut Subscription,
-    predicate: &mut F,
+    matcher: &mut impl Matcher,
     last: &mut Option<ReadingValue>,
-) -> Result<ReadingValue, BsrsError>
-where
-    F: FnMut(&ReadingValue) -> bool,
-{
+) -> Result<ReadingValue, BsrsError> {
     loop {
         let r = sub.recv().await.ok_or_else(closed)?;
-        if predicate(&r) {
+        if matcher.matches(&r) {
             return Ok(r);
         }
         *last = Some(r);
@@ -153,14 +201,15 @@ fn closed() -> BsrsError {
     BsrsError::Backend("subscription channel closed".into())
 }
 
-fn value_timeout<F>(
+fn value_timeout(
     sub: &Subscription,
+    matcher: &impl Matcher,
     timeout: Duration,
     last: Option<ReadingValue>,
 ) -> BsrsError {
     BsrsError::ValueTimeout {
         name: sub.key().to_string(),
-        matcher: matcher_name::<F>(),
+        matcher: matcher.name(),
         timeout,
         last: last.map(|r| Box::new(r.value)),
     }
@@ -191,7 +240,7 @@ mod tests {
     use crate::core::subscription::Fanout;
     use serde_json::json;
 
-    fn reading(v: f64) -> ReadingValue {
+    fn reading(v: impl serde::Serialize) -> ReadingValue {
         ReadingValue {
             value: json!(v),
             timestamp: 0.0,
@@ -201,7 +250,7 @@ mod tests {
     }
 
     /// A fan-out whose latest value is `v`, and a subscription to it.
-    fn fanout_at(v: f64, key: &str) -> (Fanout<ReadingValue>, Subscription) {
+    fn fanout_at(v: impl serde::Serialize, key: &str) -> (Fanout<ReadingValue>, Subscription) {
         let f = Fanout::default();
         f.post(reading(v));
         let sub = Subscription::new(f.listen(), SubToken::noop(), key);
@@ -211,20 +260,14 @@ mod tests {
     #[tokio::test]
     async fn wait_for_value_matches_current_immediately() {
         let (_f, sub) = fanout_at(5.0, "x");
-        let got = wait_for_value(sub, |r| r.value == json!(5.0), None)
-            .await
-            .unwrap();
+        let got = wait_for_value(sub, 5.0, None).await.unwrap();
         assert_eq!(got.value, json!(5.0));
     }
 
     #[tokio::test]
     async fn wait_for_value_waits_for_a_matching_change() {
         let (f, sub) = fanout_at(0.0, "x");
-        let h = tokio::spawn(wait_for_value(
-            sub,
-            |r| r.value == json!(3.0),
-            Some(Duration::from_secs(2)),
-        ));
+        let h = tokio::spawn(wait_for_value(sub, 3.0, Some(Duration::from_secs(2))));
         tokio::task::yield_now().await;
         f.post(reading(1.0));
         f.post(reading(3.0));
@@ -239,7 +282,7 @@ mod tests {
         let (f, sub) = fanout_at(1.0, "x");
         f.post(reading(0.0));
         f.post(reading(1.0));
-        let got = wait_for_value(sub, |r| r.value == json!(0.0), Some(Duration::ZERO))
+        let got = wait_for_value(sub, 0.0, Some(Duration::ZERO))
             .await
             .unwrap();
         assert_eq!(got.value, json!(0.0));
@@ -248,11 +291,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn wait_for_value_times_out_with_the_last_value_seen() {
         let (f, sub) = fanout_at(0.0, "x");
-        let h = tokio::spawn(wait_for_value(
-            sub,
-            |r| r.value == json!(9.0),
-            Some(Duration::from_millis(50)),
-        ));
+        let h = tokio::spawn(wait_for_value(sub, 9.0, Some(Duration::from_millis(50))));
         tokio::task::yield_now().await;
         // The fan-out stays alive, so the failure is a timeout, not a close.
         f.post(reading(1.0));
@@ -264,12 +303,7 @@ mod tests {
                 last,
             }) => assert_eq!(
                 (name.as_str(), matcher.as_str(), timeout, last.map(|v| *v)),
-                (
-                    "x",
-                    "<closure>",
-                    Duration::from_millis(50),
-                    Some(json!(1.0))
-                )
+                ("x", "9.0", Duration::from_millis(50), Some(json!(1.0)))
             ),
             other => panic!("{other:?}"),
         }
@@ -281,9 +315,13 @@ mod tests {
     async fn wait_for_value_times_out_with_no_value_seen() {
         let f = Fanout::<ReadingValue>::default();
         let sub = Subscription::new(f.listen(), SubToken::noop(), "x");
-        let err = wait_for_value(sub, |_| true, Some(Duration::from_millis(50)))
-            .await
-            .unwrap_err();
+        let err = wait_for_value(
+            sub,
+            |_: &ReadingValue| true,
+            Some(Duration::from_millis(50)),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(
             err.to_string(),
             "x didn't match <closure> in 0.05s, last value None"
@@ -296,7 +334,7 @@ mod tests {
         let f = Fanout::<ReadingValue>::default();
         let sub = Subscription::new(f.listen(), SubToken::noop(), "m");
         let set = async { Err::<(), _>(BsrsError::Other("set ran".into())) };
-        let err = set_and_wait_for_other_value(sub, set, |_| true, Duration::from_millis(50))
+        let err = set_and_wait_for_other_value(sub, set, true, Duration::from_millis(50))
             .await
             .unwrap_err();
         assert_eq!(
@@ -309,22 +347,16 @@ mod tests {
     // with test_acquire_logic_when_arming_times_out's message.
     #[tokio::test(start_paused = true)]
     async fn set_and_wait_times_out_with_the_last_value_seen() {
-        let (f, sub) = fanout_at(0.0, "m");
+        // Acquire_RBV stays False after the put.
+        let (f, sub) = fanout_at(false, "m");
         let set = async {
-            f.post(reading(1.0));
+            f.post(reading(false));
             Ok(())
         };
-        let err = set_and_wait_for_other_value(
-            sub,
-            set,
-            |r| r.value == json!(2.0),
-            Duration::from_millis(50),
-        )
-        .await
-        .unwrap_err();
+        let err = set_and_wait_for_other_value(sub, set, true, Duration::from_millis(50));
         assert_eq!(
-            err.to_string(),
-            "m didn't match <closure> in 0.05s, last value 1.0"
+            err.await.unwrap_err().to_string(),
+            "m didn't match True in 0.05s, last value False"
         );
     }
 
@@ -338,24 +370,39 @@ mod tests {
             f.post(reading(0.0));
             Ok("set")
         };
-        let out = set_and_wait_for_other_value(sub, set, |r| r.value == json!(1.0), Duration::ZERO)
+        let out = set_and_wait_for_other_value(sub, set, 1.0, Duration::ZERO)
             .await
             .unwrap();
         assert_eq!(out, "set");
     }
 
     #[test]
-    fn matcher_name_is_the_fn_name_or_the_nameless_type() {
+    fn a_matcher_is_named_by_its_repr_fn_name_or_nameless_type() {
         fn is_nine(r: &ReadingValue) -> bool {
             r.value == json!(9.0)
         }
-        fn name_of<F: FnMut(&ReadingValue) -> bool>(_: F) -> String {
-            matcher_name::<F>()
-        }
-        assert_eq!(name_of(is_nine), "is_nine");
-        assert_eq!(name_of(|_: &ReadingValue| true), "<closure>");
+        assert_eq!(is_nine.name(), "is_nine");
+        assert_eq!((|_: &ReadingValue| true).name(), "<closure>");
         let ptr: fn(&ReadingValue) -> bool = is_nine;
-        assert!(name_of(ptr).starts_with("<fn("), "{}", name_of(ptr));
+        assert!(ptr.name().starts_with("<fn("), "{}", ptr.name());
+        assert_eq!("something".name(), "'something'");
+        assert_eq!(true.name(), "True");
+        assert_eq!(45.8_f64.name(), "45.8");
+        assert_eq!(json!([1, "a", null]).name(), "[1, 'a', None]");
+    }
+
+    // A value matches as Python `==` does: across int and float, item by item.
+    #[test]
+    fn a_value_matches_as_python_eq() {
+        let m = |mut v: Value, r| v.matches(&reading(r));
+        assert!(1_i64.matches(&reading(1.0)));
+        assert!(1.5_f64.matches(&reading(1.5)));
+        assert!(!1_i64.matches(&reading("1")));
+        assert!(!(-1_i64).matches(&reading(u64::MAX)));
+        assert!(m(json!([1, {"a": 2}]), json!([1.0, {"a": 2.0}])));
+        assert!(!m(json!([1, 2]), json!([1, 2, 3])));
+        assert!(!m(json!({"a": 1}), json!({"b": 1})));
+        assert!(Matcher::matches(&mut "blah", &reading("blah")));
     }
 
     #[tokio::test]

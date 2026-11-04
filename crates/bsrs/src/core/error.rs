@@ -15,12 +15,13 @@ pub enum BsrsError {
     #[error(
         "{name} didn't match {matcher} in {}s, last value {}",
         .timeout.as_secs_f64(),
-        .last.as_ref().map_or_else(|| "None".into(), ToString::to_string)
+        crate::devices::signal::repr(.last)
     )]
     ValueTimeout {
         /// Subscription key (the signal name).
         name: String,
-        /// The predicate's fn name, or `<closure>`.
+        /// The [`Matcher::name`](crate::devices::Matcher::name): a value's
+        /// `repr`, a predicate's fn name, or `<closure>`.
         matcher: String,
         /// The timeout that elapsed.
         timeout: std::time::Duration,
