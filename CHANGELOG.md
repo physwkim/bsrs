@@ -118,6 +118,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `host::areadetector::wait_for_good_state`, ophyd-async's: wait until a
   state signal is one of the good states, with its `message_signal` as an
   optional signal whose value ends the not-in-a-good-state error.
+- `EpicsCaBackend::new_rw(read_pv, write_pv)`, ophyd-async's
+  `epics_signal_rw` with a separate read PV: puts and `get_setpoint` go to
+  the write PV, every other read to the read PV, and `connect` refuses the
+  pair when they differ in type, element count, choices or precision.
 
 ### Changed
 
@@ -292,6 +296,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   detector_state}` and `NdFile::{num_captured, full_file_name,
   file_path_exists}`. A readback paired with a setpoint field
   (`acquire_rbv`, `capture_rbv`, `size_x_rbv`, …) keeps it.
+- **Breaking**: `AreaDetectorCam::array_counter` is a `SignalRW` that
+  writes `ArrayCounter` and reads `ArrayCounter_RBV`, as ophyd-async's
+  `PvSuffix.rbv("ArrayCounter")`.
 
 ### Removed
 

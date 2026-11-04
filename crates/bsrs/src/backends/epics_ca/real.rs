@@ -14,6 +14,7 @@ use super::channel::SharedChannel;
 use crate::core::error::{BsrsError, Result};
 use crate::core::reading::ReadingValue;
 use crate::core::status::SubToken;
+use crate::devices::wait_for_connection;
 use crate::event_model::{make_datakey, DataKey, Dtype, Limits, LimitsRange, SignalMetadata};
 use crate::protocols_async::{PutCompletion, ReadingValueCallback, SignalBackend};
 use async_trait::async_trait;
@@ -174,23 +175,69 @@ impl CaConverter {
     }
 }
 
-/// ophyd-async `make_converter`: the converter that reads `pv`, of `native`
-/// type and `element_count` elements, as `want`, from its DBR_CTRL read
-/// `snap`, or the `TypeError` that refuses it.
-fn make_converter(
-    pv: &str,
-    want: Datatype,
+/// A PV's connect-time DBR_CTRL read and type: ophyd-async's
+/// `initial_values` entry for it.
+struct CtrlRead {
+    pv: String,
     native: DbFieldType,
     element_count: u32,
-    snap: &Snapshot,
-) -> Result<CaConverter> {
+    snap: Snapshot,
+}
+
+impl CtrlRead {
+    fn new(pv: &str, snap: Snapshot, info: &ChannelInfo) -> Self {
+        Self {
+            pv: pv.to_string(),
+            native: info.native_type,
+            element_count: info.element_count,
+            snap,
+        }
+    }
+}
+
+/// What `of` gives every read, or ophyd-async `get_unique`'s refusal naming
+/// what each PV has.
+fn unique<V: PartialEq + std::fmt::Debug>(
+    reads: &[CtrlRead],
+    what: &str,
+    of: impl Fn(&CtrlRead) -> V,
+) -> Result<V> {
+    let mut values: Vec<V> = reads.iter().map(of).collect();
+    if values.windows(2).all(|w| w[0] == w[1]) {
+        return Ok(values.swap_remove(0));
+    }
+    let diffs: Vec<_> = reads
+        .iter()
+        .zip(&values)
+        .map(|(r, v)| format!("{} has {v:?}", r.pv))
+        .collect();
+    Err(BsrsError::Datatype(format!(
+        "Differing {what}: {}",
+        diffs.join(", ")
+    )))
+}
+
+/// ophyd-async `make_converter`: the converter that reads the PVs of
+/// `reads`, read PV first, as `want`, or the `TypeError` that refuses them.
+/// Every attribute it depends on must be the same on each PV.
+fn make_converter(want: Datatype, reads: &[CtrlRead]) -> Result<CaConverter> {
     use Datatype as D;
     use DbFieldType as F;
-    let is_array = element_count > 1;
+    let pv = &reads[0].pv;
+    let (native, is_array) = unique(reads, "datatypes and element_count", |r| {
+        (r.native, r.element_count > 1)
+    })?;
+    let labels = |r: &CtrlRead| {
+        r.snap
+            .enums
+            .as_ref()
+            .map(|e| enum_labels_to_strings(&e.strings))
+            .unwrap_or_default()
+    };
     match (want, native, is_array) {
         (D::Str, F::Char, true) => Ok(CaConverter::LongStr),
         (D::Bool, F::Enum, false) => {
-            let n = snap.enums.as_ref().map_or(0, |e| e.strings.len());
+            let n = unique(reads, "number of choices", |r| labels(r).len())?;
             if n != 2 {
                 return Err(BsrsError::Datatype(format!(
                     "{pv} has {n} choices, can't map to bool"
@@ -198,15 +245,12 @@ fn make_converter(
             }
             Ok(CaConverter::Native(native))
         }
-        (D::Str, F::Enum, false) => Ok(CaConverter::Enum(
-            snap.enums
-                .as_ref()
-                .map(|e| enum_labels_to_strings(&e.strings))
-                .unwrap_or_default(),
-        )),
+        (D::Str, F::Enum, false) => Ok(CaConverter::Enum(unique(reads, "choices", labels)?)),
         // An int on a float record whose precision shows no fraction.
         (D::Int, F::Float | F::Double, false)
-            if snap.display.as_ref().is_some_and(|d| d.precision == 0) =>
+            if unique(reads, "precision", |r| {
+                r.snap.display.as_ref().map(|d| d.precision)
+            })? == Some(0) =>
         {
             Ok(CaConverter::Native(native))
         }
@@ -247,18 +291,17 @@ fn inferred_name(native: DbFieldType, is_array: bool) -> String {
     .to_string()
 }
 
-/// The converter for reading `pv` as `want` on the connected `ch`, made from
-/// one DBR_CTRL read, which it returns too: ophyd-async's connect-time
-/// `caget(FORMAT_CTRL)`.
-async fn converter_for(
-    pv: &str,
-    want: Datatype,
-    ch: &SharedChannel,
-) -> Result<(CaConverter, Snapshot)> {
-    let snap = ctrl_get(ch).await?;
-    let info = ch.info().await.map_err(|e| ca_failed("info", pv, e))?;
-    let conv = make_converter(pv, want, info.native_type, info.element_count, &snap)?;
-    Ok((conv, snap))
+/// The converter for reading the PVs of the connected `chs`, read PV first,
+/// as `want`, made from one DBR_CTRL read of each: ophyd-async's
+/// connect-time `caget(FORMAT_CTRL)`.
+async fn converter_for(want: Datatype, chs: &[Arc<SharedChannel>]) -> Result<CaConverter> {
+    let mut reads = Vec::with_capacity(chs.len());
+    for ch in chs {
+        let snap = ctrl_get(ch).await?;
+        let info = ch.info().await.map_err(|e| ca_failed("info", ch.pv(), e))?;
+        reads.push(CtrlRead::new(ch.pv(), snap, &info));
+    }
+    make_converter(want, &reads)
 }
 
 mod sealed {
@@ -462,18 +505,44 @@ fn ca_failed(op: &str, pv: &str, e: impl std::fmt::Display) -> BsrsError {
     BsrsError::Backend(format!("ca {op} {pv}: {e}"))
 }
 
-/// CA backend for a single PV.
-pub struct EpicsCaBackend<T: Clone + Send + Sync + 'static> {
-    pv: String,
-    ctx: Arc<CaContext>,
+/// One PV of an [`EpicsCaBackend`], and its channel once first used.
+struct Pv {
+    name: String,
     channel: OnceLock<Arc<SharedChannel>>,
-    /// What the PV is read as: `T`'s datatype, or [`Datatype::Number`].
+}
+
+impl Pv {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            channel: OnceLock::new(),
+        }
+    }
+
+    fn channel(&self, ctx: &CaContext) -> &Arc<SharedChannel> {
+        self.channel.get_or_init(|| ctx.channel(&self.name))
+    }
+
+    fn undecodable(&self, v: &EpicsValue) -> BsrsError {
+        undecodable(&format!("ca://{}", self.name), v)
+    }
+}
+
+/// CA backend for a signal's PV, or for its read PV and its write PV.
+pub struct EpicsCaBackend<T: Clone + Send + Sync + 'static> {
+    /// The PV `get_value`, `get_reading`, `get_datakey` and the monitor read.
+    read: Pv,
+    /// The PV `put` writes and `get_setpoint` reads; `read`'s PV for a
+    /// one-PV signal.
+    write: Pv,
+    ctx: Arc<CaContext>,
+    /// What the PVs are read as: `T`'s datatype, or [`Datatype::Number`].
     want: Datatype,
     /// The converter the latest `connect`, or before one the first call,
-    /// made for the PV.
+    /// made for the PVs.
     converter: Mutex<Option<Arc<CaConverter>>>,
-    /// ophyd-async's `initial_values`: what `connect` read, which
-    /// `put(None)` writes.
+    /// ophyd-async's `initial_values[write_pv]`: what `connect` read from
+    /// the write PV, which `put(None)` writes.
     initial: Mutex<Option<T>>,
     /// ophyd-async's `EpicsOptions.wait`: whether a put of a value waits
     /// for the record to process.
@@ -489,14 +558,24 @@ impl<T: CaType> EpicsCaBackend<T> {
     /// type: `i16` short, `f32` float, `u8` char, `i32` long, `f64` double,
     /// `String` string or enum (as its indices).
     pub fn new(pv: impl Into<String>) -> Self {
-        Self::reading_as(pv.into(), T::DATATYPE)
+        let pv = pv.into();
+        Self::reading_as(pv.clone(), pv, T::DATATYPE)
     }
 
-    fn reading_as(pv: String, want: Datatype) -> Self {
+    /// Read `read_pv` and write `write_pv`, as ophyd-async's
+    /// `epics_signal_rw(datatype, read_pv, write_pv)`. `connect` refuses
+    /// them as [`new`](Self::new) refuses a PV, and also when they differ in
+    /// anything the conversion depends on: type, element count, choices or
+    /// precision.
+    pub fn new_rw(read_pv: impl Into<String>, write_pv: impl Into<String>) -> Self {
+        Self::reading_as(read_pv.into(), write_pv.into(), T::DATATYPE)
+    }
+
+    fn reading_as(read_pv: String, write_pv: String, want: Datatype) -> Self {
         Self {
-            pv,
+            read: Pv::new(read_pv),
+            write: Pv::new(write_pv),
             ctx: ca_context(),
-            channel: OnceLock::new(),
             want,
             converter: Mutex::new(None),
             initial: Mutex::new(None),
@@ -519,7 +598,8 @@ impl EpicsCaBackend<f64> {
     /// user's to name (`ca_value`, a suspender, a positioner's done PV).
     #[cfg(feature = "host")]
     pub(crate) fn new_inferred(pv: impl Into<String>) -> Self {
-        Self::reading_as(pv.into(), Datatype::Number)
+        let pv = pv.into();
+        Self::reading_as(pv.clone(), pv, Datatype::Number)
     }
 }
 
@@ -530,56 +610,86 @@ impl<T: CaType> crate::devices::BackendFromPv for EpicsCaBackend<T> {
 }
 
 impl<T: CaType> EpicsCaBackend<T> {
-    fn channel(&self) -> &Arc<SharedChannel> {
-        self.channel.get_or_init(|| self.ctx.channel(&self.pv))
+    /// The PVs ophyd-async's `initial_values` holds a read of: the read PV,
+    /// then the write PV when it is another one.
+    fn pvs(&self) -> impl Iterator<Item = &Pv> {
+        let write = (self.write.name != self.read.name).then_some(&self.write);
+        std::iter::once(&self.read).chain(write)
     }
 
-    /// The channel, once connected within `timeout`. Asked on every call, as
-    /// aioca's `channel.wait()`: a call during an outage waits for the
+    /// `pv`'s channel, once connected within `timeout`. Asked on every call,
+    /// as aioca's `channel.wait()`: a call during an outage waits for the
     /// reconnect.
-    async fn ensure_channel(&self, timeout: Duration) -> Result<Arc<SharedChannel>> {
-        let ch = self.channel();
+    async fn ensure_channel(&self, pv: &Pv, timeout: Duration) -> Result<Arc<SharedChannel>> {
+        let ch = pv.channel(&self.ctx);
         ch.wait_connected(timeout)
             .await
-            .map_err(|e| ca_failed("connect", &self.pv, e))?;
+            .map_err(|e| ca_failed("connect", &pv.name, e))?;
         Ok(ch.clone())
     }
 
-    /// `connect`: make the converter from a [`connect_read`] whose value is
-    /// the one `put(None)` writes, as ophyd-async's connect-time `caget` and
-    /// `make_converter`.
+    /// `connect`: make the converter from a [`connect_read`] of each PV, the
+    /// write PV's value being the one `put(None)` writes, as ophyd-async's
+    /// connect-time `caget` and `make_converter`.
     async fn connect_reading(&self, timeout: Duration) -> Result<()> {
-        let (snap, info) = connect_read(&self.pv, self.channel(), timeout).await?;
-        let conv = make_converter(
-            &self.pv,
-            self.want,
-            info.native_type,
-            info.element_count,
-            &snap,
-        )?;
-        let v = T::decode(&conv, &snap.value).ok_or_else(|| self.undecodable(&snap.value))?;
+        let reads = self.connect_reads(timeout).await?;
+        let conv = make_converter(self.want, &reads)?;
+        let write = &reads[reads.len() - 1];
+        let v = T::decode(&conv, &write.snap.value)
+            .ok_or_else(|| self.write.undecodable(&write.snap.value))?;
         *self.converter.lock().unwrap() = Some(Arc::new(conv));
         *self.initial.lock().unwrap() = Some(v);
         Ok(())
     }
 
+    /// A [`connect_read`] of each of [`pvs`](Self::pvs), as ophyd-async's
+    /// `connect` stores them: two at once, a failure named by the PV's role.
+    async fn connect_reads(&self, timeout: Duration) -> Result<Vec<CtrlRead>> {
+        let (mut r, mut w) = (None, None);
+        if self.write.name == self.read.name {
+            self.connect_pv(&self.read, timeout, &mut r).await?;
+        } else {
+            wait_for_connection([
+                ("read_pv", self.connect_pv(&self.read, timeout, &mut r)),
+                ("write_pv", self.connect_pv(&self.write, timeout, &mut w)),
+            ])
+            .await?;
+        }
+        Ok(r.into_iter().chain(w).collect())
+    }
+
+    async fn connect_pv(
+        &self,
+        pv: &Pv,
+        timeout: Duration,
+        read: &mut Option<CtrlRead>,
+    ) -> Result<()> {
+        let (snap, info) = connect_read(&pv.name, pv.channel(&self.ctx), timeout).await?;
+        *read = Some(CtrlRead::new(&pv.name, snap, &info));
+        Ok(())
+    }
+
     /// The converter `connect` made, or one made now if none has.
-    async fn converter(&self, ch: &SharedChannel) -> Result<Arc<CaConverter>> {
+    async fn converter(&self) -> Result<Arc<CaConverter>> {
         if let Some(conv) = self.converter.lock().unwrap().clone() {
             return Ok(conv);
         }
-        let conv = Arc::new(converter_for(&self.pv, self.want, ch).await?.0);
+        let mut chs = Vec::new();
+        for pv in self.pvs() {
+            chs.push(self.ensure_channel(pv, Duration::from_secs(2)).await?);
+        }
+        let conv = Arc::new(converter_for(self.want, &chs).await?);
         *self.converter.lock().unwrap() = Some(conv.clone());
         Ok(conv)
     }
 
-    /// `value`, or for `None` the value `connect` read, read now if no
-    /// `connect` has.
+    /// `value`, or for `None` the value `connect` read, read now from the
+    /// write PV if no `connect` has.
     async fn or_initial(&self, value: Option<T>) -> Result<T> {
         if let Some(v) = value.or_else(|| self.initial.lock().unwrap().clone()) {
             return Ok(v);
         }
-        let v = self.value().await?;
+        let v = self.value(&self.write).await?;
         *self.initial.lock().unwrap() = Some(v.clone());
         Ok(v)
     }
@@ -587,28 +697,26 @@ impl<T: CaType> EpicsCaBackend<T> {
     async fn put_value(&self, value: Option<T>) -> Result<PutCompletion> {
         let value = self.or_initial(value).await?;
         let wait = (self.wait)(&value);
-        let ch = self.ensure_channel(Duration::from_secs(2)).await?;
-        let v = T::encode(&*self.converter(&ch).await?, value)?;
+        let ch = self
+            .ensure_channel(&self.write, Duration::from_secs(2))
+            .await?;
+        let v = T::encode(&*self.converter().await?, value)?;
         if wait {
             return put_callback(&ch, &v);
         }
         ch.put_no_callback(&v)
-            .map_err(|e| ca_failed("put", &self.pv, e))?;
+            .map_err(|e| ca_failed("put", &self.write.name, e))?;
         Ok(Box::pin(futures::future::ready(Ok(()))))
     }
 
-    async fn value(&self) -> Result<T> {
-        let ch = self.ensure_channel(Duration::from_secs(2)).await?;
-        let conv = self.converter(&ch).await?;
+    async fn value(&self, pv: &Pv) -> Result<T> {
+        let ch = self.ensure_channel(pv, Duration::from_secs(2)).await?;
+        let conv = self.converter().await?;
         let (_ty, v) = ch
             .get_with_timeout(CA_IO_TIMEOUT)
             .await
-            .map_err(|e| ca_failed("get", &self.pv, e))?;
-        T::decode(&conv, &v).ok_or_else(|| self.undecodable(&v))
-    }
-
-    fn undecodable(&self, v: &EpicsValue) -> BsrsError {
-        undecodable(&format!("ca://{}", self.pv), v)
+            .map_err(|e| ca_failed("get", &pv.name, e))?;
+        T::decode(&conv, &v).ok_or_else(|| pv.undecodable(&v))
     }
 }
 
@@ -897,21 +1005,25 @@ impl<T: CaType> SignalBackend<T> for EpicsCaBackend<T> {
         self.put_value(value).await
     }
     async fn put(&self, value: Option<T>) -> Result<()> {
-        await_put(self.put_value(value).await?, &self.pv).await
+        await_put(self.put_value(value).await?, &self.write.name).await
     }
     async fn get_datakey(&self, source: &str) -> Result<DataKey> {
-        let ch = self.ensure_channel(Duration::from_secs(2)).await?;
-        let conv = self.converter(&ch).await?;
+        let ch = self
+            .ensure_channel(&self.read, Duration::from_secs(2))
+            .await?;
+        let conv = self.converter().await?;
         T::datakey(format!("ca://{source}"), &conv, &ctrl_get(&ch).await?)
     }
     async fn get_reading(&self) -> Result<ReadingValue> {
-        let ch = self.ensure_channel(Duration::from_secs(2)).await?;
-        let conv = self.converter(&ch).await?;
+        let ch = self
+            .ensure_channel(&self.read, Duration::from_secs(2))
+            .await?;
+        let conv = self.converter().await?;
         let snap = ch
             .get_with_metadata(DbrClass::Time, CA_IO_TIMEOUT)
             .await
-            .map_err(|e| ca_failed("get", &self.pv, e))?;
-        let v = T::decode(&conv, &snap.value).ok_or_else(|| self.undecodable(&snap.value))?;
+            .map_err(|e| ca_failed("get", &self.read.name, e))?;
+        let v = T::decode(&conv, &snap.value).ok_or_else(|| self.read.undecodable(&snap.value))?;
         Ok(ReadingValue {
             value: v.into(),
             timestamp: ts_to_f64(snap.timestamp),
@@ -920,47 +1032,48 @@ impl<T: CaType> SignalBackend<T> for EpicsCaBackend<T> {
         })
     }
     async fn get_value(&self) -> Result<T> {
-        self.value().await
+        self.value(&self.read).await
     }
     async fn get_setpoint(&self) -> Result<T> {
-        // CA channels expose only one read path; we treat readback as the
-        // best-effort setpoint as well.
-        self.value().await
+        self.value(&self.write).await
     }
     fn set_callback(&self, cb: Option<ReadingValueCallback<T>>) -> SubToken {
         let cb = match cb {
             None => return SubToken::noop(),
             Some(cb) => cb,
         };
-        let ch = self.channel().clone();
+        let chs: Vec<_> = self.pvs().map(|pv| pv.channel(&self.ctx).clone()).collect();
         let cached = self.converter.lock().unwrap().clone();
-        let (pv, want) = (self.pv.clone(), self.want);
+        let want = self.want;
         // Spawn a forwarder. Held tokio::JoinHandle is aborted on Drop (K1).
         let handle = tokio::spawn(async move {
             let conv = match cached {
                 Some(conv) => conv,
                 None => {
-                    // No connect made the converter: wait for the channel as
+                    // No connect made the converter: wait for the channels as
                     // long as the token lives, as camonitor does.
-                    if ch.wait_connected(Duration::MAX).await.is_err() {
-                        return;
+                    for ch in &chs {
+                        if ch.wait_connected(Duration::MAX).await.is_err() {
+                            return;
+                        }
                     }
-                    match converter_for(&pv, want, &ch).await {
-                        Ok((conv, _)) => Arc::new(conv),
+                    match converter_for(want, &chs).await {
+                        Ok(conv) => Arc::new(conv),
                         Err(e) => {
-                            tracing::warn!("ca monitor {pv}: {e}");
+                            tracing::warn!("ca monitor {}: {e}", chs[0].pv());
                             return;
                         }
                     }
                 }
             };
-            forward_monitor(&ch, |v| T::decode(&conv, v), &cb).await;
+            forward_monitor(&chs[0], |v| T::decode(&conv, v), &cb).await;
         });
         let abort = handle.abort_handle();
         SubToken::new(move || abort.abort())
     }
-    fn source(&self, name: &str, _read: bool) -> String {
-        format!("ca://{name}")
+    fn source(&self, _name: &str, read: bool) -> String {
+        let pv = if read { &self.read } else { &self.write };
+        format!("ca://{}", pv.name)
     }
 }
 
@@ -1381,15 +1494,73 @@ mod tests {
         snap
     }
 
+    fn read(pv: &str, native: DbFieldType, n: u32, snap: &Snapshot) -> CtrlRead {
+        CtrlRead {
+            pv: pv.into(),
+            native,
+            element_count: n,
+            snap: snap.clone(),
+        }
+    }
+
     fn converter(want: Datatype, native: DbFieldType, n: u32, snap: &Snapshot) -> CaConverter {
-        make_converter("P", want, native, n, snap).unwrap()
+        make_converter(want, &[read("P", native, n, snap)]).unwrap()
     }
 
     fn refusal(want: Datatype, native: DbFieldType, n: u32, snap: &Snapshot) -> String {
-        match make_converter("P", want, native, n, snap) {
+        split_refusal(want, &[read("P", native, n, snap)])
+    }
+
+    fn split_refusal(want: Datatype, reads: &[CtrlRead]) -> String {
+        match make_converter(want, reads) {
             Err(BsrsError::Datatype(msg)) => msg,
-            other => panic!("{want:?} on {native:?}[{n}]: {other:?}"),
+            other => panic!("{want:?}: {other:?}"),
         }
+    }
+
+    /// A read PV and a write PV convert only when alike in all a converter
+    /// depends on, as ophyd-async's `get_unique` over both.
+    #[test]
+    fn split_pvs_must_agree() {
+        let none = ctrl(&[], None);
+        let alike = [
+            read("P_RBV", DbFieldType::Long, 1, &none),
+            read("P", DbFieldType::Long, 1, &none),
+        ];
+        assert_eq!(
+            make_converter(Datatype::Int, &alike).unwrap(),
+            CaConverter::Native(DbFieldType::Long)
+        );
+        assert_eq!(
+            split_refusal(
+                Datatype::Int,
+                &[
+                    read("P_RBV", DbFieldType::Long, 1, &none),
+                    read("P", DbFieldType::Short, 1, &none)
+                ]
+            ),
+            "Differing datatypes and element_count: P_RBV has (Long, false), P has (Short, false)"
+        );
+        assert_eq!(
+            split_refusal(
+                Datatype::Str,
+                &[
+                    read("P_RBV", DbFieldType::Enum, 1, &ctrl(&["A", "B"], None)),
+                    read("P", DbFieldType::Enum, 1, &ctrl(&["A", "C"], None))
+                ]
+            ),
+            r#"Differing choices: P_RBV has ["A", "B"], P has ["A", "C"]"#
+        );
+        assert_eq!(
+            split_refusal(
+                Datatype::Int,
+                &[
+                    read("P_RBV", DbFieldType::Double, 1, &ctrl(&[], Some(0))),
+                    read("P", DbFieldType::Double, 1, &ctrl(&[], Some(3)))
+                ]
+            ),
+            "Differing precision: P_RBV has Some(0), P has Some(3)"
+        );
     }
 
     #[test]

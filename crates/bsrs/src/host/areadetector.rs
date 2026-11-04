@@ -202,7 +202,7 @@ pub async fn wait_for_good_state<B: SignalBackend<String>>(
 }
 
 /// Cam-side handle: `ImageMode`/`NumImages`/`Acquire`/`AcquireTime`
-/// setters plus `ArrayCounter_RBV` / `DetectorState_RBV` readbacks.
+/// setters plus `ArrayCounter` / `DetectorState_RBV` readbacks.
 pub struct AreaDetectorCam {
     /// PV prefix, e.g. `"13SIM1:cam1:"`.
     pub prefix: String,
@@ -226,8 +226,9 @@ pub struct AreaDetectorCam {
     pub acquire_time_rbv: Arc<SignalR<f64, EpicsCaBackend<f64>>>,
     /// `AcquirePeriod_RBV` (ai) — the period the driver applied.
     pub acquire_period_rbv: Arc<SignalR<f64, EpicsCaBackend<f64>>>,
-    /// `ArrayCounter_RBV` (longin) — total frames produced.
-    pub array_counter: Arc<SignalR<i64, EpicsCaBackend<i64>>>,
+    /// `ArrayCounter` (longout), read from `ArrayCounter_RBV` (longin) —
+    /// total frames produced.
+    pub array_counter: Arc<SignalRW<i64, EpicsCaBackend<i64>>>,
     /// `DetectorState_RBV` (mbbi).
     pub detector_state: Arc<SignalR<String, EpicsCaBackend<String>>>,
     /// `NDAttributesFile` (waveform) — per-frame attribute config, either
@@ -376,7 +377,11 @@ impl AreaDetectorCam {
             acquire_period: ca_signal(&prefix, "AcquirePeriod"),
             acquire_time_rbv: ca_signal(&prefix, ACQUIRE_TIME_RBV),
             acquire_period_rbv: ca_signal(&prefix, ACQUIRE_PERIOD_RBV),
-            array_counter: ca_signal(&prefix, "ArrayCounter_RBV"),
+            array_counter: {
+                let rbv = join(&prefix, "ArrayCounter_RBV");
+                let backend = EpicsCaBackend::new_rw(&rbv, join(&prefix, "ArrayCounter"));
+                Arc::new(pv_signal(backend, &rbv, rbv.clone()))
+            },
             detector_state: ca_signal(&prefix, "DetectorState_RBV"),
             nd_attributes_file: ca_signal(&prefix, "NDAttributesFile"),
             wait_for_plugins: ca_signal(&prefix, "WaitForPlugins"),

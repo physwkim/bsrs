@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use bsrs::backends::epics_ca::EpicsCaBackend;
 use bsrs::callbacks::CapturingSink;
-use bsrs::core::msg::{ConfigurableObj, ReadableObj, StageableObj, TriggerableObj};
+use bsrs::core::msg::{ConfigurableObj, MonitorableObj, ReadableObj, StageableObj, TriggerableObj};
 use bsrs::core::status::Status;
 use bsrs::devices::{
     BackendFromPv, DataLogic, SignalConfig, SignalR, StandardDetector, StaticFilenameProvider,
@@ -1472,6 +1472,31 @@ async fn select_save_plugin_routes_while_staged() {
         pre_en
     );
     assert_eq!(port_of(&hdf1).await, pre_hdf1_port);
+}
+
+/// `array_counter` writes `ArrayCounter` and reads `ArrayCounter_RBV`, as
+/// ophyd-async's `PvSuffix.rbv("ArrayCounter")`: a put of 0 resets the
+/// count the readback reports.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+async fn array_counter_writes_the_counter_and_reads_its_readback() {
+    boot();
+    let _cam = CAM_LOCK.lock().await;
+    let cam = AreaDetectorCam::new(CAM);
+    cam.connect(TIMEOUT).await.expect("connect cam1");
+    let counter = &cam.array_counter;
+    assert_eq!(counter.source(), format!("ca://{CAM}ArrayCounter_RBV"));
+    cam.warmup().await.expect("warmup");
+    assert!(counter.get().await.expect("read ArrayCounter_RBV") > 0);
+
+    assert!(counter.put(0).await.success(), "put ArrayCounter");
+    assert_eq!(counter.get_setpoint().await.expect("read ArrayCounter"), 0);
+    let sub = MonitorableObj::subscribe_dyn(counter.as_ref())
+        .await
+        .expect("subscribe");
+    bsrs::devices::wait_for_value(sub, 0, Some(TIMEOUT))
+        .await
+        .unwrap_or_else(|e| panic!("ArrayCounter_RBV never read 0: {e}"));
 }
 
 /// The `ad_cam` Lua factory reaches the IOC: `cam:warmup()` takes a frame and
