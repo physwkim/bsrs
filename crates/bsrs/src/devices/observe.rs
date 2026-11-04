@@ -152,7 +152,7 @@ pub async fn wait_for_value(
 /// runs, so a change `set` causes, even one already undone, is queued
 /// behind it. With no first value it fails with ophyd-async's
 /// "didn't provide an initial value" text, else as [`wait_for_value`].
-pub(crate) async fn set_and_wait_for_other_value<R>(
+pub async fn set_and_wait_for_other_value<R>(
     mut sub: Subscription,
     set: impl std::future::Future<Output = Result<R, BsrsError>>,
     mut matcher: impl Matcher,

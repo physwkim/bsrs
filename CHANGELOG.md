@@ -112,6 +112,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   them connect in parallel with failures keyed by variable. The
   `blocking;` form connects from sync code; `timeout = d;` replaces the
   10 s default.
+- `devices::set_and_wait_for_other_value`, exported as ophyd-async exports
+  it: wait for a subscription's first value, run a set, then wait for a
+  value that matches, all within one timeout.
 
 ### Changed
 

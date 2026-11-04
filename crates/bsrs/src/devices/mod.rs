@@ -21,7 +21,9 @@ pub use command::{
 };
 pub use detector::{DataLogic, DetectorTrigger, StandardDetector, TriggerInfo};
 pub use device::{wait_for_connection, walk_signal_sources, Device, DeviceVector};
-pub use observe::{observe_signals_value, observe_value, wait_for_value, Matcher};
+pub use observe::{
+    observe_signals_value, observe_value, set_and_wait_for_other_value, wait_for_value, Matcher,
+};
 pub use path_provider::{
     AutoIncrementFilenameProvider, AutoIncrementingPathProvider, AutoMaxIncrementingPathProvider,
     FilenameProvider, PathInfo, PathProvider, PurePath, StaticFilenameProvider, StaticPathProvider,
