@@ -295,6 +295,21 @@ async fn a_positioner_refuses_a_target_past_the_limit_and_settles_on_done() {
     assert!((rb - target).abs() <= MRES + 1e-9, "{rb}");
 }
 
+/// test_pvpositioner.py `test_hints`: the positioner hints its readback,
+/// under the positioner's own name, and every hinted field is described.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+async fn a_positioner_hints_its_described_readback() {
+    example_ioc::boot(BIN, EXAMPLE);
+    let p = slit_positioner().await;
+    let desc = p.describe_dyn().await.unwrap();
+    let hints = p.hint_fields().unwrap();
+    assert_eq!(hints, ["slit"]);
+    for k in &hints {
+        assert!(desc.contains_key(k), "{k} not in {:?}", desc.keys());
+    }
+}
+
 /// ophyd `PositionerBase.stop` (test_pvpositioner.py `test_pvpos`
 /// `m.stop()`): a positioner with no stop PV ends its move on `stop`, failed
 /// for `success=False`, done for `success=True`.
