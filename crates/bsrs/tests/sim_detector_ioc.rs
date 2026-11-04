@@ -5,6 +5,8 @@
 //! its plugins holds `CAM_LOCK`.
 #![cfg(all(feature = "ca", feature = "host"))]
 
+#[path = "../src/caplog.rs"]
+mod caplog;
 mod example_ioc;
 
 use std::collections::{HashMap, HashSet};
@@ -22,10 +24,12 @@ use bsrs::devices::{
 };
 use bsrs::event_model::{DataKey, Dtype, DtypeNumpy, StreamDatum, StreamResource};
 use bsrs::host::areadetector::{
-    area_detector_hdf, num_rois, AdHdfWriter, AreaDetectorCam, AreaDetectorHdf, NdArrayDescription,
-    NdFile, NdFileHdf5, NdFileIo, NdRoi, NdStats, PluginSignalDataLogic, AD_COLOR_MODE_MONO,
-    AD_COLOR_MODE_RGB1, AD_IMAGE_MODE_CONTINUOUS, AD_IMAGE_MODE_MULTIPLE, AD_IMAGE_MODE_SINGLE,
+    area_detector_hdf, num_rois, select_save_plugin, AdHdfWriter, AreaDetectorCam, AreaDetectorHdf,
+    NdArrayDescription, NdFile, NdFileHdf5, NdFileIo, NdRoi, NdStats, PluginSignalDataLogic,
+    AD_COLOR_MODE_MONO, AD_COLOR_MODE_RGB1, AD_IMAGE_MODE_CONTINUOUS, AD_IMAGE_MODE_MULTIPLE,
+    AD_IMAGE_MODE_SINGLE, AD_STATE_IDLE,
 };
+use bsrs::host::lua_env::build_lua;
 use bsrs::prelude::*;
 use bsrs::protocols_async::{
     DetectorControl, Flyable, Preparable, SignalBackend, Stageable, StreamAsset, Triggerable,
@@ -42,6 +46,7 @@ const HDF: &str = "SIM1:HDF1:";
 const HDF2: &str = "SIM1:HDF2:";
 const TIFF: &str = "SIM1:TIFF1:";
 const JPEG: &str = "SIM1:JPEG1:";
+const NEXUS: &str = "SIM1:Nexus1:";
 const TIMEOUT: Duration = Duration::from_secs(10);
 const EXPOSURE: f64 = 0.01;
 const WIDTH: i64 = 64;
@@ -1286,4 +1291,187 @@ async fn step_scan_through_the_run_engine_links_datums_to_events() {
         h5_shape(&h5, "entry/data/data"),
         vec![2, HEIGHT as usize, WIDTH as usize]
     );
+}
+
+/// `AreaDetectorCam::warmup` takes a frame, leaves the detector idle and
+/// restores the `ImageMode` and `NumImages` it found.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+async fn warmup_takes_a_frame_and_restores_the_cam() {
+    boot();
+    let _cam = CAM_LOCK.lock().await;
+    let cam = AreaDetectorCam::new(CAM);
+    cam.connect(TIMEOUT).await.expect("connect cam1");
+
+    let prev_mode = cam.image_mode.get().await.expect("read ImageMode");
+    let prev_num = cam.num_images.get().await.expect("read NumImages");
+    let c0 = cam
+        .array_counter_rbv
+        .get()
+        .await
+        .expect("read ArrayCounter");
+
+    cam.warmup().await.expect("warmup");
+
+    let c1 = cam
+        .array_counter_rbv
+        .get()
+        .await
+        .expect("read ArrayCounter");
+    let state = cam.detector_state_rbv.get().await.expect("read state");
+    assert!(
+        c1 > c0,
+        "warmup did not acquire any frame (counter {c0} -> {c1})"
+    );
+    assert_eq!(
+        state, AD_STATE_IDLE,
+        "post-warmup DetectorState is not Idle"
+    );
+    assert_eq!(
+        cam.image_mode.get().await.expect("read ImageMode"),
+        prev_mode
+    );
+    assert_eq!(
+        cam.num_images.get().await.expect("read NumImages"),
+        prev_num
+    );
+}
+
+/// ophyd-async `test_signal_get_and_set_logging`, on a cam's PV signals: its
+/// connect, get and put are logged with the PV as the source.
+#[tokio::test]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+async fn cam_signals_log_connect_get_and_put() {
+    boot();
+    let _cam = CAM_LOCK.lock().await;
+    let (caplog, _guard) = caplog::Caplog::start();
+    let cam = AreaDetectorCam::new(CAM);
+    cam.connect(TIMEOUT).await.expect("connect cam1");
+    let set = format!("ca://{CAM}AcquireTime");
+    let rbv = format!("ca://{CAM}AcquireTime_RBV");
+    assert!(caplog.text().contains(&format!("Connecting to {set}\n")));
+
+    let t = cam.acquire_time_rbv.get().await.expect("read AcquireTime");
+    assert!(caplog
+        .text()
+        .contains(&format!("get_value() on source {rbv} returned ")));
+    timeout(TIMEOUT, async { cam.acquire_time.put(t).await.await })
+        .await
+        .expect("AcquireTime put timed out")
+        .expect("rewrite AcquireTime");
+    let text = caplog.text();
+    let logged = |head: &str| {
+        text.lines()
+            .any(|l| l.contains(head) && l.ends_with(&format!(" to backend at source {set}")))
+    };
+    assert!(logged("Putting value "), "{text}");
+    assert!(logged("Successfully put value "), "{text}");
+}
+
+/// `select_save_plugin` records the routing in each plugin's `stage_sigs`
+/// without writing to the IOC; staging routes HDF1 to the cam, enables it and
+/// disables its siblings, and unstaging restores every signal. Also round-trips
+/// the long-string `HDF1:FilePath` (CHAR waveform).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+async fn select_save_plugin_routes_while_staged() {
+    boot();
+    let _cam = CAM_LOCK.lock().await;
+    async fn en(f: &NdFile) -> bool {
+        f.plugin
+            .enable_callbacks
+            .get()
+            .await
+            .expect("read EnableCallbacks")
+    }
+    async fn port_of(f: &NdFile) -> String {
+        f.plugin
+            .nd_array_port
+            .get()
+            .await
+            .expect("read NDArrayPort")
+    }
+
+    let hdf1 = file_plugin(HDF).await;
+    let jpeg1 = file_plugin(JPEG).await;
+    let tiff1 = file_plugin(TIFF).await;
+    let nexus1 = file_plugin(NEXUS).await;
+
+    let orig_path = hdf1.file_path.get().await.expect("read HDF1.FilePath");
+    let path = "/tmp/bsrs_smoke/";
+    hdf1.set_path(path).await.expect("HDF1.set_path");
+    let read_back = hdf1.file_path.get().await.expect("read HDF1.FilePath");
+    assert_eq!(read_back.trim_end_matches('\0'), path);
+    hdf1.set_path(orig_path.trim_end_matches('\0'))
+        .await
+        .expect("restore HDF1.FilePath");
+
+    let pre_en = [
+        en(&hdf1).await,
+        en(&jpeg1).await,
+        en(&tiff1).await,
+        en(&nexus1).await,
+    ];
+    let pre_hdf1_port = port_of(&hdf1).await;
+
+    let siblings = [&jpeg1, &tiff1, &nexus1];
+    select_save_plugin(&hdf1, PORT, &siblings);
+    assert_eq!(
+        en(&hdf1).await,
+        pre_en[0],
+        "select_save_plugin wrote to the IOC before staging"
+    );
+
+    hdf1.stage_dyn().await.expect("stage HDF1");
+    for s in &siblings {
+        s.stage_dyn().await.expect("stage sibling");
+    }
+    assert_eq!(port_of(&hdf1).await, PORT);
+    assert_eq!(
+        [
+            en(&hdf1).await,
+            en(&jpeg1).await,
+            en(&tiff1).await,
+            en(&nexus1).await
+        ],
+        [true, false, false, false]
+    );
+
+    for s in siblings.iter().rev() {
+        s.unstage_dyn().await.expect("unstage sibling");
+    }
+    hdf1.unstage_dyn().await.expect("unstage HDF1");
+    assert_eq!(
+        [
+            en(&hdf1).await,
+            en(&jpeg1).await,
+            en(&tiff1).await,
+            en(&nexus1).await
+        ],
+        pre_en
+    );
+    assert_eq!(port_of(&hdf1).await, pre_hdf1_port);
+}
+
+/// The `ad_cam` Lua factory reaches the IOC: `cam:warmup()` takes a frame and
+/// `cam:state()` reads `Idle` after it. A plain `#[test]`, since the factories
+/// `block_on` bsrs's runtime from inside Lua.
+#[test]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+fn lua_ad_cam_warms_up() {
+    boot();
+    let _cam = CAM_LOCK.blocking_lock();
+    let lua = build_lua(Arc::new(RunEngine::new(vec![]))).expect("build_lua");
+    let script = format!(
+        r#"
+local cam = ad_cam("{CAM}")
+local c0 = cam:array_counter()
+cam:warmup()
+local s1 = cam:state()
+local c1 = cam:array_counter()
+assert(s1 == "Idle", "post-warmup state should be Idle, got " .. tostring(s1))
+assert(c1 > c0, "warmup did not increment counter: " .. c0 .. " -> " .. c1)
+"#
+    );
+    lua.load(&script).exec().expect("lua exec");
 }
