@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 use std::time::Duration;
 
-const DISABLED: &str = "epics-ca backend disabled — build with --features ca";
+const DISABLED: &str = "Protocol ca not available, did you build bsrs with `--features ca`?";
 
 /// Stub backend that always errors. Replace by enabling the `ca` feature.
 pub struct EpicsCaBackend<T: Clone + Send + Sync + 'static> {
@@ -58,5 +58,20 @@ impl<T: Clone + Send + Sync + Serialize + 'static> SignalBackend<T> for EpicsCaB
     }
     fn source(&self, _name: &str, _read: bool) -> String {
         format!("ca://{}", self.pv)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ophyd-async test_no_transport::test_transport_not_available_error
+    #[tokio::test]
+    async fn connect_names_the_missing_protocol() {
+        let backend = EpicsCaBackend::<f64>::new("TEST-PV");
+        let err = backend.connect(Duration::from_secs(1)).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .ends_with("Protocol ca not available, did you build bsrs with `--features ca`?"));
     }
 }

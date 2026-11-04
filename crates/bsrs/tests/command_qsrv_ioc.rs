@@ -30,7 +30,10 @@ fn refusal(e: BsrsError) -> String {
     }
 }
 
-/// DEMO:BI is a bi, an enum over CA and an NTEnum over PVA.
+/// DEMO:BI is a bi, an enum over CA and an NTEnum over PVA: ophyd-async
+/// `test_command_backends_accept_enum`, and
+/// `test_command_backends_accept_pva_bool`, whose `bool` PV is a bo, which
+/// QSRV serves as the same NTEnum.
 #[test]
 #[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
 fn an_enum_pv_is_a_command() {

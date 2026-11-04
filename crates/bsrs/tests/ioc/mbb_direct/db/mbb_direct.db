@@ -1,0 +1,12 @@
+# ophyd-async epics/testing/_epics_test_ca_records.db, the records whose B0
+# bit tests/mbb_direct_qsrv_ioc.rs reads and writes.
+
+record(mbbiDirect, "$(device)mbb_direct") {
+  field(VAL, "0")
+  field(PINI, "YES")
+}
+
+record(mbboDirect, "$(device)mbb_direct_rw") {
+  field(VAL, "0")
+  field(PINI, "YES")
+}

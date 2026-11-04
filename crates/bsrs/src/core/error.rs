@@ -9,17 +9,19 @@ pub enum BsrsError {
     /// Operation timed out.
     #[error("timeout after {0:?}")]
     Timeout(std::time::Duration),
-    /// [`wait_for_value`](crate::devices::wait_for_value) timed out; the
-    /// message is ophyd-async `wait_for_value`'s `TimeoutError` text.
+    /// [`wait_for_value`](crate::devices::wait_for_value), or an areaDetector
+    /// readback waited on after a put, timed out; the message is ophyd-async
+    /// `wait_for_value`'s `TimeoutError` text.
     #[error(
         "{name} didn't match {matcher} in {}s, last value {}",
         .timeout.as_secs_f64(),
-        .last.as_ref().map_or_else(|| "None".into(), ToString::to_string)
+        crate::devices::signal::repr(.last)
     )]
     ValueTimeout {
         /// Subscription key (the signal name).
         name: String,
-        /// The predicate's fn name, or `<closure>`.
+        /// The [`Matcher::name`](crate::devices::Matcher::name): a value's
+        /// `repr`, a predicate's fn name, or `<closure>`.
         matcher: String,
         /// The timeout that elapsed.
         timeout: std::time::Duration,

@@ -982,6 +982,14 @@ mod tests {
         assert_eq!(log.closes(), 1, "stage() stops the writer");
     }
 
+    // ophyd-async test_standard_detector::test_unstage_disarms_detector.
+    #[tokio::test]
+    async fn unstage_disarms_once() {
+        let (det, disarms, _log) = detector();
+        Stageable::unstage(&det).await.unwrap();
+        assert_eq!(disarms.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn describe_reads_the_prepare_without_reopening_writer() {
         // DB-04: describe must read the DataKeys the prepare opened the

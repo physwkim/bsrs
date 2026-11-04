@@ -1,13 +1,19 @@
 //! `#[derive(Device)]` round-trip — define a Motor and an XYStage, build
 //! instances, run `connect_all`, verify field PV names.
 
+use std::fmt::Debug;
 use std::time::Duration;
 
 use bsrs::backends::soft::SoftSignalBackend;
-use bsrs::core::Kind;
+use bsrs::core::{Kind, SignalDatatype};
 use bsrs::devices::{
-    walk_signal_sources, Command, Device, DeviceVector, MockCommandBackend, SignalR, SignalRW,
+    observe_value, walk_signal_sources, Command, Device, DeviceVector, MockCommandBackend, SignalR,
+    SignalRW,
 };
+use bsrs::protocols_async::{AsyncMovable, AsyncSubscribable, Locatable};
+use futures::StreamExt;
+use serde::Serialize;
+use serde_json::json;
 
 #[derive(Device)]
 struct Motor {
@@ -179,4 +185,69 @@ async fn command_field_is_built_connected_and_named_like_a_signal() {
         sources,
         vec![("position".to_string(), "soft://BL10C:sh:POS".to_string())]
     );
+}
+
+#[derive(Device)]
+struct Child {
+    name: String,
+    #[signal(rw, "{prefix}:a_int")]
+    a_int: SignalRW<i64, SoftSignalBackend<i64>>,
+}
+
+#[derive(Device)]
+struct Parent {
+    name: String,
+    #[device("{prefix}:child")]
+    child: std::sync::Arc<Child>,
+    #[signal(rw, "{prefix}:sig_rw")]
+    sig_rw: SignalRW<String, SoftSignalBackend<String>>,
+}
+
+/// ophyd-async `assert_signal_lifecycle`: the monitor starts at the current
+/// value, locate agrees with it, a set reaches the monitor and locate, and
+/// the describe is unchanged by the set.
+async fn assert_signal_lifecycle<T>(sig: &SignalRW<T, SoftSignalBackend<T>>, initial: T, put: T)
+where
+    T: SignalDatatype + Clone + Send + Sync + Serialize + PartialEq + Debug + 'static,
+{
+    let describe_before = sig.describe().await.unwrap();
+    let mut values = Box::pin(observe_value(
+        AsyncSubscribable::subscribe(sig).await.unwrap(),
+    ));
+    assert_eq!(values.next().await.unwrap().value, json!(initial));
+    let at = sig.locate().await.unwrap();
+    assert_eq!((at.setpoint, at.readback), (initial.clone(), initial));
+
+    assert!(sig.set(put.clone()).await.success());
+    assert_eq!(values.next().await.unwrap().value, json!(put));
+    let at = sig.locate().await.unwrap();
+    assert_eq!((at.setpoint, at.readback), (put.clone(), put));
+    assert_eq!(sig.describe().await.unwrap(), describe_before);
+}
+
+// ophyd-async test_signal_lifecycle::test_nested_signal_lifecycle: signals
+// under a sub-device, in DeviceVector entries and on the device itself.
+#[tokio::test]
+async fn nested_signals_keep_the_signal_lifecycle() {
+    let parent = Parent::new_named("P", "parent");
+    let vector: DeviceVector<std::sync::Arc<Child>> = [1, 3]
+        .into_iter()
+        .map(|i| {
+            let child = Child::new_named(&format!("P:vector:{i}"), &format!("parent-vector-{i}"));
+            (i, child)
+        })
+        .collect();
+    parent
+        .connect_all(Duration::from_millis(100))
+        .await
+        .unwrap();
+    vector
+        .connect_all(Duration::from_millis(100))
+        .await
+        .unwrap();
+
+    assert_signal_lifecycle(&parent.child.a_int, 0, 42).await;
+    assert_signal_lifecycle(&vector[1].a_int, 0, 42).await;
+    assert_signal_lifecycle(&vector[3].a_int, 0, 42).await;
+    assert_signal_lifecycle(&parent.sig_rw, String::new(), "changed".into()).await;
 }

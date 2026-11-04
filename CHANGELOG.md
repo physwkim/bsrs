@@ -55,16 +55,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `CaMotor::set_current_position` and `PvaMotor::set_current_position`
   (ophyd `EpicsMotor.set_current_position`).
 - `StandardDetector::events_to_kickoff` / `set_events_to_kickoff`,
-  `TriggerInfo::effective_exposure_timeout`, `DetectorWriter::hinted_fields`
-  and `AreaDetectorCam::acquire_time_rbv` / `acquire_period_rbv`.
+  `TriggerInfo::effective_exposure_timeout` and
+  `DetectorWriter::hinted_fields`.
 - `host::areadetector::PluginSignalDataLogic` (ophyd-async
   `PluginSignalDataLogic`), a `SingleDataLogic` that reads a plugin signal
   with each event after setting the new `AreaDetectorCam::wait_for_plugins`;
   and `NdStats::total`.
 - `host::areadetector::NdArrayDescription::new` (ophyd-async
   `NDArrayDescription`) describes a writer's frame from any shape signals,
-  such as the new `NdRoi::size_y_rbv` / `size_x_rbv` for a writer fed from
-  an ROI.
+  such as an `NdRoi`'s `size_y` / `size_x` for a writer fed from that ROI.
 - `StandardDetector::add_plugin` (ophyd-async `AreaDetector(plugins=...)`)
   and `StandardDetector::connect`, which connects the control (the new
   `DetectorControl::connect`), every writer and every plugin, so a plugin
@@ -112,6 +111,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   them connect in parallel with failures keyed by variable. The
   `blocking;` form connects from sync code; `timeout = d;` replaces the
   10 s default.
+- `devices::set_and_wait_for_other_value`, exported as ophyd-async exports
+  it: wait for a subscription's first value, run a set, then wait for a
+  value that matches, all within one timeout.
+- `host::areadetector::wait_for_good_state`, ophyd-async's: wait until a
+  state signal is one of the good states, with its `message_signal` as an
+  optional signal whose value ends the not-in-a-good-state error.
+- `EpicsCaBackend::new_rw(read_pv, write_pv)`, ophyd-async's
+  `epics_signal_rw` with a separate read PV: puts and `get_setpoint` go to
+  the write PV, every other read to the read PV, and `connect` refuses the
+  pair when they differ in type, element count, choices or precision.
 
 ### Changed
 
@@ -171,7 +180,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `EpicsOptions(wait=...)`): `Acquire` and `Capture` put 0 without a
   callback, and `Signal::put_start` sends a put and returns its completion,
   so `Capture=1` now goes with a callback whose completion is not awaited.
-- **Breaking**: areaDetector enum fields (`image_mode`, `detector_state_rbv`,
+- **Breaking**: areaDetector enum fields (`image_mode`, `detector_state`,
   `data_type`, `color_mode`, `file_write_mode`) are `String` labels, as are
   the `AD_STATE_*`, `AD_IMAGE_MODE_*`, `AD_COLOR_MODE_*` and
   `AD_FILE_WRITE_MODE_*` constants; `ad_datatype_to_numpy` and
@@ -263,6 +272,38 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   first reading, and `ValueTimeout.last` is `None` when none arrived. The
   suspenders take a `&Arc<Fanout<T>>`, held weakly, which `ca_watch_f64` and
   `ca_watch_bool` return.
+- Without the `ca` / `pva` feature, the EPICS backends fail with
+  ophyd-async's text, ``Protocol ca not available, did you build bsrs with
+  `--features ca`?``, not `epics-ca backend disabled`.
+- `AreaDetectorCam::arm`/`disarm` and `NdFile::start_capture`/`stop_capture`
+  wait for their readback as ophyd-async `set_and_wait_for_other_value`
+  does: a readback that never matches is a `ValueTimeout` with the last
+  value seen, one that never reports `didn't provide an initial value`, and
+  an arm failure no longer starts with the cam's prefix.
+- `AreaDetectorCam::wait_for_idle` monitors `DetectorState_RBV` instead of
+  polling it, and fails as ophyd-async `wait_for_good_state` does, with
+  `Could not monitor state: …` or `… not in a good state: …`.
+- **Breaking**: `wait_for_value` takes a `Matcher`, a value to equal or a
+  predicate, as ophyd-async's `match` does; a closure needs its argument
+  typed, `|r: &ReadingValue|`. A `ValueTimeout` names a value matcher and
+  shows the last value by Python `repr` (`'blah'`, `True`, `None`).
+- A CA or PVA get, put or decode error names its PV, as aioca's `CANothing`
+  does: `ca put X:cam1:Acquire: …`, not `ca put: …`. An areaDetector arm
+  failure is that error alone, without an `…arm: Acquire:` prefix.
+- **Breaking**: the areaDetector readbacks without a setpoint drop `_rbv`,
+  as ophyd-async names them: `AreaDetectorCam::{array_counter,
+  detector_state}` and `NdFile::{num_captured, full_file_name,
+  file_path_exists}`.
+- **Breaking**: `AreaDetectorCam::array_counter` is a `SignalRW` that
+  writes `ArrayCounter` and reads `ArrayCounter_RBV`, as ophyd-async's
+  `PvSuffix.rbv("ArrayCounter")`.
+- **Breaking**: the areaDetector setpoints ophyd-async declares with
+  `PvSuffix.rbv` read their `_RBV` record and are named by it, while puts
+  still go to the setpoint; so do `NdPlugin::blocking_callbacks` and
+  `NdRoi::{min_x, min_y, enable_x, enable_y}`, as ophyd declares them.
+  `AreaDetectorCam::acquire_rbv`, `NdFile::capture_rbv` and
+  `NdFileHdf5::num_frames_chunks_rbv` are removed; read `acquire`,
+  `capture` and `num_frames_chunks`.
 
 ### Removed
 

@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 use std::time::Duration;
 
-const DISABLED: &str = "epics-pva backend disabled — build with --features pva";
+const DISABLED: &str = "Protocol pva not available, did you build bsrs with `--features pva`?";
 
 /// Stub PVA backend.
 pub struct EpicsPvaBackend<T: Clone + Send + Sync + 'static> {
@@ -58,5 +58,20 @@ impl<T: Clone + Send + Sync + Serialize + 'static> SignalBackend<T> for EpicsPva
     }
     fn source(&self, _name: &str, _read: bool) -> String {
         format!("pva://{}", self.pv)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ophyd-async test_no_transport::test_transport_not_available_error
+    #[tokio::test]
+    async fn connect_names_the_missing_protocol() {
+        let backend = EpicsPvaBackend::<f64>::new("TEST-PV");
+        let err = backend.connect(Duration::from_secs(1)).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .ends_with("Protocol pva not available, did you build bsrs with `--features pva`?"));
     }
 }

@@ -621,18 +621,44 @@ fn less_than_42(r: &ReadingValue) -> bool {
     r.value.as_f64().is_some_and(|v| v < 42.0)
 }
 
-// ophyd-async test_wait_for_value_with_value, test_wait_for_value_with_function;
-// the combinator's own timeout and wake-up are pinned in devices::observe.
+// ophyd-async test_wait_for_value_with_value
 #[tokio::test(start_paused = true)]
-async fn wait_for_value_on_a_signal_sees_its_current_value_and_mock_sets() {
+async fn wait_for_value_matches_a_value() {
+    let backend = Arc::new(MockSignalBackend::with_value(String::new()));
+    let sig: SignalRW<String, _> = Signal::new(backend.clone(), cfg("signal"));
+    assert!(sig.set("blah".to_string()).await.success());
+    let sub = || async { AsyncSubscribable::subscribe(&sig).await.unwrap() };
+    let timeout = Some(Duration::from_millis(100));
+
+    let err = wait_for_value(sub().await, "something", timeout)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "signal didn't match 'something' in 0.1s, last value 'blah'"
+    );
+    let current = wait_for_value(sub().await, "blah", timeout).await;
+    assert_eq!(current.unwrap().value, json!("blah"));
+
+    let waiter = tokio::spawn(wait_for_value(sub().await, "something else", None));
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished());
+    backend.set_value("something else".to_string());
+    assert_eq!(
+        waiter.await.unwrap().unwrap().value,
+        json!("something else")
+    );
+}
+
+// ophyd-async test_wait_for_value_with_function; the combinator's own
+// timeout and wake-up are pinned in devices::observe.
+#[tokio::test(start_paused = true)]
+async fn wait_for_value_matches_a_function() {
     let backend = Arc::new(MockSignalBackend::with_value(0.0_f64));
     let sig: SignalRW<f64, _> = Signal::new(backend.clone(), cfg("signal"));
     backend.set_value(45.8);
     let sub = || async { AsyncSubscribable::subscribe(&sig).await.unwrap() };
     let timeout = Some(Duration::from_millis(100));
-
-    let current = wait_for_value(sub().await, |r| r.value == json!(45.8), timeout).await;
-    assert_eq!(current.unwrap().value, json!(45.8));
 
     let err = wait_for_value(sub().await, less_than_42, timeout)
         .await
@@ -640,13 +666,6 @@ async fn wait_for_value_on_a_signal_sees_its_current_value_and_mock_sets() {
     assert_eq!(
         err.to_string(),
         "signal didn't match less_than_42 in 0.1s, last value 45.8"
-    );
-    let err = wait_for_value(sub().await, |r| r.value == json!("blah"), timeout)
-        .await
-        .unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "signal didn't match <closure> in 0.1s, last value 45.8"
     );
 
     let waiter = tokio::spawn(wait_for_value(sub().await, less_than_42, None));

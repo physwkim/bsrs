@@ -64,6 +64,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # EPICS-free build, where the CA/PVA backends are stubs.
+      - name: test bsrs --no-default-features
+        run: cargo test -p bsrs --no-default-features --no-fail-fast
       # ZMQ document sink.
       - name: test bsrs --features zmq
         run: cargo test -p bsrs --features zmq --no-fail-fast
