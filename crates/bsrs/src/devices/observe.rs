@@ -5,7 +5,8 @@
 //! (`core/_signal.py:380-580`). bsrs subscriptions carry JSON-erased
 //! [`ReadingValue`]s, so these operate on `ReadingValue` rather than a strongly
 //! typed value. As in the reference, the first item observed is the current
-//! value, followed by every subsequent change (even if equal to the previous).
+//! value, followed by every subsequent update in order (even if equal to the
+//! previous): each subscription queues them, so none is skipped.
 
 use crate::core::error::BsrsError;
 use crate::core::reading::ReadingValue;
@@ -15,7 +16,7 @@ use futures::{Stream, StreamExt};
 use std::time::Duration;
 
 /// Stream each value from `sub`, starting with the current one and then every
-/// subsequent change. The returned stream owns the subscription, so dropping
+/// subsequent update. The returned stream owns the subscription, so dropping
 /// the stream unsubscribes (releases the backend slot). The stream ends when
 /// the backend closes the channel.
 ///
@@ -26,21 +27,9 @@ use std::time::Duration;
 /// }
 /// ```
 pub fn observe_value(sub: Subscription) -> impl Stream<Item = ReadingValue> {
-    futures::stream::unfold((sub, true), |(mut sub, first)| async move {
-        if first {
-            // Yield the current value and mark it seen so the next `changed()`
-            // waits for a genuinely new update.
-            let v = sub.rx_mut().borrow_and_update().clone();
-            Some((v, (sub, false)))
-        } else {
-            match sub.rx_mut().changed().await {
-                Ok(()) => {
-                    let v = sub.rx_mut().borrow_and_update().clone();
-                    Some((v, (sub, false)))
-                }
-                Err(_) => None,
-            }
-        }
+    futures::stream::unfold(sub, |mut sub| async move {
+        let v = sub.recv().await?;
+        Some((v, sub))
     })
 }
 
@@ -72,37 +61,36 @@ pub fn observe_signals_value(
 }
 
 /// Wait until `sub`'s value satisfies `predicate`, returning the matching
-/// reading. The current value is checked first, then each subsequent change.
+/// reading. The current value is checked first, then each subsequent update.
+/// `sub` is consumed, as ophyd-async subscribes afresh for every wait: a
+/// reused one would start from whatever it queued before.
 ///
 /// Returns [`BsrsError::ValueTimeout`] if `timeout` elapses before a match,
-/// carrying the last value seen and the predicate's name (its fn name, or
-/// `<closure>`) as ophyd-async's `TimeoutError` does, or
-/// [`BsrsError::Backend`] if the channel closes first. With `timeout = None`
-/// it waits indefinitely.
+/// carrying the last value seen (`None` if none arrived) and the predicate's
+/// name (its fn name, or `<closure>`) as ophyd-async's `TimeoutError` does,
+/// or [`BsrsError::Backend`] if the channel closes first. With
+/// `timeout = None` it waits indefinitely.
 pub async fn wait_for_value<F>(
-    sub: &mut Subscription,
+    mut sub: Subscription,
     mut predicate: F,
     timeout: Option<Duration>,
 ) -> Result<ReadingValue, BsrsError>
 where
     F: FnMut(&ReadingValue) -> bool,
 {
-    // The current value is observed first (mirrors observe_value), before the
-    // timer starts, so a timeout always has a last value to report.
-    let mut last = sub.rx_mut().borrow_and_update().clone();
-    if predicate(&last) {
-        return Ok(last);
-    }
+    // The timer covers the first value too (ophyd-async wraps the whole
+    // `observe_value` in `asyncio.timeout`).
+    let mut last = None;
     let fut = async {
         loop {
-            sub.rx_mut()
-                .changed()
+            let r = sub
+                .recv()
                 .await
-                .map_err(|_| BsrsError::Backend("subscription channel closed".into()))?;
-            last = sub.rx_mut().borrow_and_update().clone();
-            if predicate(&last) {
-                return Ok(last.clone());
+                .ok_or_else(|| BsrsError::Backend("subscription channel closed".into()))?;
+            if predicate(&r) {
+                return Ok(r);
             }
+            last = Some(r);
         }
     };
     match timeout {
@@ -112,7 +100,7 @@ where
                 name: sub.key().to_string(),
                 matcher: matcher_name::<F>(),
                 timeout: d,
-                last: Box::new(last.value),
+                last: last.map(|r| Box::new(r.value)),
             }),
         },
         None => fut.await,
@@ -141,8 +129,8 @@ fn matcher_name<F>() -> String {
 mod tests {
     use super::*;
     use crate::core::status::SubToken;
+    use crate::core::subscription::Fanout;
     use serde_json::json;
-    use tokio::sync::watch;
 
     fn reading(v: f64) -> ReadingValue {
         ReadingValue {
@@ -153,51 +141,62 @@ mod tests {
         }
     }
 
+    /// A fan-out whose latest value is `v`, and a subscription to it.
+    fn fanout_at(v: f64, key: &str) -> (Fanout<ReadingValue>, Subscription) {
+        let f = Fanout::default();
+        f.post(reading(v));
+        let sub = Subscription::new(f.listen(), SubToken::noop(), key);
+        (f, sub)
+    }
+
     #[tokio::test]
     async fn wait_for_value_matches_current_immediately() {
-        let (tx, rx) = watch::channel(reading(5.0));
-        let mut sub = Subscription::new(rx, SubToken::noop(), "x");
-        let got = wait_for_value(&mut sub, |r| r.value == json!(5.0), None)
+        let (_f, sub) = fanout_at(5.0, "x");
+        let got = wait_for_value(sub, |r| r.value == json!(5.0), None)
             .await
             .unwrap();
         assert_eq!(got.value, json!(5.0));
-        drop(tx);
     }
 
     #[tokio::test]
     async fn wait_for_value_waits_for_a_matching_change() {
-        let (tx, rx) = watch::channel(reading(0.0));
-        let mut sub = Subscription::new(rx, SubToken::noop(), "x");
-        let h = tokio::spawn(async move {
-            wait_for_value(
-                &mut sub,
-                |r| r.value == json!(3.0),
-                Some(Duration::from_secs(2)),
-            )
-            .await
-        });
+        let (f, sub) = fanout_at(0.0, "x");
+        let h = tokio::spawn(wait_for_value(
+            sub,
+            |r| r.value == json!(3.0),
+            Some(Duration::from_secs(2)),
+        ));
         tokio::task::yield_now().await;
-        tx.send(reading(1.0)).unwrap();
-        tx.send(reading(3.0)).unwrap();
+        f.post(reading(1.0));
+        f.post(reading(3.0));
         let got = h.await.unwrap().unwrap();
         assert_eq!(got.value, json!(3.0));
     }
 
+    // A pulse that is over before the waiter polls (DMOV 1 → 0 → 1 on a
+    // null move) still matches: a latest-value channel kept only the final 1.
+    #[tokio::test]
+    async fn wait_for_value_sees_a_pulse_posted_before_it_polls() {
+        let (f, sub) = fanout_at(1.0, "x");
+        f.post(reading(0.0));
+        f.post(reading(1.0));
+        let got = wait_for_value(sub, |r| r.value == json!(0.0), Some(Duration::ZERO))
+            .await
+            .unwrap();
+        assert_eq!(got.value, json!(0.0));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn wait_for_value_times_out_with_the_last_value_seen() {
-        let (tx, rx) = watch::channel(reading(0.0));
-        let mut sub = Subscription::new(rx, SubToken::noop(), "x");
-        let h = tokio::spawn(async move {
-            wait_for_value(
-                &mut sub,
-                |r| r.value == json!(9.0),
-                Some(Duration::from_millis(50)),
-            )
-            .await
-        });
+        let (f, sub) = fanout_at(0.0, "x");
+        let h = tokio::spawn(wait_for_value(
+            sub,
+            |r| r.value == json!(9.0),
+            Some(Duration::from_millis(50)),
+        ));
         tokio::task::yield_now().await;
-        // The sender stays alive, so the failure is a timeout, not a close.
-        tx.send(reading(1.0)).unwrap();
+        // The fan-out stays alive, so the failure is a timeout, not a close.
+        f.post(reading(1.0));
         match h.await.unwrap() {
             Err(BsrsError::ValueTimeout {
                 name,
@@ -205,11 +204,31 @@ mod tests {
                 timeout,
                 last,
             }) => assert_eq!(
-                (name.as_str(), matcher.as_str(), timeout, *last),
-                ("x", "<closure>", Duration::from_millis(50), json!(1.0))
+                (name.as_str(), matcher.as_str(), timeout, last.map(|v| *v)),
+                (
+                    "x",
+                    "<closure>",
+                    Duration::from_millis(50),
+                    Some(json!(1.0))
+                )
             ),
             other => panic!("{other:?}"),
         }
+    }
+
+    // Boundary: no value ever arrives. The timeout reports `None`, as
+    // ophyd-async prints `last value None`.
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_value_times_out_with_no_value_seen() {
+        let f = Fanout::<ReadingValue>::default();
+        let sub = Subscription::new(f.listen(), SubToken::noop(), "x");
+        let err = wait_for_value(sub, |_| true, Some(Duration::from_millis(50)))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "x didn't match <closure> in 0.05s, last value None"
+        );
     }
 
     #[test]
@@ -229,11 +248,10 @@ mod tests {
     #[tokio::test]
     async fn observe_value_yields_current_then_changes() {
         use futures::StreamExt;
-        let (tx, rx) = watch::channel(reading(1.0));
-        let sub = Subscription::new(rx, SubToken::noop(), "x");
+        let (f, sub) = fanout_at(1.0, "x");
         let mut s = Box::pin(observe_value(sub));
         assert_eq!(s.next().await.unwrap().value, json!(1.0));
-        tx.send(reading(2.0)).unwrap();
+        f.post(reading(2.0));
         assert_eq!(s.next().await.unwrap().value, json!(2.0));
     }
 
@@ -241,10 +259,8 @@ mod tests {
     async fn observe_signals_value_merges_and_tags_by_index() {
         use futures::StreamExt;
         use std::collections::HashMap;
-        let (tx0, rx0) = watch::channel(reading(1.0));
-        let (tx1, rx1) = watch::channel(reading(2.0));
-        let s0 = Subscription::new(rx0, SubToken::noop(), "s0");
-        let s1 = Subscription::new(rx1, SubToken::noop(), "s1");
+        let (f0, s0) = fanout_at(1.0, "s0");
+        let (f1, s1) = fanout_at(2.0, "s1");
         let mut merged = Box::pin(observe_signals_value(vec![s0, s1]));
 
         // Both current values arrive first, each tagged with its input index.
@@ -257,13 +273,13 @@ mod tests {
         assert_eq!(initial[&1], json!(2.0));
 
         // A change on subscription 1 is reported with index 1.
-        tx1.send(reading(5.0)).unwrap();
+        f1.post(reading(5.0));
         let (i, v) = merged.next().await.unwrap();
         assert_eq!(i, 1);
         assert_eq!(v.value, json!(5.0));
 
         // A change on subscription 0 is reported with index 0.
-        tx0.send(reading(9.0)).unwrap();
+        f0.post(reading(9.0));
         let (i, v) = merged.next().await.unwrap();
         assert_eq!(i, 0);
         assert_eq!(v.value, json!(9.0));
@@ -272,16 +288,14 @@ mod tests {
     #[tokio::test]
     async fn observe_signals_value_ends_when_all_channels_close() {
         use futures::StreamExt;
-        let (tx0, rx0) = watch::channel(reading(1.0));
-        let (tx1, rx1) = watch::channel(reading(2.0));
-        let s0 = Subscription::new(rx0, SubToken::noop(), "s0");
-        let s1 = Subscription::new(rx1, SubToken::noop(), "s1");
+        let (f0, s0) = fanout_at(1.0, "s0");
+        let (f1, s1) = fanout_at(2.0, "s1");
         let mut merged = Box::pin(observe_signals_value(vec![s0, s1]));
         // Drain the two initial values.
         merged.next().await.unwrap();
         merged.next().await.unwrap();
-        drop(tx0);
-        drop(tx1);
+        drop(f0);
+        drop(f1);
         assert!(merged.next().await.is_none());
     }
 

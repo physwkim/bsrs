@@ -12,18 +12,23 @@
 //!   bluesky's `SuspenderBase.remove` sets the suspender's event.
 //! - User-facing impls — [`SuspendBoolHigh`], [`SuspendBoolLow`],
 //!   [`SuspendThreshold`], [`SuspendOutsideBand`], [`SuspendWhenChanged`].
-//!   Each watches a `tokio::sync::watch::Receiver` and implements
-//!   [`Suspender`] over it: the engine suspends the run while the watched
-//!   value is in the impl's BAD region and resumes once it has been GOOD for
-//!   the resume delay. Install one with `RunEngine::install_suspender`.
+//!   Each watches a [`Fanout`] and implements [`Suspender`] over it: the
+//!   engine suspends the run while the watched value is in the impl's BAD
+//!   region and resumes once it has been GOOD for the resume delay. Every
+//!   posted value is judged, as bluesky runs its callback per value, so a
+//!   BAD glitch that is GOOD again before the watcher polls still trips.
+//!   The fan-out is held weakly: once its producers drop it, a suspension
+//!   lifts and no new one trips. Install one with
+//!   `RunEngine::install_suspender`.
 
+use crate::core::subscription::Fanout;
 pub use crate::core::suspender::{SuspendCallback, Suspender};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::future::BoxFuture;
-use tokio::sync::watch;
+use tokio::sync::mpsc;
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
@@ -79,7 +84,9 @@ impl Drop for SuspenderHandle {
 /// justification, and the plans run around a suspension.
 struct SignalSuspender<T> {
     name: String,
-    rx: watch::Receiver<T>,
+    // Weak, so the source dropped by its producers reaches the watchers as a
+    // closed queue, as a dropped `watch::Sender` did.
+    source: Weak<Fanout<T>>,
     bad: Arc<dyn Fn(&T) -> bool + Send + Sync>,
     resume_delay: Option<Duration>,
     /// `false`: the suspension never lifts on its own — a manual
@@ -93,17 +100,17 @@ struct SignalSuspender<T> {
 
 impl<T> SignalSuspender<T>
 where
-    T: Send + Sync + 'static,
+    T: Clone + Send + Sync + 'static,
 {
     fn new(
         name: String,
-        rx: watch::Receiver<T>,
+        source: &Arc<Fanout<T>>,
         bad: impl Fn(&T) -> bool + Send + Sync + 'static,
         justification: String,
     ) -> Self {
         Self {
             name,
-            rx,
+            source: Arc::downgrade(source),
             bad: Arc::new(bad),
             resume_delay: None,
             auto_resume: true,
@@ -113,9 +120,17 @@ where
         }
     }
 
+    /// A listener on the source; already closed once the source is gone.
+    fn listen(&self) -> mpsc::UnboundedReceiver<T> {
+        match self.source.upgrade() {
+            Some(source) => source.listen(),
+            None => mpsc::unbounded_channel().1,
+        }
+    }
+
     fn trip(&self) -> BoxFuture<'static, ()> {
         let bad = self.bad.clone();
-        Box::pin(await_bad(self.rx.clone(), move |v| bad(v)))
+        Box::pin(await_bad(self.listen(), move |v| bad(v)))
     }
 
     fn watch(&self) -> BoxFuture<'static, ()> {
@@ -124,14 +139,15 @@ where
         }
         let bad = self.bad.clone();
         Box::pin(await_good_stable(
-            self.rx.clone(),
+            self.listen(),
             move |v| bad(v),
             self.resume_delay,
         ))
     }
 
     fn tripped(&self) -> Option<BoxFuture<'static, ()>> {
-        (self.bad)(&self.rx.borrow()).then(|| self.watch())
+        let latest = self.source.upgrade().and_then(|source| source.latest());
+        latest.is_some_and(|v| (self.bad)(&v)).then(|| self.watch())
     }
 }
 
@@ -198,12 +214,12 @@ pub struct SuspendBoolHigh(SignalSuspender<bool>);
 impl SuspendBoolHigh {
     /// Build with a stable name (used in the interruption-stream
     /// justification when `record_interruptions` is on) and a
-    /// `watch::Receiver<bool>` whose published value reflects the
-    /// monitored condition.
-    pub fn new(name: impl Into<String>, rx: watch::Receiver<bool>) -> Self {
+    /// [`Fanout<bool>`] whose posted values reflect the monitored condition,
+    /// held weakly.
+    pub fn new(name: impl Into<String>, source: &Arc<Fanout<bool>>) -> Self {
         let name = name.into();
         let justification = format!("{name}: signal high");
-        Self(SignalSuspender::new(name, rx, |v| *v, justification))
+        Self(SignalSuspender::new(name, source, |v| *v, justification))
     }
 }
 signal_suspender!(SuspendBoolHigh);
@@ -214,10 +230,10 @@ pub struct SuspendBoolLow(SignalSuspender<bool>);
 
 impl SuspendBoolLow {
     /// See [`SuspendBoolHigh::new`].
-    pub fn new(name: impl Into<String>, rx: watch::Receiver<bool>) -> Self {
+    pub fn new(name: impl Into<String>, source: &Arc<Fanout<bool>>) -> Self {
         let name = name.into();
         let justification = format!("{name}: signal low");
-        Self(SignalSuspender::new(name, rx, |v| !*v, justification))
+        Self(SignalSuspender::new(name, source, |v| !*v, justification))
     }
 }
 signal_suspender!(SuspendBoolLow);
@@ -241,7 +257,7 @@ impl SuspendThreshold {
     /// Build a threshold-based suspender.
     pub fn new(
         name: impl Into<String>,
-        rx: watch::Receiver<f64>,
+        source: &Arc<Fanout<f64>>,
         threshold: f64,
         direction: ThresholdDirection,
     ) -> Self {
@@ -257,7 +273,7 @@ impl SuspendThreshold {
             ThresholdDirection::BadIfBelow => *v < threshold,
             ThresholdDirection::BadIfAbove => *v > threshold,
         };
-        Self(SignalSuspender::new(name, rx, bad, justification))
+        Self(SignalSuspender::new(name, source, bad, justification))
     }
 }
 signal_suspender!(SuspendThreshold);
@@ -273,14 +289,14 @@ impl SuspendOutsideBand {
     /// the lower edge; values are GOOD only strictly inside the band.
     pub fn new(
         name: impl Into<String>,
-        rx: watch::Receiver<f64>,
+        source: &Arc<Fanout<f64>>,
         band_bottom: f64,
         band_top: f64,
     ) -> Self {
         let name = name.into();
         let justification = format!("{name}: outside ({band_bottom}, {band_top})");
         let bad = move |v: &f64| *v <= band_bottom || *v >= band_top;
-        Self(SignalSuspender::new(name, rx, bad, justification))
+        Self(SignalSuspender::new(name, source, bad, justification))
     }
 }
 signal_suspender!(SuspendOutsideBand);
@@ -299,11 +315,11 @@ where
 {
     /// Build with the `expected` value. Defaults to `allow_resume = false`
     /// (matches bluesky): manual resume required after a deviation.
-    pub fn new(name: impl Into<String>, rx: watch::Receiver<T>, expected: T) -> Self {
+    pub fn new(name: impl Into<String>, source: &Arc<Fanout<T>>, expected: T) -> Self {
         let name = name.into();
         let justification = format!("{name}: value changed (manual resume required)");
         let bad = move |v: &T| *v != expected;
-        let mut inner = SignalSuspender::new(name, rx, bad, justification);
+        let mut inner = SignalSuspender::new(name, source, bad, justification);
         inner.auto_resume = false;
         Self(inner)
     }
@@ -319,17 +335,19 @@ where
 }
 signal_suspender!(SuspendWhenChanged<T>);
 
-/// Resolve once `rx` is BAD — at once if it already is. A closed channel never
-/// resolves: with the source gone there is nothing left to suspend on.
-async fn await_bad<T>(mut rx: watch::Receiver<T>, bad: impl Fn(&T) -> bool + Send + 'static)
+/// Resolve once `rx` delivers a BAD value — at once if its first (the value
+/// current at listen) is. A closed channel never resolves: with the source
+/// gone there is nothing left to suspend on.
+async fn await_bad<T>(mut rx: mpsc::UnboundedReceiver<T>, bad: impl Fn(&T) -> bool + Send + 'static)
 where
     T: Send + Sync + 'static,
 {
-    while !bad(&rx.borrow_and_update()) {
-        if rx.changed().await.is_err() {
-            std::future::pending::<()>().await;
+    while let Some(v) = rx.recv().await {
+        if bad(&v) {
+            return;
         }
     }
+    std::future::pending::<()>().await;
 }
 
 /// Resolve once `rx` has been continuously GOOD (`!bad`) for `resume_delay`.
@@ -341,17 +359,21 @@ where
 /// instant the signal is GOOD (no delay). A closed channel resolves too —
 /// the source is gone, so staying suspended forever is the wrong default.
 async fn await_good_stable<T>(
-    mut rx: watch::Receiver<T>,
+    mut rx: mpsc::UnboundedReceiver<T>,
     bad: impl Fn(&T) -> bool + Send + 'static,
     resume_delay: Option<Duration>,
 ) where
     T: Send + Sync + 'static,
 {
+    let Some(mut v) = rx.recv().await else {
+        return;
+    };
     loop {
         // Wait until the signal is GOOD.
-        while bad(&rx.borrow_and_update()) {
-            if rx.changed().await.is_err() {
-                return;
+        while bad(&v) {
+            match rx.recv().await {
+                Some(next) => v = next,
+                None => return,
             }
         }
         // GOOD. With no delay, resume now.
@@ -361,13 +383,12 @@ async fn await_good_stable<T>(
         // Stay GOOD for the whole delay; any update cancels and re-checks.
         tokio::select! {
             _ = tokio::time::sleep(delay) => return,
-            changed = rx.changed() => {
-                if changed.is_err() {
-                    return;
-                }
-                // Value changed — loop re-evaluates GOOD/BAD and restarts
-                // the delay if still GOOD, or waits for GOOD again if BAD.
-            }
+            next = rx.recv() => match next {
+                // The loop re-evaluates GOOD/BAD and restarts the delay if
+                // still GOOD, or waits for GOOD again if BAD.
+                Some(next) => v = next,
+                None => return,
+            },
         }
     }
 }
@@ -382,81 +403,118 @@ mod tests {
         *v
     }
 
+    /// A fan-out whose current value is `v`.
+    fn source<T: Clone>(v: T) -> Arc<Fanout<T>> {
+        let f = Arc::new(Fanout::default());
+        f.post(v);
+        f
+    }
+
     #[tokio::test(start_paused = true)]
     async fn await_bad_resolves_at_once_when_already_bad() {
-        let (_tx, rx) = watch::channel(true); // BAD
-        let mut fut = Box::pin(await_bad(rx, bad_high));
+        let f = source(true); // BAD
+        let mut fut = Box::pin(await_bad(f.listen(), bad_high));
         assert!((&mut fut).now_or_never().is_some());
     }
 
     #[tokio::test(start_paused = true)]
     async fn await_bad_waits_for_the_signal_to_go_bad() {
-        let (tx, rx) = watch::channel(false); // GOOD
-        let mut fut = Box::pin(await_bad(rx, bad_high));
+        let f = source(false); // GOOD
+        let mut fut = Box::pin(await_bad(f.listen(), bad_high));
         assert!((&mut fut).now_or_never().is_none());
-        tx.send(true).unwrap(); // BAD
+        f.post(true); // BAD
         assert!((&mut fut).now_or_never().is_some());
+    }
+
+    // A BAD glitch that is GOOD again before the watcher polls still trips:
+    // a latest-value channel kept only the final GOOD.
+    #[tokio::test(start_paused = true)]
+    async fn trip_sees_a_bad_glitch_posted_before_it_polls() {
+        let f = source(false);
+        let s = SuspendBoolHigh::new("shutter", &f);
+        let mut trip = s.trip();
+        f.post(true);
+        f.post(false);
+        assert!((&mut trip).now_or_never().is_some());
     }
 
     #[tokio::test(start_paused = true)]
     async fn await_bad_never_resolves_on_a_closed_channel() {
-        let (tx, rx) = watch::channel(false); // GOOD
-        let mut fut = Box::pin(await_bad(rx, bad_high));
-        drop(tx);
+        let f = source(false); // GOOD
+        let mut fut = Box::pin(await_bad(f.listen(), bad_high));
+        drop(f);
         assert!(
             (&mut fut).now_or_never().is_none(),
             "a dead source must not trip a suspension"
         );
     }
 
+    // Boundary: the producers drop the source while a suspension holds, and
+    // after it is gone. The suspender's own handle must not keep it alive.
     #[tokio::test(start_paused = true)]
-    async fn tripped_reports_the_current_bad_state() {
-        let (tx, rx) = watch::channel(false);
-        let s = SuspendBoolHigh::new("shutter", rx);
-        assert!(s.tripped().is_none(), "GOOD at rest: not tripped");
-        tx.send(true).unwrap();
+    async fn a_dropped_source_lifts_the_suspension_and_trips_nothing() {
+        let f = source(true); // BAD
+        let s = SuspendBoolHigh::new("shutter", &f);
         let mut clear = s.tripped().expect("BAD at rest: tripped");
         assert!((&mut clear).now_or_never().is_none());
-        tx.send(false).unwrap();
+        drop(f);
+        assert!((&mut clear).now_or_never().is_some(), "source gone: lifts");
+        assert!(s.tripped().is_none());
+        assert!(
+            s.trip().now_or_never().is_none(),
+            "a dead source never trips"
+        );
+        assert!(s.watch().now_or_never().is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tripped_reports_the_current_bad_state() {
+        let f = source(false);
+        let s = SuspendBoolHigh::new("shutter", &f);
+        assert!(s.tripped().is_none(), "GOOD at rest: not tripped");
+        f.post(true);
+        let mut clear = s.tripped().expect("BAD at rest: tripped");
+        assert!((&mut clear).now_or_never().is_none());
+        f.post(false);
         assert!((&mut clear).now_or_never().is_some());
     }
 
     #[tokio::test(start_paused = true)]
     async fn one_shot_when_changed_never_lifts_but_stays_tripped() {
-        let (tx, rx) = watch::channel(0_i64);
-        let s = SuspendWhenChanged::new("mode", rx, 0_i64);
-        tx.send(1).unwrap();
+        let f = source(0_i64);
+        let s = SuspendWhenChanged::new("mode", &f, 0_i64);
+        f.post(1);
         let mut watch = s.watch();
-        tx.send(0).unwrap();
+        f.post(0);
         assert!(
             (&mut watch).now_or_never().is_none(),
             "manual resume only: returning to expected does not lift"
         );
-        tx.send(1).unwrap();
+        f.post(1);
         assert!(s.tripped().is_some(), "gates plan start while deviated");
     }
 
     #[tokio::test(start_paused = true)]
     async fn await_good_stable_no_delay_resolves_on_good() {
-        let (tx, rx) = watch::channel(true); // BAD
-        let mut fut = Box::pin(await_good_stable(rx, bad_high, None));
+        let f = source(true); // BAD
+        let mut fut = Box::pin(await_good_stable(f.listen(), bad_high, None));
         // Still BAD: pending.
         assert!((&mut fut).now_or_never().is_none());
-        tx.send(false).unwrap(); // GOOD
-                                 // No delay → resolves immediately on GOOD.
+        f.post(false); // GOOD
+                       // No delay → resolves immediately on GOOD.
         assert!((&mut fut).now_or_never().is_some());
     }
 
     #[tokio::test(start_paused = true)]
     async fn await_good_stable_waits_resume_delay() {
-        let (tx, rx) = watch::channel(true); // BAD
+        let f = source(true); // BAD
         let mut fut = Box::pin(await_good_stable(
-            rx,
+            f.listen(),
             bad_high,
             Some(Duration::from_secs(5)),
         ));
         assert!((&mut fut).now_or_never().is_none());
-        tx.send(false).unwrap(); // GOOD — arms the 5s delay
+        f.post(false); // GOOD — arms the 5s delay
         assert!(
             (&mut fut).now_or_never().is_none(),
             "must not resume before the delay elapses"
@@ -470,23 +528,23 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn await_good_stable_restarts_on_flicker_back_to_bad() {
-        let (tx, rx) = watch::channel(true); // BAD
+        let f = source(true); // BAD
         let mut fut = Box::pin(await_good_stable(
-            rx,
+            f.listen(),
             bad_high,
             Some(Duration::from_secs(5)),
         ));
-        tx.send(false).unwrap(); // GOOD — arms 5s
+        f.post(false); // GOOD — arms 5s
         assert!((&mut fut).now_or_never().is_none());
         tokio::time::advance(Duration::from_secs(3)).await; // partway through
-        tx.send(true).unwrap(); // flicker BAD — cancels the pending delay
+        f.post(true); // flicker BAD — cancels the pending delay
         assert!((&mut fut).now_or_never().is_none());
         tokio::time::advance(Duration::from_secs(5)).await; // old timer must NOT fire
         assert!(
             (&mut fut).now_or_never().is_none(),
             "flicker to BAD must cancel the resume"
         );
-        tx.send(false).unwrap(); // GOOD again — fresh 5s
+        f.post(false); // GOOD again — fresh 5s
         assert!((&mut fut).now_or_never().is_none());
         tokio::time::advance(Duration::from_secs(5)).await;
         assert!(
@@ -497,14 +555,14 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn await_good_stable_closed_channel_resolves() {
-        let (tx, rx) = watch::channel(true); // BAD
+        let f = source(true); // BAD
         let mut fut = Box::pin(await_good_stable(
-            rx,
+            f.listen(),
             bad_high,
             Some(Duration::from_secs(5)),
         ));
         assert!((&mut fut).now_or_never().is_none());
-        drop(tx); // source gone while BAD
+        drop(f); // source gone while BAD
         assert!(
             (&mut fut).now_or_never().is_some(),
             "closed channel must resolve, not hang suspended"

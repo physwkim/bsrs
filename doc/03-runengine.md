@@ -179,7 +179,8 @@ by `resume()`. Uninstalling a suspender releases a suspension it holds.
 equivalent); a second suspender tripping while the run is already suspended
 adds a hold but its plans do not run and its justification is not recorded.
 
-Reference impls over a `tokio::sync::watch::Receiver`, each with
+Reference impls over a `core::Fanout`, judging every posted value so a
+glitch between polls still trips, each with
 `with_resume_delay` / `with_pre_plan` / `with_post_plan`:
 
 - `SuspendBoolHigh` / `SuspendBoolLow` — a `bool` signal (e.g. shutter PV).

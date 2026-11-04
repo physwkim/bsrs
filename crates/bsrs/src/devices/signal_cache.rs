@@ -3,37 +3,20 @@
 //!
 //! Without it, every `subscribe()` opens a fresh CA/PVA monitor and staging
 //! does not persist a subscription. The cache fires `backend.set_callback`
-//! exactly once and fans the values out over a `watch` channel; the monitor
-//! stays alive while the signal is staged or has at least one listener.
+//! exactly once and queues every value to each listener through a
+//! [`Fanout`]; the monitor stays alive while the signal is staged or has at
+//! least one listener.
 
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::core::reading::ReadingValue;
 use crate::core::status::SubToken;
+use crate::core::subscription::Fanout;
 use crate::devices::signal::shown;
 use crate::protocols_async::{ReadingValueCallback, SignalBackend};
 use serde::Serialize;
-use serde_json::Value;
-use tokio::sync::watch;
-
-fn null_reading() -> ReadingValue {
-    ReadingValue {
-        value: Value::Null,
-        timestamp: 0.0,
-        alarm_severity: None,
-        message: None,
-    }
-}
-
-/// Fan-out sink updated by the single backend callback. Held separately from
-/// [`CacheState`] so the callback can capture it without forming a reference
-/// cycle through the `SubToken` (which itself lives in `CacheState`).
-struct Fanout {
-    tx: watch::Sender<ReadingValue>,
-    has_value: AtomicBool,
-}
+use tokio::sync::mpsc;
 
 /// Lifecycle of the shared backend monitor. Mutated only through
 /// [`SignalCache`] methods while holding the `state` lock (single owner).
@@ -68,7 +51,9 @@ pub struct SignalCache<T, B> {
     backend: Arc<B>,
     /// `backend.source(name, true)`, which the cache's logs name.
     source: Arc<str>,
-    fanout: Arc<Fanout>,
+    // Held apart from `CacheState` so the backend callback can capture it
+    // without a reference cycle through the `SubToken` living in the state.
+    fanout: Arc<Fanout<ReadingValue>>,
     // `Arc<Mutex<..>>` (not `Mutex<..>`) so the per-listener drop closure can
     // own a handle to the state + fanout without capturing `Arc<Self>` — that
     // would force `B: 'static` on every caller. Teardown touches neither the
@@ -87,14 +72,10 @@ where
     /// backend monitor is opened until the cache is staged or gains a
     /// listener.
     pub fn new(backend: Arc<B>, name: &str) -> Arc<Self> {
-        let (tx, _) = watch::channel(null_reading());
         Arc::new(Self {
             source: backend.source(name, true).into(),
             backend,
-            fanout: Arc::new(Fanout {
-                tx,
-                has_value: AtomicBool::new(false),
-            }),
+            fanout: Arc::default(),
             state: Arc::new(Mutex::new(CacheState {
                 staged: false,
                 listeners: 0,
@@ -115,20 +96,12 @@ where
                     alarm_severity,
                     message: None,
                 };
+                let prev = fanout.post(reading.clone());
                 tracing::debug!(
                     "Updated subscription: reading of source {source} changed from {} to {}",
-                    if fanout.has_value.load(Ordering::SeqCst) {
-                        shown(&*fanout.tx.borrow())
-                    } else {
-                        "None".into()
-                    },
+                    prev.as_ref().map_or_else(|| "None".into(), shown),
                     shown(&reading),
                 );
-                // `send_replace`, not `send`: a staged cache with no listener
-                // has no receiver, and `send` would drop the value while
-                // `cached_reading` keeps serving the initial null.
-                fanout.tx.send_replace(reading);
-                fanout.has_value.store(true, Ordering::SeqCst);
             }
         })
     }
@@ -150,7 +123,7 @@ where
         if !st.staged && st.listeners == 0 {
             // Dropping the SubToken unsubscribes from the backend.
             st.token = None;
-            self.fanout.has_value.store(false, Ordering::SeqCst);
+            self.fanout.clear();
         }
     }
 
@@ -166,21 +139,18 @@ where
         }
     }
 
-    /// Register a listener. Returns a `watch::Receiver` over the shared fan-out
-    /// and a `SubToken` that decrements the listener count (and tears the
-    /// monitor down if it was the last and the cache is not staged) on drop.
+    /// Register a listener. Returns its own queue of every reading and a
+    /// `SubToken` that decrements the listener count (and tears the monitor
+    /// down if it was the last and the cache is not staged) on drop.
     ///
-    /// When a reading is already cached the receiver starts with it pending,
-    /// so the listener's first `changed()` yields the current value: ophyd-async
+    /// When a reading is already cached the queue starts with it, so the
+    /// listener's first `recv()` yields the current value: ophyd-async
     /// `_SignalCache.subscribe` notifies a new listener at once when valid.
-    pub fn add_listener(&self) -> (watch::Receiver<ReadingValue>, SubToken) {
+    pub fn add_listener(&self) -> (mpsc::UnboundedReceiver<ReadingValue>, SubToken) {
         let mut st = self.state.lock().unwrap();
         st.listeners += 1;
         self.ensure_token(&mut st);
-        let mut rx = self.fanout.tx.subscribe();
-        if self.fanout.has_value.load(Ordering::SeqCst) {
-            rx.mark_changed();
-        }
+        let rx = self.fanout.listen();
         drop(st);
 
         // Capture only the state + fanout handles (no backend / `B`) so the
@@ -193,7 +163,7 @@ where
             st.listeners = st.listeners.saturating_sub(1);
             if !st.staged && st.listeners == 0 {
                 st.token = None;
-                fanout.has_value.store(false, Ordering::SeqCst);
+                fanout.clear();
             }
         });
         (rx, token)
@@ -202,11 +172,7 @@ where
     /// Latest cached reading, or `None` if no callback has fired yet (or the
     /// monitor has been torn down).
     pub fn cached_reading(&self) -> Option<ReadingValue> {
-        if self.fanout.has_value.load(Ordering::SeqCst) {
-            Some(self.fanout.tx.borrow().clone())
-        } else {
-            None
-        }
+        self.fanout.latest()
     }
 
     /// Whether the cache is currently staged.
@@ -283,15 +249,13 @@ mod tests {
         let (mut rx_b, _tb) = cache.add_listener();
         assert_eq!(be.subscriber_count(), 1, "N listeners → 1 backend monitor");
         // Opening the soft monitor delivers the current value to everyone.
-        assert_eq!(rx_a.borrow_and_update().value, serde_json::json!(0.0));
-        assert_eq!(rx_b.borrow_and_update().value, serde_json::json!(0.0));
+        assert_eq!(rx_a.recv().await.unwrap().value, serde_json::json!(0.0));
+        assert_eq!(rx_b.recv().await.unwrap().value, serde_json::json!(0.0));
 
         // A backend write fans out to every listener and seeds the cache.
         be.write_now(4.5);
-        rx_a.changed().await.unwrap();
-        rx_b.changed().await.unwrap();
-        assert_eq!(rx_a.borrow().value, serde_json::json!(4.5));
-        assert_eq!(rx_b.borrow().value, serde_json::json!(4.5));
+        assert_eq!(rx_a.recv().await.unwrap().value, serde_json::json!(4.5));
+        assert_eq!(rx_b.recv().await.unwrap().value, serde_json::json!(4.5));
         assert_eq!(
             cache.cached_reading().unwrap().value,
             serde_json::json!(4.5)
@@ -342,26 +306,40 @@ mod tests {
     }
 
     // Boundary: a listener added before the monitor's first reading waits
-    // for it; one added after starts with the cached reading pending
-    // (ophyd-async `_SignalCache.subscribe` notifies at once when valid).
+    // for it, with no placeholder queued; one added after starts with the
+    // cached reading (ophyd-async `_SignalCache.subscribe` notifies at once
+    // when valid).
     #[tokio::test]
-    async fn a_listener_added_after_a_reading_starts_with_it_pending() {
+    async fn a_listener_added_after_a_reading_starts_with_it_queued() {
         let be = Arc::new(DeferredBackend::default());
         let cache = SignalCache::new(be.clone(), "x");
-        let (early, _t0) = cache.add_listener();
-        assert!(!early.has_changed().unwrap(), "nothing cached yet");
+        let (mut early, _t0) = cache.add_listener();
+        assert!(early.try_recv().is_err(), "nothing cached yet");
 
         be.post(3.0);
         let (mut late, _t1) = cache.add_listener();
-        assert!(late.has_changed().unwrap(), "cached reading is pending");
-        assert_eq!(late.borrow_and_update().value, serde_json::json!(3.0));
-        assert!(early.has_changed().unwrap(), "the update reached it too");
+        assert_eq!(late.try_recv().unwrap().value, serde_json::json!(3.0));
+        assert_eq!(early.try_recv().unwrap().value, serde_json::json!(3.0));
     }
 
-    // INVARIANT boundary: listeners == 0 while staged. The fan-out watch has
-    // no receiver then, and `watch::Sender::send` drops the value in that
-    // case, so a staged-only cache served the initial null reading with
-    // `has_value` already true.
+    // A pulse delivered faster than the listener reads (DMOV 1 → 0 → 1 on a
+    // null move) reaches it whole.
+    #[tokio::test]
+    async fn a_pulse_between_reads_is_queued_whole() {
+        let be = Arc::new(DeferredBackend::default());
+        let cache = SignalCache::new(be.clone(), "x");
+        let (mut rx, _t) = cache.add_listener();
+        for v in [1.0, 0.0, 1.0] {
+            be.post(v);
+        }
+        let got: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|r| r.value)
+            .collect();
+        assert_eq!(got, [1.0, 0.0, 1.0].map(|v| serde_json::json!(v)));
+    }
+
+    // INVARIANT boundary: listeners == 0 while staged. No listener queue
+    // takes the value then, and the cache must still hold it.
     #[tokio::test]
     async fn staged_cache_without_listeners_caches_the_update() {
         let be = backend(0.0);

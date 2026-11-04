@@ -585,17 +585,17 @@ impl EngineState {
 /// the held `Subscription`, releasing the backend slot (rule **K1**+**K2**).
 ///
 /// `Msg::Unmonitor` goes through [`MonitorTask::stop`] instead of the abort:
-/// an update that reached the subscription while the object was monitored
-/// but that the pump has not consumed yet (a starved worker, a set issued
-/// just before the unmonitor) is still emitted, then the pump exits. bluesky
-/// cannot lose that update because its monitor callback is synchronous.
+/// the updates that reached the subscription while the object was monitored
+/// but that the pump has not consumed yet (a starved worker, sets issued
+/// just before the unmonitor) are still emitted, then the pump exits. bluesky
+/// cannot lose them because its monitor callback is synchronous.
 struct MonitorTask {
     stop: Arc<tokio::sync::Notify>,
     handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl MonitorTask {
-    /// Ask the pump to drain its pending update and exit, then wait for it.
+    /// Ask the pump to drain its pending updates and exit, then wait for it.
     async fn stop(mut self) {
         self.stop.notify_one();
         if let Some(handle) = self.handle.take() {
@@ -2512,7 +2512,7 @@ impl RunEngine {
                 // monitor_tasks is keyed by the monitored object's name (set in
                 // start_monitor), so remove the entry whose key == obj.name().
                 // The pump is stopped gracefully (MonitorTask::stop) outside the
-                // state lock: it emits an update it has not consumed yet, then
+                // state lock: it emits the updates it has not consumed yet, then
                 // drops the Subscription.
                 let mut state = self.state.lock().await;
                 // Reject an 'unmonitor' for an object that is not being monitored.
@@ -2955,7 +2955,7 @@ impl RunEngine {
             self.broadcast(&Document::Descriptor(d)).await?;
         }
 
-        // Step 2: subscribe + spawn a pump that emits one Event per rx tick.
+        // Step 2: subscribe + spawn a pump that emits one Event per reading.
         let mut sub = obj.subscribe_dyn().await?;
         // The subscription names the data key of its readings (ophyd-async
         // `subscribe_reading` delivers `{name: reading}`); the descriptor
@@ -2975,24 +2975,26 @@ impl RunEngine {
         let stop_for_task = stop.clone();
 
         let handle = tokio::spawn(async move {
+            let mut stopping = false;
             loop {
-                let last = tokio::select! {
-                    changed = sub.rx_mut().changed() => {
-                        if changed.is_err() {
-                            return;
-                        }
-                        false
+                let reading = if stopping {
+                    // Emit what was queued before the stop, then exit.
+                    match sub.try_recv() {
+                        Some(r) => r,
+                        None => return,
                     }
-                    _ = stop_for_task.notified() => {
-                        // Emit the update this pump never consumed, if any,
-                        // then exit.
-                        match sub.rx_mut().has_changed() {
-                            Ok(true) => true,
-                            _ => return,
+                } else {
+                    tokio::select! {
+                        r = sub.recv() => match r {
+                            Some(r) => r,
+                            None => return,
+                        },
+                        _ = stop_for_task.notified() => {
+                            stopping = true;
+                            continue;
                         }
                     }
                 };
-                let reading = sub.rx_mut().borrow_and_update().clone();
                 let mut data = HashMap::new();
                 let mut timestamps = HashMap::new();
                 data.insert(event_key.clone(), reading.value);
@@ -3005,9 +3007,6 @@ impl RunEngine {
                         }
                     }
                     RunEngine::dispatch_subscribers(&subs_arc, &doc);
-                }
-                if last {
-                    return;
                 }
             }
         });

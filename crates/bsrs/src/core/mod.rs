@@ -36,7 +36,7 @@ pub use status::{
     CancelGuard, Status, StatusError, StatusOutcome, SubToken, TimedOut, WaitError, Watcher,
     WatcherUpdate,
 };
-pub use subscription::Subscription;
+pub use subscription::{Fanout, Subscription};
 pub use suspender::Suspender;
 pub use table::{Column, Table, TableElement, TypedTable};
 

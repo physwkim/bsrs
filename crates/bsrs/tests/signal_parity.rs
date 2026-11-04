@@ -628,20 +628,20 @@ async fn wait_for_value_on_a_signal_sees_its_current_value_and_mock_sets() {
     let backend = Arc::new(MockSignalBackend::with_value(0.0_f64));
     let sig: SignalRW<f64, _> = Signal::new(backend.clone(), cfg("signal"));
     backend.set_value(45.8);
-    let mut sub = AsyncSubscribable::subscribe(&sig).await.unwrap();
+    let sub = || async { AsyncSubscribable::subscribe(&sig).await.unwrap() };
     let timeout = Some(Duration::from_millis(100));
 
-    let current = wait_for_value(&mut sub, |r| r.value == json!(45.8), timeout).await;
+    let current = wait_for_value(sub().await, |r| r.value == json!(45.8), timeout).await;
     assert_eq!(current.unwrap().value, json!(45.8));
 
-    let err = wait_for_value(&mut sub, less_than_42, timeout)
+    let err = wait_for_value(sub().await, less_than_42, timeout)
         .await
         .unwrap_err();
     assert_eq!(
         err.to_string(),
         "signal didn't match less_than_42 in 0.1s, last value 45.8"
     );
-    let err = wait_for_value(&mut sub, |r| r.value == json!("blah"), timeout)
+    let err = wait_for_value(sub().await, |r| r.value == json!("blah"), timeout)
         .await
         .unwrap_err();
     assert_eq!(
@@ -649,7 +649,7 @@ async fn wait_for_value_on_a_signal_sees_its_current_value_and_mock_sets() {
         "signal didn't match <closure> in 0.1s, last value 45.8"
     );
 
-    let waiter = tokio::spawn(async move { wait_for_value(&mut sub, less_than_42, None).await });
+    let waiter = tokio::spawn(wait_for_value(sub().await, less_than_42, None));
     tokio::task::yield_now().await;
     assert!(!waiter.is_finished());
     backend.set_value(41.0);
