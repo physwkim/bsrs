@@ -271,6 +271,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   does: a readback that never matches is a `ValueTimeout` with the last
   value seen, one that never reports `didn't provide an initial value`, and
   an arm failure no longer starts with the cam's prefix.
+- `AreaDetectorCam::wait_for_idle` monitors `DetectorState_RBV` instead of
+  polling it, and fails as ophyd-async `wait_for_good_state` does, with
+  `Could not monitor state: …` or `… not in a good state: …`.
 
 ### Removed
 
