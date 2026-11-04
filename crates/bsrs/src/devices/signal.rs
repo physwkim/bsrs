@@ -781,8 +781,8 @@ mod tests {
         );
 
         backend.write_now(7.0);
-        sub.rx_mut().changed().await.unwrap();
-        assert_eq!(sub.rx().borrow().value, serde_json::json!(7.0));
+        assert_eq!(sub.recv().await.unwrap().value, serde_json::json!(1.0));
+        assert_eq!(sub.recv().await.unwrap().value, serde_json::json!(7.0));
 
         drop(sub);
         drop(_sub2);

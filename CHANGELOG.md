@@ -255,6 +255,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `StandardDetector`'s errors no longer start with the detector's name, so
   they read as ophyd-async's; `complete` without a kickoff fails with
   `complete: Kickoff not called`.
+- **Breaking**: a `Subscription` queues every reading for its listener, as
+  ophyd-async queues each callback on an `asyncio.Queue`, instead of keeping
+  only the latest in a `watch` channel; `recv` and `try_recv` replace `rx`,
+  `rx_mut` and `clone_rx`, and `core::Fanout` is the producer side.
+  `wait_for_value` takes the `Subscription` by value, its timeout covers the
+  first reading, and `ValueTimeout.last` is `None` when none arrived. The
+  suspenders take a `&Arc<Fanout<T>>`, held weakly, which `ca_watch_f64` and
+  `ca_watch_bool` return.
 
 ### Removed
 
@@ -290,6 +298,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `Signal::describe` takes `DataKey.source` from `Signal::source`.
 - `AreaDetectorCam::arm` no longer misses acquisitions shorter than a poll,
   and `AdHdfWriter` no longer stalls `kickoff` on a FlushNow put.
+- A value that changed and changed back between two polls, such as DMOV
+  blinking 1 → 0 → 1 on a null motor move, no longer coalesces away, so
+  `wait_for_value` cannot wait forever on it, a monitored device emits an
+  Event for each reading and a suspender trips on a glitch. `observe_value`
+  no longer yields a null reading before the first one arrives.
 
 ## [0.5.8] - 2026-09-22
 

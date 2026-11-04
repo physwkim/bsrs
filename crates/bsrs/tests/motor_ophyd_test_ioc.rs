@@ -98,15 +98,17 @@ async fn refused_from_past_a_limit<M: MovableObj + LocatableObj>(m: &M, record: 
 }
 
 /// Wait until the subscribed readback satisfies `pred`.
-async fn readback_until(sub: &Subscription, pred: impl Fn(f64) -> bool) {
-    let mut rx = sub.clone_rx();
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        rx.wait_for(|r| r.value.as_f64().is_some_and(&pred)),
-    )
+async fn readback_until(sub: &mut Subscription, pred: impl Fn(f64) -> bool) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(r) = sub.recv().await {
+            if r.value.as_f64().is_some_and(&pred) {
+                return;
+            }
+        }
+        panic!("the subscription closed");
+    })
     .await
-    .expect("the readback gets there")
-    .unwrap();
+    .expect("the readback gets there");
 }
 
 /// Every watcher update of `st` until it settles, as ophyd-async's
@@ -156,8 +158,8 @@ async fn done_moving(record: &str) {
     let dmov = CaDetector::connect_async("dmov", &field(record, "DMOV"))
         .await
         .unwrap();
-    let sub = dmov.subscribe_dyn().await.unwrap();
-    readback_until(&sub, |v| v == 1.0).await;
+    let mut sub = dmov.subscribe_dyn().await.unwrap();
+    readback_until(&mut sub, |v| v == 1.0).await;
 }
 
 /// test_epicsmotor.py `test_move`, `test_read_in_motor_callback`,
@@ -174,13 +176,11 @@ async fn a_move_settles_once_the_motor_is_done() {
     let dmov = ca::<i64>(X1, "DMOV").await;
     let start = m.locate_dyn().await.unwrap().readback;
     let target = inward(start, 1.5);
-    let sub = m.subscribe_dyn().await.unwrap();
-    let mut rx = sub.clone_rx();
-    rx.borrow_and_update();
+    let mut sub = m.subscribe_dyn().await.unwrap();
     let seen = tokio::spawn(async move {
         let mut seen = Vec::new();
-        while rx.changed().await.is_ok() {
-            let v = rx.borrow_and_update().value.as_f64().unwrap();
+        while let Some(r) = sub.recv().await {
+            let v = r.value.as_f64().unwrap();
             seen.push(v);
             if (v - target).abs() <= MRES {
                 break;
@@ -231,9 +231,9 @@ async fn a_move_settles_once_the_motor_is_done() {
 async fn underway(m: &CaMotor) -> (Status, f64, Subscription) {
     let start = m.locate_dyn().await.unwrap().readback;
     let target = inward(start, 8.0);
-    let sub = m.subscribe_dyn().await.unwrap();
+    let mut sub = m.subscribe_dyn().await.unwrap();
     let st = m.set_dyn(target).await;
-    readback_until(&sub, |v| (v - start).abs() >= 0.5).await;
+    readback_until(&mut sub, |v| (v - start).abs() >= 0.5).await;
     (st, target, sub)
 }
 
@@ -513,9 +513,9 @@ fn a_pva_move_settles_once_done_and_stop_halts_it() {
 
         let start = rb;
         let target = inward(start, 8.0);
-        let sub = m.subscribe_dyn().await.unwrap();
+        let mut sub = m.subscribe_dyn().await.unwrap();
         let st = m.set_dyn(target).await;
-        readback_until(&sub, |v| (v - start).abs() >= 0.5).await;
+        readback_until(&mut sub, |v| (v - start).abs() >= 0.5).await;
         m.stop_dyn(false).await.unwrap();
         let err = tokio::time::timeout(Duration::from_secs(3), st)
             .await

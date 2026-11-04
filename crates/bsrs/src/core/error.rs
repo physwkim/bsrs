@@ -12,8 +12,9 @@ pub enum BsrsError {
     /// [`wait_for_value`](crate::devices::wait_for_value) timed out; the
     /// message is ophyd-async `wait_for_value`'s `TimeoutError` text.
     #[error(
-        "{name} didn't match {matcher} in {}s, last value {last}",
-        .timeout.as_secs_f64()
+        "{name} didn't match {matcher} in {}s, last value {}",
+        .timeout.as_secs_f64(),
+        .last.as_ref().map_or_else(|| "None".into(), ToString::to_string)
     )]
     ValueTimeout {
         /// Subscription key (the signal name).
@@ -22,9 +23,9 @@ pub enum BsrsError {
         matcher: String,
         /// The timeout that elapsed.
         timeout: std::time::Duration,
-        /// The last value the subscription delivered (boxed to keep
-        /// `BsrsError` small).
-        last: Box<serde_json::Value>,
+        /// The last value the subscription delivered, `None` if none came
+        /// (boxed to keep `BsrsError` small).
+        last: Option<Box<serde_json::Value>>,
     },
     /// A signal's backend connect failed; every caller that joined that
     /// connect gets this same error, as ophyd-async callers share one

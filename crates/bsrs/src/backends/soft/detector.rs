@@ -4,7 +4,7 @@ use crate::core::error::{BsrsError, Result};
 use crate::core::msg::{MonitorableObj, NamedObj, ReadableObj};
 use crate::core::reading::ReadingValue;
 use crate::core::status::{Status, SubToken};
-use crate::core::subscription::Subscription;
+use crate::core::subscription::{Fanout, Subscription};
 use crate::devices::StandardDetector;
 use crate::event_model::{DataKey, Dtype};
 use crate::protocols_async::{
@@ -37,25 +37,20 @@ fn now_ts() -> f64 {
 pub struct SoftDetector {
     name: String,
     counts: AtomicU64,
-    /// Monitor fan-out; `read` / `tick` store the fresh reading.
-    monitor: watch::Sender<ReadingValue>,
+    /// Monitor fan-out; `read` / `tick` post the fresh reading.
+    monitor: Fanout<ReadingValue>,
 }
 
 impl SoftDetector {
     /// Build with an initial counter.
     pub fn new(name: impl Into<String>) -> Arc<Self> {
-        let name = name.into();
-        let (monitor, _rx) = watch::channel(ReadingValue {
-            value: serde_json::Value::Number(0.into()),
-            timestamp: now_ts(),
-            alarm_severity: None,
-            message: None,
-        });
-        Arc::new(Self {
-            name,
+        let det = Self {
+            name: name.into(),
             counts: AtomicU64::new(0),
-            monitor,
-        })
+            monitor: Fanout::default(),
+        };
+        det.publish();
+        Arc::new(det)
     }
 
     /// One acquisition: bump the counter and publish the new reading.
@@ -64,11 +59,10 @@ impl SoftDetector {
         self.publish()
     }
 
-    /// Sample the counter and store it in the monitor channel. `send_replace`
-    /// (not `send`) so the value is kept even with no live subscriber.
+    /// Sample the counter and post it to the monitor fan-out.
     fn publish(&self) -> ReadingValue {
         let r = self.reading();
-        self.monitor.send_replace(r.clone());
+        self.monitor.post(r.clone());
         r
     }
 
@@ -146,13 +140,10 @@ impl ReadableObj for SoftDetector {
 #[async_trait]
 impl MonitorableObj for SoftDetector {
     async fn subscribe_dyn(&self) -> Result<Subscription> {
-        // The watch sender lives as long as the detector; nothing to release.
-        // The stored count is pending so the first `changed()` yields it
-        // (ophyd `subscribe(run=True)`).
-        let mut rx = self.monitor.subscribe();
-        rx.mark_changed();
+        // The fan-out lives as long as the detector; nothing to release.
+        // The queue starts with the stored count (ophyd `subscribe(run=True)`).
         Ok(Subscription::new(
-            rx,
+            self.monitor.listen(),
             SubToken::noop(),
             format!("{}_counts", self.name),
         ))
@@ -397,20 +388,19 @@ mod tests {
         let second = AsyncReadable::read(&*det).await.unwrap();
         assert_eq!(first[key].value, serde_json::json!(1));
         assert_eq!(second[key].value, serde_json::json!(2));
-        let sub = MonitorableObj::subscribe_dyn(&*det).await.unwrap();
-        assert_eq!(sub.rx().borrow().value, serde_json::json!(2));
+        let mut sub = MonitorableObj::subscribe_dyn(&*det).await.unwrap();
+        assert_eq!(sub.try_recv().unwrap().value, serde_json::json!(2));
     }
 
-    // A subscription starts with the current count pending: monitor start
+    // A subscription starts with the current count queued: monitor start
     // emits the value read so far, not only the next change.
     #[tokio::test]
     async fn soft_detector_subscription_starts_with_the_current_count() {
         let det = SoftDetector::new("det");
         det.tick();
         let mut sub = MonitorableObj::subscribe_dyn(&*det).await.unwrap();
-        assert!(sub.rx_mut().has_changed().unwrap());
-        assert_eq!(sub.rx_mut().borrow_and_update().value, serde_json::json!(1));
-        assert!(!sub.rx_mut().has_changed().unwrap(), "consumed once");
+        assert_eq!(sub.try_recv().unwrap().value, serde_json::json!(1));
+        assert!(sub.try_recv().is_none(), "consumed once");
     }
 
     // Boundary: `arm` before any `subscribe_index`. The channel has no

@@ -499,7 +499,6 @@ where
             let mv = finish(done);
             let stopped = format!("{what}: stopped");
             tokio::spawn(async move {
-                let readings = monitor.rx_mut();
                 tokio::pin!(mv);
                 let end = loop {
                     tokio::select! {
@@ -507,9 +506,8 @@ where
                         Ok(()) = halted.changed() => {
                             break if *halted.borrow() { Ok(()) } else { Err(stopped) };
                         }
-                        Ok(()) = readings.changed() => {
-                            let current = readings.borrow_and_update().value.as_f64();
-                            if let Some(current) = current {
+                        Some(r) = monitor.recv() => {
+                            if let Some(current) = r.value.as_f64() {
                                 setter.update_watcher(WatcherUpdate { current, ..update.clone() });
                             }
                         }

@@ -50,6 +50,23 @@ fn one_count_plan() -> Plan {
 
 /// Poll `pred` until it holds. For synchronous reads — `state()`, device-hook
 /// counters, receiver counts.
+/// A fan-out a suspender watches, holding `v`.
+fn fanout<T: Clone>(v: T) -> Arc<bsrs::core::Fanout<T>> {
+    let f = Arc::new(bsrs::core::Fanout::default());
+    f.post(v);
+    f
+}
+
+/// A reading of `v` at `ts`.
+fn reading_at(v: f64, ts: f64) -> bsrs::core::reading::ReadingValue {
+    bsrs::core::reading::ReadingValue {
+        value: Value::from(v),
+        timestamp: ts,
+        alarm_severity: None,
+        message: None,
+    }
+}
+
 async fn wait_until(what: &str, pred: impl Fn() -> bool) {
     for _ in 0..1000 {
         if pred() {
@@ -595,9 +612,9 @@ async fn unknown_custom_command_errors() {
 #[tokio::test]
 async fn suspend_bool_high_pauses_on_high_resumes_on_low() {
     use bsrs::engine::SuspendBoolHigh;
-    let (tx, rx) = tokio::sync::watch::channel(false);
+    let tx = fanout(false);
     let re = Arc::new(RunEngine::new(vec![]));
-    re.install_suspender(Arc::new(SuspendBoolHigh::new("shutter", rx)))
+    re.install_suspender(Arc::new(SuspendBoolHigh::new("shutter", &tx)))
         .await;
 
     let re2 = re.clone();
@@ -610,7 +627,7 @@ async fn suspend_bool_high_pauses_on_high_resumes_on_low() {
     wait_for_state(&re, EngineRunState::Running).await;
 
     // Trigger BAD: signal goes high → engine should pause.
-    tx.send(true).unwrap();
+    tx.post(true);
     wait_for_state(&re, EngineRunState::Paused).await;
     assert_eq!(
         re.state(),
@@ -619,7 +636,7 @@ async fn suspend_bool_high_pauses_on_high_resumes_on_low() {
     );
 
     // Restore GOOD: signal goes low → engine should auto-resume.
-    tx.send(false).unwrap();
+    tx.post(false);
     let result = tokio::time::timeout(Duration::from_secs(2), join)
         .await
         .expect("auto-resume in time")
@@ -632,9 +649,9 @@ async fn suspend_bool_high_pauses_on_high_resumes_on_low() {
 #[tokio::test]
 async fn suspend_bool_low_pauses_on_low_resumes_on_high() {
     use bsrs::engine::SuspendBoolLow;
-    let (tx, rx) = tokio::sync::watch::channel(true);
+    let tx = fanout(true);
     let re = Arc::new(RunEngine::new(vec![]));
-    re.install_suspender(Arc::new(SuspendBoolLow::new("beam", rx)))
+    re.install_suspender(Arc::new(SuspendBoolLow::new("beam", &tx)))
         .await;
 
     let re2 = re.clone();
@@ -646,11 +663,11 @@ async fn suspend_bool_low_pauses_on_low_resumes_on_high() {
     let join = tokio::spawn(async move { re2.run_async(plan).await });
     wait_for_state(&re, EngineRunState::Running).await;
 
-    tx.send(false).unwrap();
+    tx.post(false);
     wait_for_state(&re, EngineRunState::Paused).await;
     assert_eq!(re.state(), EngineRunState::Paused);
 
-    tx.send(true).unwrap();
+    tx.post(true);
     let _ = tokio::time::timeout(Duration::from_secs(2), join)
         .await
         .expect("auto-resume in time")
@@ -662,11 +679,11 @@ async fn suspend_bool_low_pauses_on_low_resumes_on_high() {
 #[tokio::test]
 async fn suspend_threshold_floor_pauses_when_below() {
     use bsrs::engine::{SuspendThreshold, ThresholdDirection};
-    let (tx, rx) = tokio::sync::watch::channel(100.0_f64);
+    let tx = fanout(100.0_f64);
     let re = Arc::new(RunEngine::new(vec![]));
     re.install_suspender(Arc::new(SuspendThreshold::new(
         "beam_current",
-        rx,
+        &tx,
         50.0,
         ThresholdDirection::BadIfBelow,
     )))
@@ -681,11 +698,11 @@ async fn suspend_threshold_floor_pauses_when_below() {
     let join = tokio::spawn(async move { re2.run_async(plan).await });
     wait_for_state(&re, EngineRunState::Running).await;
 
-    tx.send(40.0).unwrap();
+    tx.post(40.0);
     wait_for_state(&re, EngineRunState::Paused).await;
     assert_eq!(re.state(), EngineRunState::Paused);
 
-    tx.send(80.0).unwrap();
+    tx.post(80.0);
     let _ = tokio::time::timeout(Duration::from_secs(2), join)
         .await
         .expect("auto-resume in time")
@@ -698,11 +715,11 @@ async fn suspend_threshold_floor_pauses_when_below() {
 async fn suspend_outside_band_pauses_outside_resumes_inside() {
     // ENG-13: pause when value leaves (band_bottom, band_top), resume inside.
     use bsrs::engine::SuspendOutsideBand;
-    let (tx, rx) = tokio::sync::watch::channel(25.0_f64); // inside (20, 30)
+    let tx = fanout(25.0_f64); // inside (20, 30)
     let re = Arc::new(RunEngine::new(vec![]));
     re.install_suspender(Arc::new(SuspendOutsideBand::new(
         "temperature",
-        rx,
+        &tx,
         20.0,
         30.0,
     )))
@@ -718,7 +735,7 @@ async fn suspend_outside_band_pauses_outside_resumes_inside() {
     wait_for_state(&re, EngineRunState::Running).await;
 
     // Leave the band above the top edge → pause.
-    tx.send(35.0).unwrap();
+    tx.post(35.0);
     wait_for_state(&re, EngineRunState::Paused).await;
     assert_eq!(
         re.state(),
@@ -727,7 +744,7 @@ async fn suspend_outside_band_pauses_outside_resumes_inside() {
     );
 
     // Return inside the band → auto-resume.
-    tx.send(25.0).unwrap();
+    tx.post(25.0);
     let _ = tokio::time::timeout(Duration::from_secs(2), join)
         .await
         .expect("auto-resume in time")
@@ -741,10 +758,10 @@ async fn suspend_when_changed_allow_resume_pauses_then_resumes() {
     // ENG-13: with allow_resume, deviating from `expected` pauses; returning
     // to `expected` auto-resumes.
     use bsrs::engine::SuspendWhenChanged;
-    let (tx, rx) = tokio::sync::watch::channel("operate".to_string());
+    let tx = fanout("operate".to_string());
     let re = Arc::new(RunEngine::new(vec![]));
     re.install_suspender(Arc::new(
-        SuspendWhenChanged::new("facility_mode", rx, "operate".to_string()).allow_resume(),
+        SuspendWhenChanged::new("facility_mode", &tx, "operate".to_string()).allow_resume(),
     ))
     .await;
 
@@ -757,7 +774,7 @@ async fn suspend_when_changed_allow_resume_pauses_then_resumes() {
     let join = tokio::spawn(async move { re2.run_async(plan).await });
     wait_for_state(&re, EngineRunState::Running).await;
 
-    tx.send("shutdown".to_string()).unwrap();
+    tx.post("shutdown".to_string());
     wait_for_state(&re, EngineRunState::Paused).await;
     assert_eq!(
         re.state(),
@@ -765,7 +782,7 @@ async fn suspend_when_changed_allow_resume_pauses_then_resumes() {
         "must pause when value deviates from expected"
     );
 
-    tx.send("operate".to_string()).unwrap();
+    tx.post("operate".to_string());
     let _ = tokio::time::timeout(Duration::from_secs(2), join)
         .await
         .expect("auto-resume in time")
@@ -779,9 +796,9 @@ async fn suspend_when_changed_no_resume_requires_manual_resume() {
     // ENG-13: default (allow_resume=false) is one-shot — returning to
     // `expected` does NOT auto-resume; only a manual RE.resume() lifts it.
     use bsrs::engine::SuspendWhenChanged;
-    let (tx, rx) = tokio::sync::watch::channel(0_i64);
+    let tx = fanout(0_i64);
     let re = Arc::new(RunEngine::new(vec![]));
-    re.install_suspender(Arc::new(SuspendWhenChanged::new("interlock", rx, 0_i64)))
+    re.install_suspender(Arc::new(SuspendWhenChanged::new("interlock", &tx, 0_i64)))
         .await;
 
     let re2 = re.clone();
@@ -793,12 +810,12 @@ async fn suspend_when_changed_no_resume_requires_manual_resume() {
     let join = tokio::spawn(async move { re2.run_async(plan).await });
     wait_for_state(&re, EngineRunState::Running).await;
 
-    tx.send(1).unwrap(); // deviate → pause
+    tx.post(1); // deviate → pause
     wait_for_state(&re, EngineRunState::Paused).await;
     assert_eq!(re.state(), EngineRunState::Paused);
 
     // Return to expected: must NOT auto-resume (one-shot).
-    tx.send(0).unwrap();
+    tx.post(0);
     tokio::time::sleep(Duration::from_millis(80)).await;
     assert_eq!(
         re.state(),
@@ -856,10 +873,10 @@ async fn installed_suspender_runs_pre_and_post_plans() {
         })
     });
 
-    let (tx, rx) = tokio::sync::watch::channel(false);
+    let tx = fanout(false);
     let re = Arc::new(RunEngine::new(vec![]));
     re.install_suspender(Arc::new(
-        SuspendBoolHigh::new("shutter", rx)
+        SuspendBoolHigh::new("shutter", &tx)
             .with_pre_plan(pre)
             .with_post_plan(post),
     ))
@@ -869,7 +886,7 @@ async fn installed_suspender_runs_pre_and_post_plans() {
     let join = tokio::spawn(async move { re2.run_async(sleepy_run(3)).await });
     wait_for_state(&re, EngineRunState::Running).await;
 
-    tx.send(true).unwrap();
+    tx.post(true);
     wait_for_state(&re, EngineRunState::Paused).await;
     // pre_plan ran on the way into the suspension; post_plan not yet.
     wait_until("pre_plan setpoint", || {
@@ -877,7 +894,7 @@ async fn installed_suspender_runs_pre_and_post_plans() {
     })
     .await;
 
-    tx.send(false).unwrap();
+    tx.post(false);
     let _ = tokio::time::timeout(Duration::from_secs(2), join)
         .await
         .expect("auto-resume in time")
@@ -897,9 +914,9 @@ async fn installed_suspender_runs_pre_and_post_plans() {
 #[tokio::test]
 async fn tripped_reference_suspender_gates_plan_start() {
     use bsrs::engine::SuspendBoolHigh;
-    let (tx, rx) = tokio::sync::watch::channel(true);
+    let tx = fanout(true);
     let re = Arc::new(RunEngine::new(vec![]));
-    re.install_suspender(Arc::new(SuspendBoolHigh::new("shutter", rx)))
+    re.install_suspender(Arc::new(SuspendBoolHigh::new("shutter", &tx)))
         .await;
 
     let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -919,7 +936,7 @@ async fn tripped_reference_suspender_gates_plan_start() {
     );
     assert_eq!(re.state(), EngineRunState::Running);
 
-    tx.send(false).unwrap();
+    tx.post(false);
     let _ = tokio::time::timeout(Duration::from_secs(2), join)
         .await
         .expect("gate lifts once the signal clears")
@@ -934,25 +951,25 @@ async fn tripped_reference_suspender_gates_plan_start() {
 #[tokio::test]
 async fn overlapping_suspensions_resume_only_when_both_clear() {
     use bsrs::engine::SuspendBoolHigh;
-    let (shutter_tx, shutter_rx) = tokio::sync::watch::channel(false);
-    let (beam_tx, beam_rx) = tokio::sync::watch::channel(false);
+    let shutter_tx = fanout(false);
+    let beam_tx = fanout(false);
     let re = Arc::new(RunEngine::new(vec![]));
-    re.install_suspender(Arc::new(SuspendBoolHigh::new("shutter", shutter_rx)))
+    re.install_suspender(Arc::new(SuspendBoolHigh::new("shutter", &shutter_tx)))
         .await;
-    re.install_suspender(Arc::new(SuspendBoolHigh::new("beam", beam_rx)))
+    re.install_suspender(Arc::new(SuspendBoolHigh::new("beam", &beam_tx)))
         .await;
 
     let re2 = re.clone();
     let join = tokio::spawn(async move { re2.run_async(sleepy_run(3)).await });
     wait_for_state(&re, EngineRunState::Running).await;
 
-    shutter_tx.send(true).unwrap();
+    shutter_tx.post(true);
     wait_for_state(&re, EngineRunState::Paused).await;
-    beam_tx.send(true).unwrap();
+    beam_tx.post(true);
     // Let the second trip register its hold before the first releases.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    shutter_tx.send(false).unwrap();
+    shutter_tx.post(false);
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         re.state(),
@@ -960,7 +977,7 @@ async fn overlapping_suspensions_resume_only_when_both_clear() {
         "the beam suspension must still hold the run"
     );
 
-    beam_tx.send(false).unwrap();
+    beam_tx.post(false);
     let _ = tokio::time::timeout(Duration::from_secs(2), join)
         .await
         .expect("resume once both clear")
@@ -975,20 +992,20 @@ async fn overlapping_suspensions_resume_only_when_both_clear() {
 #[tokio::test]
 async fn manual_pause_during_a_suspension_is_not_lifted_by_its_release() {
     use bsrs::engine::SuspendBoolHigh;
-    let (tx, rx) = tokio::sync::watch::channel(false);
+    let tx = fanout(false);
     let re = Arc::new(RunEngine::new(vec![]));
-    re.install_suspender(Arc::new(SuspendBoolHigh::new("shutter", rx)))
+    re.install_suspender(Arc::new(SuspendBoolHigh::new("shutter", &tx)))
         .await;
 
     let re2 = re.clone();
     let join = tokio::spawn(async move { re2.run_async(sleepy_run(3)).await });
     wait_for_state(&re, EngineRunState::Running).await;
 
-    tx.send(true).unwrap();
+    tx.post(true);
     wait_for_state(&re, EngineRunState::Paused).await;
     re.pause(false);
 
-    tx.send(false).unwrap();
+    tx.post(false);
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         re.state(),
@@ -1014,8 +1031,8 @@ async fn suspension_records_its_justification_not_pause() {
     let sink = Arc::new(CapturingSink::new());
     let re = Arc::new(RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]));
     re.set_record_interruptions(true);
-    let (tx, rx) = tokio::sync::watch::channel(false);
-    re.install_suspender(Arc::new(SuspendBoolHigh::new("shutter", rx)))
+    let tx = fanout(false);
+    re.install_suspender(Arc::new(SuspendBoolHigh::new("shutter", &tx)))
         .await;
 
     let re2 = re.clone();
@@ -1027,9 +1044,9 @@ async fn suspension_records_its_justification_not_pause() {
     })
     .await;
 
-    tx.send(true).unwrap();
+    tx.post(true);
     wait_for_state(&re, EngineRunState::Paused).await;
-    tx.send(false).unwrap();
+    tx.post(false);
     let _ = join.await.unwrap().unwrap();
 
     let labels: Vec<String> = sink
@@ -1055,13 +1072,10 @@ async fn suspension_records_its_justification_not_pause() {
 #[tokio::test]
 async fn installed_suspender_persists_across_runs() {
     use bsrs::engine::SuspendBoolHigh;
-    let (tx, rx) = tokio::sync::watch::channel(false);
-    // The removed suspender takes its receiver with it; keep one so the last
-    // `send` below still has somewhere to go.
-    let _rx_keep = rx.clone();
+    let tx = fanout(false);
     let re = Arc::new(RunEngine::new(vec![]));
     let id = re
-        .install_suspender(Arc::new(SuspendBoolHigh::new("shutter", rx)))
+        .install_suspender(Arc::new(SuspendBoolHigh::new("shutter", &tx)))
         .await;
 
     let _ = re.run_async(sleepy_run(1)).await.unwrap();
@@ -1069,9 +1083,9 @@ async fn installed_suspender_persists_across_runs() {
     let re2 = re.clone();
     let join = tokio::spawn(async move { re2.run_async(sleepy_run(3)).await });
     wait_for_state(&re, EngineRunState::Running).await;
-    tx.send(true).unwrap();
+    tx.post(true);
     wait_for_state(&re, EngineRunState::Paused).await;
-    tx.send(false).unwrap();
+    tx.post(false);
     let _ = tokio::time::timeout(Duration::from_secs(2), join)
         .await
         .expect("second run suspends and resumes")
@@ -1083,7 +1097,7 @@ async fn installed_suspender_persists_across_runs() {
     let re3 = re.clone();
     let join = tokio::spawn(async move { re3.run_async(sleepy_run(3)).await });
     wait_for_state(&re, EngineRunState::Running).await;
-    tx.send(true).unwrap();
+    tx.post(true);
     let _ = tokio::time::timeout(Duration::from_secs(2), join)
         .await
         .expect("removed suspender must not suspend the run")
@@ -1129,7 +1143,8 @@ async fn msg_fail_marks_run_failed_with_reason() {
 // -- Monitor → Event flow --------------------------------------------------
 //
 // MonitorableObj has no backend impl in the crate-soft yet; we fabricate one
-// here against a `tokio::sync::watch` channel.
+// here against a `Fanout`. Nothing is posted until `push`, so a pump emits
+// only the pushed values.
 
 struct TestMonitor {
     name: String,
@@ -1137,7 +1152,7 @@ struct TestMonitor {
     key: String,
     /// Data key the subscription claims (defaults to `key`).
     sub_key: String,
-    tx: tokio::sync::watch::Sender<bsrs::core::reading::ReadingValue>,
+    tx: bsrs::core::Fanout<bsrs::core::reading::ReadingValue>,
 }
 
 impl TestMonitor {
@@ -1148,29 +1163,15 @@ impl TestMonitor {
         Self::with_keys(name, key, key)
     }
     fn with_keys(name: &str, key: &str, sub_key: &str) -> Arc<Self> {
-        let (tx, _rx) = tokio::sync::watch::channel(bsrs::core::reading::ReadingValue {
-            value: Value::from(0.0),
-            timestamp: 0.0,
-            alarm_severity: None,
-            message: None,
-        });
         Arc::new(Self {
             name: name.into(),
             key: key.into(),
             sub_key: sub_key.into(),
-            tx,
+            tx: Default::default(),
         })
     }
     fn push(&self, v: f64, ts: f64) {
-        let _ = self.tx.send(bsrs::core::reading::ReadingValue {
-            value: Value::from(v),
-            timestamp: ts,
-            alarm_severity: None,
-            message: None,
-        });
-    }
-    fn rx(&self) -> tokio::sync::watch::Receiver<bsrs::core::reading::ReadingValue> {
-        self.tx.subscribe()
+        self.tx.post(reading_at(v, ts));
     }
 }
 
@@ -1188,7 +1189,7 @@ impl bsrs::core::msg::ReadableObj for TestMonitor {
         std::collections::HashMap<String, bsrs::core::reading::ReadingValue>,
         bsrs::core::error::BsrsError,
     > {
-        let v = self.tx.borrow().clone();
+        let v = self.tx.latest().unwrap_or_else(|| reading_at(0.0, 0.0));
         let mut out = std::collections::HashMap::new();
         out.insert(self.key.clone(), v);
         Ok(out)
@@ -1225,9 +1226,8 @@ impl bsrs::core::msg::MonitorableObj for TestMonitor {
     async fn subscribe_dyn(
         &self,
     ) -> Result<bsrs::core::subscription::Subscription, bsrs::core::error::BsrsError> {
-        let rx = self.rx();
         Ok(bsrs::core::subscription::Subscription::new(
-            rx,
+            self.tx.listen(),
             bsrs::core::status::SubToken::noop(),
             self.sub_key.clone(),
         ))
@@ -1641,31 +1641,20 @@ async fn monitor_rejects_a_subscription_key_the_device_does_not_describe() {
 // that exercises the descriptor-before-event ordering guarantee.
 struct ConfigurableMonitor {
     name: String,
-    tx: tokio::sync::watch::Sender<bsrs::core::reading::ReadingValue>,
+    tx: bsrs::core::Fanout<bsrs::core::reading::ReadingValue>,
     gain: StdMutex<f64>,
 }
 
 impl ConfigurableMonitor {
     fn new(name: &str) -> Arc<Self> {
-        let (tx, _rx) = tokio::sync::watch::channel(bsrs::core::reading::ReadingValue {
-            value: Value::from(0.0),
-            timestamp: 0.0,
-            alarm_severity: None,
-            message: None,
-        });
         Arc::new(Self {
             name: name.into(),
-            tx,
+            tx: Default::default(),
             gain: StdMutex::new(2.5),
         })
     }
     fn push(&self, v: f64, ts: f64) {
-        let _ = self.tx.send(bsrs::core::reading::ReadingValue {
-            value: Value::from(v),
-            timestamp: ts,
-            alarm_severity: None,
-            message: None,
-        });
+        self.tx.post(reading_at(v, ts));
     }
 }
 
@@ -1683,7 +1672,7 @@ impl bsrs::core::msg::ReadableObj for ConfigurableMonitor {
         std::collections::HashMap<String, bsrs::core::reading::ReadingValue>,
         bsrs::core::error::BsrsError,
     > {
-        let v = self.tx.borrow().clone();
+        let v = self.tx.latest().unwrap_or_else(|| reading_at(0.0, 0.0));
         Ok(std::collections::HashMap::from([(self.name.clone(), v)]))
     }
     async fn describe_dyn(
@@ -1720,7 +1709,7 @@ impl bsrs::core::msg::MonitorableObj for ConfigurableMonitor {
         &self,
     ) -> Result<bsrs::core::subscription::Subscription, bsrs::core::error::BsrsError> {
         Ok(bsrs::core::subscription::Subscription::new(
-            self.tx.subscribe(),
+            self.tx.listen(),
             bsrs::core::status::SubToken::noop(),
             self.name.clone(),
         ))
@@ -2013,23 +2002,17 @@ async fn unmonitor_of_unmonitored_object_is_rejected() {
 struct DescribeCountingMonitor {
     name: String,
     describes: Arc<AtomicU64>,
-    tx: tokio::sync::watch::Sender<bsrs::core::reading::ReadingValue>,
+    tx: bsrs::core::Fanout<bsrs::core::reading::ReadingValue>,
 }
 
 impl DescribeCountingMonitor {
     fn new(name: &str) -> (Arc<Self>, Arc<AtomicU64>) {
-        let (tx, _rx) = tokio::sync::watch::channel(bsrs::core::reading::ReadingValue {
-            value: Value::from(0.0),
-            timestamp: 0.0,
-            alarm_severity: None,
-            message: None,
-        });
         let describes = Arc::new(AtomicU64::new(0));
         (
             Arc::new(Self {
                 name: name.into(),
                 describes: describes.clone(),
-                tx,
+                tx: Default::default(),
             }),
             describes,
         )
@@ -2069,7 +2052,7 @@ impl bsrs::core::msg::MonitorableObj for DescribeCountingMonitor {
         &self,
     ) -> Result<bsrs::core::subscription::Subscription, bsrs::core::error::BsrsError> {
         Ok(bsrs::core::subscription::Subscription::new(
-            self.tx.subscribe(),
+            self.tx.listen(),
             bsrs::core::status::SubToken::noop(),
             self.name.clone(),
         ))
@@ -2198,9 +2181,9 @@ async fn close_run_tears_down_active_monitor_not_explicitly_unmonitored() {
     // bluesky's close_run clears any monitor still subscribed at run close
     // (bundlers.py:246-248). A Msg::Monitor the plan never Unmonitor'd must be
     // torn down when the run closes — not left pumping until plan end, where
-    // run_async's cleanup would mask the leak. Observed via the monitor's watch
-    // receiver count: the pump (subscribed synchronously in start_monitor)
-    // holds the only receiver.
+    // run_async's cleanup would mask the leak. Observed via the monitor's
+    // listener count: the pump (subscribed synchronously in start_monitor)
+    // holds the only listener.
     let re = Arc::new(RunEngine::new(Vec::<Arc<dyn DocumentSink>>::new()));
     let mon = TestMonitor::new("mon_close");
     let mon_for_plan: Arc<dyn bsrs::core::msg::MonitorableObj> = mon.clone();
@@ -2220,12 +2203,12 @@ async fn close_run_tears_down_active_monitor_not_explicitly_unmonitored() {
     // Inside the post-close window (close fires ~50ms in; the trailing sleep
     // runs to ~550ms; plan-end cleanup is only after that). Confirm the monitor
     // first subscribes, then is torn down by close_run (not plan-end cleanup).
-    wait_until("monitor subscribed", || mon.tx.receiver_count() == 1).await;
+    wait_until("monitor subscribed", || mon.tx.listener_count() == 1).await;
     wait_until("close_run unsubscribed the monitor", || {
-        mon.tx.receiver_count() == 0
+        mon.tx.listener_count() == 0
     })
     .await;
-    let receivers = mon.tx.receiver_count();
+    let receivers = mon.tx.listener_count();
 
     join.await.unwrap().unwrap();
     assert_eq!(
@@ -2242,7 +2225,7 @@ async fn monitor_survives_pause_and_resume() {
     // pump (monitor_tasks) but the separate `monitored` registry survives, and
     // on_resume re-installs from it. Pre-fix on_pause cleared the only record of
     // the monitor, so it was lost forever: post-resume pushes produced no Event
-    // and the watch had 0 receivers even after resume.
+    // and the monitor had 0 listeners even after resume.
     let sink = Arc::new(CapturingSink::new());
     let re = Arc::new(RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]));
     let mon = TestMonitor::new("mon_pr");
@@ -2261,22 +2244,22 @@ async fn monitor_survives_pause_and_resume() {
 
     // The pump subscribes synchronously in start_monitor → 1 receiver running.
     wait_until("monitor subscribed while running", || {
-        re.state() == EngineRunState::Running && mon.tx.receiver_count() == 1
+        re.state() == EngineRunState::Running && mon.tx.listener_count() == 1
     })
     .await;
     assert_eq!(re.state(), EngineRunState::Running);
     assert_eq!(
-        mon.tx.receiver_count(),
+        mon.tx.listener_count(),
         1,
         "pump must be subscribed while the run is running"
     );
 
     // Pause suspends the monitor: the live pump is dropped, releasing the sub.
     re.pause(false);
-    wait_until("pump dropped on pause", || mon.tx.receiver_count() == 0).await;
+    wait_until("pump dropped on pause", || mon.tx.listener_count() == 0).await;
     assert_eq!(re.state(), EngineRunState::Paused);
     assert_eq!(
-        mon.tx.receiver_count(),
+        mon.tx.listener_count(),
         0,
         "pause must drop the live pump (suspend_monitors)"
     );
@@ -2284,12 +2267,12 @@ async fn monitor_survives_pause_and_resume() {
     // Resume must re-install the monitor from the kept registry.
     re.resume();
     wait_until("monitor restored on resume", || {
-        re.state() == EngineRunState::Running && mon.tx.receiver_count() == 1
+        re.state() == EngineRunState::Running && mon.tx.listener_count() == 1
     })
     .await;
     assert_eq!(re.state(), EngineRunState::Running);
     assert_eq!(
-        mon.tx.receiver_count(),
+        mon.tx.listener_count(),
         1,
         "resume must restore the monitor (pre-fix: 0, lost forever)"
     );
@@ -3681,10 +3664,6 @@ async fn respond_channel_delivers_location_to_plan() {
 #[tokio::test]
 async fn respond_channel_delivers_reading_to_plan() {
     let det = TestMonitor::new("det");
-    // Keep a receiver alive so `push` (a `watch::Sender::send`) is not a no-op —
-    // `TestMonitor::new` drops its own receiver, and `send` with zero receivers
-    // silently leaves the stored value untouched.
-    let _keep = det.rx();
     det.push(42.0, 1.0);
     let read_det = det.clone() as Arc<dyn ReadableObj>;
     let captured: Arc<StdMutex<Option<f64>>> = Arc::new(StdMutex::new(None));

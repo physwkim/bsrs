@@ -643,12 +643,7 @@ mod tests {
             async fn subscribe_dyn(
                 &self,
             ) -> crate::core::error::Result<crate::core::subscription::Subscription> {
-                let (_tx, rx) = tokio::sync::watch::channel(crate::core::reading::ReadingValue {
-                    value: serde_json::Value::Null,
-                    timestamp: 0.0,
-                    alarm_severity: None,
-                    message: None,
-                });
+                let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
                 Ok(crate::core::subscription::Subscription::new(
                     rx,
                     crate::core::status::SubToken::noop(),
