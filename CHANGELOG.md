@@ -171,7 +171,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `EpicsOptions(wait=...)`): `Acquire` and `Capture` put 0 without a
   callback, and `Signal::put_start` sends a put and returns its completion,
   so `Capture=1` now goes with a callback whose completion is not awaited.
-- **Breaking**: areaDetector enum fields (`image_mode`, `detector_state_rbv`,
+- **Breaking**: areaDetector enum fields (`image_mode`, `detector_state`,
   `data_type`, `color_mode`, `file_write_mode`) are `String` labels, as are
   the `AD_STATE_*`, `AD_IMAGE_MODE_*`, `AD_COLOR_MODE_*` and
   `AD_FILE_WRITE_MODE_*` constants; `ad_datatype_to_numpy` and
@@ -281,6 +281,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A CA or PVA get, put or decode error names its PV, as aioca's `CANothing`
   does: `ca put X:cam1:Acquire: …`, not `ca put: …`. An areaDetector arm
   failure is that error alone, without an `…arm: Acquire:` prefix.
+- **Breaking**: the areaDetector readbacks without a setpoint drop `_rbv`,
+  as ophyd-async names them: `AreaDetectorCam::{array_counter,
+  detector_state}` and `NdFile::{num_captured, full_file_name,
+  file_path_exists}`. A readback paired with a setpoint field
+  (`acquire_rbv`, `capture_rbv`, `size_x_rbv`, …) keeps it.
 
 ### Removed
 

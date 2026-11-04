@@ -3894,10 +3894,10 @@ impl UserData for LuaAdCam {
             )
         });
         m.add_method("state", |_, this, ()| {
-            ad_block("ad_cam:state", this.0.detector_state_rbv.get())
+            ad_block("ad_cam:state", this.0.detector_state.get())
         });
         m.add_method("array_counter", |_, this, ()| {
-            ad_block("ad_cam:array_counter", this.0.array_counter_rbv.get())
+            ad_block("ad_cam:array_counter", this.0.array_counter.get())
         });
         m.add_method("set_image_mode", |_, this, mode: String| {
             ad_block("ad_cam:set_image_mode", async {

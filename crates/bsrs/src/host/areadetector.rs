@@ -216,9 +216,9 @@ pub struct AreaDetectorCam {
     /// `AcquirePeriod_RBV` (ai) — the period the driver applied.
     pub acquire_period_rbv: Arc<SignalR<f64, EpicsCaBackend<f64>>>,
     /// `ArrayCounter_RBV` (longin) — total frames produced.
-    pub array_counter_rbv: Arc<SignalR<i64, EpicsCaBackend<i64>>>,
+    pub array_counter: Arc<SignalR<i64, EpicsCaBackend<i64>>>,
     /// `DetectorState_RBV` (mbbi).
-    pub detector_state_rbv: Arc<SignalR<String, EpicsCaBackend<String>>>,
+    pub detector_state: Arc<SignalR<String, EpicsCaBackend<String>>>,
     /// `NDAttributesFile` (waveform) — per-frame attribute config, either
     /// inline XML or a filename on the IOC host. Read at `open()` to discover
     /// NDAttribute datasets for the emitted stream documents.
@@ -365,8 +365,8 @@ impl AreaDetectorCam {
             acquire_period: ca_signal(&prefix, "AcquirePeriod"),
             acquire_time_rbv: ca_signal(&prefix, ACQUIRE_TIME_RBV),
             acquire_period_rbv: ca_signal(&prefix, ACQUIRE_PERIOD_RBV),
-            array_counter_rbv: ca_signal(&prefix, "ArrayCounter_RBV"),
-            detector_state_rbv: ca_signal(&prefix, "DetectorState_RBV"),
+            array_counter: ca_signal(&prefix, "ArrayCounter_RBV"),
+            detector_state: ca_signal(&prefix, "DetectorState_RBV"),
             nd_attributes_file: ca_signal(&prefix, "NDAttributesFile"),
             wait_for_plugins: ca_signal(&prefix, "WaitForPlugins"),
             frame_info: Arc::new(NdArrayDescription::of_driver(&prefix)),
@@ -411,12 +411,12 @@ impl AreaDetectorCam {
                 futures::FutureExt::boxed(self.acquire_period_rbv.connect(timeout)),
             ),
             (
-                "array_counter_rbv",
-                futures::FutureExt::boxed(self.array_counter_rbv.connect(timeout)),
+                "array_counter",
+                futures::FutureExt::boxed(self.array_counter.connect(timeout)),
             ),
             (
-                "detector_state_rbv",
-                futures::FutureExt::boxed(self.detector_state_rbv.connect(timeout)),
+                "detector_state",
+                futures::FutureExt::boxed(self.detector_state.connect(timeout)),
             ),
             (
                 "nd_attributes_file",
@@ -449,7 +449,7 @@ impl AreaDetectorCam {
     /// `timeout` elapses.
     pub async fn wait_for_idle(&self, timeout: Duration) -> Result<()> {
         let good = [AD_STATE_IDLE, AD_STATE_ABORTED];
-        wait_for_good_state(&self.detector_state_rbv, &good, timeout).await
+        wait_for_good_state(&self.detector_state, &good, timeout).await
     }
 
     /// ophyd-async-style warmup: acquire exactly one frame so the
@@ -638,18 +638,18 @@ pub struct NdFile {
     pub num_capture: Arc<SignalRW<i64, EpicsCaBackend<i64>>>,
     /// `NumCaptured_RBV` (longin) — frames written to the file so far.
     /// This is the per-frame write index the `DetectorWriter` reports.
-    pub num_captured_rbv: Arc<SignalR<i64, EpicsCaBackend<i64>>>,
+    pub num_captured: Arc<SignalR<i64, EpicsCaBackend<i64>>>,
     /// `FullFileName_RBV` (CHAR waveform) — absolute path the IOC
     /// resolved from `FilePath`/`FileName`/`FileTemplate`/`FileNumber`.
     /// The `StreamResource` URI is built from this readback so it points
     /// at the file the IOC actually wrote, not at a re-derived guess.
-    pub full_file_name_rbv: Arc<SignalR<String, EpicsCaBackend<String>>>,
+    pub full_file_name: Arc<SignalR<String, EpicsCaBackend<String>>>,
     /// `FileNumber` (longout) — next file's sequence number, substituted
     /// into `FileTemplate`.
     pub file_number: Arc<SignalRW<i64, EpicsCaBackend<i64>>>,
     /// `FilePathExists_RBV` (bi) — whether the IOC can see (and write)
     /// `FilePath`. Checked after configuring the paths.
-    pub file_path_exists_rbv: Arc<SignalR<bool, EpicsCaBackend<bool>>>,
+    pub file_path_exists: Arc<SignalR<bool, EpicsCaBackend<bool>>>,
     /// `CreateDirectory` (longout) — how many missing trailing path levels
     /// the IOC may create when `FilePath` is processed (`0` = none).
     pub create_directory: Arc<SignalRW<i64, EpicsCaBackend<i64>>>,
@@ -669,10 +669,10 @@ impl NdFile {
             capture: busy_signal(&prefix, "Capture"),
             capture_rbv: ca_signal(&prefix, "Capture_RBV"),
             num_capture: ca_signal(&prefix, "NumCapture"),
-            num_captured_rbv: ca_signal(&prefix, "NumCaptured_RBV"),
-            full_file_name_rbv: ca_signal(&prefix, "FullFileName_RBV"),
+            num_captured: ca_signal(&prefix, "NumCaptured_RBV"),
+            full_file_name: ca_signal(&prefix, "FullFileName_RBV"),
             file_number: ca_signal(&prefix, "FileNumber"),
-            file_path_exists_rbv: ca_signal(&prefix, "FilePathExists_RBV"),
+            file_path_exists: ca_signal(&prefix, "FilePathExists_RBV"),
             create_directory: ca_signal(&prefix, "CreateDirectory"),
             plugin,
         }
@@ -714,20 +714,20 @@ impl NdFile {
                 futures::FutureExt::boxed(self.num_capture.connect(timeout)),
             ),
             (
-                "num_captured_rbv",
-                futures::FutureExt::boxed(self.num_captured_rbv.connect(timeout)),
+                "num_captured",
+                futures::FutureExt::boxed(self.num_captured.connect(timeout)),
             ),
             (
-                "full_file_name_rbv",
-                futures::FutureExt::boxed(self.full_file_name_rbv.connect(timeout)),
+                "full_file_name",
+                futures::FutureExt::boxed(self.full_file_name.connect(timeout)),
             ),
             (
                 "file_number",
                 futures::FutureExt::boxed(self.file_number.connect(timeout)),
             ),
             (
-                "file_path_exists_rbv",
-                futures::FutureExt::boxed(self.file_path_exists_rbv.connect(timeout)),
+                "file_path_exists",
+                futures::FutureExt::boxed(self.file_path_exists.connect(timeout)),
             ),
             (
                 "create_directory",
@@ -799,7 +799,7 @@ impl NdFile {
     /// Read `FilePathExists_RBV` — whether the IOC can see the configured
     /// `FilePath`.
     pub async fn file_path_exists(&self) -> Result<bool> {
-        self.file_path_exists_rbv.get().await
+        self.file_path_exists.get().await
     }
 
     /// Start capture (`Capture=1`). In Stream mode the file opens on this
@@ -826,14 +826,14 @@ impl NdFile {
 
     /// Read `NumCaptured_RBV` — frames written so far (clamped to `>= 0`).
     pub async fn num_captured(&self) -> Result<u64> {
-        let n = self.num_captured_rbv.get().await?;
+        let n = self.num_captured.get().await?;
         Ok(n.max(0) as u64)
     }
 
     /// Read `FullFileName_RBV` — the absolute path the IOC resolved, with any
     /// trailing NUL padding from the CHAR waveform stripped.
     pub async fn full_file_name(&self) -> Result<String> {
-        let s = self.full_file_name_rbv.get().await?;
+        let s = self.full_file_name.get().await?;
         Ok(s.trim_end_matches('\0').to_string())
     }
 
@@ -1399,13 +1399,13 @@ impl AdFileIo for NdFileIo {
     async fn connect(&self, timeout: Duration) -> Result<()> {
         self.file.connect(timeout).await?;
         let tx = self.index_tx.clone();
-        let token =
-            self.file
-                .file
-                .num_captured_rbv
-                .subscribe(Box::new(move |v: &i64, _ts, _alarm| {
-                    let _ = tx.send((*v).max(0) as u64);
-                }));
+        let token = self
+            .file
+            .file
+            .num_captured
+            .subscribe(Box::new(move |v: &i64, _ts, _alarm| {
+                let _ = tx.send((*v).max(0) as u64);
+            }));
         *self.token.lock().unwrap() = Some(token);
         Ok(())
     }
@@ -1485,7 +1485,7 @@ impl AdFileIo for NdPluginFileIo {
         let tx = self.index_tx.clone();
         let token = self
             .file
-            .num_captured_rbv
+            .num_captured
             .subscribe(Box::new(move |v: &i64, _ts, _alarm| {
                 let _ = tx.send((*v).max(0) as u64);
             }));
@@ -2612,9 +2612,9 @@ mod tests {
     }
 
     /// A signal field is the last part of its PV in snake case, `_RBV`
-    /// dropped. bsrs keeps a readback apart from its setpoint, so the field
-    /// may keep `_rbv` where the PV has `_RBV`.
-    fn assert_regularly_named(field: &str, source: &str) {
+    /// dropped. bsrs keeps a readback apart from its setpoint, so a readback
+    /// whose setpoint is among the device's `fields` keeps `_rbv`.
+    fn assert_regularly_named(field: &str, source: &str, fields: &[&str]) {
         let pv = source.strip_prefix("ca://").unwrap();
         let pv = pv.rsplit(':').next().unwrap();
         let (pv, rbv) = match pv.strip_suffix("_RBV") {
@@ -2622,7 +2622,7 @@ mod tests {
             None => (pv, false),
         };
         let base = match field.strip_suffix("_rbv") {
-            Some(base) if rbv => base,
+            Some(base) if rbv && fields.contains(&base) => base,
             _ => field,
         };
         assert_eq!(base, underscore(pv), "{field} reads {source}");
@@ -2633,7 +2633,8 @@ mod tests {
     macro_rules! assert_signals_regularly_named {
         ($dev:expr => $ty:ident { $($signal:ident),+ ; $($other:ident),* }) => {{
             let $ty { $($signal,)+ $($other: _,)* } = &$dev;
-            $(assert_regularly_named(stringify!($signal), &$signal.source());)+
+            let fields = [$(stringify!($signal)),+];
+            $(assert_regularly_named(stringify!($signal), &$signal.source(), &fields);)+
         }};
     }
 
@@ -2736,7 +2737,7 @@ mod tests {
         assert_signals_regularly_named!(cam => AreaDetectorCam {
             image_mode, num_images, acquire, acquire_rbv, acquire_time,
             acquire_period, acquire_time_rbv, acquire_period_rbv,
-            array_counter_rbv, detector_state_rbv, nd_attributes_file,
+            array_counter, detector_state, nd_attributes_file,
             wait_for_plugins; prefix, frame_info, acquire_status
         });
         assert_signals_regularly_named!(*cam.frame_info => NdArrayDescription {
@@ -2750,8 +2751,8 @@ mod tests {
         assert_signals_regularly_named!(hdf.file => NdFile {
             file_path, file_name, file_template, auto_increment,
             file_write_mode, capture, capture_rbv, num_capture,
-            num_captured_rbv, full_file_name_rbv, file_number,
-            file_path_exists_rbv, create_directory; plugin
+            num_captured, full_file_name, file_number,
+            file_path_exists, create_directory; plugin
         });
         assert_signals_regularly_named!(hdf.file.plugin => NdPlugin {
             enable_callbacks, blocking_callbacks, nd_array_port, queue_size;

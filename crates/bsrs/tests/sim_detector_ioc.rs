@@ -1334,20 +1334,12 @@ async fn warmup_takes_a_frame_and_restores_the_cam() {
 
     let prev_mode = cam.image_mode.get().await.expect("read ImageMode");
     let prev_num = cam.num_images.get().await.expect("read NumImages");
-    let c0 = cam
-        .array_counter_rbv
-        .get()
-        .await
-        .expect("read ArrayCounter");
+    let c0 = cam.array_counter.get().await.expect("read ArrayCounter");
 
     cam.warmup().await.expect("warmup");
 
-    let c1 = cam
-        .array_counter_rbv
-        .get()
-        .await
-        .expect("read ArrayCounter");
-    let state = cam.detector_state_rbv.get().await.expect("read state");
+    let c1 = cam.array_counter.get().await.expect("read ArrayCounter");
+    let state = cam.detector_state.get().await.expect("read state");
     assert!(
         c1 > c0,
         "warmup did not acquire any frame (counter {c0} -> {c1})"
