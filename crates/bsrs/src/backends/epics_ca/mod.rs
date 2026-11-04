@@ -8,7 +8,7 @@
 //!   Subscription tokens propagate `Drop` to `MonitorHandle::drop`,
 //!   satisfying rule **K2**.
 //! - **`--no-default-features`**: exposes [`EpicsCaBackend`] as a stub whose
-//!   methods all return the `epics-ca backend disabled` error, letting the
+//!   methods all return the `Protocol ca not available` error, letting the
 //!   rest of the workspace compile without dragging in `epics-ca-rs`.
 
 #![deny(missing_docs)]

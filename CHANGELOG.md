@@ -263,6 +263,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   first reading, and `ValueTimeout.last` is `None` when none arrived. The
   suspenders take a `&Arc<Fanout<T>>`, held weakly, which `ca_watch_f64` and
   `ca_watch_bool` return.
+- Without the `ca` / `pva` feature, the EPICS backends fail with
+  ophyd-async's text, ``Protocol ca not available, did you build bsrs with
+  `--features ca`?``, not `epics-ca backend disabled`.
 
 ### Removed
 
