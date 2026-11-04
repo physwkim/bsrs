@@ -40,7 +40,8 @@ const MAX_ARRAY_BYTES: &str = "16000000";
 
 /// Boot `bin` from `examples/<example>` once per process and point the CA
 /// and PVA clients at it, or start it again if a test stopped it. Call it
-/// before any client exists.
+/// before any client exists. An absolute `example` is a directory of this
+/// crate's own, holding its `ioc/st.cmd`.
 pub fn boot(bin: &str, example: &str) {
     let booted = BOOTED.get_or_init(|| start(bin, example));
     assert_eq!(
