@@ -13,6 +13,8 @@
 //! The IOC exits with this process: its iocsh ends on stdin EOF.
 //! `outage.rs` stops it and starts it again on the same ports.
 
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, UdpSocket};
 use std::path::PathBuf;
@@ -35,6 +37,8 @@ pub static BOOTED: OnceLock<Booted> = OnceLock::new();
 const READY: &str = "BSRS_EXAMPLE_IOC_READY";
 const BOOT_TIMEOUT: Duration = Duration::from_secs(120);
 const ATTEMPTS: usize = 16;
+// Above the EPICS defaults (5064, 5075) and other well-known services.
+const PORT_FLOOR: u16 = 10000;
 // Room for a full detector frame over CA; the C default is 16 kB.
 const MAX_ARRAY_BYTES: &str = "16000000";
 
@@ -102,18 +106,36 @@ fn start(bin: &str, example: &str) -> Booted {
     panic!("{bin} lost its port {ATTEMPTS} times in a row");
 }
 
-/// A CA port free on TCP and UDP and a distinct PVA port free on TCP. A hint
-/// only: the IOC's bind is the verdict.
-fn free_ports() -> (u16, u16) {
+/// A CA port free on TCP and UDP and a distinct PVA port free on TCP, both
+/// below [`ephemeral_start`]. A hint only: the IOC's bind is the verdict.
+pub fn free_ports() -> (u16, u16) {
+    let ports = PORT_FLOOR..ephemeral_start();
+    assert!(!ports.is_empty(), "no ports between {ports:?}");
+    let pick = || {
+        let n = RandomState::new().hash_one(());
+        ports.start + (n % ports.len() as u64) as u16
+    };
     loop {
-        let ca = TcpListener::bind("0.0.0.0:0").expect("an ephemeral port");
-        let ca_port = ca.local_addr().expect("bound").port();
-        if UdpSocket::bind(("0.0.0.0", ca_port)).is_err() {
-            continue;
+        let (ca, pva) = (pick(), pick());
+        if ca != pva
+            && TcpListener::bind(("0.0.0.0", ca)).is_ok()
+            && UdpSocket::bind(("0.0.0.0", ca)).is_ok()
+            && TcpListener::bind(("0.0.0.0", pva)).is_ok()
+        {
+            return (ca, pva);
         }
-        let pva = TcpListener::bind("0.0.0.0:0").expect("an ephemeral port");
-        return (ca_port, pva.local_addr().expect("bound").port());
     }
+}
+
+/// The first port the kernel hands out by itself. The IOC's ports lie below
+/// it, so no socket bound to port 0, nor a connect to the stopped IOC, can
+/// take one while an outage test has the IOC down.
+pub fn ephemeral_start() -> u16 {
+    std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .ok()
+        .and_then(|range| range.split_whitespace().next()?.parse().ok())
+        // Linux's default; macOS and Windows start at 49152.
+        .unwrap_or(32768)
 }
 
 /// Boot `bin` on CA port `ca` and PVA port `pva`. `None` only when the IOC

@@ -24,6 +24,13 @@ async fn ca_and_pva_reach_the_booted_ioc() {
     assert_eq!(pva.get_value().await.unwrap(), 25.0);
 }
 
+#[test]
+fn the_ioc_ports_lie_below_the_ephemeral_range() {
+    let (ca, pva) = example_ioc::free_ports();
+    let start = example_ioc::ephemeral_start();
+    assert!(ca < start && pva < start, "{ca}/{pva} not below {start}");
+}
+
 fn free_tcp() -> u16 {
     let l = TcpListener::bind("0.0.0.0:0").unwrap();
     l.local_addr().unwrap().port()
