@@ -38,14 +38,15 @@ use crate::core::msg::{NamedObj, StageableObj};
 use crate::core::reading::ReadingValue;
 use crate::core::status::{Status, StatusError, SubToken};
 use crate::devices::device::Device;
+use crate::devices::observe::set_and_wait_for_other_value;
 use crate::devices::signal::{Access, Read, Readable, Signal, SignalR, SignalRW};
 use crate::devices::stage_sigs::StageSigs;
 use crate::devices::BackendFromPv;
 use crate::devices::{wait_for_connection, PathInfo, PathProvider, PurePath, StandardDetector};
 use crate::event_model::{DataKey, Dtype, StreamDatum, StreamRange, StreamResource};
 use crate::protocols_async::{
-    DetectorControl, DetectorTrigger, DetectorWriter, SignalBackend, SingleDataLogic, StreamAsset,
-    TriggerInfo,
+    AsyncSubscribable, DetectorControl, DetectorTrigger, DetectorWriter, SignalBackend,
+    SingleDataLogic, StreamAsset, TriggerInfo,
 };
 use futures::stream::{BoxStream, StreamExt};
 use std::collections::HashMap;
@@ -154,43 +155,16 @@ where
 }
 
 /// Run `set`, then wait until the bool readback `rbv` has been `want`,
-/// bounded by [`PUT_TIMEOUT`]; returns what `set` returned. Port of
-/// ophyd-async `set_and_wait_for_other_value(..., wait_for_set_completion=
-/// False)`, used for busy records whose put-callback tracks the operation,
-/// not the value. The readback's monitor has delivered its current value
-/// before `set` runs, so a transition back out of `want` (a 1 ms
-/// acquisition's Acquire_RBV pulse) is still seen.
+/// bounded by [`PUT_TIMEOUT`]; returns what `set` returned. Used for busy
+/// records whose put-callback tracks the operation, not the value.
 async fn set_and_wait_for_bool<R>(
     rbv: &SignalR<bool, EpicsCaBackend<bool>>,
     want: bool,
     set: impl std::future::Future<Output = Result<R>>,
-    what: &str,
 ) -> Result<R> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let _sub = rbv.subscribe(Box::new(move |v: &bool, _, _| {
-        let _ = tx.send(*v);
-    }));
-    let deadline = tokio::time::Instant::now() + PUT_TIMEOUT;
-    let mut last = match tokio::time::timeout_at(deadline, rx.recv()).await {
-        Ok(Some(v)) => v,
-        _ => {
-            return Err(BsrsError::Backend(format!(
-                "{what}: no initial value within {PUT_TIMEOUT:?}, is it connected?"
-            )))
-        }
-    };
-    let out = set.await?;
-    while last != want {
-        last = match tokio::time::timeout_at(deadline, rx.recv()).await {
-            Ok(Some(v)) => v,
-            _ => {
-                return Err(BsrsError::Backend(format!(
-                    "{what}: readback did not reach {want} within {PUT_TIMEOUT:?}"
-                )))
-            }
-        };
-    }
-    Ok(out)
+    let sub = AsyncSubscribable::subscribe(rbv).await?;
+    let want = serde_json::json!(want);
+    set_and_wait_for_other_value(sub, set, |r| r.value == want, PUT_TIMEOUT).await
 }
 
 /// Cam-side handle: `ImageMode`/`NumImages`/`Acquire`/`AcquireTime`
@@ -828,13 +802,7 @@ impl NdFile {
             tokio::spawn(self.capture.put_start(true).await?);
             Ok(())
         };
-        set_and_wait_for_bool(
-            &self.capture_rbv,
-            true,
-            put,
-            "NdFile::start_capture: Capture_RBV",
-        )
-        .await
+        set_and_wait_for_bool(&self.capture_rbv, true, put).await
     }
 
     /// Stop capture (`Capture=0`) — flushes and closes the file. Same busy
@@ -842,13 +810,7 @@ impl NdFile {
     /// `Capture_RBV=0` (ophyd-async `stop_busy_record`).
     pub async fn stop_capture(&self) -> Result<()> {
         let put = async { Ok(self.capture.put(false).await.await?) };
-        set_and_wait_for_bool(
-            &self.capture_rbv,
-            false,
-            put,
-            "NdFile::stop_capture: Capture_RBV",
-        )
-        .await
+        set_and_wait_for_bool(&self.capture_rbv, false, put).await
     }
 
     /// Read `NumCaptured_RBV` — frames written so far (clamped to `>= 0`).
@@ -2373,14 +2335,7 @@ impl DetectorControl for AreaDetectorCam {
         // completion is stashed for `wait_for_idle`, deliberately unbounded.
         // Acquire=1 is sent here, not in the spawned task, so a later
         // disarm's Acquire=0 cannot overtake it on the wire.
-        match set_and_wait_for_bool(
-            &self.acquire_rbv,
-            true,
-            self.acquire.put_start(true),
-            "arm: Acquire_RBV",
-        )
-        .await
-        {
+        match set_and_wait_for_bool(&self.acquire_rbv, true, self.acquire.put_start(true)).await {
             Ok(done) => {
                 let (acquired, setter) = Status::new();
                 let prefix = self.prefix.clone();
@@ -2395,7 +2350,7 @@ impl DetectorControl for AreaDetectorCam {
                 *self.acquire_status.lock().unwrap() = Some(acquired);
                 Status::done()
             }
-            Err(e) => Status::fail(StatusError::Failed(format!("{}{e}", self.prefix))),
+            Err(e) => Status::fail(StatusError::Failed(e.to_string())),
         }
     }
     async fn wait_for_idle(&self) -> Result<()> {
@@ -2412,12 +2367,9 @@ impl DetectorControl for AreaDetectorCam {
         // stop_busy_record: a put-callback for Acquire=0 can deadlock on a
         // busy record, so `acquire` sends it without one; then wait for the
         // readback.
-        set_and_wait_for_bool(
-            &self.acquire_rbv,
-            false,
-            async { Ok(self.acquire.put(false).await.await?) },
-            "disarm: Acquire_RBV",
-        )
+        set_and_wait_for_bool(&self.acquire_rbv, false, async {
+            Ok(self.acquire.put(false).await.await?)
+        })
         .await
     }
     async fn read_configuration(&self, name: &str) -> Result<HashMap<String, ReadingValue>> {

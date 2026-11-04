@@ -9,8 +9,9 @@ pub enum BsrsError {
     /// Operation timed out.
     #[error("timeout after {0:?}")]
     Timeout(std::time::Duration),
-    /// [`wait_for_value`](crate::devices::wait_for_value) timed out; the
-    /// message is ophyd-async `wait_for_value`'s `TimeoutError` text.
+    /// [`wait_for_value`](crate::devices::wait_for_value), or an areaDetector
+    /// readback waited on after a put, timed out; the message is ophyd-async
+    /// `wait_for_value`'s `TimeoutError` text.
     #[error(
         "{name} didn't match {matcher} in {}s, last value {}",
         .timeout.as_secs_f64(),

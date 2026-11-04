@@ -81,29 +81,88 @@ where
     // The timer covers the first value too (ophyd-async wraps the whole
     // `observe_value` in `asyncio.timeout`).
     let mut last = None;
-    let fut = async {
-        loop {
-            let r = sub
-                .recv()
-                .await
-                .ok_or_else(|| BsrsError::Backend("subscription channel closed".into()))?;
-            if predicate(&r) {
-                return Ok(r);
-            }
-            last = Some(r);
-        }
-    };
+    let fut = next_match(&mut sub, &mut predicate, &mut last);
     match timeout {
         Some(d) => match tokio::time::timeout(d, fut).await {
             Ok(r) => r,
-            Err(_) => Err(BsrsError::ValueTimeout {
-                name: sub.key().to_string(),
-                matcher: matcher_name::<F>(),
-                timeout: d,
-                last: last.map(|r| Box::new(r.value)),
-            }),
+            Err(_) => Err(value_timeout::<F>(&sub, d, last)),
         },
         None => fut.await,
+    }
+}
+
+/// Wait for `sub`'s first value, run `set`, then wait until a value
+/// satisfies `predicate`, all within `timeout`; returns what `set` returned.
+/// Port of ophyd-async `set_and_wait_for_other_value(...,
+/// wait_for_set_completion=False)`: the first value is in hand before `set`
+/// runs, so a change `set` causes, even one already undone, is queued
+/// behind it. With no first value it fails with ophyd-async's
+/// "didn't provide an initial value" text, else as [`wait_for_value`].
+pub(crate) async fn set_and_wait_for_other_value<F, R>(
+    mut sub: Subscription,
+    set: impl std::future::Future<Output = Result<R, BsrsError>>,
+    mut predicate: F,
+    timeout: Duration,
+) -> Result<R, BsrsError>
+where
+    F: FnMut(&ReadingValue) -> bool,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    let Ok(first) = tokio::time::timeout_at(deadline, sub.recv()).await else {
+        return Err(BsrsError::Other(format!(
+            "{} didn't provide an initial value within {}s, is it connected?",
+            sub.key(),
+            timeout.as_secs_f64()
+        )));
+    };
+    let first = first.ok_or_else(closed)?;
+    let out = set.await?;
+    if !predicate(&first) {
+        let mut last = Some(first);
+        let fut = next_match(&mut sub, &mut predicate, &mut last);
+        match tokio::time::timeout_at(deadline, fut).await {
+            Ok(r) => {
+                r?;
+            }
+            Err(_) => return Err(value_timeout::<F>(&sub, timeout, last)),
+        }
+    }
+    Ok(out)
+}
+
+/// The next value from `sub` that satisfies `predicate`, keeping each one
+/// that does not in `last`.
+async fn next_match<F>(
+    sub: &mut Subscription,
+    predicate: &mut F,
+    last: &mut Option<ReadingValue>,
+) -> Result<ReadingValue, BsrsError>
+where
+    F: FnMut(&ReadingValue) -> bool,
+{
+    loop {
+        let r = sub.recv().await.ok_or_else(closed)?;
+        if predicate(&r) {
+            return Ok(r);
+        }
+        *last = Some(r);
+    }
+}
+
+fn closed() -> BsrsError {
+    BsrsError::Backend("subscription channel closed".into())
+}
+
+fn value_timeout<F>(
+    sub: &Subscription,
+    timeout: Duration,
+    last: Option<ReadingValue>,
+) -> BsrsError {
+    BsrsError::ValueTimeout {
+        name: sub.key().to_string(),
+        matcher: matcher_name::<F>(),
+        timeout,
+        last: last.map(|r| Box::new(r.value)),
     }
 }
 
@@ -229,6 +288,60 @@ mod tests {
             err.to_string(),
             "x didn't match <closure> in 0.05s, last value None"
         );
+    }
+
+    // ophyd-async test_set_and_wait_for_other_value_gives_helpful_error_with_no_first_value
+    #[tokio::test(start_paused = true)]
+    async fn set_and_wait_with_no_first_value_never_sets() {
+        let f = Fanout::<ReadingValue>::default();
+        let sub = Subscription::new(f.listen(), SubToken::noop(), "m");
+        let set = async { Err::<(), _>(BsrsError::Other("set ran".into())) };
+        let err = set_and_wait_for_other_value(sub, set, |_| true, Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "m didn't provide an initial value within 0.05s, is it connected?"
+        );
+    }
+
+    // ophyd-async test_set_and_wait_for_value_different_set_and_read_times_out,
+    // with test_acquire_logic_when_arming_times_out's message.
+    #[tokio::test(start_paused = true)]
+    async fn set_and_wait_times_out_with_the_last_value_seen() {
+        let (f, sub) = fanout_at(0.0, "m");
+        let set = async {
+            f.post(reading(1.0));
+            Ok(())
+        };
+        let err = set_and_wait_for_other_value(
+            sub,
+            set,
+            |r| r.value == json!(2.0),
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "m didn't match <closure> in 0.05s, last value 1.0"
+        );
+    }
+
+    // A pulse the set causes is over before the wait polls (a 1 ms
+    // acquisition's Acquire_RBV 0 → 1 → 0), and still matches.
+    #[tokio::test(start_paused = true)]
+    async fn set_and_wait_sees_a_pulse_the_set_caused() {
+        let (f, sub) = fanout_at(0.0, "m");
+        let set = async {
+            f.post(reading(1.0));
+            f.post(reading(0.0));
+            Ok("set")
+        };
+        let out = set_and_wait_for_other_value(sub, set, |r| r.value == json!(1.0), Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(out, "set");
     }
 
     #[test]

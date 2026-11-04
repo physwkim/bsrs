@@ -266,6 +266,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Without the `ca` / `pva` feature, the EPICS backends fail with
   ophyd-async's text, ``Protocol ca not available, did you build bsrs with
   `--features ca`?``, not `epics-ca backend disabled`.
+- `AreaDetectorCam::arm`/`disarm` and `NdFile::start_capture`/`stop_capture`
+  wait for their readback as ophyd-async `set_and_wait_for_other_value`
+  does: a readback that never matches is a `ValueTimeout` with the last
+  value seen, one that never reports `didn't provide an initial value`, and
+  an arm failure no longer starts with the cam's prefix.
 
 ### Removed
 
