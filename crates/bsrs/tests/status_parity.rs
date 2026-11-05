@@ -435,7 +435,7 @@ async fn an_operation_timeout_fails_the_plan_as_a_status_failure() {
         let result = RunEngine::new(vec![]).run_async(plan).await.unwrap();
         assert!(
             matches!(
-                result.exception,
+                result.exception.as_deref(),
                 Some(BsrsError::Status(StatusError::Timeout(_)))
             ),
             "{:?}",

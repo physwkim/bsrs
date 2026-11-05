@@ -97,7 +97,7 @@ pub fn run_wrapper(inner: Plan, md: RunMetadata) -> Plan {
         yield PlanItem::from(Msg::OpenRun(md));
         let except: ExceptPlan = Box::new(|thrown| {
             let (exit_status, reason) = match thrown {
-                Thrown::Error(text) => ("fail".to_string(), Some(text)),
+                Thrown::Error(e) => ("fail".to_string(), Some(e.to_string())),
                 Thrown::Interrupt(kind, reason) => (kind.exit_status().to_string(), reason),
             };
             plan_items(async_stream::stream! {

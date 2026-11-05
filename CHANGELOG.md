@@ -304,6 +304,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `AreaDetectorCam::acquire_rbv`, `NdFile::capture_rbv` and
   `NdFileHdf5::num_frames_chunks_rbv` are removed; read `acquire`,
   `capture` and `num_frames_chunks`.
+- **Breaking**: `Thrown::Error` carries the handler's error as an
+  `Arc<BsrsError>` instead of its text, and `RunResult::exception` is that
+  same `Arc`.
 
 ### Removed
 
@@ -314,6 +317,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `EpicsPvaBackend<String>` an int8 array.
 - **Breaking**: `connect_area_detector_hdf` and
   `connect_area_detector_multipart`; use `StandardDetector::connect`.
+- **Breaking**: `BsrsError::Interrupted` and `impl From<Thrown> for
+  BsrsError`, which only carried a re-raise through the message handlers.
 
 ### Fixed
 
@@ -344,6 +349,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `wait_for_value` cannot wait forever on it, a monitored device emits an
   Event for each reading and a suspender trips on a glitch. `observe_value`
   no longer yields a null reading before the first one arrives.
+- An error re-raised through nested contingency regions, such as
+  `run_wrapper` around `finalize_wrapper`, gained a "plan logic error: "
+  prefix per region and became `BsrsError::Plan`; a re-raise now throws the
+  caught error unchanged.
 
 ## [0.5.8] - 2026-09-22
 

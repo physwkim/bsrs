@@ -866,7 +866,7 @@ async fn run_result_on_failure_carries_typed_exception_and_reason() {
     );
     // The typed error is carried so callers can match on the variant, not just
     // re-parse a string.
-    match &result.exception {
+    match result.exception.as_deref() {
         Some(BsrsError::Plan(m)) => assert_eq!(m.as_str(), "boom"),
         other => panic!("expected a Plan exception carrying \"boom\", got {other:?}"),
     }
