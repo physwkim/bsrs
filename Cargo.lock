@@ -1759,8 +1759,8 @@ checksum = "869b0adbda23651a9c5c0c3d270aac9fcb52e8622a8f2b17e57802d7791962f2"
 
 [[package]]
 name = "epics-base-rs"
-version = "0.33.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#2c1db5edd3cefb7df902dd7a0d7037006a7d8ee6"
+version = "0.34.0"
+source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#3718d7ea016481cef6e69b2af8b8afc2be9033e4"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1785,8 +1785,8 @@ dependencies = [
 
 [[package]]
 name = "epics-ca-rs"
-version = "0.33.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#2c1db5edd3cefb7df902dd7a0d7037006a7d8ee6"
+version = "0.34.0"
+source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#3718d7ea016481cef6e69b2af8b8afc2be9033e4"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1809,8 +1809,8 @@ dependencies = [
 
 [[package]]
 name = "epics-libcom-rs"
-version = "0.33.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#2c1db5edd3cefb7df902dd7a0d7037006a7d8ee6"
+version = "0.34.0"
+source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#3718d7ea016481cef6e69b2af8b8afc2be9033e4"
 dependencies = [
  "chrono",
  "hostname",
@@ -1825,8 +1825,8 @@ dependencies = [
 
 [[package]]
 name = "epics-macros-rs"
-version = "0.33.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#2c1db5edd3cefb7df902dd7a0d7037006a7d8ee6"
+version = "0.34.0"
+source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#3718d7ea016481cef6e69b2af8b8afc2be9033e4"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1836,8 +1836,8 @@ dependencies = [
 
 [[package]]
 name = "epics-pva-rs"
-version = "0.33.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#2c1db5edd3cefb7df902dd7a0d7037006a7d8ee6"
+version = "0.34.0"
+source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#3718d7ea016481cef6e69b2af8b8afc2be9033e4"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -1875,8 +1875,8 @@ dependencies = [
 
 [[package]]
 name = "epics-rtems-boot"
-version = "0.33.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#2c1db5edd3cefb7df902dd7a0d7037006a7d8ee6"
+version = "0.34.0"
+source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#3718d7ea016481cef6e69b2af8b8afc2be9033e4"
 dependencies = [
  "cc",
  "libc",
@@ -6590,7 +6590,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

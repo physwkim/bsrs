@@ -307,6 +307,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Breaking**: `Thrown::Error` carries the handler's error as an
   `Arc<BsrsError>` instead of its text, and `RunResult::exception` is that
   same `Arc`.
+- EPICS backends move to epics-rs 0.34.0 (`epics-ca-rs`, `epics-base-rs`,
+  `epics-pva-rs`) from 0.30.0.
 
 ### Removed
 
