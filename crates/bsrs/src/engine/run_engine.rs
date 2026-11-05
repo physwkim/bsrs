@@ -177,8 +177,9 @@ pub struct RunResult {
     /// empty when the plan completed cleanly. bluesky `RunEngineResult.reason`.
     pub reason: String,
     /// The error that failed the run, if any — `Some` only on the `fail` path,
-    /// `None` on success/abort/halt. bluesky `RunEngineResult.exception`.
-    pub exception: Option<BsrsError>,
+    /// `None` on success/abort/halt. The same error the plan's `except_plan`s
+    /// were handed. bluesky `RunEngineResult.exception`.
+    pub exception: Option<Arc<BsrsError>>,
 }
 
 /// Per-call options for [`RunEngine::run_async_with`]. Mirrors
@@ -1637,7 +1638,7 @@ impl RunEngine {
         &self,
         run_uids: Vec<String>,
         exit_status: String,
-        exception: Option<BsrsError>,
+        exception: Option<Arc<BsrsError>>,
     ) -> RunResult {
         // Interrupted = anything but a clean run to completion. bluesky sets
         // `_interrupted` on pause/stop/abort/halt/fail; a natural end leaves it
@@ -1702,10 +1703,16 @@ impl RunEngine {
             if let Some(h) = self.msg_hook.lock().unwrap().clone() {
                 h(&msg);
             }
-            match self.handle(msg).await {
-                Ok(Some(uid)) => run_uids.push(uid),
-                Ok(None) => {}
-                Err(e) => {
+            let thrown = match msg {
+                // A re-raise throws the value it carries on unchanged, as
+                // Python's bare `raise` does; handled as a message error it
+                // would be wrapped again by every enclosing region.
+                Msg::Raise(thrown) => Some(thrown),
+                msg => match self.handle(msg).await {
+                    Ok(uid) => {
+                        run_uids.extend(uid);
+                        None
+                    }
                     // What the plan sees at its `yield`. A handler cancelled while
                     // an interrupt request is outstanding is that request arriving
                     // (`stop`/`abort`/`halt` cancel the token to unpark an in-flight
@@ -1715,46 +1722,41 @@ impl RunEngine {
                     // `CancelledError` in the "pausing" state (run_engine.py:
                     // 1710-1716) — and the pause gate takes it from here.
                     // `Cancelled` with no request outstanding (a device cancelling
-                    // its own status) stays a failure. `Interrupted` is a
-                    // `Msg::Raise` of an interrupt a wrapper finished unwinding: it
-                    // keeps propagating outward.
-                    let thrown = match &e {
-                        BsrsError::Cancelled => match self.take_interrupt(&mut thrown_seq) {
-                            None if self.pause_pending(pause_seen) => continue,
-                            None => Thrown::Error(e.to_string()),
-                            Some(InterruptRequest::Halt) => {
-                                return self.end_interrupted(run_uids, "halt").await;
-                            }
-                            Some(InterruptRequest::Throw(kind)) => {
-                                Thrown::Interrupt(kind, self.stop_reason())
-                            }
-                        },
-                        BsrsError::Interrupted(kind) => {
-                            Thrown::Interrupt(*kind, self.stop_reason())
+                    // its own status) stays a failure.
+                    Err(BsrsError::Cancelled) => match self.take_interrupt(&mut thrown_seq) {
+                        None if self.pause_pending(pause_seen) => continue,
+                        None => Some(Thrown::Error(Arc::new(BsrsError::Cancelled))),
+                        Some(InterruptRequest::Halt) => {
+                            return self.end_interrupted(run_uids, "halt").await;
                         }
-                        _ => Thrown::Error(e.to_string()),
-                    };
-                    if self.throw_into_plan(thrown.clone()).await {
-                        tracing::debug!("thrown into the plan: {thrown:?}");
-                        continue;
-                    }
-                    // Nothing in the plan catches it: the run ends the way the
-                    // value leaving bluesky's plan stack ends `_run` — an
-                    // interrupt with its exit status, an error as `fail`.
-                    return match thrown {
-                        Thrown::Interrupt(kind, _) => {
-                            self.end_interrupted(run_uids, kind.exit_status()).await
+                        Some(InterruptRequest::Throw(kind)) => {
+                            Some(Thrown::Interrupt(kind, self.stop_reason()))
                         }
-                        Thrown::Error(text) => {
-                            tracing::error!("plan error: {text}");
-                            self.drain_and_close("fail", Some(text)).await?;
-                            // Move the error itself into the result so callers can
-                            // match on its variant (bluesky's
-                            // `RunEngineResult.exception`).
-                            Ok(self.build_result(run_uids, "fail".into(), Some(e)))
-                        }
-                    };
+                    },
+                    Err(e) => Some(Thrown::Error(Arc::new(e))),
+                },
+            };
+            if let Some(thrown) = thrown {
+                if self.throw_into_plan(thrown.clone()).await {
+                    tracing::debug!("thrown into the plan: {thrown:?}");
+                    continue;
                 }
+                // Nothing in the plan catches it: the run ends the way the
+                // value leaving bluesky's plan stack ends `_run` — an
+                // interrupt with its exit status, an error as `fail`.
+                return match thrown {
+                    Thrown::Interrupt(kind, _) => {
+                        self.end_interrupted(run_uids, kind.exit_status()).await
+                    }
+                    Thrown::Error(e) => {
+                        tracing::error!("plan error: {e}");
+                        self.drain_and_close("fail", Some(e.to_string())).await?;
+                        // The error itself goes into the result so callers can
+                        // match on its variant (bluesky's
+                        // `RunEngineResult.exception`).
+                        Ok(self.build_result(run_uids, "fail".into(), Some(e)))
+                    }
+                };
             }
             // Hand the engine's result back to a `Respond`-issuing plan so it can
             // branch on it inline (e.g. `collect_while_completing` looping on the
@@ -1973,6 +1975,10 @@ impl RunEngine {
                 Some(PlanItem::Respond(m, tx)) => (m, Some(tx)),
                 None => break,
             };
+            if let Msg::Raise(thrown) = &m {
+                tracing::warn!("suspender injected plan raised {thrown:?}");
+                break;
+            }
             if let Err(e) = self.handle(m).await {
                 tracing::warn!("suspender injected plan message failed: {e}");
                 break;
@@ -2812,8 +2818,10 @@ impl RunEngine {
             Msg::Fail(reason) => {
                 return Err(BsrsError::Plan(reason));
             }
-            Msg::Raise(thrown) => {
-                return Err(thrown.into());
+            // The run loops throw a plain `Raise` themselves; only one wrapped
+            // in `InRun` gets here.
+            Msg::Raise(_) => {
+                return Err(BsrsError::Plan("Raise cannot be routed to a run".into()));
             }
             Msg::PushContingency(sink) => {
                 // Clear any stale error before arming, so this region starts

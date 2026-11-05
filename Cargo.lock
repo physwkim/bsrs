@@ -765,7 +765,7 @@ dependencies = [
 
 [[package]]
 name = "bsrs"
-version = "0.5.8"
+version = "0.6.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -808,7 +808,7 @@ dependencies = [
 
 [[package]]
 name = "bsrs-derive"
-version = "0.5.8"
+version = "0.6.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1759,8 +1759,9 @@ checksum = "869b0adbda23651a9c5c0c3d270aac9fcb52e8622a8f2b17e57802d7791962f2"
 
 [[package]]
 name = "epics-base-rs"
-version = "0.33.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#2c1db5edd3cefb7df902dd7a0d7037006a7d8ee6"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22559567c9ab256e3f768d733824cd82848b4b59a589fb70e8b500ad34f2692e"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1785,8 +1786,9 @@ dependencies = [
 
 [[package]]
 name = "epics-ca-rs"
-version = "0.33.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#2c1db5edd3cefb7df902dd7a0d7037006a7d8ee6"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "508b843bda8b29179e32f2b6e6af35d8eeb75bc07605b7ebea826b1f54ce0a78"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1809,8 +1811,9 @@ dependencies = [
 
 [[package]]
 name = "epics-libcom-rs"
-version = "0.33.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#2c1db5edd3cefb7df902dd7a0d7037006a7d8ee6"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a56ef5f4900b39fa48e558b3e3e75ad5d55bc6fe4f79a677445bc088ff9a737"
 dependencies = [
  "chrono",
  "hostname",
@@ -1825,8 +1828,9 @@ dependencies = [
 
 [[package]]
 name = "epics-macros-rs"
-version = "0.33.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#2c1db5edd3cefb7df902dd7a0d7037006a7d8ee6"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e10cd362ca5c9c7e6952b2438b1cf403f06e883911b7a27c54fba9f2654a4081"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1836,8 +1840,9 @@ dependencies = [
 
 [[package]]
 name = "epics-pva-rs"
-version = "0.33.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#2c1db5edd3cefb7df902dd7a0d7037006a7d8ee6"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1be4c541c9704e267f971b1e14801cf6b0ba1fa03ed0db852d00d0a644c62810"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -1875,8 +1880,9 @@ dependencies = [
 
 [[package]]
 name = "epics-rtems-boot"
-version = "0.33.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#2c1db5edd3cefb7df902dd7a0d7037006a7d8ee6"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15fb0f120cf341785ddd2f9233fd2061bee2fc8cbd09b8ba40b5356c4eb99c50"
 dependencies = [
  "cc",
  "libc",
@@ -3337,7 +3343,7 @@ dependencies = [
 
 [[package]]
 name = "mini-beamline-qs"
-version = "0.5.8"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "bsrs",
@@ -6590,7 +6596,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

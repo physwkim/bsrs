@@ -4037,9 +4037,77 @@ async fn contingency_wrapper_except_plan_receives_what_was_thrown() {
     assert_eq!(result.exit_status, "success");
     let thrown = got.lock().unwrap().take();
     match thrown {
-        Some(bsrs::core::Thrown::Error(text)) => assert!(text.contains("boom"), "{text}"),
+        Some(bsrs::core::Thrown::Error(e)) => assert!(e.to_string().contains("boom"), "{e}"),
         other => panic!("except_plan got {other:?}"),
     }
+}
+
+/// A stageable that refuses to stage, as a device in the wrong state does.
+struct RefusingStage;
+impl bsrs::core::msg::NamedObj for RefusingStage {
+    fn name(&self) -> &str {
+        "refusing_stage"
+    }
+}
+#[async_trait::async_trait]
+impl bsrs::core::msg::StageableObj for RefusingStage {
+    async fn stage_dyn(&self) -> Result<(), bsrs::core::error::BsrsError> {
+        Err(bsrs::core::error::BsrsError::State("angle too low".into()))
+    }
+    async fn unstage_dyn(&self) -> Result<(), bsrs::core::error::BsrsError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn an_error_reraised_through_nested_wrappers_ends_the_run_unchanged() {
+    use bsrs::core::error::BsrsError;
+    use bsrs::plans::preprocessors::{contingency_wrapper, run_wrapper, ExceptPlan};
+
+    let got: Arc<StdMutex<Option<bsrs::core::Thrown>>> = Arc::new(StdMutex::new(None));
+    let except: ExceptPlan = {
+        let got = got.clone();
+        Box::new(move |thrown| {
+            *got.lock().unwrap() = Some(thrown);
+            plan_box(async_stream::stream! {
+                yield Msg::Null;
+            })
+        })
+    };
+    let refuse = plan_box(async_stream::stream! {
+        yield Msg::Stage(Arc::new(RefusingStage));
+    });
+    let inner = contingency_wrapper(refuse, Some(except), None, None, true);
+    let outer = contingency_wrapper(inner, None, None, None, true);
+    let plan = run_wrapper(outer, Default::default());
+
+    let sink = Arc::new(CapturingSink::new());
+    let re = RunEngine::new(vec![sink.clone() as Arc<dyn DocumentSink>]);
+    let result = re.run_async(plan).await.unwrap();
+
+    assert_eq!(result.exit_status, "fail");
+    assert_eq!(result.reason, "device state error: angle too low");
+    let exception = result.exception.expect("a failed run carries its error");
+    assert!(
+        matches!(&*exception, BsrsError::State(m) if m == "angle too low"),
+        "{exception:?}"
+    );
+    match got.lock().unwrap().take() {
+        Some(bsrs::core::Thrown::Error(e)) => assert!(Arc::ptr_eq(&e, &exception)),
+        other => panic!("except_plan got {other:?}"),
+    }
+    let docs = sink.snapshot().await;
+    let stop = docs
+        .iter()
+        .find_map(|d| match d {
+            Document::Stop(s) => Some(s.clone()),
+            _ => None,
+        })
+        .expect("a RunStop was emitted");
+    assert_eq!(
+        stop.reason.as_deref(),
+        Some("device state error: angle too low")
+    );
 }
 
 /// A stageable whose `unstage_dyn` appends "unstage" to a log.

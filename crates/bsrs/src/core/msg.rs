@@ -47,24 +47,14 @@ pub type AwaitableFactory =
 /// message it forwarded, and re-raises with [`Msg::Raise`] once its
 /// `except`/`finally` plans have run — bluesky's exception object,
 /// propagating frame by frame up the plan stack.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum Thrown {
-    /// A message handler failed; the text is the error's `Display`.
-    Error(String),
+    /// The error a message handler failed with, shared by every region it
+    /// propagates through and by the run's result.
+    Error(Arc<crate::core::error::BsrsError>),
     /// A `stop`/`abort` request (`RequestStop`/`RequestAbort`), with the
     /// caller's reason — `abort(reason)`; `stop` carries none.
     Interrupt(Interrupt, Option<String>),
-}
-
-impl From<Thrown> for crate::core::error::BsrsError {
-    /// The error a [`Msg::Raise`] hands the run loop: an error re-raised as a
-    /// plan error carrying its text, an interrupt as `Interrupted`.
-    fn from(thrown: Thrown) -> Self {
-        match thrown {
-            Thrown::Error(text) => Self::Plan(text),
-            Thrown::Interrupt(kind, _) => Self::Interrupted(kind),
-        }
-    }
 }
 
 /// Sink of a [`Msg::PushContingency`] region. While a run has one on its
@@ -304,8 +294,8 @@ pub enum Msg {
     Fail(String),
 
     /// Re-raise what a contingency region caught, once its `except`/`finally`
-    /// plans have run: the engine throws it into the next enclosing region, or
-    /// ends the run with it — `fail` for an error, the interrupt's exit status
+    /// plans have run: the engine throws it, unchanged, into the next
+    /// enclosing region, or ends the run with it — `fail` for an error, the interrupt's exit status
     /// for a `stop`/`abort`. Emitted only by `contingency_wrapper`.
     Raise(Thrown),
 

@@ -40,12 +40,6 @@ pub enum BsrsError {
     /// Cancellation was requested.
     #[error("cancelled")]
     Cancelled,
-    /// A `stop`/`abort` request the plan's contingency regions have finished
-    /// unwinding: what a [`Msg::Raise`](crate::core::Msg::Raise) of a
-    /// `Thrown::Interrupt` returns to the run loop, which then throws it into
-    /// the next enclosing region or ends the run with it.
-    #[error("interrupted by {0}")]
-    Interrupted(Interrupt),
     /// A signal value was rejected by `check_value`.
     #[error("invalid value: {0}")]
     InvalidValue(String),

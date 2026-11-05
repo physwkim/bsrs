@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.5.8"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.98"
 license = "BSD-3-Clause"
@@ -41,15 +41,8 @@ nu-ansi-term = "0.50"
 
 # internal — the only surviving library crate besides the consolidated `bsrs`
 # is the proc-macro companion (a proc-macro cannot be a module of a normal crate).
-bsrs                = { version = "0.5.8", path = "crates/bsrs" }
-bsrs-derive         = { version = "0.5.8", path = "crates/bsrs-derive" }
-
-# PutOp::send (epics-rs #169) is on main but not in 0.33.0; drop this
-# section once a release carries it.
-[patch.crates-io]
-epics-base-rs = { git = "https://github.com/epics-rs/epics-rs.git", branch = "main" }
-epics-ca-rs   = { git = "https://github.com/epics-rs/epics-rs.git", branch = "main" }
-epics-pva-rs  = { git = "https://github.com/epics-rs/epics-rs.git", branch = "main" }
+bsrs                = { version = "0.6.0", path = "crates/bsrs" }
+bsrs-derive         = { version = "0.6.0", path = "crates/bsrs-derive" }
 
 [profile.dev]
 opt-level = 1
