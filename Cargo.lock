@@ -1760,7 +1760,8 @@ checksum = "869b0adbda23651a9c5c0c3d270aac9fcb52e8622a8f2b17e57802d7791962f2"
 [[package]]
 name = "epics-base-rs"
 version = "0.34.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#3718d7ea016481cef6e69b2af8b8afc2be9033e4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22559567c9ab256e3f768d733824cd82848b4b59a589fb70e8b500ad34f2692e"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1786,7 +1787,8 @@ dependencies = [
 [[package]]
 name = "epics-ca-rs"
 version = "0.34.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#3718d7ea016481cef6e69b2af8b8afc2be9033e4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "508b843bda8b29179e32f2b6e6af35d8eeb75bc07605b7ebea826b1f54ce0a78"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1810,7 +1812,8 @@ dependencies = [
 [[package]]
 name = "epics-libcom-rs"
 version = "0.34.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#3718d7ea016481cef6e69b2af8b8afc2be9033e4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a56ef5f4900b39fa48e558b3e3e75ad5d55bc6fe4f79a677445bc088ff9a737"
 dependencies = [
  "chrono",
  "hostname",
@@ -1826,7 +1829,8 @@ dependencies = [
 [[package]]
 name = "epics-macros-rs"
 version = "0.34.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#3718d7ea016481cef6e69b2af8b8afc2be9033e4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e10cd362ca5c9c7e6952b2438b1cf403f06e883911b7a27c54fba9f2654a4081"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1837,7 +1841,8 @@ dependencies = [
 [[package]]
 name = "epics-pva-rs"
 version = "0.34.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#3718d7ea016481cef6e69b2af8b8afc2be9033e4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1be4c541c9704e267f971b1e14801cf6b0ba1fa03ed0db852d00d0a644c62810"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -1876,7 +1881,8 @@ dependencies = [
 [[package]]
 name = "epics-rtems-boot"
 version = "0.34.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#3718d7ea016481cef6e69b2af8b8afc2be9033e4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15fb0f120cf341785ddd2f9233fd2061bee2fc8cbd09b8ba40b5356c4eb99c50"
 dependencies = [
  "cc",
  "libc",
