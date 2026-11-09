@@ -6,6 +6,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- EPICS backends move to epics-rs 0.34.1 from 0.34.0, in which a get after
+  a waited CA or PVA put reads the value put.
+
 ## [0.6.0] - 2026-11-05
 
 ### Added
