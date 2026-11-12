@@ -6,10 +6,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-13
+
 ### Changed
 
 - EPICS backends move to epics-rs 0.34.1 from 0.34.0, in which a get after
   a waited CA or PVA put reads the value put.
+
+### Fixed
+
+- `StandardDetector::trigger` and `complete` return their status while the
+  acquisition runs, as ophyd-async's `AsyncStatus.wrap` does, and cancelling
+  the status drops the wait. They awaited the acquisition inline, so a run
+  waiting on a detector whose busy never cleared could not be paused or
+  aborted.
+- `cargo install --locked` on Windows takes clipboard-win 5.4.3; the lockfile
+  pinned 5.4.1, which is yanked.
 
 ## [0.6.0] - 2026-11-05
 
