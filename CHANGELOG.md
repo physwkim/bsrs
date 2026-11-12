@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- `Hdf5FrameSink` (feature `hdf5`) appends past chunk index 131,059, 128 GiB
+  into a file at the default 1 MiB chunks, where rust-hdf5 0.3.2 refused the
+  append. The `hdf5` feature now takes rust-hdf5 0.7.13.
+
 ## [0.6.1] - 2026-11-13
 
 ### Changed
