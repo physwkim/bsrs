@@ -398,4 +398,28 @@ mod tests {
         assert_eq!(f.attr_string("NX_class").unwrap(), "NXroot");
         assert_eq!(f.attr_string("default").unwrap(), "entry");
     }
+
+    // rust-hdf5 0.3.2 refused chunk index 131,060 ("needs a paged
+    // extensible-array data block"): 128 GiB into a file at 1 MiB chunks.
+    #[tokio::test]
+    async fn appends_past_chunk_131060_read_back_whole() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("long.h5");
+        let sink =
+            Hdf5FrameSink::with_config(Hdf5SinkConfig::new("d", &path, 0).chunk_size_bytes(1));
+        let payload: Vec<u8> = (0..140_000u32).map(|i| (i % 251) as u8).collect();
+        sink.accept(Frame {
+            payload: Bytes::from(payload.clone()),
+            ts_ns: 0,
+            channel: 0,
+            flags: 0,
+            seq: 1,
+        })
+        .await
+        .unwrap();
+        drop(sink);
+        let f = rust_hdf5::H5File::open(&path).unwrap();
+        let data = f.dataset("entry/instrument/d/data").unwrap();
+        assert!(data.read_raw::<u8>().unwrap() == payload);
+    }
 }
