@@ -15,6 +15,7 @@ use crate::protocols_async::{
     Triggerable, WritesStreamAssets,
 };
 use async_trait::async_trait;
+use futures::future::BoxFuture;
 use futures::stream::{BoxStream, StreamExt};
 use futures::FutureExt;
 use serde_json::Value;
@@ -94,7 +95,8 @@ where
     C: DetectorControl,
 {
     name: String,
-    control: C,
+    // Shared with the wait a trigger or complete leaves running.
+    control: Arc<C>,
     // ophyd-async `_data_logics`, in the order added.
     data_logics: Vec<DataLogic>,
     plugins: Vec<Arc<dyn Device>>,
@@ -123,7 +125,7 @@ where
     ) -> Self {
         Self {
             name: name.into(),
-            control,
+            control: Arc::new(control),
             data_logics,
             plugins: Vec::new(),
             prepared: std::sync::Mutex::new(None),
@@ -323,9 +325,13 @@ where
         Ok((keys.into_iter().flatten().collect(), singles))
     }
 
-    /// ophyd-async `StandardDetector.trigger`: one event of the prepare since
-    /// stage, or of an implicit `TriggerInfo()` one.
-    async fn trigger_one(&self) -> Result<()> {
+    /// ophyd-async `StandardDetector.trigger` up to starting the acquisition:
+    /// one event of the prepare since stage, or of an implicit `TriggerInfo()`
+    /// one. Returns the wait for that event.
+    async fn trigger_one(&self) -> Result<BoxFuture<'static, Result<()>>>
+    where
+        C: 'static,
+    {
         let prepared = self.prepared.lock().unwrap().clone();
         let ctx = match prepared {
             None => self.prepare_for(TriggerInfo::default()).await?,
@@ -339,50 +345,56 @@ where
             Some(ctx) => self.update_prepare_context(ctx.trigger_info).await?,
         };
         self.control.arm().await.await?;
-        self.wait_for_index(
+        Ok(self.wait_for_index(
             ctx.collections_written,
             ctx.trigger_info.collections_per_event.into(),
             ctx.trigger_info.effective_exposure_timeout(),
             true,
-        )
-        .await
+        ))
     }
 
     /// ophyd-async `_wait_for_index`: wait until every writer has written
     /// `requested` collections past `initial`, each update of an index
     /// within `exposure_timeout`, then for the hardware to go idle if asked.
-    async fn wait_for_index(
+    fn wait_for_index(
         &self,
         initial: u64,
         requested: u64,
         exposure_timeout: std::time::Duration,
         wait_for_idle: bool,
-    ) -> Result<()> {
+    ) -> BoxFuture<'static, Result<()>>
+    where
+        C: 'static,
+    {
         let target = initial + requested;
         let mut rxs: Vec<_> = self
             .writers()
             .map(|w| w.observe_indices_written())
             .collect();
-        while let Some(written) = rxs.iter_mut().map(|rx| *rx.borrow_and_update()).min() {
-            if written >= target {
-                break;
-            }
-            let changed =
-                futures::future::select_all(rxs.iter_mut().map(|rx| Box::pin(rx.changed())));
-            match tokio::time::timeout(exposure_timeout, changed).await {
-                Ok((Ok(()), _, _)) => {}
-                Ok((Err(_), _, _)) => {
-                    return Err(BsrsError::State(format!(
-                        "writer closed at index {written} of {target}"
-                    )))
+        let idle = wait_for_idle.then(|| self.control.clone());
+        async move {
+            while let Some(written) = rxs.iter_mut().map(|rx| *rx.borrow_and_update()).min() {
+                if written >= target {
+                    break;
                 }
-                Err(_) => return Err(BsrsError::Timeout(exposure_timeout)),
+                let changed =
+                    futures::future::select_all(rxs.iter_mut().map(|rx| Box::pin(rx.changed())));
+                match tokio::time::timeout(exposure_timeout, changed).await {
+                    Ok((Ok(()), _, _)) => {}
+                    Ok((Err(_), _, _)) => {
+                        return Err(BsrsError::State(format!(
+                            "writer closed at index {written} of {target}"
+                        )))
+                    }
+                    Err(_) => return Err(BsrsError::Timeout(exposure_timeout)),
+                }
             }
+            if let Some(control) = idle {
+                control.wait_for_idle().await?;
+            }
+            Ok(())
         }
-        if wait_for_idle {
-            self.control.wait_for_idle().await?;
-        }
-        Ok(())
+        .boxed()
     }
 
     /// ophyd-async `StandardDetector.kickoff` up to starting the acquisition:
@@ -473,14 +485,16 @@ where
 #[async_trait]
 impl<C> Triggerable for StandardDetector<C>
 where
-    C: DetectorControl,
+    C: DetectorControl + 'static,
 {
     fn name(&self) -> &str {
         &self.name
     }
     async fn trigger(&self) -> Status {
+        // Set-up and arm run before returning, as kickoff's do, so a later
+        // disarm cannot overtake the arm; the status is only the wait.
         match self.trigger_one().await {
-            Ok(()) => Status::done(),
+            Ok(wait) => spawn_status("trigger", wait),
             Err(e) => Status::fail(crate::core::status::StatusError::Failed(format!(
                 "trigger: {e}"
             ))),
@@ -488,10 +502,31 @@ where
     }
 }
 
+/// ophyd-async `AsyncStatus.wrap`: `work` runs on its own task and its status
+/// is returned at once, so a run engine waiting on it can still pause or
+/// abort; cancelling the status drops `work`.
+fn spawn_status(what: &'static str, work: BoxFuture<'static, Result<()>>) -> Status {
+    let (status, setter) = Status::new();
+    tokio::spawn(async move {
+        let outcome = tokio::select! {
+            r = work => Some(r),
+            () = setter.cancelled() => None,
+        };
+        match outcome {
+            Some(Ok(())) => setter.success(),
+            Some(Err(e)) => setter.fail(crate::core::status::StatusError::Failed(format!(
+                "{what}: {e}"
+            ))),
+            None => {}
+        }
+    });
+    status
+}
+
 #[async_trait]
 impl<C> Flyable for StandardDetector<C>
 where
-    C: DetectorControl,
+    C: DetectorControl + 'static,
 {
     fn name(&self) -> &str {
         &self.name
@@ -511,20 +546,15 @@ where
                 "complete: Kickoff not called".into(),
             ));
         };
-        let waited = self
-            .wait_for_index(
+        spawn_status(
+            "complete",
+            self.wait_for_index(
                 kickoff.collections_written,
                 kickoff.collections_requested,
                 kickoff.exposure_timeout,
                 kickoff.is_last_kickoff,
-            )
-            .await;
-        match waited {
-            Ok(()) => Status::done(),
-            Err(e) => Status::fail(crate::core::status::StatusError::Failed(format!(
-                "complete: {e}"
-            ))),
-        }
+            ),
+        )
     }
 }
 
@@ -1112,24 +1142,125 @@ mod tests {
         .await;
         let _kickoff = Flyable::kickoff(&*det).await;
 
-        // complete() must block — no frames yet.
-        let det_c = det.clone();
-        let complete = tokio::spawn(async move { Flyable::complete(&*det_c).await.success() });
+        // complete()'s status must stay pending — no frames yet.
+        let complete = Flyable::complete(&*det).await;
 
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(
-            !complete.is_finished(),
-            "complete() must block when frames have not yet arrived (was target==0 bug)"
+            !complete.done_state(),
+            "complete() must not finish when frames have not yet arrived (was target==0 bug)"
         );
 
-        // Deliver 3 frames; complete() must unblock.
+        // Deliver 3 frames; complete() must finish.
         tx.send(3).unwrap();
 
-        let succeeded = tokio::time::timeout(Duration::from_secs(1), complete)
+        tokio::time::timeout(Duration::from_secs(1), complete)
             .await
             .expect("complete() timed out after frames were delivered")
-            .expect("task panicked");
-        assert!(succeeded, "complete() should succeed after frames arrive");
+            .expect("complete() should succeed after frames arrive");
+    }
+
+    /// A control whose acquisition never ends, as when a busy record is
+    /// never cleared: counts its arms, and the waits for idle begun and
+    /// dropped.
+    #[derive(Default)]
+    struct NeverIdle {
+        arms: AtomicU64,
+        waits: AtomicU64,
+        dropped: Arc<AtomicU64>,
+    }
+
+    struct CountDrop(Arc<AtomicU64>);
+
+    impl Drop for CountDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl DetectorControl for NeverIdle {
+        fn deadtime(&self, _exposure: Option<Duration>) -> Duration {
+            Duration::ZERO
+        }
+        async fn prepare(&self, _info: TriggerInfo) -> Result<()> {
+            Ok(())
+        }
+        async fn arm(&self) -> Status {
+            self.arms.fetch_add(1, Ordering::SeqCst);
+            Status::done()
+        }
+        async fn wait_for_idle(&self) -> Result<()> {
+            self.waits.fetch_add(1, Ordering::SeqCst);
+            let _dropped = CountDrop(self.dropped.clone());
+            std::future::pending().await
+        }
+        async fn disarm(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Wait up to a second for `cond`.
+    async fn until(cond: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !cond() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("condition not met within 1s");
+    }
+
+    /// ophyd-async `trigger` is an `AsyncStatus`: it returns while the
+    /// acquisition runs, and a cancel of its status ends the wait.
+    #[tokio::test]
+    async fn trigger_returns_while_the_acquisition_runs() {
+        let (tx, rx) = watch::channel(0u64);
+        let det = StandardDetector::new("det", NeverIdle::default(), ControlledWriter { rx });
+        Stageable::stage(&det).await.unwrap();
+        let status = Triggerable::trigger(&det).await;
+        tx.send(1).unwrap();
+        until(|| det.control().waits.load(Ordering::SeqCst) == 1).await;
+        assert!(!status.done_state());
+        status.cancel();
+        until(|| det.control().dropped.load(Ordering::SeqCst) == 1).await;
+        assert!(status.cancelled());
+    }
+
+    /// An acquisition that never ends must not keep an abort from ending the
+    /// run waiting on its trigger.
+    #[tokio::test]
+    async fn a_run_waiting_on_an_endless_trigger_aborts() {
+        use crate::core::msg::Msg;
+        use crate::engine::run_engine::RunEngine;
+        let (tx, rx) = watch::channel(0u64);
+        let det = Arc::new(StandardDetector::new(
+            "det",
+            NeverIdle::default(),
+            ControlledWriter { rx },
+        ));
+        let obj = det.clone();
+        let plan = crate::core::plan::plan_box(async_stream::stream! {
+            yield Msg::OpenRun(Default::default());
+            yield Msg::Trigger { obj, group: Some("g".into()) };
+            yield Msg::Wait { group: "g".into(), error_on_timeout: true, timeout: None };
+            yield Msg::CloseRun { exit_status: "success".into(), reason: None };
+        });
+        let re = Arc::new(RunEngine::new(Vec::new()));
+        let run = tokio::spawn({
+            let re = re.clone();
+            async move { re.run_async(plan).await }
+        });
+        until(|| det.control().arms.load(Ordering::SeqCst) == 1).await;
+        tx.send(1).unwrap();
+        until(|| det.control().waits.load(Ordering::SeqCst) == 1).await;
+        re.abort("test");
+        let result = tokio::time::timeout(Duration::from_secs(1), run)
+            .await
+            .expect("the abort must end the run")
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.exit_status, "abort");
     }
 
     /// A detector whose index `tx` drives, and its count of `wait_for_idle`.
