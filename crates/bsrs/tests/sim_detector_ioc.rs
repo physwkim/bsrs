@@ -19,8 +19,8 @@ use bsrs::callbacks::CapturingSink;
 use bsrs::core::msg::{ConfigurableObj, MonitorableObj, ReadableObj, StageableObj, TriggerableObj};
 use bsrs::core::status::Status;
 use bsrs::devices::{
-    BackendFromPv, DataLogic, SignalConfig, SignalR, StandardDetector, StaticFilenameProvider,
-    StaticPathProvider, TriggerInfo,
+    BackendFromPv, DataLogic, Matcher, SignalConfig, SignalR, StandardDetector,
+    StaticFilenameProvider, StaticPathProvider, TriggerInfo,
 };
 use bsrs::event_model::{DataKey, Dtype, DtypeNumpy, StreamDatum, StreamResource};
 use bsrs::host::areadetector::{
@@ -91,6 +91,18 @@ where
     SignalBackend::get_value(&ch)
         .await
         .unwrap_or_else(|e| panic!("get {pv}: {e}"))
+}
+
+/// Wait until `signal` reads a value `want` matches. An `_RBV` record is
+/// I/O Intr: the IOC processes it after the setpoint put's callback has
+/// returned, so a get straight after that put can still read the old value.
+async fn wait_rbv(signal: &dyn MonitorableObj, want: impl Matcher) {
+    let sub = MonitorableObj::subscribe_dyn(signal)
+        .await
+        .expect("subscribe");
+    bsrs::devices::wait_for_value(sub, want, Some(TIMEOUT))
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
 }
 
 async fn file_plugin(prefix: &str) -> NdFile {
@@ -949,22 +961,20 @@ async fn num_rois_enables_the_first_rois_while_staged() {
     assert!(num_rois(&refs, 5).is_err());
     num_rois(&refs, 2).unwrap();
 
-    async fn enabled(rois: &[NdRoi]) -> Vec<bool> {
-        let mut out = Vec::new();
-        for roi in rois {
-            out.push(roi.plugin.enable_callbacks.get().await.unwrap());
+    async fn wait_enabled(rois: &[NdRoi], want: [bool; 4]) {
+        for (roi, want) in rois.iter().zip(want) {
+            wait_rbv(roi.plugin.enable_callbacks.as_ref(), want).await;
         }
-        out
     }
-    assert_eq!(enabled(&rois).await, [false, false, false, true]);
+    wait_enabled(&rois, [false, false, false, true]).await;
     for roi in &rois {
         StageableObj::stage_dyn(roi).await.unwrap();
     }
-    assert_eq!(enabled(&rois).await, [true, true, false, false]);
+    wait_enabled(&rois, [true, true, false, false]).await;
     for roi in &rois {
         StageableObj::unstage_dyn(roi).await.unwrap();
     }
-    assert_eq!(enabled(&rois).await, [false, false, false, true]);
+    wait_enabled(&rois, [false, false, false, true]).await;
     rois[3].plugin.set_enabled(false).await.unwrap();
 }
 
@@ -1348,14 +1358,8 @@ async fn warmup_takes_a_frame_and_restores_the_cam() {
         state, AD_STATE_IDLE,
         "post-warmup DetectorState is not Idle"
     );
-    assert_eq!(
-        cam.image_mode.get().await.expect("read ImageMode"),
-        prev_mode
-    );
-    assert_eq!(
-        cam.num_images.get().await.expect("read NumImages"),
-        prev_num
-    );
+    wait_rbv(cam.image_mode.as_ref(), prev_mode).await;
+    wait_rbv(cam.num_images.as_ref(), prev_num).await;
 }
 
 /// ophyd-async `test_signal_get_and_set_logging`, on a cam's PV signals: its
@@ -1421,8 +1425,12 @@ async fn select_save_plugin_routes_while_staged() {
     let orig_path = hdf1.file_path.get().await.expect("read HDF1.FilePath");
     let path = "/tmp/bsrs_smoke/";
     hdf1.set_path(path).await.expect("HDF1.set_path");
-    let read_back = hdf1.file_path.get().await.expect("read HDF1.FilePath");
-    assert_eq!(read_back.trim_end_matches('\0'), path);
+    wait_rbv(hdf1.file_path.as_ref(), |r: &ReadingValue| {
+        r.value
+            .as_str()
+            .is_some_and(|s| s.trim_end_matches('\0') == path)
+    })
+    .await;
     hdf1.set_path(orig_path.trim_end_matches('\0'))
         .await
         .expect("restore HDF1.FilePath");
@@ -1447,31 +1455,21 @@ async fn select_save_plugin_routes_while_staged() {
     for s in &siblings {
         s.stage_dyn().await.expect("stage sibling");
     }
-    assert_eq!(port_of(&hdf1).await, PORT);
-    assert_eq!(
-        [
-            en(&hdf1).await,
-            en(&jpeg1).await,
-            en(&tiff1).await,
-            en(&nexus1).await
-        ],
-        [true, false, false, false]
-    );
+    let files = [&hdf1, &jpeg1, &tiff1, &nexus1];
+    async fn wait_en(files: [&NdFile; 4], want: [bool; 4]) {
+        for (f, want) in files.into_iter().zip(want) {
+            wait_rbv(f.plugin.enable_callbacks.as_ref(), want).await;
+        }
+    }
+    wait_rbv(hdf1.plugin.nd_array_port.as_ref(), PORT).await;
+    wait_en(files, [true, false, false, false]).await;
 
     for s in siblings.iter().rev() {
         s.unstage_dyn().await.expect("unstage sibling");
     }
     hdf1.unstage_dyn().await.expect("unstage HDF1");
-    assert_eq!(
-        [
-            en(&hdf1).await,
-            en(&jpeg1).await,
-            en(&tiff1).await,
-            en(&nexus1).await
-        ],
-        pre_en
-    );
-    assert_eq!(port_of(&hdf1).await, pre_hdf1_port);
+    wait_en(files, pre_en).await;
+    wait_rbv(hdf1.plugin.nd_array_port.as_ref(), pre_hdf1_port).await;
 }
 
 /// `array_counter` writes `ArrayCounter` and reads `ArrayCounter_RBV`, as
