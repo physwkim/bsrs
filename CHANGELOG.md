@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-11-13
+
 ### Fixed
 
 - `Hdf5FrameSink` (feature `hdf5`) appends past chunk index 131,059, 128 GiB
