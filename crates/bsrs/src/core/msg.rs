@@ -720,6 +720,16 @@ pub trait ReadableObj: NamedObj {
     fn as_stageable(self: Arc<Self>) -> Option<Arc<dyn StageableObj>> {
         None
     }
+    /// Triggering capability query, the [`as_stageable`] of `trigger()`: a
+    /// readable that must acquire before it has anything to read returns
+    /// `Some(self)`, and every plan that reads a bundle triggers it and waits
+    /// first — bluesky's `isinstance(obj, Triggerable)` in `trigger_and_read`
+    /// (plan_stubs.py:1457). The default is `None` (read as it stands).
+    ///
+    /// [`as_stageable`]: ReadableObj::as_stageable
+    fn as_triggerable(self: Arc<Self>) -> Option<Arc<dyn TriggerableObj>> {
+        None
+    }
     /// Whether this readable also writes external assets, i.e. it emits
     /// `StreamResource` / `StreamDatum` documents alongside its Event. Default
     /// `false`; only asset-writing readables (e.g. `StandardDetector` in step

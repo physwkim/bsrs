@@ -6,6 +6,8 @@ use crate::core::msg::{
     PausableObj, PreparableObj, ReadableObj, StageableObj, StoppableObj, TriggerableObj,
 };
 use crate::core::plan::Plan;
+use crate::devices::StandardDetector;
+use crate::protocols_async::DetectorControl;
 use serde_json::Value;
 use std::any::Any;
 use std::collections::HashMap;
@@ -241,6 +243,31 @@ impl Registry {
         self.locatables.insert(name.clone(), obj.clone());
         self.stoppables.insert(name.clone(), obj.clone());
         self.monitorables.insert(name, obj);
+    }
+
+    /// Register a detector under every facet it implements, and each of its
+    /// control's [`DetectorControl::settable_signals`] as the device
+    /// `{name}_{key}` — `mythen_acquire_time` beside `mythen`, the name its
+    /// configuration reading already has. A scan takes no exposure
+    /// argument, as in bluesky: `mv(mythen_acquire_time, 0.5)` before it.
+    pub fn register_detector<C>(&mut self, name: impl Into<String>, obj: Arc<StandardDetector<C>>)
+    where
+        C: DetectorControl + 'static,
+    {
+        let name = name.into();
+        for signal in obj.control().settable_signals() {
+            let child = format!("{name}_{}", signal.key);
+            self.readables.insert(child.clone(), signal.readable);
+            self.movables.insert(child.clone(), signal.movable);
+            self.locatables.insert(child, signal.locatable);
+        }
+        self.readables.insert(name.clone(), obj.clone());
+        self.stageables.insert(name.clone(), obj.clone());
+        self.triggerables.insert(name.clone(), obj.clone());
+        self.preparables.insert(name.clone(), obj.clone());
+        self.flyables.insert(name.clone(), obj.clone());
+        self.collectables.insert(name.clone(), obj.clone());
+        self.configurables.insert(name, obj);
     }
 
     /// Register a `ReadableObj` device under a name.
@@ -615,5 +642,74 @@ fn parse_count_args(args: &Value) -> Result<(Vec<String>, usize), String> {
         Ok((detectors, num))
     } else {
         Err(format!("count args must be object; got {args}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backends::soft::SoftSignalBackend;
+    use crate::core::error::Result;
+    use crate::core::status::Status;
+    use crate::devices::signal::{Signal, SignalConfig, SignalRW};
+    use crate::protocols_async::{ControlSignal, TriggerInfo};
+    use std::time::Duration;
+
+    struct Control {
+        acquire_time: Arc<SignalRW<f64, SoftSignalBackend<f64>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl DetectorControl for Control {
+        fn deadtime(&self, _exposure: Option<Duration>) -> Duration {
+            Duration::ZERO
+        }
+        async fn prepare(&self, _info: TriggerInfo) -> Result<()> {
+            Ok(())
+        }
+        async fn arm(&self) -> Status {
+            Status::done()
+        }
+        async fn wait_for_idle(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn disarm(&self) -> Result<()> {
+            Ok(())
+        }
+        fn settable_signals(&self) -> Vec<ControlSignal> {
+            vec![ControlSignal::new(
+                "acquire_time",
+                self.acquire_time.clone(),
+            )]
+        }
+    }
+
+    // The detector's exposure is a device of its own beside it, and setting
+    // that device sets the control's signal.
+    #[tokio::test]
+    async fn register_detector_registers_the_controls_settable_signals() {
+        let acquire_time = Arc::new(Signal::new(
+            Arc::new(SoftSignalBackend::new(0.1)),
+            SignalConfig {
+                source: "acquire_time".into(),
+                ..Default::default()
+            },
+        ));
+        let control = Control {
+            acquire_time: acquire_time.clone(),
+        };
+        let mut registry = Registry::new();
+        registry.register_detector(
+            "det",
+            Arc::new(StandardDetector::with_data_logics("det", control, vec![])),
+        );
+
+        assert!(registry.triggerable("det").is_some());
+        assert!(registry.stageable("det").is_some());
+        assert!(registry.movable("det").is_none());
+        assert!(registry.readable("det_acquire_time").is_some());
+        let exposure = registry.movable("det_acquire_time").unwrap();
+        exposure.set_dyn(0.5).await.await.unwrap();
+        assert_eq!(acquire_time.get().await.unwrap(), 0.5);
     }
 }

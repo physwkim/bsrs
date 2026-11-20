@@ -501,6 +501,30 @@ async fn unstage_stops_an_acquisition_in_progress() {
     assert!(!get::<bool>(&format!("{CAM}Acquire_RBV")).await);
 }
 
+/// A cam signal in `stage_sigs` holds its staged value from stage to
+/// unstage and is back at what it was found at afterwards, through a
+/// trigger's own `ImageMode` write and a second stage with no unstage.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs BSRS_EPICS_RS; see tests/example_ioc"]
+async fn unstage_puts_back_the_image_mode_the_cam_staged() {
+    boot();
+    let _cam = CAM_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let det = hdf_det("det", dir.path(), "stagesigs").await;
+    let cam = det.control();
+    cam.stage_sigs
+        .set(cam.image_mode.clone(), AD_IMAGE_MODE_MULTIPLE.to_string());
+    let pv = format!("{CAM}ImageMode");
+    assert_eq!(get::<String>(&pv).await, AD_IMAGE_MODE_SINGLE);
+
+    Stageable::stage(&det).await.expect("stage");
+    assert_eq!(get::<String>(&pv).await, AD_IMAGE_MODE_MULTIPLE);
+    Stageable::stage(&det).await.expect("stage again");
+    trigger(&det).await.unwrap();
+    Stageable::unstage(&det).await.expect("unstage");
+    assert_eq!(get::<String>(&pv).await, AD_IMAGE_MODE_SINGLE);
+}
+
 /// ophyd-async `_detector.py:616` `trigger` prepares `TriggerInfo()` when
 /// nothing was prepared since stage, so a trigger takes exactly one frame
 /// whatever image mode the cam was left in.
