@@ -259,17 +259,19 @@ pub fn baseline_wrapper(
     during_run_wrapper(
         inner,
         move || {
-            let mut msgs = vec![Msg::Create {
+            let mut msgs = super::trigger_msgs(&pre_devices);
+            msgs.push(Msg::Create {
                 stream_name: pre_stream.clone(),
-            }];
+            });
             msgs.extend(pre_devices.iter().map(|d| Msg::Read(d.clone())));
             msgs.push(Msg::Save);
             msgs
         },
         move || {
-            let mut msgs = vec![Msg::Create {
+            let mut msgs = super::trigger_msgs(&devices);
+            msgs.push(Msg::Create {
                 stream_name: stream.clone(),
-            }];
+            });
             msgs.extend(devices.iter().map(|d| Msg::Read(d.clone())));
             msgs.push(Msg::Save);
             msgs

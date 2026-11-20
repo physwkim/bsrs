@@ -760,6 +760,9 @@ where
     fn as_stageable(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn StageableObj>> {
         Some(self)
     }
+    fn as_triggerable(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn TriggerableObj>> {
+        Some(self)
+    }
     fn hint_fields(&self) -> Option<Vec<String>> {
         Some(
             self.data_logics

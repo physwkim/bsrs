@@ -857,9 +857,9 @@ pub mod stubs {
 
     /// `one_nd_step(detectors, motors)` — the default [`PerStep`]:
     /// [`move_per_step`] then read the motor readers and detectors into
-    /// `"primary"` as a `Create → Read* → Save` bundle. bsrs's port of bluesky's
-    /// `one_nd_step` (plan_stubs.py:1707); reads without triggering (bsrs step
-    /// scans take plain `Readable` detectors, not `Triggerable`).
+    /// `"primary"` as a `Create → Read* → Save` bundle, triggering first the
+    /// ones that acquire ([`ReadableObj::as_triggerable`]). bsrs's port of
+    /// bluesky's `one_nd_step` (plan_stubs.py:1707).
     pub fn one_nd_step(
         detectors: Vec<Arc<dyn ReadableObj>>,
         motors: Vec<super::StepMotor>,
@@ -869,6 +869,14 @@ pub mod stubs {
             while let Some(item) = futures::StreamExt::next(&mut mv).await {
                 // Internal Bare-only sub-plan: no `Respond` item to preserve.
                 let (PlanItem::Bare(m) | PlanItem::Respond(m, _)) = item;
+                yield m;
+            }
+            let bundle: Vec<_> = detectors
+                .iter()
+                .cloned()
+                .chain(motors.iter().map(|(_, reader, _)| reader.clone()))
+                .collect();
+            for m in super::trigger_msgs(&bundle) {
                 yield m;
             }
             yield Msg::Create { stream_name: "primary".into() };
@@ -882,15 +890,17 @@ pub mod stubs {
         })
     }
 
-    /// `read_shot(detectors)` — the default read-only [`PerShot`]
-    /// for [`count`]: a `Checkpoint` then read the detectors into
-    /// `"primary"` as a `Create → Read* → Save` bundle, without triggering. This
-    /// is the plain-read analogue of [`one_shot`], which triggers via
-    /// `trigger_and_read`; `count` takes plain `Readable` detectors, so its
-    /// default does not trigger.
+    /// `read_shot(detectors)` — the default [`PerShot`] for [`count`]: a
+    /// `Checkpoint` then read the detectors into `"primary"` as a
+    /// `Create → Read* → Save` bundle, triggering first the ones that acquire
+    /// ([`ReadableObj::as_triggerable`]). [`one_shot`] instead triggers the
+    /// devices its caller names.
     pub fn read_shot(detectors: Vec<Arc<dyn ReadableObj>>) -> Plan {
         plan_box(async_stream::stream! {
             yield Msg::Checkpoint;
+            for m in super::trigger_msgs(&detectors) {
+                yield m;
+            }
             yield Msg::Create { stream_name: "primary".into() };
             for d in &detectors {
                 yield Msg::Read(d.clone());
@@ -990,6 +1000,37 @@ fn stageables_for(
         }
     }
     out
+}
+
+/// The `Trigger`s, and the `Wait` on them, that precede a bundle reading
+/// `readables`: one per distinct device that acquires before it can be read
+/// ([`ReadableObj::as_triggerable`]), nothing when none does. Every plan
+/// that reads a bundle yields these first, so a detector is exposed by the
+/// plan it is handed to — bluesky's `trigger_and_read` head
+/// (plan_stubs.py:1455-1462).
+pub(crate) fn trigger_msgs(readables: &[Arc<dyn ReadableObj>]) -> Vec<Msg> {
+    let mut triggered: Vec<Arc<dyn TriggerableObj>> = Vec::new();
+    for t in readables.iter().cloned().filter_map(|r| r.as_triggerable()) {
+        if !triggered.iter().any(|o| Arc::ptr_eq(o, &t)) {
+            triggered.push(t);
+        }
+    }
+    if triggered.is_empty() {
+        return Vec::new();
+    }
+    let mut msgs: Vec<Msg> = triggered
+        .into_iter()
+        .map(|obj| Msg::Trigger {
+            obj,
+            group: Some("trig".into()),
+        })
+        .collect();
+    msgs.push(Msg::Wait {
+        group: "trig".into(),
+        error_on_timeout: true,
+        timeout: None,
+    });
+    msgs
 }
 
 /// `count_ext(detectors, num, delay, per_shot)` — the full `count`: read the
@@ -1521,6 +1562,9 @@ pub fn grid_scan_snake(
                     error_on_timeout: true,
                     timeout: None,
                 };
+                for m in trigger_msgs(&detectors.iter().chain([&motor1_reader, &motor2_reader]).cloned().collect::<Vec<_>>()) {
+                    yield m;
+                }
                 yield Msg::Create { stream_name: "primary".into() };
                 yield Msg::Read(motor1_reader.clone());
                 yield Msg::Read(motor2_reader.clone());
@@ -1938,6 +1982,9 @@ pub fn spiral_square(
             yield Msg::Set { obj: x_motor.clone(), value: x, group: Some("set".into()) };
             yield Msg::Set { obj: y_motor.clone(), value: y, group: Some("set".into()) };
             yield Msg::Wait { group: "set".into(), error_on_timeout: true, timeout: None };
+            for m in trigger_msgs(&detectors.iter().chain([&x_reader, &y_reader]).cloned().collect::<Vec<_>>()) {
+                yield m;
+            }
             yield Msg::Create { stream_name: "primary".into() };
             yield Msg::Read(x_reader.clone());
             yield Msg::Read(y_reader.clone());
@@ -1999,6 +2046,9 @@ pub fn spiral(
             yield Msg::Set { obj: x_motor.clone(), value: x, group: Some("set".into()) };
             yield Msg::Set { obj: y_motor.clone(), value: y, group: Some("set".into()) };
             yield Msg::Wait { group: "set".into(), error_on_timeout: true, timeout: None };
+            for m in trigger_msgs(&detectors.iter().chain([&x_reader, &y_reader]).cloned().collect::<Vec<_>>()) {
+                yield m;
+            }
             yield Msg::Create { stream_name: "primary".into() };
             yield Msg::Read(x_reader.clone());
             yield Msg::Read(y_reader.clone());
@@ -2290,6 +2340,9 @@ pub fn spiral_fermat(
             yield Msg::Set { obj: x_motor.clone(), value: x, group: Some("set".into()) };
             yield Msg::Set { obj: y_motor.clone(), value: y, group: Some("set".into()) };
             yield Msg::Wait { group: "set".into(), error_on_timeout: true, timeout: None };
+            for m in trigger_msgs(&detectors.iter().chain([&x_reader, &y_reader]).cloned().collect::<Vec<_>>()) {
+                yield m;
+            }
             yield Msg::Create { stream_name: "primary".into() };
             yield Msg::Read(x_reader.clone());
             yield Msg::Read(y_reader.clone());
@@ -2527,6 +2580,9 @@ pub fn adaptive_scan(
                 error_on_timeout: true,
                 timeout: None,
             };
+            for m in trigger_msgs(&detectors.iter().chain([&motor_reader]).cloned().collect::<Vec<_>>()) {
+                yield m;
+            }
             yield Msg::Create { stream_name: "primary".into() };
             yield Msg::Read(motor_reader.clone());
             for d in &detectors {
@@ -2665,6 +2721,9 @@ pub fn tune_centroid(
                 error_on_timeout: true,
                 timeout: None,
             };
+            for m in trigger_msgs(&detectors.iter().chain([&motor_reader]).cloned().collect::<Vec<_>>()) {
+                yield m;
+            }
             yield Msg::Create { stream_name: "primary".into() };
             yield Msg::Read(motor_reader.clone());
             for d in &detectors {
@@ -3169,6 +3228,101 @@ mod tests {
             "scan_1d must Unstage the detector last, got {:?}",
             msgs.last()
         );
+    }
+
+    /// Readable that acquires before it can be read: its `as_triggerable`
+    /// returns `Some`, so a plan reading it in a bundle triggers it first.
+    struct AcquiringFake(String);
+
+    impl NamedObj for AcquiringFake {
+        fn name(&self) -> &str {
+            &self.0
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ReadableObj for AcquiringFake {
+        async fn read_dyn(
+            &self,
+        ) -> Result<HashMap<String, ReadingValue>, crate::core::error::BsrsError> {
+            Ok(HashMap::new())
+        }
+        async fn describe_dyn(
+            &self,
+        ) -> Result<HashMap<String, crate::event_model::DataKey>, crate::core::error::BsrsError>
+        {
+            Ok(HashMap::new())
+        }
+        fn as_triggerable(self: Arc<Self>) -> Option<Arc<dyn TriggerableObj>> {
+            Some(self)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TriggerableObj for AcquiringFake {
+        async fn trigger_dyn(&self) -> Status {
+            Status::done()
+        }
+    }
+
+    /// The device-facing shape of a bundle: `T`rigger, `W`ait, `C`reate,
+    /// `R`ead, `S`ave, in the order the plan yields them.
+    fn bundle_shape(msgs: &[Msg]) -> String {
+        msgs.iter()
+            .filter_map(|m| match m {
+                Msg::Trigger { .. } => Some('T'),
+                Msg::Wait { group, .. } if group == "trig" => Some('W'),
+                Msg::Create { .. } => Some('C'),
+                Msg::Read(_) => Some('R'),
+                Msg::Save => Some('S'),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // No acquiring readable → no Trigger and no Wait; one handed over twice
+    // is triggered once.
+    #[tokio::test]
+    async fn trigger_msgs_triggers_each_acquiring_readable_once() {
+        let plain: Arc<dyn ReadableObj> = Arc::new(FakeReadable("plain".into()));
+        assert!(trigger_msgs(std::slice::from_ref(&plain)).is_empty());
+        let det: Arc<dyn ReadableObj> = Arc::new(AcquiringFake("det".into()));
+        assert_eq!(
+            bundle_shape(&trigger_msgs(&[det.clone(), plain, det])),
+            "TW"
+        );
+    }
+
+    // `count`'s default shot exposes an acquiring detector before reading it.
+    #[tokio::test]
+    async fn read_shot_triggers_an_acquiring_detector_before_the_bundle() {
+        let det: Arc<dyn ReadableObj> = Arc::new(AcquiringFake("det".into()));
+        let plain: Arc<dyn ReadableObj> = Arc::new(FakeReadable("plain".into()));
+        let msgs = drain(stubs::read_shot(vec![det, plain])).await;
+        assert_eq!(bundle_shape(&msgs), "TWCRRS");
+    }
+
+    // A scan step does the same, after the motor has arrived.
+    #[tokio::test]
+    async fn one_nd_step_triggers_an_acquiring_detector_after_the_move() {
+        let det: Arc<dyn ReadableObj> = Arc::new(AcquiringFake("det".into()));
+        let motor = Arc::new(FakeMotor {
+            name: "m".into(),
+            bias: 0.0,
+        });
+        let reader = Arc::new(FakeReadable("m".into()));
+        let step: StepMotor = (motor, reader, Some(1.0));
+        let msgs = drain(stubs::one_nd_step(vec![det], vec![step])).await;
+        let set = msgs
+            .iter()
+            .position(|m| matches!(m, Msg::Set { .. }))
+            .unwrap();
+        let trigger = msgs
+            .iter()
+            .position(|m| matches!(m, Msg::Trigger { .. }))
+            .unwrap();
+        assert!(set < trigger);
+        assert_eq!(bundle_shape(&msgs), "TWCRRS");
     }
 
     /// Triggerable carried only inside `Msg::Trigger`; `trigger_dyn` is never
