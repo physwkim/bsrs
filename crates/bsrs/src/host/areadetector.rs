@@ -45,8 +45,8 @@ use crate::devices::BackendFromPv;
 use crate::devices::{wait_for_connection, PathInfo, PathProvider, PurePath, StandardDetector};
 use crate::event_model::{DataKey, Dtype, StreamDatum, StreamRange, StreamResource};
 use crate::protocols_async::{
-    AsyncSubscribable, DetectorControl, DetectorTrigger, DetectorWriter, SignalBackend,
-    SingleDataLogic, StreamAsset, TriggerInfo,
+    AsyncSubscribable, ControlSignal, DetectorControl, DetectorTrigger, DetectorWriter,
+    SignalBackend, SingleDataLogic, StreamAsset, TriggerInfo,
 };
 use futures::stream::{BoxStream, StreamExt};
 use std::collections::HashMap;
@@ -2401,6 +2401,12 @@ impl DetectorControl for AreaDetectorCam {
     }
     async fn unstage(&self) -> Result<()> {
         self.stage_sigs.unstage().await
+    }
+    fn settable_signals(&self) -> Vec<ControlSignal> {
+        vec![
+            ControlSignal::new("acquire_time", self.acquire_time.clone()),
+            ControlSignal::new("acquire_period", self.acquire_period.clone()),
+        ]
     }
     async fn connect(&self, timeout: Duration) -> Result<()> {
         AreaDetectorCam::connect(self, timeout).await

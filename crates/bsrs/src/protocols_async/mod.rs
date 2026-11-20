@@ -10,6 +10,7 @@ pub use crate::core::Subscription;
 use async_trait::async_trait;
 use bytes::Bytes;
 
+use crate::core::msg::{LocatableObj, MovableObj, ReadableObj};
 use crate::core::{
     error::Result,
     reading::ReadingValue,
@@ -21,6 +22,7 @@ use futures::stream::BoxStream;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -279,10 +281,45 @@ pub trait DetectorControl: Send + Sync {
     async fn unstage(&self) -> Result<()> {
         Ok(())
     }
+    /// The acquisition parameters a plan sets before a scan, keyed as in
+    /// [`DetectorControl::read_configuration`] (`acquire_time`, ...): the
+    /// children ophyd-async reaches as `det.driver.acquire_time`. Default
+    /// none.
+    fn settable_signals(&self) -> Vec<ControlSignal> {
+        Vec::new()
+    }
     /// Connect what the control drives (ophyd-async connects the driver as
     /// a child of its detector); nothing by default.
     async fn connect(&self, _timeout: Duration) -> Result<()> {
         Ok(())
+    }
+}
+
+/// One [`DetectorControl::settable_signals`] entry: a signal under each
+/// facet a plan addresses it by.
+pub struct ControlSignal {
+    /// Its name under the detector: `{detector}_{key}`.
+    pub key: &'static str,
+    /// The signal, to read.
+    pub readable: Arc<dyn ReadableObj>,
+    /// The signal, to set.
+    pub movable: Arc<dyn MovableObj>,
+    /// The signal, to locate.
+    pub locatable: Arc<dyn LocatableObj>,
+}
+
+impl ControlSignal {
+    /// `signal` under every facet, as `key`.
+    pub fn new<T>(key: &'static str, signal: Arc<T>) -> Self
+    where
+        T: ReadableObj + MovableObj + LocatableObj + 'static,
+    {
+        Self {
+            key,
+            readable: signal.clone(),
+            movable: signal.clone(),
+            locatable: signal,
+        }
     }
 }
 
