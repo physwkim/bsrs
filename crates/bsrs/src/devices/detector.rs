@@ -474,11 +474,16 @@ where
         *self.prepared.lock().unwrap() = None;
         *self.kicked_off.lock().unwrap() = None;
         self.set_events_to_kickoff(0);
-        self.stop_data_logics().await
+        self.stop_data_logics().await?;
+        self.control.stage().await
     }
     async fn unstage(&self) -> Result<()> {
-        self.control.disarm().await?;
-        self.stop_data_logics().await
+        // Each step runs whether another fails, so a detector that would
+        // not stop still gets back what its control staged.
+        let disarmed = self.control.disarm().await;
+        let stopped = self.stop_data_logics().await;
+        let unstaged = self.control.unstage().await;
+        disarmed.and(stopped).and(unstaged)
     }
 }
 

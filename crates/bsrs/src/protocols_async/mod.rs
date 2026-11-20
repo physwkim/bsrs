@@ -267,6 +267,18 @@ pub trait DetectorControl: Send + Sync {
         let _ = name;
         Ok(HashMap::new())
     }
+    /// Apply what the control holds only for the duration of a scan (ophyd
+    /// `stage_sigs`). Called by the detector's `stage` once it is idle;
+    /// staging again before an `unstage` must keep what the first captured.
+    /// Nothing by default.
+    async fn stage(&self) -> Result<()> {
+        Ok(())
+    }
+    /// Put back what [`DetectorControl::stage`] replaced. Called by the
+    /// detector's `unstage` once it is idle; nothing by default.
+    async fn unstage(&self) -> Result<()> {
+        Ok(())
+    }
     /// Connect what the control drives (ophyd-async connects the driver as
     /// a child of its detector); nothing by default.
     async fn connect(&self, _timeout: Duration) -> Result<()> {
